@@ -7,16 +7,31 @@
 //
 //   bun run check:gate
 //
-// It sends one request per profile, using the wording and User-Agent that
-// profile carries, and reports each as:
+// Each profile is asked twice, because the plugin sends two shapes and Zen
+// does not answer them alike:
 //
-//   answered   Zen served the request; this profile is current
+//   floor  the names in `required`, which is what the plugin stands in for a
+//          host that is not OpenCode and has none of these tools by name. This
+//          is the shape the plugin exists to send, so it is the one that
+//          decides the answer.
+//   full   every tool the profile carries, which is what a host that is
+//          OpenCode itself sends. It is reported for what it says about a
+//          wording that has gone stale, and does not decide the exit code.
+//
+// Asking only the full shape hid a real gap: `read` alone is served and
+// everything but `read` is refused, so a Zen that started insisting on another
+// name would leave the full shape passing while the shape the plugin actually
+// sends was refused.
+//
+// Each request is reported as:
+//
+//   answered   Zen served the request; this shape is current
 //   refused    Zen did not recognise this generation (403)
 //   superseded Zen wants a newer OpenCode than the one this profile claims (426)
 //   unreachable the free tier could not be asked at all
 //
-// Exit code is 0 only when every profile is answered. One profile being
-// refused is not a failure while the other still works.
+// Exit code is 0 when at least one generation's floor is answered. A generation
+// being refused is not a failure while another still works.
 
 import { randomBytes } from "node:crypto";
 import { PROFILES, agentFor } from "./core-tools.mjs";
@@ -41,7 +56,15 @@ function sessionID() {
   return `ses_${value.toString(16).padStart(12, "0")}${tail}`;
 }
 
-async function check(generation, profile) {
+// Zen gives the same sentence whichever part of a request failed to look like
+// OpenCode, so it is worth printing: a refusal that arrives with no message at
+// all reads as something other than a stale fingerprint.
+function says(text) {
+  const match = text.match(/"message"\s*:\s*"([^"]{0,120})"/);
+  return match ? `: ${match[1]}` : "";
+}
+
+async function check(generation, profile, shape, names) {
   const session = sessionID();
   const headers = {
     authorization: "Bearer public",
@@ -52,7 +75,7 @@ async function check(generation, profile) {
     "x-opencode-session": session,
     "x-opencode-session-id": session,
   };
-  const tools = Object.values(profile.tools).map((tool) => ({ type: "function", function: tool }));
+  const tools = names.map((name) => ({ type: "function", function: profile.tools[name] }));
   const body = {
     model: MODEL,
     messages: [{ role: "user", content: "hi" }],
@@ -68,29 +91,63 @@ async function check(generation, profile) {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30000),
     });
-    await response.text();
-    if (response.ok) return { generation, verdict: "answered", detail: `as ${headers["user-agent"]}` };
-    if (response.status === 426) return { generation, verdict: "superseded", detail: "Zen wants a newer OpenCode than this profile claims" };
-    return { generation, verdict: "refused", detail: `HTTP ${response.status}` };
+    const text = await response.text();
+    if (response.ok)
+      return { generation, shape, verdict: "answered", detail: `as ${headers["user-agent"]}` };
+    if (response.status === 426)
+      return {
+        generation,
+        shape,
+        verdict: "superseded",
+        detail: "Zen wants a newer OpenCode than this profile claims",
+      };
+    return { generation, shape, verdict: "refused", detail: `HTTP ${response.status}${says(text)}` };
   } catch (error) {
-    return { generation, verdict: "unreachable", detail: error.message };
+    return { generation, shape, verdict: "unreachable", detail: error.message };
   }
 }
 
 const results = [];
-for (const [generation, profile] of Object.entries(PROFILES)) results.push(await check(generation, profile));
+for (const [generation, profile] of Object.entries(PROFILES)) {
+  results.push(await check(generation, profile, "floor", [...profile.required]));
+  results.push(await check(generation, profile, "full", Object.keys(profile.tools)));
+}
 
 const width = Math.max(...results.map((result) => result.generation.length));
 for (const result of results)
-  console.log(`${result.verdict.padEnd(12)} ${result.generation.padEnd(width)}  ${result.detail}`);
-
-const answered = results.filter((result) => result.verdict === "answered");
-console.log(`\n${answered.length}/${results.length} profiles answered at ${BASE}`);
-if (!answered.length) {
   console.log(
-    "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
+    `${result.shape.padEnd(6)}${result.verdict.padEnd(12)} ${result.generation.padEnd(width)}  ${result.detail}`,
   );
+
+const floor = results.filter((result) => result.shape === "floor");
+const served = floor.filter((result) => result.verdict === "answered");
+console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${BASE}`);
+
+// A generation whose full shape is served while its floor is not is the case
+// this gate was widened to see: the plugin would work for a host bringing its
+// own OpenCode tools and be refused for the host it was written for.
+for (const result of floor) {
+  if (result.verdict === "answered") continue;
+  const full = results.find((other) => other.generation === result.generation && other.shape === "full");
+  if (full?.verdict === "answered")
+    console.log(
+      `${result.generation} answers the full OpenCode shape but not the tools the plugin stands in: a host that has none of them by name will be refused.`,
+    );
+}
+
+if (!served.length) {
+  // Being unable to ask is not an answer. Saying the fingerprint has gone stale
+  // when nothing was reached sends the reader to `capture` over a dead network.
+  if (results.every((result) => result.verdict === "unreachable")) {
+    console.log(
+      "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
+    );
+  } else {
+    console.log(
+      "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
+    );
+  }
   process.exitCode = 1;
-} else if (answered.length < results.length) {
+} else if (served.length < floor.length) {
   console.log("Some are refused but at least one works, so the plugin still has a generation Zen will serve.");
 }

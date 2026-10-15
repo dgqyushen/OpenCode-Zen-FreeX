@@ -123,8 +123,14 @@ function normalizeTools(body, protocol) {
       setDescription(body.tools[index], spoken.description);
       continue;
     }
-    // The names Zen insists on are added; the rest are read by it when present
-    // and mean nothing when they are not.
+    // The names in `required` are stood in for: a host that is not OpenCode has
+    // no tool by these names, and Zen reads a request as belonging to a
+    // generation partly by the tools it carries. `required` is deliberately
+    // wider than what Zen was measured to insist on — `read` alone was answered,
+    // and everything but `read` was refused, on 2026-10-15 — because a wider
+    // set is served, so the extra names cost a host that lacks them only the
+    // tokens of a tool it will not call, and they are the first thing a
+    // tightened check would otherwise find missing.
     if (!profile.required.includes(name)) continue;
     filled.push(name);
     // A tool added here has nothing behind it: the agent has no such tool and

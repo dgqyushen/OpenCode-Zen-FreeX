@@ -24,14 +24,28 @@ bun run capture            # writes it
 bun run check:gate         # did that fix it
 ```
 
-`check:gate` is the one that matters. It reports each generation as:
+`check:gate` is the one that matters. It asks each generation twice, because the
+plugin sends two shapes and Zen does not answer them alike:
+
+| shape | tools sent | what it is |
+| --- | --- | --- |
+| `floor` | the names in `required` | what the plugin stands in for a host that is not OpenCode and has none of these tools by name |
+| `full` | every tool in the profile | what a host that is OpenCode itself sends |
+
+It reports each request as:
 
 | verdict | meaning |
 | --- | --- |
-| `answered` | Zen served it; this generation is current |
+| `answered` | Zen served it; this shape is current |
 | `refused` | Zen did not recognise it (403) |
 | `superseded` | Zen wants a newer OpenCode than the profile claims (426) |
 | `unreachable` | Zen could not be asked at all |
+
+The `floor` decides the exit code, because it is the shape this plugin exists to
+send. The `full` is reported for what it says about a wording that has gone
+stale. Asking only the full shape left a real gap: `read` alone is `answered` and
+everything but `read` is `refused`, so a Zen that began insisting on one more
+name would keep `full` passing while the shape actually sent was refused.
 
 `capture` needs `opencode` on PATH. It points a real OpenCode at a server running
 locally and reads the request it makes, so nothing is sent to Zen and no key is
@@ -39,13 +53,20 @@ involved.
 
 ## Reading a failure
 
-**Every generation `refused`.** OpenCode reworded its tools, or moved the
-endpoint. Run `bun run capture`, then `check:gate` again. If the endpoint moved,
+**Every `floor` `refused`.** OpenCode reworded its tools, or moved the endpoint.
+Run `bun run capture`, then `check:gate` again. If the endpoint moved,
 `DEFAULT_BASE` in `provider.mjs` is what has to change.
 
-**One generation `refused`, the other `answered`.** OpenCode has released and
-this generation is retired. Capture from a current OpenCode: it will be detected
-as the other generation, so what is captured goes into that profile.
+**One `floor` `refused`, the other `answered`.** OpenCode has released and this
+generation is retired. Capture from a current OpenCode: it will be detected as
+the other generation, so what is captured goes into that profile.
+
+**A `floor` `refused` while its `full` is `answered`.** Zen has begun insisting
+on a tool this plugin does not stand in, which the gate names in a line of its
+own. What gets stood in is `required` in `fingerprint.json`, and the wording it
+is stood in with is that profile's `tools`, so the name has to reach both, from a
+capture taken of an OpenCode that has it. A host that brings its own tool by that
+name is served either way, which is why only the `floor` shows this.
 
 **`superseded` (426).** Zen raised the minimum version this profile claims. Raise
 `agent.opencode` in `fingerprint.json` above what it asks for. 426 is Zen saying
