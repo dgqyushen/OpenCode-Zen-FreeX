@@ -1,8 +1,6 @@
 # OpenCode Zen FreeX
 
-[magpie](https://github.com/yetone/magpie)的拓展插件，为其提供OpenCode Zen的免费模型 Provider id：`opencode-zen-free`。
-
-不需要注册账号，也没有费用。凭据就是 `public` 这一个词。
+[magpie](https://github.com/yetone/magpie)的拓展插件，为其提供OpenCode Zen的免费模型
 
 本项目是 `magpie-community/plugins` 里[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)插件的维护分支，分叉的理由是magpie-community已放弃对OpenCode Zen免费模型继续维护，维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
 
