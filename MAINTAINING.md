@@ -190,19 +190,38 @@ provider id, and which one wins is down to load order. Pick one.
 To publish: bump `version`, `npm publish`, and tag. `magpie plugin add
 opencode-zen-freex` installs it by that name.
 
-Publishing is the one step here that cannot be run unattended, because it is
-the one step npm asks a person about. Run it as yourself.
+**The second factor is a browser, not a password.** Run `npm publish` in a
+terminal. When the account has 2FA on, the command stops and offers the whole
+exchange at once:
 
-**With 2FA on the account.** `npm publish` fails with `EOTP` and prints a
-`https://www.npmjs.com/auth/cli/...` address, redacted in the error and
-different every time. Open it, finish, and the same command carries on. There
-is nothing to pass to a script: the address is tied to the browser session that
-prints it.
+```
+Authenticate your account at:
+https://www.npmjs.com/auth/cli/...
+Press ENTER to open in the browser...
+```
 
-**With a granular token.** A token with publish permission authorizes the
-publish on its own and never asks for the second factor. Write it to an npmrc
-outside the repository and point npm at it for that one command, so it does
-not land in a tracked file:
+Press ENTER, authorize in the browser, and the same command carries on by
+itself. Nothing is typed back into the terminal and nothing is passed to a
+script: the address is tied to the browser session that printed it and differs
+every time, so it is read out of the running command rather than composed in
+advance. Whoever is at the browser authorizes, so the command can be started for
+them and left waiting — the one thing it needs from them is the ENTER that opens
+it.
+
+Both halves of that depend on the command having a terminal. Run as a background
+job or piped into a file, npm has no browser to offer, redacts the address to
+`https://www.npmjs.com/auth/cli/***` and exits `EOTP` rather than waiting, so a
+log of the failed attempt cannot be used to finish it — start it again in a
+terminal.
+
+An account with no second factor to give publishes in one step. So does
+`npm login --auth-type=web`, which is the same browser exchange kept as a
+session, and so does a granular token below.
+
+**With a granular token** (unattended, CI). A token with publish permission
+authorizes the publish on its own and never asks for the second factor. Write it
+to an npmrc outside the repository and point npm at it for that one command, so
+it does not land in a tracked file:
 
 ```sh
 printf '//registry.npmjs.org/:_authToken=npm_...\n' > "$TMP/npmrc"
