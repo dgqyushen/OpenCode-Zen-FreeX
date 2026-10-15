@@ -280,3 +280,25 @@ you do not have permission to access it.
 which reads exactly like the package not existing. It is the same status npm
 gives a genuine permission failure, so a 404 from a publish says nothing at
 all until the token has been checked.
+
+**A publish that no longer offers the browser at all.** A token can be dead
+while npm says nothing about it until a write is attempted. Measured: `npm
+whoami` answers
+
+```
+npm error 401 Unauthorized - GET https://registry.npmjs.org/-/whoami
+```
+
+and the publish answers that same 404 without ever printing an auth address,
+because with no usable credential the request goes out unauthenticated and npm
+reports the result as not-found. `npm login --auth-type=web` is the fix — the
+browser exchange again, which replaces the stored token — and the publish after
+it asks for the second factor in the browser once more. **Two authorizations in
+a row is the normal shape of this**, not a sign that something is wrong. So on a
+404 from a publish, ask `npm whoami` before anything else: 401 is a session that
+has to be renewed, and everything else is the permission problem above.
+
+npm says on login that "tokens that bypass 2FA are being restricted for account
+changes and direct publishing", so the granular route below is on its way out as
+a way to publish; the browser is the road, and the token is the exception it is
+already written to be.
