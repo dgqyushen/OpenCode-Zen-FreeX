@@ -100,3 +100,46 @@ provider id, and which one wins is down to load order. Pick one.
 
 To publish: bump `version`, `npm publish`, and tag. `magpie plugin add
 opencode-zen-freex` installs it by that name.
+
+Publishing is the one step here that cannot be run unattended, because it is
+the one step npm asks a person about. Run it as yourself.
+
+**With 2FA on the account.** `npm publish` fails with `EOTP` and prints a
+`https://www.npmjs.com/auth/cli/...` address, redacted in the error and
+different every time. Open it, finish, and the same command carries on. There
+is nothing to pass to a script: the address is tied to the browser session that
+prints it.
+
+**With a granular token.** A token with publish permission authorizes the
+publish on its own and never asks for the second factor. Write it to an npmrc
+outside the repository and point npm at it for that one command, so it does
+not land in a tracked file:
+
+```sh
+printf '//registry.npmjs.org/:_authToken=npm_...\n' > "$TMP/npmrc"
+npm publish --userconfig "$TMP/npmrc"; rm -f "$TMP/npmrc"
+```
+
+Whatever carries a token — a shell, a chat, a CI log under
+`%LOCALAPPDATA%\npm-cache\_logs` — is now a place the token has been, and
+npm's debug log records the whole command line. Rotate it once the publish is
+done. It is not needed to install the package afterwards.
+
+Two things that read as failures and are not. A version already published
+cannot be published again, so a republished README means a new `version`, not
+a retry — `README.md` is in `files`, so it ships and npmjs.com renders it.
+And for a minute or two after a successful publish, `npm view` still 404s
+while the registry replicates; wait rather than publishing under a second
+number.
+
+One trap worth knowing: a token that is missing, truncated or malformed is
+reported by npm as
+
+```
+404 The requested resource 'opencode-zen-freex@0.2.1' could not be found or
+you do not have permission to access it.
+```
+
+which reads exactly like the package not existing. It is the same status npm
+gives a genuine permission failure, so a 404 from a publish says nothing at
+all until the token has been checked.
