@@ -20,7 +20,7 @@ working now.
 ## Install
 
 ```sh
-magpie plugin add <package-name>
+magpie plugin add opencode-zen-freex
 magpie plugin login opencode-zen-free
 ```
 

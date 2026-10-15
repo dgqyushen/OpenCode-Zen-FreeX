@@ -1,5 +1,5 @@
 {
-  "name": "opencode-zen-free",
+  "name": "opencode-zen-freex",
   "version": "0.2.0",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
@@ -17,9 +17,9 @@
   ],
   "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/opencode-zen-free.git" },
-  "bugs": { "url": "https://github.com/tkhs101/opencode-zen-free/issues" },
-  "homepage": "https://github.com/tkhs101/opencode-zen-free#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/opencode-zen-freex.git" },
+  "bugs": { "url": "https://github.com/tkhs101/opencode-zen-freex/issues" },
+  "homepage": "https://github.com/tkhs101/opencode-zen-freex#readme",
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",

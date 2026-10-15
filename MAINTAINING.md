@@ -92,5 +92,5 @@ that passes under the stricter of them, since the looser one will not last.
 ## Publishing
 
 The package name and `repository` in `package.json` are set for the fork. To
-publish: bump `version`, `npm publish`, and tag. `magpie plugin add <name>`
-installs it by that name.
+publish: bump `version`, `npm publish`, and tag. `magpie plugin add
+opencode-zen-freex` installs it by that name.
