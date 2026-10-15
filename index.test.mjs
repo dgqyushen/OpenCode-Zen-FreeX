@@ -847,3 +847,31 @@ test("a Chat stream Zen closes before its [DONE] ends cut short for a streaming 
   assert.notEqual(whole.status, 200);
   assert.match(await whole.text(), /without a completion marker \(reply x2, 3 events/);
 });
+
+// A refusal is the one place this route states its own window, and the plugin
+// reads it on its way past (observeRouteStatement, called from the provider's
+// fetch). The window in this fixture is one no measurement ever produced, so
+// only the live path can put it there: a unit test of the reader would pass
+// with the call site missing, which is exactly how the last plugin lost a
+// mechanism it had already shipped and tested.
+test("a refusal that names a window reaches the declaration, not only the caller", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 400;
+  state.body = JSON.stringify({
+    error: {
+      type: "invalid_request_error",
+      message:
+        "This model's maximum context length is 900000 tokens. However, you requested 1000000 tokens (900000 in the messages, 100000 in the completion).",
+    },
+  });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /maximum context length is 900000 tokens/);
+  const { limitOverrides } = await import("./limits.mjs");
+  assert.equal(limitOverrides("chat-free", { context: 200000, output: 8192 }).context, 900000);
+});

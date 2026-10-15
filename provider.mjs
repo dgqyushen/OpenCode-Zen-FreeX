@@ -9,6 +9,7 @@ import {
   configModels,
   parseProtocolDocs,
 } from "./models.mjs";
+import { observeRouteStatement } from "./limits.mjs";
 import { collapseResponse } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
 
@@ -466,6 +467,11 @@ async function server(_input, options = {}) {
               signal: request.signal,
               redirect: "error",
             });
+            // A refusal is the one place this route states its own window, and
+            // it has to be read before explain() replaces the body. See
+            // limits.mjs: an under-declared window is never refused, it is just
+            // quietly never used.
+            await observeRouteStatement(body.model, response);
             const guarded = await guardToolResponse(await explain(response, toolPolicy), protocol, toolPolicy, {
               endCutShort: streaming,
             });

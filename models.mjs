@@ -1,3 +1,5 @@
+import { limitOverrides } from "./limits.mjs";
+
 export const PROVIDER = "opencode-zen-free";
 export const SDK = {
   chat: "@ai-sdk/openai-compatible",
@@ -63,7 +65,7 @@ export function buildModels(ids, provider, protocols, baseURL) {
       providerID: PROVIDER,
       name: model.name ?? id,
       api: { id, url: baseURL, npm: SDK[protocol] },
-      limit: { context: 32768, output: 4096, ...model.limit },
+      limit: { context: 32768, output: 4096, ...model.limit, ...limitOverrides(id, model.limit) },
       capabilities: {
         temperature: model.temperature ?? true,
         reasoning: model.reasoning ?? false,

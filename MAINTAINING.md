@@ -1,6 +1,6 @@
 # Maintaining this plugin
 
-The plugin is one file of logic and one piece of data, and the data is the part
+The plugin is one file of logic and two pieces of data, and the data is the part
 that goes out of date. This is how to look after it.
 
 ## What is actually fragile
@@ -13,6 +13,68 @@ OpenCode changes any of that, the copy here stops being accepted.
 Nothing about a stale copy looks different from a working one. The symptom is a
 `403 FreeTierError` on every request, which reads as "you are not OpenCode" and
 sends people off to change headers.
+
+## Limits Zen under-reports
+
+`models.mjs` declares each model's limits from Zen's catalogue, and for some free
+ids the catalogue is wrong in the one direction nothing complains about: too
+small. `deepseek-v4.1-flash-free` is declared 200000/32000 while
+`deepseek-v4.1-flash` — the paid id serving the same upstream model, which
+`x-opencode-upstream-model-id` confirms — is declared 1000000/384000 in that
+same catalogue.
+
+Both numbers are acted on. The window decides when a conversation is compacted
+and how much of it is ever sent; the output cap is sent as `max_tokens` on every
+request, so a reply is cut at it with a finish reason that reads like the
+model's own decision. A window that is too small is never refused, it is just
+quietly never used, which is why this stayed invisible for so long.
+
+`limits.mjs` holds what was measured, per axis, with the catalogue value it was
+measured against. Each axis carries `samples` and `how`; the short of it:
+
+| axis | value | from |
+| --- | --- | --- |
+| context | 1048576 | the route's own refusal, in its own words |
+| output | 384000 | what this route declares for the same upstream model |
+
+A prompt sized just over the window is refused with
+
+```
+This model's maximum context length is 1048576 tokens. However, you requested
+1422278 tokens (1038278 in the messages, 384000 in the completion).
+```
+
+which is the route stating its own window, and better evidence than any vendor
+page. The output figure is the paid twin's declaration, so the route has already
+published what that model does; a single reply of 306,880 completion tokens
+(`finish_reason: stop`) was watched and is recorded as the witness.
+
+**Re-measuring.** The window: send a prompt of about 1.05M tokens and read the
+number out of the refusal, three times, interleaved, per the rule below. The
+filler measured 4.887 characters per token with about 1700 tokens of fixed
+request overhead, and a request that is *served* says nothing about where the
+wall is. The output: re-read the paid id's `limit` in
+`https://models.opencode.ai/api.json`. A value Zen accepts is not evidence —
+`max_tokens: 2000000` under a short prompt answers 200 and writes nothing like
+it — and neither is a generation nobody watched finish.
+
+**What voids it.** Each axis records the catalogue value it was measured
+against, and an axis whose declaration moved is dropped rather than kept: a
+measurement of one question is not an answer to another. A catalogue that raises
+the free id to the paid twin's figures therefore makes this file inert on its
+own, which is the intended end state.
+
+**While the plugin runs.** A refusal that names a window is read on its way past
+(`observeRouteStatement`, called from the provider's `fetch`), and it corrects
+that model's window for the rest of the process. The list is rebuilt at every
+start and hourly after, so a route that changes the window it enforces is
+followed without anyone editing this file. Nothing is persisted: a restart falls
+back to what is measured here.
+
+**A lead, not evidence.** `mimo-v2.6-flash-free` is declared 200000/32000 here
+too, and another plugin on this route has reported Zen answering that id with
+`maximum context length is 1048576 tokens`. That is somebody else's measurement
+of a different id, so it is not in `limits.mjs`: measure it before adding it.
 
 ## The loop
 
@@ -107,10 +169,11 @@ that passes under the stricter of them, since the looser one will not last.
 
 | file | what it is |
 | --- | --- |
-| `fingerprint.json` | the capture. The only thing that goes out of date |
+| `fingerprint.json` | the capture: the wording and User-Agent Zen accepts |
 | `core-tools.mjs` | reads the capture; says which generation a request is |
 | `provider.mjs` | the plugin: discovery, headers, tools, the diagnostic |
 | `models.mjs` | which models are free, and what protocol each speaks |
+| `limits.mjs` | what a model's limits are, where the catalogue under-reports them |
 | `stream.mjs`, `tool-response.mjs` | replies Zen cuts short, and tool calls |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
