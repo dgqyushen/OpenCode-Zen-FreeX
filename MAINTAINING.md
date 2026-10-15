@@ -187,8 +187,10 @@ either way, so one stays in place whichever is installed. It does mean the two
 are mutually exclusive — installing both leaves two plugins claiming one
 provider id, and which one wins is down to load order. Pick one.
 
-To publish: bump `version`, `npm publish`, and tag. `magpie plugin add
-opencode-zen-freex` installs it by that name.
+To publish: bump `version`, commit, `npm publish` in a terminal, and tag — in
+that order, so the tarball, the commit the tag names, and the tree both were
+built from are one thing. `magpie plugin add opencode-zen-freex` installs it by
+that name.
 
 **The second factor is a browser, not a password.** Run `npm publish` in a
 terminal. When the account has 2FA on, the command stops and offers the whole
