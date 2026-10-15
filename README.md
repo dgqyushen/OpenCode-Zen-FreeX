@@ -102,4 +102,4 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 
 ## 许可
 
-MIT。分叉自 `magpie-community/plugins`（MIT）。
+分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)（MIT）。
