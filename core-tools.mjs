@@ -23,9 +23,6 @@ const captured = JSON.parse(readFileSync(new URL("./fingerprint.json", import.me
 
 export const PROFILES = captured.profiles;
 
-/** The names Zen reads the wording of, for a generation. */
-const readNames = (generation) => Object.keys(PROFILES[generation].tools);
-
 /**
  * The generation a request belongs to, told by the tools it carries. Tool names
  * move far less often than descriptions do, so this survives a rewording that a
@@ -49,5 +46,3 @@ export function agentFor(generation, protocol = "chat") {
     ? `opencode/${agent.opencode} ai-sdk/provider-utils/${agent.providerUtils[protocol]} ${agent.runtime}`
     : `opencode/${agent.channel}/${agent.opencode}/${agent.client}`;
 }
-
-export { readNames };
