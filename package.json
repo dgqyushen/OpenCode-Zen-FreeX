@@ -17,7 +17,9 @@
   ],
   "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/CHANGE-ME/opencode-zen-free.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/opencode-zen-free.git" },
+  "bugs": { "url": "https://github.com/tkhs101/opencode-zen-free/issues" },
+  "homepage": "https://github.com/tkhs101/opencode-zen-free#readme",
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",
