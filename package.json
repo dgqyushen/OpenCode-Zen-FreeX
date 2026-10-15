@@ -12,7 +12,10 @@
     "models.mjs",
     "stream.mjs",
     "tool-response.mjs",
+    "tools-smoke.mjs",
+    "capture.mjs",
     "README.md",
+    "MAINTAINING.md",
     "LICENSE"
   ],
   "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],

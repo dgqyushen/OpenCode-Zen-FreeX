@@ -2,7 +2,7 @@
 
 [magpie](https://github.com/yetone/magpie)的拓展插件，为其提供OpenCode Zen的免费模型
 
-本项目是 `magpie-community/plugins` 里[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)插件的维护分支，分叉的理由是magpie-community已放弃对OpenCode Zen免费模型继续维护，维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
+本项目是 `magpie-community/plugins` 里[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)插件的维护分支。上游仍在维护，上游的修复也会跟进；分叉是因为它有一处跟不上的节奏：Zen 只在请求的整体属于某一代 OpenCode 时才应答，而那份「整体」是从真实 OpenCode 采集来的（`fingerprint.json`），OpenCode 一改工具措辞或 User-Agent 它就过期，过期了从外表看不出来，症状是每个请求都 `403 FreeTierError`。本分支存在的理由就是能立刻重跑采集，不必等下一次发版。维护步骤见 [MAINTAINING.md](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
 
 ## 目录
 
