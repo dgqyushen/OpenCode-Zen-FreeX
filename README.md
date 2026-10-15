@@ -1,4 +1,4 @@
-# OpenCode Zen Free
+# OpenCode Zen FreeX
 
 给非 OpenCode 宿主使用的 OpenCode Zen 免费模型。provider id：`opencode-zen-free`。
 
@@ -6,7 +6,7 @@ Zen 的免费层会拒绝一切不像 OpenCode 发出的请求，回答 403 Free
 
 不需要注册账号，也没有费用。凭据就是 `public` 这一个词。
 
-本项目是 `magpie-community/plugins` 里那个插件的维护分支，同样是 MIT。分叉的理由是那份指纹的变动比那个仓库跟得快：它最后一个版本仍然对着一个早已不提供免费层的端点。两个插件只能装一个——它们注册的是同一个 provider id，都装上的话谁生效取决于加载顺序。维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
+本项目是 `magpie-community/plugins` 里zen-free插件的维护分支，同样是 MIT。分叉的理由是magpie-community已放弃对免费模型继续维护。两个插件只能装一个——它们注册的是同一个 provider id，都装上的话谁生效取决于加载顺序。维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
 
 ## 目录
 
