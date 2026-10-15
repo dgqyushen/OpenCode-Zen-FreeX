@@ -43,13 +43,31 @@ export function isFree(id, model = {}) {
   );
 }
 
+// Whether an id names itself free — Zen names them "-free" — which is all this
+// can know about one that neither the catalogue nor the docs describe yet: Zen
+// made it free after they were last written, or they could not be read. Such a
+// model is asked the way OpenCode asks a model with no package of its own,
+// through the provider's own (openai-compatible, and so chat), so a new free
+// model is offered the hour Zen lists it rather than the hour the catalogue
+// catches up. An id that does not call itself free still needs the catalogue's
+// word (a paid one, or a zero-cost one Zen never named).
+function listedFree(id) {
+  return /-free$/.test(id);
+}
+
 export function buildModels(ids, provider, protocols, baseURL) {
   const result = {};
   for (const id of ids) {
     if (typeof id !== "string" || !id || id === "__proto__") continue;
     const raw = provider.models?.[id];
     const model = raw ?? {};
-    const protocol = protocols[id] ?? (raw && sdkProtocol(model.provider?.npm ?? provider.npm));
+    const protocol =
+      protocols[id] ??
+      (raw
+        ? sdkProtocol(model.provider?.npm ?? provider.npm)
+        : listedFree(id)
+          ? (sdkProtocol(provider.npm) ?? "chat")
+          : undefined);
     if (!isFree(id, model) || !Object.hasOwn(SDK, protocol)) continue;
     const input = model.modalities?.input ?? ["text"];
     const output = model.modalities?.output ?? ["text"];

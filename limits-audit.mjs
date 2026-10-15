@@ -16,11 +16,12 @@
 // prompt of about a million tokens — minutes and megabytes — and belongs to the
 // one id a signal has already pointed at; the numbers live in limits.mjs and are
 // put there by a measurement, never by a script. What this does ask is cheap:
-// one request of `max_tokens: 1000000` per offered id, stopped as soon as it
-// starts writing. An upstream that validates the ceiling refuses and names its
-// own; one that does not just begins to answer and is cut off after the first
-// chunk. Either way the cost is a handful of tokens, and a 410 or a 400 for a
-// model that is gone is visible in the same request.
+// one request of `max_tokens: 1000000` per offered id that speaks the chat
+// shape, stopped as soon as it starts writing. An upstream that validates the
+// ceiling refuses and names its own; one that does not just begins to answer and
+// is cut off after the first chunk. Either way the cost is a handful of tokens,
+// and a 410 or a 400 for a model that is gone is visible in the same request.
+// An id the snapshot places on another protocol is listed and not asked.
 //
 // The offered set is the listing's, not the catalogue's: Zen's /v1/models
 // carries 10 of the 40 free ids the catalogue still describes, and a plugin
@@ -36,6 +37,7 @@
 
 import { PROFILES } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedContextWindow, namedOutputCap } from "./limits.mjs";
+import { SDK, bootstrapProtocols } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
@@ -46,11 +48,18 @@ const READ_BUDGET = 4096;
 const ASKED_CEILING = 1_000_000;
 
 // The ids the plugin would offer: the listing's, kept where the catalogue calls
-// them free. Exported for the tests.
-export function offeredIds(listing, catalog) {
+// them free — or, for an id neither the catalogue nor the docs describe, where
+// the id names itself free and nothing else names its protocol, which is what
+// models.mjs offers on its own say-so. An id the snapshot already calls
+// something this plugin has no SDK for is not offered by anyone: `jev-1.13-free`
+// is SystemOne, and stays out here for the same reason buildModels leaves it out.
+// Exported for the tests.
+export function offeredIds(listing, catalog, snapshot = bootstrapProtocols) {
   return listing.filter((id) => {
+    const protocol = snapshot?.[id];
+    if (protocol !== undefined && !Object.hasOwn(SDK, protocol)) return false;
     const model = catalog?.[id];
-    if (!model) return false;
+    if (!model) return /-free$/.test(id);
     return /free/i.test(id) || (model.cost?.input === 0 && model.cost?.output === 0);
   });
 }
@@ -87,15 +96,13 @@ export function findings(rows, covered = new Set()) {
         `${row.id}: a refusal named a window of ${row.window}, the catalogue declares ${declared.context ?? "none"}`,
       );
     const named = row.ceiling !== undefined || row.window !== undefined;
+    // A model that does not speak the shape this audit asks with is not a limits
+    // finding and must not sit in this list for ever: it is said once, beside the
+    // ids that were not asked at all.
+    if (protocolScoped(row)) continue;
     if (row.status !== 200 && !named) {
-      // A 400 this audit provoked by asking for too much is the audit working,
-      // not a finding, and neither is a refusal a number was just read out of.
-      // What is left is worth reading: a 410, a 400 that named nothing, and a
-      // model that does not speak the shape asked with.
-      const protocol = /protocol|format/i.test(row.says ?? "");
-      out.push(
-        `${row.id}: HTTP ${row.status}${protocol ? " (does not speak the chat shape this audit asks with)" : ""}${row.says ? ` — ${row.says}` : ""}`,
-      );
+      // What is left is worth reading: a 410, and a 400 that named nothing.
+      out.push(`${row.id}: HTTP ${row.status}${row.says ? ` — ${row.says}` : ""}`);
     }
   }
   for (const [upstream, list] of groupByUpstream(rows)) {
@@ -125,6 +132,13 @@ function says(text) {
   // and a refusal nobody can read is not a finding.
   const flat = text.replace(/\s+/g, " ").trim();
   return flat ? flat.slice(0, 160) : "";
+}
+
+// A refusal that names the protocol rather than a limit. This audit asks the
+// chat shape, so a model that speaks Responses or Messages answers by saying so;
+// that is the host's business, not a limit to measure.
+export function protocolScoped(row) {
+  return /protocol|format/i.test(row?.says ?? "");
 }
 
 async function getJSON(url) {
@@ -202,7 +216,12 @@ if (import.meta.main) {
   console.log(`${ids.length} free ids are offered; the catalogue still describes ${free.length}\n`);
 
   const rows = [];
-  for (const id of ids) {
+  // This asks the chat shape only. An id the snapshot places on another protocol
+  // is left to the host that speaks it, and said once rather than reported as a
+  // finding it cannot be.
+  const asked = ids.filter((id) => (bootstrapProtocols[id] ?? "chat") === "chat");
+  const elsewhere = ids.filter((id) => !asked.includes(id));
+  for (const id of asked) {
     const answer = await ask(id, names);
     const declared = models[id]?.limit ?? {};
     rows.push({ id, declared, ...answer });
@@ -210,12 +229,12 @@ if (import.meta.main) {
     // so that is what is printed; the catalogue's own pair is shown beside it
     // when the two differ, since that is the under-report being answered.
     const effective = { ...declared, ...limitOverrides(id, declared) };
-    const moved =
-      effective.context !== declared.context || effective.output !== declared.output;
+    const moved = effective.context !== declared.context || effective.output !== declared.output;
+    const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
     const mark = answer.status === 200 ? "  " : "! ";
     console.log(
-      `${mark}${id.padEnd(34)} ${`${effective.context}/${effective.output}`.padStart(17)}` +
-        `${moved ? `  (catalogue ${declared.context}/${declared.output})` : ""}  ${answer.status}` +
+      `${mark}${id.padEnd(34)} ${pair(effective).padStart(17)}` +
+        `${moved ? `  (catalogue ${pair(declared)})` : ""}  ${answer.status}` +
         `${answer.upstream ? `  ${answer.upstream}${answer.endpoint ? ` via ${answer.endpoint}` : ""}` : ""}` +
         `${answer.ceiling !== undefined ? `  ceiling=${answer.ceiling}` : ""}${answer.window !== undefined ? `  window=${answer.window}` : ""}` +
         `${answer.says ? `  — ${answer.says}` : ""}`,
@@ -224,6 +243,11 @@ if (import.meta.main) {
 
   const answered = rows.filter((row) => row.status === 200);
   const candidates = findings(rows, new Set(Object.keys(LIMITS)));
+  const skipped = [...elsewhere, ...rows.filter(protocolScoped).map((row) => row.id)];
+  if (skipped.length)
+    console.log(
+      `\nnot asked, this audit asks the chat shape only: ${skipped.map((id) => `${id}${bootstrapProtocols[id] ? ` (${bootstrapProtocols[id]})` : ""}`).join(", ")}`,
+    );
   console.log(`\nlimits.mjs already carries evidence for: ${Object.keys(LIMITS).join(", ")}`);
   console.log(`\n${candidates.length} candidate${candidates.length === 1 ? "" : "s"}:`);
   for (const line of candidates) console.log(`  ${line}`);

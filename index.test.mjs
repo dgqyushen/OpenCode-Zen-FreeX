@@ -351,9 +351,11 @@ test("partial catalog failure retains previously verified models rather than dro
   const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   state.catalogStatus = 503;
   state.docsStatus = 503;
-  const fallback = await plugin.provider.models({ models }, { auth: await publicAuth() });
-  assert.deepEqual(Object.keys(fallback).sort(), ["chat-free", "messages-free", "responses-free"]);
-  assert.equal(fallback[Symbol.for("magpie.fellBack")], true);
+  const partial = await plugin.provider.models({ models }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(partial).sort(), ["chat-free", "messages-free", "responses-free"]);
+  // and it is not said as fallen back: Zen's own list was read, and a host that
+  // cannot reach the catalogue or the docs must still see what that list says
+  assert.equal(partial[Symbol.for("magpie.fellBack")], undefined);
 });
 
 // The reporter of yetone/magpie#2305 saw only the three models the plugin
@@ -373,7 +375,9 @@ test("listed free models are offered when the catalog and the docs can't be read
   assert.equal(models["step-5-preview-free"].api.npm, "@ai-sdk/openai-compatible");
   assert.equal(models["step-5-preview-free"].name, "Step 5 Preview Free");
   assert.equal(models["step-5-preview-free"].limit.context, 1000000);
-  assert.equal(models[Symbol.for("magpie.fellBack")], true);
+  // offered, not said as fallen back: the listing was read, so a host that can't
+  // reach the catalogue or the docs still gets every model Zen lists (#2385)
+  assert.equal(models[Symbol.for("magpie.fellBack")], undefined);
 });
 
 // The floor is not a rival to the docs: what they name wins, and only what

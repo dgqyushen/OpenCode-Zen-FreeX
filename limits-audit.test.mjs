@@ -16,10 +16,27 @@ const catalog = {
 test("the audit asks about the ids the listing offers, not every id the catalogue calls free", async () => {
   const { offeredIds } = await subject;
   assert.equal(typeof offeredIds, "function", "the audit must be implemented");
+  // `brand-new-free` is in no catalogue and is still offered, because its id says
+  // so; `not-in-the-catalogue` is offered by nobody including itself; and an id
+  // the snapshot calls SystemOne is not offered, whatever its name says
   assert.deepEqual(
-    offeredIds(["deepseek-v4.1-flash-free", "paid", "not-in-the-catalogue", "big-pickle"], catalog),
-    ["deepseek-v4.1-flash-free", "big-pickle"],
+    offeredIds(
+      [
+        "deepseek-v4.1-flash-free",
+        "paid",
+        "not-in-the-catalogue",
+        "big-pickle",
+        "brand-new-free",
+        "jev-1.13-free",
+      ],
+      catalog,
+    ),
+    ["deepseek-v4.1-flash-free", "big-pickle", "brand-new-free"],
   );
+  // a snapshot can be handed in, so a test says what it knows without depending
+  // on what the shipped one happens to carry
+  assert.deepEqual(offeredIds(["x-free"], {}, { "x-free": "systemone" }), []);
+  assert.deepEqual(offeredIds(["x-free"], {}, { "x-free": "chat" }), ["x-free"]);
 });
 
 test("ids are grouped by the upstream model the route names, and one that names none is left out", async () => {
@@ -64,7 +81,7 @@ test("a ceiling the route names is a candidate, and one it agrees with is not", 
 });
 
 test("a 400 the audit provoked is not a candidate, and the ones it cannot explain are", async () => {
-  const { findings } = await subject;
+  const { findings, protocolScoped } = await subject;
   const rows = [
     // asked for too much on purpose and told the window, which the catalogue agrees with
     { id: "provoked-free", declared: { context: 1000000, output: 65536 }, status: 400, window: 1000000, says: "" },
@@ -81,7 +98,10 @@ test("a 400 the audit provoked is not a candidate, and the ones it cannot explai
   assert.equal(lines.filter((line) => line.startsWith("provoked-free")).length, 0);
   assert.match(lines.find((line) => line.startsWith("silent-free")), /HTTP 400 — invalid request/);
   assert.match(lines.find((line) => line.startsWith("dead-free")), /HTTP 410 — Model has been deprecated\./);
-  assert.match(lines.find((line) => line.startsWith("wrong-shape-free")), /does not speak the chat shape/);
+  // a model that speaks another protocol is said once, beside the ids that were
+  // not asked, and never sits in this list as a finding
+  assert.equal(lines.filter((line) => line.startsWith("wrong-shape-free")).length, 0);
+  assert.equal(protocolScoped(rows.at(-1)), true);
 });
 
 test("one upstream model declared twice, unlike, makes the smaller declaration the candidate", async () => {

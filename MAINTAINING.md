@@ -195,6 +195,26 @@ the cooldown answers like a refusal.
 
 ## Things that are easy to break
 
+**Marking a list as fallen back when Zen's own list was read.** `discover()`
+returns every id Zen's `/models` lists; the catalogue and the console docs only
+add what each model *is* — name, protocol, limits. When either of those two
+cannot be read, the list is not a fallback: it is Zen's, current, and complete to
+the last id. Saying so costs a user something real, because the host reacts to
+that marker by keeping the last list it read in full, and a machine that cannot
+reach `raw.githubusercontent.com` or `models.opencode.ai` — mainland China, for
+one — then never sees a model Zen made free since. The marker belongs to the one
+case that describes it: the listing itself could not be read, so what is returned
+really is the last list there was (`yetone/magpie#2385`).
+
+**Waiting for the catalogue before offering a model Zen already lists.** An id
+ending in `-free` that neither the catalogue nor the docs describe is offered
+anyway, asked through the provider's own protocol (openai-compatible, and so
+chat) — the way OpenCode asks a model with no package of its own. Zen lists a
+model the hour it turns free and the catalogue catches up later; a host should
+see it in between. An id that does not call itself free still needs the
+catalogue's word, and one the snapshot or the docs name keeps that say:
+`jev-1.13-free` is SystemOne and stays out.
+
 **Adding a header.** The set sent has one owner: `outboundHeaders` in
 `provider.mjs`, which the plugin builds its request with and which the gate asks
 Zen with, so neither can drift from the other on its own. `index.test.mjs` pins

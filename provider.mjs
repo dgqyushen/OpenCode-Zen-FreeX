@@ -359,7 +359,13 @@ async function server(_input, options = {}) {
           discovered[id] = known[id];
         }
       }
-      discovered[Symbol.for("magpie.fellBack")] = true;
+      // Deliberately not said as fallen back. Zen's own list was read, and what
+      // it lists is what gets offered; said as a fallback, magpie keeps the last
+      // list it read in full instead, and a host that cannot reach the catalogue
+      // or the docs — GitHub's raw host, from mainland China — would never see a
+      // model Zen made free since (yetone/magpie#2385). A listing that could not
+      // be read is still said so, above, because then this really is the last
+      // list there was.
     }
     known = discovered;
     listed = true;

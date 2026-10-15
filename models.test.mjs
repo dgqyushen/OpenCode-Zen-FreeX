@@ -60,13 +60,39 @@ test("endpoint documentation overrides inherited SDK and excludes SystemOne", as
   assert.equal(models["decision-free"], undefined);
 });
 
-test("unknown models require a known protocol rather than a guessed chat endpoint", async () => {
+test("an unknown id is offered on its own free name, never on a guessed endpoint", async () => {
   const { buildModels } = await subject;
   assert.equal(typeof buildModels, "function", "model discovery must be implemented");
-  assert.deepEqual(Object.keys(buildModels(["new-free", "unknown-paid"], {}, {}, baseURL)), []);
+  // an id that does not name itself free is not offered at all
+  assert.deepEqual(Object.keys(buildModels(["unknown-paid"], {}, {}, baseURL)), []);
+  // one that does is asked through the provider's own protocol, not a guess at it
+  const free = buildModels(["new-free"], {}, {}, baseURL);
+  assert.deepEqual(Object.keys(free), ["new-free"]);
+  assert.equal(free["new-free"].api.npm, "@ai-sdk/openai-compatible");
   const models = buildModels(["new-free"], {}, { "new-free": "chat" }, baseURL);
   assert.equal(models["new-free"].api.url, baseURL);
   assert.equal(models["new-free"].cost.input, 0);
+});
+
+// A model Zen lists that neither the catalogue nor the docs describe yet: the id
+// says it is free, so it is offered at the protocol the provider itself speaks
+// rather than waiting for the catalogue to catch up (yetone/magpie#2385). An id
+// that does not call itself free still needs the catalogue's word, and one the
+// catalogue does describe keeps the protocol the catalogue gave it.
+test("an id that calls itself free is offered before the catalogue describes it", async () => {
+  const { buildModels } = await subject;
+  const models = buildModels(
+    ["brand-new-free", "brand-new", "responses-free"],
+    provider,
+    {},
+    baseURL,
+  );
+  assert.deepEqual(Object.keys(models).sort(), ["brand-new-free", "responses-free"]);
+  assert.equal(models["brand-new-free"].api.npm, "@ai-sdk/openai-compatible");
+  assert.equal(models["brand-new-free"].name, "brand-new-free");
+  assert.equal(models["brand-new-free"].limit.context, 32768);
+  // the catalogue's own package still decides the protocol for an id it describes
+  assert.equal(models["responses-free"].api.npm, "@ai-sdk/openai");
 });
 
 // Rows as OpenCode's console docs have them since 2026-10-12
