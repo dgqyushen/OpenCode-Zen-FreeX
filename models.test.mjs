@@ -68,3 +68,35 @@ test("unknown models require a known protocol rather than a guessed chat endpoin
   assert.equal(models["new-free"].api.url, baseURL);
   assert.equal(models["new-free"].cost.input, 0);
 });
+
+// Rows as OpenCode's console docs have them since 2026-10-12
+// (services/www/src/docs/content/console/models.mdx), and the pricing table
+// beside it that names no endpoint (yetone/magpie#2305): the zen.mdx these
+// were read from before was removed that day.
+const consoleDocs = [
+  "| Claude Haiku 4.5                | claude-haiku-4-5                | `https://opencode.ai/inference/v1/messages`                     | `@ai-sdk/anthropic`         |",
+  "| Gemini 3 Flash                  | gemini-3-flash                  | `https://opencode.ai/inference/v1/models/gemini-3-flash`        | `@ai-sdk/google`            |",
+  "| Jev 1.13 Free                   | jev-1.13-free                   | `https://opencode.ai/inference/v1/systemone`                    | -                           |",
+  "| Big Pickle                      | big-pickle                      | `https://opencode.ai/inference/v1/chat/completions`             | `@ai-sdk/openai-compatible` |",
+  "| Step 5 Preview Free             | step-5-preview-free             | `https://opencode.ai/inference/v1/chat/completions`             | `@ai-sdk/openai-compatible` |",
+  "| Muse Spark 1.3 Contributor Free | muse-spark-1.3-contributor-free | `https://opencode.ai/inference/v1/responses`                    | `@ai-sdk/openai`            |",
+  "| Step 5 Preview Free               | Free            | Free            | Free            | -            |",
+].join("\n");
+
+test("reads the console docs' endpoint table, and Jev stays out as SystemOne", async () => {
+  const { buildModels, parseProtocolDocs, bootstrapProtocols } = await subject;
+  const protocols = parseProtocolDocs(consoleDocs);
+  assert.deepEqual(protocols, {
+    "claude-haiku-4-5": "anthropic",
+    "jev-1.13-free": "systemone",
+    "big-pickle": "chat",
+    "step-5-preview-free": "chat",
+    "muse-spark-1.3-contributor-free": "responses",
+  });
+  // the snapshot kept for when the docs can't be read says the same
+  for (const [id, protocol] of Object.entries(protocols)) {
+    if (bootstrapProtocols[id]) assert.equal(bootstrapProtocols[id], protocol, id);
+  }
+  const models = buildModels(["jev-1.13-free", "step-5-preview-free"], {}, protocols, baseURL);
+  assert.deepEqual(Object.keys(models), ["step-5-preview-free"]);
+});

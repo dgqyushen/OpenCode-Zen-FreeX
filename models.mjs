@@ -85,10 +85,73 @@ export function buildModels(ids, provider, protocols, baseURL) {
   return result;
 }
 
-// Offline bootstrap metadata from the OpenCode catalog, 2026-10-06.
+// What each free model is asked at, from OpenCode's console docs
+// (services/www/src/docs/content/console/models.mdx) on 2026-10-15: used for
+// a listed model when the docs can't be read, so the catalog or the docs
+// being out of reach never leaves a listed free model out. Jev is a
+// SystemOne decision model, not one to chat with.
+export const bootstrapProtocols = {
+  "big-pickle": "chat",
+  "space-bunny-free": "chat",
+  "cat-jam-free": "chat",
+  "longcat-2.5-preview-free": "chat",
+  "step-5-preview-free": "chat",
+  "mimo-v2.6-flash-free": "chat",
+  "nemotron-3.5-lightning-free": "chat",
+  "muse-spark-1.3-contributor-free": "responses",
+  "jev-1.13-free": "systemone",
+};
+
+// Offline bootstrap metadata from the OpenCode catalog, 2026-10-06; the
+// free models listed since added on 2026-10-15.
 export const bootstrapProvider = {
   npm: SDK.chat,
   models: {
+    "cat-jam-free": {
+      name: "Cat Jam Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 262144, output: 131072 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    },
+    "step-5-preview-free": {
+      name: "Step 5 Preview Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 1000000, input: 1000000, output: 65536 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image", "video"], output: ["text"] },
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+    },
+    "longcat-2.5-preview-free": {
+      name: "LongCat 2.5 Preview Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 1000000, output: 131072 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image"], output: ["text"] },
+    },
+    "mimo-v2.6-flash-free": {
+      name: "MiMo-V2.6-Flash Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 200000, output: 32000 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image", "audio", "video"], output: ["text"] },
+    },
+    "nemotron-3.5-lightning-free": {
+      name: "Nemotron 3.5 Lightning Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 262144, output: 262144 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+    },
     "big-pickle": {
       name: "Big Pickle",
       cost: { input: 0, output: 0 },

@@ -3,6 +3,7 @@ import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import {
   PROVIDER,
   SDK,
+  bootstrapProtocols,
   bootstrapProvider,
   buildModels,
   configModels,
@@ -265,9 +266,14 @@ async function server(_input, options = {}) {
   const baseURL = httpURL(options.baseURL ?? DEFAULT_BASE);
   const catalogURL = httpURL(options.catalogURL ?? CATALOG);
   const docsURL = httpURL(options.docsURL ?? DOCS);
-  let known = buildModels(Object.keys(bootstrapProvider.models), bootstrapProvider, {}, baseURL);
+  let known = buildModels(
+    Object.keys(bootstrapProvider.models),
+    bootstrapProvider,
+    bootstrapProtocols,
+    baseURL,
+  );
   let metadata = bootstrapProvider;
-  let protocols = {};
+  let protocols = { ...bootstrapProtocols };
   let listed = false;
   let listedAt = 0;
 
@@ -286,7 +292,9 @@ async function server(_input, options = {}) {
       partial = true;
     }
     if (docs.status === "fulfilled" && Object.keys(parseProtocolDocs(docs.value)).length) {
-      protocols = parseProtocolDocs(docs.value);
+      // The snapshot is the floor, not a rival: the docs say what they say and
+      // the snapshot only fills what they no longer name.
+      protocols = { ...bootstrapProtocols, ...parseProtocolDocs(docs.value) };
     } else {
       partial = true;
     }

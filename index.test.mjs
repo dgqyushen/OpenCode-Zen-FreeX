@@ -51,7 +51,8 @@ async function fixture(t, input = {}) {
     } else if (req.url === "/docs") {
       res.writeHead(state.docsStatus);
       res.end(
-        `| Model | chat-free | \`https://opencode.ai/zen/v1/${state.chatProtocol ?? "chat/completions"}\` | sdk |`,
+        state.docsText ??
+          `| Model | chat-free | \`https://opencode.ai/zen/v1/${state.chatProtocol ?? "chat/completions"}\` | sdk |`,
       );
     } else if (state.body !== undefined) {
       res.writeHead(state.status ?? 403, { "content-type": "application/json" });
@@ -318,6 +319,39 @@ test("partial catalog failure retains previously verified models rather than dro
   const fallback = await plugin.provider.models({ models }, { auth: await publicAuth() });
   assert.deepEqual(Object.keys(fallback).sort(), ["chat-free", "messages-free", "responses-free"]);
   assert.equal(fallback[Symbol.for("magpie.fellBack")], true);
+});
+
+// The reporter of yetone/magpie#2305 saw only the three models the plugin
+// knew offline: the catalog and the docs out of reach dropped every listed
+// free model they didn't name. The coverage the other tests here cannot see,
+// because theirs all name synthetic ids the fixture catalog supplies — these
+// are the real ones only bootstrapProvider covers. A listed free model now
+// takes its endpoint from the snapshot of OpenCode's console docs; Jev is a
+// SystemOne decision model and stays out, and a paid one is not offered.
+test("listed free models are offered when the catalog and the docs can't be read", async (t) => {
+  const { plugin, state } = await fixture(t);
+  state.catalogStatus = 503;
+  state.docsStatus = 404;
+  state.ids = ["big-pickle", "step-5-preview-free", "cat-jam-free", "jev-1.13-free", "paid"];
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(models).sort(), ["big-pickle", "cat-jam-free", "step-5-preview-free"]);
+  assert.equal(models["step-5-preview-free"].api.npm, "@ai-sdk/openai-compatible");
+  assert.equal(models["step-5-preview-free"].name, "Step 5 Preview Free");
+  assert.equal(models["step-5-preview-free"].limit.context, 1000000);
+  assert.equal(models[Symbol.for("magpie.fellBack")], true);
+});
+
+// The floor is not a rival to the docs: what they name wins, and only what
+// they no longer name falls back to the snapshot. The snapshot calls Muse
+// Spark a Responses model; the docs calling it Anthropic is what is sent.
+test("the console docs' table wins over the bootstrap snapshot", async (t) => {
+  const { plugin, state } = await fixture(t);
+  state.ids = ["cat-jam-free", "muse-spark-1.3-contributor-free"];
+  state.docsText =
+    "| Muse Spark 1.3 Contributor Free | muse-spark-1.3-contributor-free | `https://opencode.ai/inference/v1/messages` | `@ai-sdk/anthropic` |";
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(models["muse-spark-1.3-contributor-free"].api.npm, "@ai-sdk/anthropic");
+  assert.equal(models["cat-jam-free"].api.npm, "@ai-sdk/openai-compatible");
 });
 
 test("forces upstream streaming, preserves existing tools and returns the SSE body unbuffered", async (t) => {
