@@ -1,12 +1,10 @@
 # OpenCode Zen FreeX
 
-给非 OpenCode 宿主使用的 OpenCode Zen 免费模型。provider id：`opencode-zen-free`。
-
-Zen 的免费层会拒绝一切不像 OpenCode 发出的请求，回答 403 FreeTierError（"can only be used from within OpenCode"）。它不只看请求头，也读请求体：凡是它认得出名字的工具，描述都必须和 OpenCode 自己写的一样。这个插件直接去问真正提供免费层的那个端点，把工具按 OpenCode 的样子呈现出去，同时保留宿主自己的工具，所以模型发出的调用仍然跑得起来。
+[magpie](https://github.com/yetone/magpie)的拓展插件，为其提供OpenCode Zen的免费模型 Provider id：`opencode-zen-free`。
 
 不需要注册账号，也没有费用。凭据就是 `public` 这一个词。
 
-本项目是 `magpie-community/plugins` 里[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)插件的维护分支，同样是 MIT。分叉的理由是magpie-community已放弃对OpenCode Zen免费模型继续维护。两个插件只能装一个——它们注册的是同一个 provider id，都装上的话谁生效取决于加载顺序。维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
+本项目是 `magpie-community/plugins` 里[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)插件的维护分支，分叉的理由是magpie-community已放弃对OpenCode Zen免费模型继续维护，维护步骤见 [MAINTAINING.md](MAINTAINING.md)；想确认现在还能不能用，跑 `bun run check:gate`。
 
 ## 目录
 
