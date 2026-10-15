@@ -91,6 +91,12 @@ that passes under the stricter of them, since the looser one will not last.
 
 ## Publishing
 
-The package name and `repository` in `package.json` are set for the fork. To
-publish: bump `version`, `npm publish`, and tag. `magpie plugin add
+The package is `opencode-zen-freex`; the provider it registers is
+`opencode-zen-free`, which is the same one magpie-community/plugins' version
+registers. That is deliberate: a model is written `opencode-zen-free/<model>`
+either way, so one stays in place whichever is installed. It does mean the two
+are mutually exclusive — installing both leaves two plugins claiming one
+provider id, and which one wins is down to load order. Pick one.
+
+To publish: bump `version`, `npm publish`, and tag. `magpie plugin add
 opencode-zen-freex` installs it by that name.
