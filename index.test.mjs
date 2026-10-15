@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { PROFILES } from "./core-tools.mjs";
+import { PROFILES, generationOf } from "./core-tools.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
+import { requestFor } from "./tools-smoke.mjs";
 
 const subject = import("./index.mjs").then((module) => ({
   default: { server: module.ZenFreePlugin },
@@ -233,10 +234,44 @@ for (const [path, model, utils, key] of [
       ].sort(),
     );
     assert.equal(sent["x-opencode-session-id"], sent["x-opencode-session"]);
-    // Measured rejected by Zen on 2026-10-14 and never measured to be needed,
-    // so it is not sent: the set above has to stay a strict subset of what has
-    // been seen accepted (#4842 of decolua/9router).
+    // x-opencode-request, x-session-affinity and x-session-id are in OpenCode's
+    // own header set upstream, and none of them is needed: measured 2026-10-15,
+    // each answers on its own and x-opencode-request with x-session-affinity is
+    // refused. So the set above stays a strict subset of what has been seen
+    // accepted (#4842 of decolua/9router).
     assert.equal(sent["x-opencode-request"], undefined);
+  });
+}
+
+// The gate is what says whether this plugin still works, so it has to ask with
+// the request the plugin makes. It used to build its own copy of the headers,
+// and that copy had already drifted - it was missing `accept` - with nothing
+// failing on it. Both generations are held here against what the plugin was
+// observed to send, so the gate cannot go back to asking with a shape of its own.
+for (const [generation, profile] of Object.entries(PROFILES)) {
+  test(`the gate asks Zen with the ${generation} request this plugin sends`, async (t) => {
+    const { plugin, state, origin } = await fixture(t);
+    await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    const loader = await plugin.auth.loader(publicAuth);
+    const names = [...profile.required];
+    const tools = names.map((name) => ({ type: "function", function: profile.tools[name] }));
+    const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "user-agent": "claude-cli/2.1.0" },
+      body: JSON.stringify({ model: "chat-free", stream: true, tools }),
+    });
+    await response.text();
+
+    const sent = state.calls.at(-1).headers;
+    const wire = Object.keys(sent).filter(
+      (name) => !["host", "connection", "content-length", "accept-encoding"].includes(name),
+    );
+    const gate = requestFor(generation, profile, names).headers;
+    assert.deepEqual([...gate.keys()].sort(), wire.sort());
+    assert.equal(gate.get("user-agent"), sent["user-agent"]);
+    // The tools the floor is asked with have to name the generation they came
+    // from, or the plugin would present itself as the other one.
+    assert.equal(generationOf(tools), generation);
   });
 }
 
@@ -420,8 +455,9 @@ test("collapses SSE for a non-streaming client and preserves upstream HTTP error
 
 // Zen accepts a request only when every part of it belongs to one generation of
 // OpenCode, and a header belonging to none is enough to lose it. x-session-
-// affinity and x-session-id are in OpenCode's own header set upstream and are
-// refused here, so the outbound set is pinned by name rather than by comment
+// affinity and x-session-id are in OpenCode's own header set upstream but are
+// not needed, so the outbound set is pinned by name rather than by comment:
+// measured 2026-10-15, either alone answers and the two together are refused
 // (#131).
 test("sends exactly the headers one generation of OpenCode sends", async (t) => {
   const { plugin, state, origin } = await fixture(t);
@@ -449,12 +485,13 @@ test("sends exactly the headers one generation of OpenCode sends", async (t) => 
     "x-opencode-session",
     "x-opencode-session-id",
   ]);
-  // Measured rejected by Zen on 2026-10-14 and never measured to be needed, so
-  // it is not sent. The set above has to stay a strict subset of what has been
-  // seen accepted (#4842 of decolua/9router).
+  // x-opencode-request is not needed either: measured 2026-10-15, it answers on
+  // its own and it is the pair x-opencode-request + x-session-affinity that is
+  // refused, so the set above has to stay a strict subset of what has been seen
+  // accepted (#4842 of decolua/9router).
   assert.equal(sent["x-opencode-request"], undefined);
-  // The two that upstream sends and Zen refuses, named here so that adding
-  // them is a deliberate act rather than an accident.
+  // The two that upstream sends and this plugin does not, named here so that
+  // adding one is a deliberate act rather than an accident.
   assert.equal(sent["x-session-affinity"], undefined);
   assert.equal(sent["x-session-id"], undefined);
   assert.equal(sent["x-opencode-parent-session-id"], undefined);

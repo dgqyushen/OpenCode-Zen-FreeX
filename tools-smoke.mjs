@@ -23,6 +23,12 @@
 // name would leave the full shape passing while the shape the plugin actually
 // sends was refused.
 //
+// Every request here is built by the plugin itself: the header names come from
+// provider.mjs's outboundHeaders and the tools from the same `required` the
+// plugin stands in, so this cannot report on a shape the plugin does not send.
+// A copy of the headers is what it used to ask with, and that copy had drifted -
+// it was missing `accept` - with nothing failing on it.
+//
 // Each request is reported as:
 //
 //   answered   Zen served the request; this shape is current
@@ -35,6 +41,7 @@
 
 import { randomBytes } from "node:crypto";
 import { PROFILES, agentFor } from "./core-tools.mjs";
+import { outboundHeaders } from "./provider.mjs";
 
 const BASE = process.env.ZEN_BASE_URL ?? "https://opencode.ai/inference/v1";
 const MODEL = process.env.ZEN_CHECK_MODEL ?? "space-bunny-free";
@@ -64,26 +71,29 @@ function says(text) {
   return match ? `: ${match[1]}` : "";
 }
 
+// The request a shape is asked with. It is its own function so index.test.mjs
+// can hold it against the request the plugin was observed to send, offline.
+export function requestFor(generation, profile, names) {
+  return {
+    headers: outboundHeaders({
+      session: sessionID(),
+      agent: agentFor(generation),
+      project: "global",
+      protocol: "chat",
+    }),
+    body: {
+      model: MODEL,
+      messages: [{ role: "user", content: "hi" }],
+      tools: names.map((name) => ({ type: "function", function: profile.tools[name] })),
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: 40,
+    },
+  };
+}
+
 async function check(generation, profile, shape, names) {
-  const session = sessionID();
-  const headers = {
-    authorization: "Bearer public",
-    "content-type": "application/json",
-    "user-agent": agentFor(generation),
-    "x-opencode-client": "cli",
-    "x-opencode-project": "global",
-    "x-opencode-session": session,
-    "x-opencode-session-id": session,
-  };
-  const tools = names.map((name) => ({ type: "function", function: profile.tools[name] }));
-  const body = {
-    model: MODEL,
-    messages: [{ role: "user", content: "hi" }],
-    tools,
-    stream: true,
-    stream_options: { include_usage: true },
-    max_tokens: 40,
-  };
+  const { headers, body } = requestFor(generation, profile, names);
   try {
     const response = await fetch(`${BASE}/chat/completions`, {
       method: "POST",
@@ -93,7 +103,7 @@ async function check(generation, profile, shape, names) {
     });
     const text = await response.text();
     if (response.ok)
-      return { generation, shape, verdict: "answered", detail: `as ${headers["user-agent"]}` };
+      return { generation, shape, verdict: "answered", detail: `as ${headers.get("user-agent")}` };
     if (response.status === 426)
       return {
         generation,
@@ -107,47 +117,53 @@ async function check(generation, profile, shape, names) {
   }
 }
 
-const results = [];
-for (const [generation, profile] of Object.entries(PROFILES)) {
-  results.push(await check(generation, profile, "floor", [...profile.required]));
-  results.push(await check(generation, profile, "full", Object.keys(profile.tools)));
-}
-
-const width = Math.max(...results.map((result) => result.generation.length));
-for (const result of results)
-  console.log(
-    `${result.shape.padEnd(6)}${result.verdict.padEnd(12)} ${result.generation.padEnd(width)}  ${result.detail}`,
-  );
-
-const floor = results.filter((result) => result.shape === "floor");
-const served = floor.filter((result) => result.verdict === "answered");
-console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${BASE}`);
-
-// A generation whose full shape is served while its floor is not is the case
-// this gate was widened to see: the plugin would work for a host bringing its
-// own OpenCode tools and be refused for the host it was written for.
-for (const result of floor) {
-  if (result.verdict === "answered") continue;
-  const full = results.find((other) => other.generation === result.generation && other.shape === "full");
-  if (full?.verdict === "answered")
-    console.log(
-      `${result.generation} answers the full OpenCode shape but not the tools the plugin stands in: a host that has none of them by name will be refused.`,
-    );
-}
-
-if (!served.length) {
-  // Being unable to ask is not an answer. Saying the fingerprint has gone stale
-  // when nothing was reached sends the reader to `capture` over a dead network.
-  if (results.every((result) => result.verdict === "unreachable")) {
-    console.log(
-      "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
-    );
-  } else {
-    console.log(
-      "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
-    );
+// Only a run asks Zen. index.test.mjs imports this module to hold its request
+// against the plugin's, and an import must not reach the network.
+if (import.meta.main) {
+  const results = [];
+  for (const [generation, profile] of Object.entries(PROFILES)) {
+    results.push(await check(generation, profile, "floor", [...profile.required]));
+    results.push(await check(generation, profile, "full", Object.keys(profile.tools)));
   }
-  process.exitCode = 1;
-} else if (served.length < floor.length) {
-  console.log("Some are refused but at least one works, so the plugin still has a generation Zen will serve.");
+
+  const width = Math.max(...results.map((result) => result.generation.length));
+  for (const result of results)
+    console.log(
+      `${result.shape.padEnd(6)}${result.verdict.padEnd(12)} ${result.generation.padEnd(width)}  ${result.detail}`,
+    );
+
+  const floor = results.filter((result) => result.shape === "floor");
+  const served = floor.filter((result) => result.verdict === "answered");
+  console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${BASE}`);
+
+  // A generation whose full shape is served while its floor is not is the case
+  // this gate was widened to see: the plugin would work for a host bringing its
+  // own OpenCode tools and be refused for the host it was written for.
+  for (const result of floor) {
+    if (result.verdict === "answered") continue;
+    const full = results.find(
+      (other) => other.generation === result.generation && other.shape === "full",
+    );
+    if (full?.verdict === "answered")
+      console.log(
+        `${result.generation} answers the full OpenCode shape but not the tools the plugin stands in: a host that has none of them by name will be refused.`,
+      );
+  }
+
+  if (!served.length) {
+    // Being unable to ask is not an answer. Saying the fingerprint has gone stale
+    // when nothing was reached sends the reader to `capture` over a dead network.
+    if (results.every((result) => result.verdict === "unreachable")) {
+      console.log(
+        "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
+      );
+    } else {
+      console.log(
+        "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
+      );
+    }
+    process.exitCode = 1;
+  } else if (served.length < floor.length) {
+    console.log("Some are refused but at least one works, so the plugin still has a generation Zen will serve.");
+  }
 }

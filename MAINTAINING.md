@@ -79,10 +79,15 @@ the cooldown answers like a refusal.
 
 ## Things that are easy to break
 
-**Adding a header.** The set sent is pinned by name in `index.test.mjs`. Zen has
-been measured refusing `x-opencode-request`, `x-session-affinity` and
-`x-session-id`, all of which appear in OpenCode's own header set upstream. Adding
-one is the easiest way to break this plugin, so the test names them.
+**Adding a header.** The set sent has one owner: `outboundHeaders` in
+`provider.mjs`, which the plugin builds its request with and which the gate asks
+Zen with, so neither can drift from the other on its own. `index.test.mjs` pins
+the names on the wire. `x-opencode-request`, `x-session-affinity` and
+`x-session-id` are all in OpenCode's own header set upstream and none is sent;
+measured 2026-10-15, each of the three answers on its own while
+x-opencode-request with x-session-affinity is refused. A header cannot be judged
+by adding it on its own, so add it in `outboundHeaders` and let the pinned test
+and a live `check:gate` say what it did.
 
 **Rewriting the tool wording.** The wording sent upstream is OpenCode's, because
 Zen reads it. What replaces it is only the wording: the host's tool and its

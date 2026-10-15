@@ -42,6 +42,46 @@ function agentForRequest(protocol, tools, given) {
   if (said && RELEASE.test(said)) return said;
   return agentFor(generationOf(tools) ?? DEFAULT_GENERATION, protocol);
 }
+
+// The complete set of headers that leaves here, and nothing else: one owner for
+// the names. tools-smoke.mjs builds the request it asks Zen with from this
+// function, so what the gate reports is about the request this plugin makes and
+// not about a copy of it. A copy drifts, and one did: the gate was missing
+// `accept`, and nothing failed on it. index.test.mjs asserts the names on the
+// wire.
+//
+// x-session-affinity, x-session-id and x-opencode-request are in OpenCode's own
+// header set upstream (packages/core/src/session/model-request.ts) and none of
+// them is needed, so none is sent. Measured on this set, 2026-10-15: each of the
+// three answers on its own, x-opencode-request with x-session-id answers, and
+// x-opencode-request with x-session-affinity is refused. It is the pair and not
+// either header, so a header cannot be judged by adding it on its own.
+export function outboundHeaders({
+  session,
+  agent,
+  protocol = "chat",
+  project = "global",
+  given,
+}) {
+  const headers = new Headers({
+    "content-type": "application/json",
+    accept: "*/*",
+    "user-agent": agent,
+    "x-opencode-project": project,
+    "x-opencode-session": session,
+    "x-opencode-client": "cli",
+    "x-opencode-session-id": session,
+  });
+  if (protocol === "anthropic") {
+    headers.set("x-api-key", "public");
+    headers.set("anthropic-version", given?.get("anthropic-version") || "2023-06-01");
+    if (given?.get("anthropic-beta")) headers.set("anthropic-beta", given.get("anthropic-beta"));
+  } else {
+    headers.set("authorization", "Bearer public");
+  }
+  return headers;
+}
+
 // How long a request for a model the last list didn't have waits before it
 // asks Zen's list again: a model Zen made free since is served at once,
 // and a model typed in by hand doesn't ask the list on every request.
@@ -403,35 +443,22 @@ async function server(_input, options = {}) {
             const toolPolicy = normalizeTools(body, protocol);
             if (protocol === "chat")
               body.stream_options = { ...body.stream_options, include_usage: true };
-            // The complete set of headers that leaves here, and nothing else. Zen takes a
-            // request for one generation of OpenCode or the other, and a header
-            // belonging to neither is as good as saying so: x-session-affinity
-            // and x-session-id are in OpenCode's own header set upstream
-            // (packages/core/src/session/model-request.ts) and sending them
-            // turns an answered request into 403. Adding one here is the
-            // easiest way to break this plugin, so index.test.mjs asserts the
-            // outbound set by name.
+            // Adding a header here is the easiest way to break this plugin: Zen
+            // takes a request for one generation of OpenCode or the other, and a
+            // header belonging to neither is as good as saying so. The names are
+            // outboundHeaders', which is also what the gate asks Zen with.
             const given = request.headers;
             const session = sessionID(given, body);
             const project = _input?.project;
-            const headers = new Headers({
-              "content-type": "application/json",
-              accept: "*/*",
-              "user-agent": agentForRequest(protocol, body.tools, given),
-              "x-opencode-project":
+            const headers = outboundHeaders({
+              session,
+              agent: agentForRequest(protocol, body.tools, given),
+              protocol,
+              given,
+              project:
                 given.get("x-opencode-project") ||
                 (project?.vcs === "git" && project.id ? project.id : "global"),
-              "x-opencode-session": session,
-              "x-opencode-client": "cli",
-              "x-opencode-session-id": session,
             });
-            if (protocol === "anthropic") {
-              headers.set("x-api-key", "public");
-              headers.set("anthropic-version", given.get("anthropic-version") || "2023-06-01");
-              if (given.get("anthropic-beta")) headers.set("anthropic-beta", given.get("anthropic-beta"));
-            } else {
-              headers.set("authorization", "Bearer public");
-            }
             const response = await fetch(request.url, {
               method: "POST",
               headers,
@@ -461,11 +488,12 @@ async function server(_input, options = {}) {
     async "chat.headers"(input, output) {
       if (![PROVIDER, `${PROVIDER}-plugin`].includes(input.model?.providerID) || !input.sessionID)
         return;
-      // The pair Zen wants, both present and equal (see fetch). x-session-
-      // affinity and x-session-id are in OpenCode's own header set upstream and
-      // have been measured refused here, so they are not named: this hook is
-      // the one place where the host is asked for them, and a host that sets
-      // them would send a request that answers 403 (tkhs101#100 follow-up).
+      // The pair Zen wants, both present and equal (see outboundHeaders). This
+      // hook is the one place where the host is asked to carry them, and it asks
+      // for these two only: x-session-affinity and x-session-id are in OpenCode's
+      // own header set upstream but are not needed, and measured 2026-10-15 two
+      // headers of that set together are refused where either one alone answers
+      // (tkhs101#100 follow-up).
       output.headers["x-opencode-session"] = input.sessionID;
       output.headers["x-opencode-session-id"] = input.sessionID;
     },
