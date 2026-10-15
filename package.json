@@ -1,0 +1,27 @@
+{
+  "name": "opencode-zen-free",
+  "version": "0.2.0",
+  "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "provider.mjs",
+    "core-tools.mjs",
+    "fingerprint.json",
+    "models.mjs",
+    "stream.mjs",
+    "tool-response.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/CHANGE-ME/opencode-zen-free.git" },
+  "scripts": {
+    "test": "bun test",
+    "check:gate": "bun tools-smoke.mjs",
+    "capture": "bun capture.mjs"
+  },
+  "magpie": { "icon": "https://opencode.ai/favicon-v3.ico", "maxConcurrency": 2 }
+}

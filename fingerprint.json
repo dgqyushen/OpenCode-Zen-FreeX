@@ -1,0 +1,241 @@
+{
+  "_note": "Captured from a real OpenCode by capture.mjs. Refresh with: bun run capture",
+  "profiles": {
+    "1.x": {
+      "agent": {
+        "opencode": "1.19.0",
+        "providerUtils": {
+          "chat": "4.0.23",
+          "responses": "4.0.40",
+          "anthropic": "4.0.46"
+        },
+        "runtime": "runtime/bun/1.3.14"
+      },
+      "required": [
+        "bash",
+        "glob",
+        "grep",
+        "read"
+      ],
+      "tools": {
+        "bash": {
+          "name": "bash",
+          "description": "Executes a given Windows PowerShell (5.1) command with optional timeout, ensuring proper handling and security measures.\n\nBe aware: OS: linux, Shell: bash\n\nAll commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead.\n\nUse `/tmp` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\n\n# Windows PowerShell (5.1) shell notes\n- Use `cmd1; if ($?) { cmd2 }` to chain dependent commands.\n- Use double quotes for interpolated strings (`\"Hello $name\"`), single quotes for verbatim strings.\n- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.\n- Use `$(...)` for subexpressions. Use `@(...)` for array expressions.\n- To call a native executable whose path contains spaces, use the call opera",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "The command to execute"
+              },
+              "timeout": {
+                "minimum": -9007199254740991,
+                "exclusiveMinimum": 0,
+                "type": "integer",
+                "maximum": 9007199254740991,
+                "description": "Optional timeout in milliseconds"
+              },
+              "workdir": {
+                "type": "string",
+                "description": "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands."
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        },
+        "glob": {
+          "name": "glob",
+          "description": "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths\n- Use this tool when you need to find files by name patterns\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful.\n",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "The glob pattern to match files against"
+              },
+              "path": {
+                "type": "string",
+                "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        "grep": {
+          "name": "grep",
+          "description": "- Fast content search tool that works with any codebase size\n- Searches file contents using regular expressions\n- Supports full regex syntax (eg. \"log.*Error\", \"function\\s+\\w+\", etc.)\n- Filter files by pattern with the include parameter (eg. \"*.js\", \"*.{ts,tsx}\")\n- Returns file paths and line numbers with matching lines\n- Use this tool when you need to find files containing specific patterns\n- If you need to identify/count the number of matches within files, use the Bash tool with `rg` (ripgrep) directly. Do NOT use `grep`.\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\n",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "The regex pattern to search for in file contents"
+              },
+              "path": {
+                "type": "string",
+                "description": "The directory to search in. Defaults to the current working directory."
+              },
+              "include": {
+                "type": "string",
+                "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        "read": {
+          "name": "read",
+          "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The filePath parameter should be an absolute path.\n- By default, this tool returns up to 2000 lines from the start of the file.\n- The offset parameter is the line number to start from (1-indexed).\n- To read later sections, call this tool again with a larger offset.\n- Use the grep tool to find specific content in large files or files with long lines.\n- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. For example, if a file has contents \"foo\\n\", you will receive \"1: foo\\n\". For directories, entries are returned one per line (without line numbers) with a trailing `/` for subdirectories.\n- Any line longer than 2000 characters is truncated.\n- Call this tool in parallel when you know there are multiple files you want to read.\n- Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.\n- This tool can read image files and PDFs and return them as file attachments.\n",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "type": "string",
+                "description": "The absolute path to the file or directory to read"
+              },
+              "offset": {
+                "minimum": 0,
+                "type": "integer",
+                "maximum": 9007199254740991,
+                "description": "The line number to start reading from (1-indexed)"
+              },
+              "limit": {
+                "minimum": 0,
+                "type": "integer",
+                "maximum": 9007199254740991,
+                "description": "The maximum number of lines to read (defaults to 2000)"
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          }
+        },
+        "edit": {
+          "name": "edit",
+          "description": "Performs exact string replacements in files. \n\nUsage:\n- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + colon + space (e.g., `1: `). Everything after that space is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n- The edit will FAIL if `oldString` is not found in the file with an error \"oldString not found in content\".\n- The edit will FAIL if `oldString` is found multiple times in the file with an error \"Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match.\" Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every ",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "type": "string",
+                "description": "The absolute path to the file to modify"
+              },
+              "oldString": {
+                "type": "string",
+                "description": "The text to replace"
+              },
+              "newString": {
+                "type": "string",
+                "description": "The text to replace it with (must be different from oldString)"
+              },
+              "replaceAll": {
+                "type": "boolean",
+                "description": "Replace all occurrences of oldString (default false)"
+              }
+            },
+            "required": [
+              "filePath",
+              "oldString",
+              "newString"
+            ]
+          }
+        },
+        "write": {
+          "name": "write",
+          "description": "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provided path.\n- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.\n- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.\n",
+          "parameters": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string",
+                "description": "The content to write to the file"
+              },
+              "filePath": {
+                "type": "string",
+                "description": "The absolute path to the file to write (must be absolute, not relative)"
+              }
+            },
+            "required": [
+              "content",
+              "filePath"
+            ]
+          }
+        }
+      }
+    },
+    "2.x": {
+      "agent": {
+        "channel": "latest",
+        "opencode": "2.0.29",
+        "client": "cli"
+      },
+      "required": [
+        "shell",
+        "read"
+      ],
+      "tools": {
+        "shell": {
+          "name": "shell",
+          "description": "Execute a shell command and return its output. Commands run on Windows using PowerShell (5.1). Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Shell command string to execute"
+              },
+              "workdir": {
+                "type": "string",
+                "description": "Working directory to execute the command in."
+              },
+              "timeout": {
+                "type": "number",
+                "description": "Timeout in milliseconds. Set to 0 to disable the timeout."
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        },
+        "read": {
+          "name": "read",
+          "description": "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "File or directory to read"
+              },
+              "offset": {
+                "type": "number",
+                "description": "The line or directory entry to start reading from (1-based)"
+              },
+              "limit": {
+                "type": "number",
+                "description": "The maximum number of lines or directory entries to read"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
