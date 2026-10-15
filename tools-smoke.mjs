@@ -34,12 +34,15 @@
 //   answered   Zen served the request; this shape is current
 //   refused    Zen did not recognise this generation (403)
 //   superseded Zen wants a newer OpenCode than the one this profile claims (426)
+//   failed     Zen answered something other than 403: the request was made, and
+//              what came back is not a verdict on the fingerprint
 //   unreachable the free tier could not be asked at all
 //
 // Exit code is 0 when at least one generation's floor is answered. A generation
 // being refused is not a failure while another still works.
 
 import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { PROFILES, agentFor } from "./core-tools.mjs";
 import { outboundHeaders } from "./provider.mjs";
 
@@ -90,7 +93,15 @@ export function chatRequest({ model, generation, profile, names, maxTokens = 40,
     body: {
       model,
       messages: messages ?? [{ role: "user", content: "hi" }],
-      tools: names.map((name) => ({ type: "function", function: profile.tools[name] })),
+      // A name in `required` that the profile does not carry is a broken
+      // fingerprint, not a request to ask Zen with: without this it is sent as
+      // `{"type":"function"}`, Zen refuses it as malformed, and the gate blames
+      // the wording instead of the file it came from.
+      tools: names.map((name) => {
+        const tool = profile.tools[name];
+        if (!tool) throw new Error(`${generation} has no tool named "${name}" in fingerprint.json`);
+        return { type: "function", function: tool };
+      }),
       stream: true,
       stream_options: { include_usage: true },
       max_tokens: maxTokens,
@@ -117,20 +128,55 @@ async function check(generation, profile, shape, names) {
         verdict: "superseded",
         detail: "Zen wants a newer OpenCode than this profile claims",
       };
-    return { generation, shape, verdict: "refused", detail: `HTTP ${response.status}${says(text)}` };
+    // Only a 403 is the answer this gate reads: Zen quoting the fingerprint
+    // back. A 5xx, a 429 or a 401 says something about the service or the way
+    // it was asked, and reading any of them as "the fingerprint is stale" sends
+    // the reader to `capture` over a problem capturing cannot fix.
+    if (response.status === 403)
+      return { generation, shape, verdict: "refused", detail: `HTTP 403${says(text)}` };
+    return { generation, shape, verdict: "failed", detail: `HTTP ${response.status}${says(text)}` };
   } catch (error) {
     return { generation, shape, verdict: "unreachable", detail: error.message };
   }
 }
 
+// Whether this module is the file that was run rather than one the tests
+// import. `import.meta.main` is the direct answer and the one Bun gives, but it
+// arrived in Node 22.18 and nothing before that has it — and a gate that cannot
+// tell whether it was run is a gate that reports success without asking.
+function invokedDirectly() {
+  // `typeof` rather than `??`: a runtime without the property throws on the
+  // member access itself, where there is nothing to fall back from.
+  if (typeof import.meta.main === "boolean") return import.meta.main;
+  try {
+    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+  } catch {
+    return undefined;
+  }
+}
+
 // Only a run asks Zen. index.test.mjs imports this module to hold its request
 // against the plugin's, and an import must not reach the network.
-if (import.meta.main) {
-  const results = [];
-  for (const [generation, profile] of Object.entries(PROFILES)) {
-    results.push(await check(generation, profile, "floor", [...profile.required]));
-    results.push(await check(generation, profile, "full", Object.keys(profile.tools)));
-  }
+const entry = invokedDirectly();
+if (entry === undefined) {
+  console.error(
+    "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run check:gate`.",
+  );
+  process.exit(1);
+}
+
+if (entry) {
+  // Each request is independent and every result is printed in order, so the
+  // two shapes of every profile are asked at once rather than one abort's
+  // worth of waiting after another.
+  const results = (
+    await Promise.all(
+      Object.entries(PROFILES).map(async ([generation, profile]) => [
+        await check(generation, profile, "floor", [...profile.required]),
+        await check(generation, profile, "full", Object.keys(profile.tools)),
+      ]),
+    )
+  ).flat();
 
   const width = Math.max(...results.map((result) => result.generation.length));
   for (const result of results)
@@ -159,13 +205,26 @@ if (import.meta.main) {
   if (!served.length) {
     // Being unable to ask is not an answer. Saying the fingerprint has gone stale
     // when nothing was reached sends the reader to `capture` over a dead network.
-    if (results.every((result) => result.verdict === "unreachable")) {
+    // Only 403 and 426 are Zen answering about the fingerprint at all: a 5xx or a
+    // 429 was answered by something that never judged it, and counting those as a
+    // verdict would blame the wording for an outage.
+    const answered = (result) => ["refused", "superseded"].includes(result.verdict);
+    const unreached = results.filter((result) => result.verdict === "unreachable");
+    if (results.every(answered)) {
       console.log(
-        "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
+        "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
+      );
+    } else if (results.some(answered)) {
+      console.log(
+        "Some of this run was answered about the fingerprint and some of it was not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.",
+      );
+    } else if (!unreached.length) {
+      console.log(
+        "Zen answered every request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.",
       );
     } else {
       console.log(
-        "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
+        "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
       );
     }
     process.exitCode = 1;

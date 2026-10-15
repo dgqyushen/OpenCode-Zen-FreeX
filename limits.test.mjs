@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const subject = import("./limits.mjs").catch(() => ({}));
+const subject = import("./limits.mjs").catch((error) => {
+  assert.fail(`limits.mjs failed to load: ${error?.message ?? error}`);
+});
 
 const DECLARED = { context: 200000, output: 32000 };
 
@@ -54,7 +56,12 @@ test("a model with no evidence keeps exactly what the catalogue declared", async
   const { limitOverrides } = await subject;
   assert.deepEqual(limitOverrides("nemotron-3.5-lightning-free", DECLARED), {});
   assert.deepEqual(limitOverrides("big-pickle", {}), {});
-  assert.deepEqual(limitOverrides("__proto__", DECLARED), {});
+  // an id that is not an id at all must not reach the prototype chain for a
+  // record: `table["toString"]` is a function, and reading an entry off it
+  // would invent evidence for a model nobody declared
+  for (const key of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+    assert.deepEqual(limitOverrides(key, DECLARED), {}, `${key} must never yield phantom evidence`);
+  }
 });
 
 test("weaker evidence may raise a limit but never lower one", async () => {
@@ -76,13 +83,18 @@ test("weaker evidence may raise a limit but never lower one", async () => {
 test("a refusal naming a window while the process runs outranks the shipped table forever after", async () => {
   const { observeRouteStatement, namedContextWindow, limitOverrides } = await subject;
   assert.equal(namedContextWindow(REFUSAL), 1048576);
-  assert.deepEqual(
-    await observeRouteStatement(
-      "deepseek-v4.1-flash-free",
-      new Response(REFUSAL, { status: 400, headers: { "content-type": "application/json" } }),
-    ),
-    { context: 1048576, output: undefined },
-  );
+  // the caller is still waiting on this response when the plugin reads it, so
+  // observing has to be non-destructive: it reads a copy, never the body itself
+  const response = new Response(REFUSAL, {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  });
+  assert.deepEqual(await observeRouteStatement("deepseek-v4.1-flash-free", response), {
+    context: 1048576,
+    output: undefined,
+  });
+  assert.equal(response.bodyUsed, false, "observing must not consume the caller's body");
+  assert.equal(await response.text(), REFUSAL, "the caller still gets the whole body");
   const live = new Map([["deepseek-v4.1-flash-free", 900000]]);
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED, undefined, live), {
     context: 900000,
@@ -138,6 +150,39 @@ test("the audit's first run named two more, each on the axis its refusal named",
     limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }),
     { output: 262144 },
   );
+});
+
+// LongCat's wording ends with the digits it captured, and the body is read only
+// up to a budget. A cut inside those digits leaves a smaller number that looks
+// complete — and that number would be stored as live evidence, past the
+// catalogue-staleness check and past the downgrade guard, and sent as
+// max_tokens on every request after it.
+const CEILING_WORDING =
+  "Upstream request failed: [invalid_parameter] 参数校验失败: \n/max_tokens: 1000000 is not less or equal to 262144\n";
+
+test("a body cut inside the ceiling it names is not read as a smaller ceiling", async () => {
+  const { observeRouteStatement, limitOverrides, namedOutputCap } = await subject;
+  const at = CEILING_WORDING.indexOf("262144");
+  // whole, and cut after the number is complete: the ceiling is read
+  assert.equal(namedOutputCap(CEILING_WORDING), 262144);
+  assert.deepEqual(
+    await observeRouteStatement("longcat-2.5-preview-free", new Response(CEILING_WORDING, { status: 400 })),
+    { context: undefined, output: 262144 },
+  );
+  // cut inside it: no axis is read at all, so nothing reaches the declaration.
+  // The read that ends on the last digit counts too — there is no way to tell
+  // it from that same digit being the first of a longer number.
+  for (let limit = at + 1; limit <= at + 6; limit++) {
+    assert.equal(
+      await observeRouteStatement("longcat-2.5-preview-free", new Response(CEILING_WORDING, { status: 400 }), limit),
+      undefined,
+      `a read that ends inside 262144 must not be taken as a ceiling (limit ${limit}, would read "${CEILING_WORDING.slice(at, limit)}")`,
+    );
+  }
+  // and the declaration is still the one the table measured, not the half number
+  assert.deepEqual(limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }), {
+    output: 262144,
+  });
 });
 
 test("only a refusal that names a window is read, and only its first few KiB", async () => {

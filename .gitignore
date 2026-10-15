@@ -1,4 +1,13 @@
 node_modules/
-*.log
+/*.log
 .DS_Store
-zenfree-audit/
+/zenfree-audit/
+
+# Secrets. Nothing here is written by this repository, and none of it belongs in
+# a commit: the npm token MAINTAINING.md describes lives in an npmrc outside it.
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key

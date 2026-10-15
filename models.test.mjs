@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const subject = import("./models.mjs").catch(() => ({}));
+// Not caught: a syntax error, a renamed file or a failure while models.mjs (or
+// limits.mjs, which it imports) is evaluated has to surface as itself. Swallowed
+// into an empty module it reads as "model discovery must be implemented" or
+// "parseProtocolDocs is not a function", which is not what broke.
+const subject = import("./models.mjs");
 const provider = {
   npm: "@ai-sdk/openai-compatible",
   models: {
@@ -41,7 +45,7 @@ test("lists only live free models with supported protocols and excludes retired 
   assert.deepEqual(models["coder-free"].limit, { context: 200000, input: 160000, output: 32000 });
   assert.equal(models["coder-free"].capabilities.input.image, true);
   assert.equal(models["coder-free"].capabilities.toolcall, true);
-  assert.deepEqual(Object.keys(models["coder-free"].variants), ["low", "high"]);
+  assert.deepEqual(Object.keys(models["coder-free"].variants).sort(), ["high", "low"]);
   assert.equal(models["responses-free"].api.npm, "@ai-sdk/openai");
   assert.equal(models["messages-free"].api.npm, "@ai-sdk/anthropic");
 });
@@ -90,6 +94,7 @@ test("an id that calls itself free is offered before the catalogue describes it"
   assert.deepEqual(Object.keys(models).sort(), ["brand-new-free", "responses-free"]);
   assert.equal(models["brand-new-free"].api.npm, "@ai-sdk/openai-compatible");
   assert.equal(models["brand-new-free"].name, "brand-new-free");
+  // the fallback used when the catalogue carries no limit for the model
   assert.equal(models["brand-new-free"].limit.context, 32768);
   // the catalogue's own package still decides the protocol for an id it describes
   assert.equal(models["responses-free"].api.npm, "@ai-sdk/openai");
@@ -98,7 +103,11 @@ test("an id that calls itself free is offered before the catalogue describes it"
 // Rows as OpenCode's console docs have them since 2026-10-12
 // (services/www/src/docs/content/console/models.mdx), and the pricing table
 // beside it that names no endpoint (yetone/magpie#2305): the zen.mdx these
-// were read from before was removed that day.
+// were read from before was removed that day. Two of the rows below are ones the
+// parser has to leave out, and the assertions say so rather than leaving it to
+// the whole-object comparison: a pricing row carries no endpoint at all, and an
+// endpoint path that is not one of the four protocols (`/v1/models/…`, Gemini's)
+// is not a protocol this plugin can ask.
 const consoleDocs = [
   "| Claude Haiku 4.5                | claude-haiku-4-5                | `https://opencode.ai/inference/v1/messages`                     | `@ai-sdk/anthropic`         |",
   "| Gemini 3 Flash                  | gemini-3-flash                  | `https://opencode.ai/inference/v1/models/gemini-3-flash`        | `@ai-sdk/google`            |",
@@ -111,6 +120,7 @@ const consoleDocs = [
 
 test("reads the console docs' endpoint table, and Jev stays out as SystemOne", async () => {
   const { buildModels, parseProtocolDocs, bootstrapProtocols } = await subject;
+  assert.equal(typeof bootstrapProtocols, "object", "the console-docs snapshot must be exported");
   const protocols = parseProtocolDocs(consoleDocs);
   assert.deepEqual(protocols, {
     "claude-haiku-4-5": "anthropic",
@@ -119,9 +129,16 @@ test("reads the console docs' endpoint table, and Jev stays out as SystemOne", a
     "step-5-preview-free": "chat",
     "muse-spark-1.3-contributor-free": "responses",
   });
-  // the snapshot kept for when the docs can't be read says the same
+  // the two rows that must not have produced a protocol: the pricing row that
+  // names no endpoint, and the path outside the supported set
+  assert.equal(protocols["step-5-preview-free"], "chat");
+  assert.equal(protocols["gemini-3-flash"], undefined);
+  // the snapshot kept for when the docs can't be read says the same, for every
+  // id it carries: `claude-haiku-4-5` is a paid model the free snapshot has no
+  // entry for, and every other id here has to be in it
   for (const [id, protocol] of Object.entries(protocols)) {
-    if (bootstrapProtocols[id]) assert.equal(bootstrapProtocols[id], protocol, id);
+    if (id === "claude-haiku-4-5") continue;
+    assert.equal(bootstrapProtocols?.[id], protocol, id);
   }
   const models = buildModels(["jev-1.13-free", "step-5-preview-free"], {}, protocols, baseURL);
   assert.deepEqual(Object.keys(models), ["step-5-preview-free"]);

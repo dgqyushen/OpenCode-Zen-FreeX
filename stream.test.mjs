@@ -3,6 +3,12 @@ import test from "node:test";
 import { collapseResponse } from "./stream.mjs";
 
 const encoder = new TextEncoder();
+// The guard's own SSE limit (MAX_BYTES in stream.mjs), for the tests that
+// measure how much of a stream it reads before stopping.
+const LIMIT_BYTES = 32 * 1024 * 1024;
+// Generous enough that a slow machine still reports a real hang rather than
+// a slow cancellation as one.
+const LIVENESS_MS = 5000;
 const event = (data, name) =>
   `${name ? `event: ${name}\n` : ""}data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
 
@@ -26,6 +32,7 @@ async function collapseOpenStream(text, protocol, cancel = () => {}) {
   let controller;
   let cancelled = false;
   let timer;
+  let timedOut = false;
   const bytes = encoder.encode(text);
   const response = new Response(
     new ReadableStream({
@@ -45,7 +52,10 @@ async function collapseOpenStream(text, protocol, cancel = () => {}) {
     const result = await Promise.race([
       collapseResponse(response, protocol),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("SSE error waited for EOF")), 500);
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error("SSE error waited for EOF"));
+        }, LIVENESS_MS);
       }),
     ]);
     assert.equal(cancelled, true);
@@ -53,7 +63,9 @@ async function collapseOpenStream(text, protocol, cancel = () => {}) {
     return result;
   } finally {
     clearTimeout(timer);
-    if (!cancelled) controller.close();
+    // The collapse is still reading when the timer wins, so the source is
+    // left alone rather than closed under a promise that lost the race.
+    if (!timedOut && !cancelled) controller.close();
   }
 }
 
@@ -64,17 +76,23 @@ async function json(text, protocol, options) {
   return response.json();
 }
 
-async function failure(text, protocol, pattern = /./) {
-  const response = await collapseResponse(sse(text), protocol);
-  assert.equal(response.status, 502);
-  const body = await response.json();
+// The shape a collapsed upstream failure has, wherever one is asserted: the
+// contract lives here once rather than in each test that reads it.
+function assertProtocolError(body, protocol, message) {
   assert.equal(body.error.type, "upstream_error");
-  assert.match(body.error.message, pattern);
+  if (message instanceof RegExp) assert.match(body.error.message, message);
+  else assert.equal(body.error.message, message);
   if (protocol === "anthropic") assert.equal(body.type, "error");
   else {
     assert.equal(body.error.param, null);
     assert.equal(body.error.code, null);
   }
+}
+
+async function failure(text, protocol, pattern = /./) {
+  const response = await collapseResponse(sse(text), protocol);
+  assert.equal(response.status, 502);
+  assertProtocolError(await response.json(), protocol, pattern);
 }
 
 test("chat preserves text, reasoning, indexed choices, tool arguments, usage and finish reasons", async () => {
@@ -230,6 +248,9 @@ test("Responses uses the complete final response without replacing authoritative
     usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
     metadata: { retained: true },
   };
+  // A copy, so an implementation that rewrote the final response in place
+  // cannot answer for itself.
+  const expected = structuredClone(final);
   const body = await json(
     event({
       type: "response.output_text.delta",
@@ -239,7 +260,7 @@ test("Responses uses the complete final response without replacing authoritative
     }) + event({ type: "response.completed", response: final }, "response.completed"),
     "responses",
   );
-  assert.deepEqual(body, final);
+  assert.deepEqual(body, expected);
 });
 
 test("Responses incomplete keeps the original response and its usage", async () => {
@@ -251,9 +272,12 @@ test("Responses incomplete keeps the original response and its usage", async () 
     output: [],
     usage: { output_tokens: 20 },
   };
+  // Taken before the collapse runs: a reply that rewrote final in place
+  // would otherwise be compared against itself.
+  const expected = structuredClone(final);
   assert.deepEqual(
     await json(event({ response: final }, "response.incomplete"), "responses"),
-    final,
+    expected,
   );
 });
 
@@ -326,6 +350,10 @@ test("Responses done snapshots do not duplicate accumulated deltas", async () =>
     arguments: '{"a":1}',
     status: "completed",
   };
+  // The snapshot the events carry, copied before the collapse: an
+  // implementation that appended the deltas to it again would be mutating
+  // the expected value along with its own.
+  const expected = structuredClone(item);
   const body = await json(
     event({
       type: "response.output_item.added",
@@ -342,7 +370,42 @@ test("Responses done snapshots do not duplicate accumulated deltas", async () =>
       event({ type: "response.completed" }),
     "responses",
   );
-  assert.deepEqual(body.output, [item]);
+  assert.deepEqual(body.output, [expected]);
+});
+
+test("Responses finds an item snapshot's slot by item_id when output_index is missing", async () => {
+  const body = await json(
+    event({ type: "response.created", response: { id: "r", output: [] } }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { id: "m", type: "message", role: "assistant", content: [] },
+      }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { id: "f", type: "function_call", call_id: "call", name: "lookup", arguments: "" },
+      }) +
+      event({
+        type: "response.output_item.done",
+        item: {
+          id: "f",
+          type: "function_call",
+          call_id: "call",
+          name: "lookup",
+          arguments: '{"a":1}',
+        },
+      }) +
+      event({ type: "response.completed" }),
+    "responses",
+  );
+  // The snapshot belongs to the item it names, not to whichever slot 0 held.
+  assert.deepEqual(
+    body.output.map((item) => item.id),
+    ["m", "f"],
+  );
+  assert.equal(body.output[1].arguments, '{"a":1}');
+  assert.deepEqual(body.output[0].content, []);
 });
 
 test("Anthropic preserves initial content, thinking, signatures, tool JSON, usage and stop reason", async () => {
@@ -435,6 +498,34 @@ test("Anthropic retains complete tool input when there are no JSON deltas", asyn
   assert.equal(body.content[0].text, "initial");
 });
 
+test("Anthropic reads an empty argument delta set as no arguments at all", async () => {
+  const body = await json(
+    event({ type: "message_start", message: { id: "m", content: [] } }) +
+      event({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "t", name: "f", input: { a: 1 } },
+      }) +
+      event({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta" } }) +
+      event({
+        type: "content_block_start",
+        index: 1,
+        content_block: { type: "tool_use", id: "u", name: "g", input: {} },
+      }) +
+      event({
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: "  " },
+      }) +
+      event({ type: "message_stop" }),
+    "anthropic",
+  );
+  // No bytes to parse is not malformed JSON, and not a reason to drop the
+  // input the block opened with.
+  assert.deepEqual(body.content[0].input, { a: 1 });
+  assert.deepEqual(body.content[1].input, {});
+});
+
 for (const protocol of ["chat", "responses", "anthropic"]) {
   test(`${protocol}: HTTP failures and non-SSE JSON return the same unread Response`, async () => {
     const httpError = sse(event({ error: { message: "quota" } }), { status: 429 });
@@ -478,14 +569,7 @@ for (const protocol of ["chat", "responses", "anthropic"]) {
     ]) {
       const response = await collapseOpenStream(text, protocol);
       assert.equal(response.status, 502);
-      const body = await response.json();
-      assert.equal(body.error.type, "upstream_error");
-      assert.equal(body.error.message, "upstream exploded");
-      if (protocol === "anthropic") assert.equal(body.type, "error");
-      else {
-        assert.equal(body.error.param, null);
-        assert.equal(body.error.code, null);
-      }
+      assertProtocolError(await response.json(), protocol, "upstream exploded");
     }
   });
 
@@ -618,6 +702,10 @@ test("success and error JSON remove stale entity headers and preserve retry meta
         headers: {
           "content-length": "999",
           "content-encoding": "gzip",
+          "transfer-encoding": "chunked",
+          "content-md5": "md5",
+          etag: 'W/"stream"',
+          "last-modified": "Wed, 21 Oct 2015 07:28:00 GMT",
           "retry-after": "12",
           "x-request-id": "req-1",
         },
@@ -625,8 +713,16 @@ test("success and error JSON remove stale entity headers and preserve retry meta
       "chat",
     );
     assert.equal(response.headers.get("content-type"), "application/json");
-    assert.equal(response.headers.get("content-length"), null);
-    assert.equal(response.headers.get("content-encoding"), null);
+    // What described the stream's own bytes cannot describe the JSON body.
+    for (const name of [
+      "content-length",
+      "content-encoding",
+      "transfer-encoding",
+      "content-md5",
+      "etag",
+      "last-modified",
+    ])
+      assert.equal(response.headers.get(name), null, name);
     assert.equal(response.headers.get("retry-after"), "12");
     assert.equal(response.headers.get("x-request-id"), "req-1");
   }
@@ -651,7 +747,12 @@ test("bounded buffering rejects oversized unterminated events and cancels the so
   const result = await collapseResponse(response, "chat");
   assert.equal(result.status, 502);
   assert.match((await result.json()).error.message, /limit|large|buffer/i);
-  assert.ok(pulls <= 35);
+  // One chunk past the limit ends the read, and the stream may have handed
+  // out a chunk or two ahead of the reader.
+  assert.ok(
+    pulls <= LIMIT_BYTES / chunk.length + 3,
+    `pulled ${pulls} chunks before the buffer limit`,
+  );
   assert.equal(cancelled, true);
 });
 
@@ -660,9 +761,11 @@ test("bounded buffering also counts many small completed events", async () => {
     event({ choices: [{ index: 0, delta: { content: "x".repeat(65536) } }] }),
   );
   let cancelled = false;
+  let pulls = 0;
   const response = new Response(
     new ReadableStream({
       pull(controller) {
+        pulls++;
         controller.enqueue(chunk);
       },
       cancel() {
@@ -673,6 +776,12 @@ test("bounded buffering also counts many small completed events", async () => {
   );
   const result = await collapseResponse(response, "chat");
   assert.equal(result.status, 502);
+  // Completed events count towards the limit too, so an upstream that never
+  // stops sending them is cut off rather than read forever.
+  assert.ok(
+    pulls <= Math.ceil(LIMIT_BYTES / chunk.byteLength) + 3,
+    `pulled ${pulls} chunks before the buffer limit`,
+  );
   assert.equal(cancelled, true);
 });
 

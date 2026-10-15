@@ -155,6 +155,7 @@ It reports each request as:
 | `answered` | Zen served it; this shape is current |
 | `refused` | Zen did not recognise it (403) |
 | `superseded` | Zen wants a newer OpenCode than the profile claims (426) |
+| `failed` | Zen answered with something other than a 403, so it never judged the fingerprint |
 | `unreachable` | Zen could not be asked at all |
 
 The `floor` decides the exit code, because it is the shape this plugin exists to
@@ -162,6 +163,11 @@ send. The `full` is reported for what it says about a wording that has gone
 stale. Asking only the full shape left a real gap: `read` alone is `answered` and
 everything but `read` is `refused`, so a Zen that began insisting on one more
 name would keep `full` passing while the shape actually sent was refused.
+
+Only a 403 and a 426 are Zen answering about the fingerprint. A 5xx, a 429 or a
+401 says nothing about the wording, and the gate says so rather than sending the
+reader to `capture` over an outage — as it does when nothing was reached, or when
+part of a run answered and part of it did not.
 
 `capture` needs `opencode` on PATH. It points a real OpenCode at a server running
 locally and reads the request it makes, so nothing is sent to Zen and no key is
@@ -192,6 +198,12 @@ by changing tools.
 **`unreachable`.** Not a fingerprint problem. Check the network, and whether
 repeated refusals from this address have put it in a cooldown — they can, and
 the cooldown answers like a refusal.
+
+**`failed`.** Zen answered, but not with 403: a 5xx or a 429, or a 401 if the
+request was not authorized. Not a fingerprint problem either, and the gate says
+so rather than naming the wording. A 429 is the one to read twice: repeated
+refusals from this address can put it in a cooldown, and a cooldown answers
+quickly and often.
 
 ## Things that are easy to break
 
@@ -251,6 +263,33 @@ that passes under the stricter of them, since the looser one will not last.
 | `stream.mjs`, `tool-response.mjs` | replies Zen cuts short, and tool calls |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
+
+## Which copy of the icon and the concurrency is authoritative
+
+`icon` and `maxConcurrency` are declared twice, and neither copy can be read by
+the other: `package.json`'s `magpie` block is host-facing JSON, and the `auth`
+object in `provider.mjs` is the runtime's. Nothing builds one from the other, so
+a change to either alone drifts.
+
+The runtime values are authoritative for what the plugin asks for. The manifest
+block is what a host reads before it loads the plugin, so a host that reads it
+will act on that copy, and one that does not will act on the runtime's — which
+means editing one and not the other silently changes how many requests the host
+makes at once (too high and Zen rate-limits them, too low and they queue behind
+each other). Change both, and keep them saying the same thing.
+
+## What runs this
+
+Every script in `package.json` names `bun`: `bun test` is the suite, and
+`check:gate`, `limits:audit` and `capture` are the tools. `bun test` is what CI
+runs, at the version pinned in `.github/workflows/ci.yml` so a run says something
+about the commit rather than about whatever Bun was newest that morning.
+
+Nothing here is installed with Bun — there are no dependencies — so Bun is the
+tools only. `import.meta.main` is what decides whether `tools-smoke.mjs` runs its
+gate or is being imported by a test, and a Node older than 22.18 does not define
+it: the gate falls back to comparing the entry path, and exits non-zero saying
+nothing was asked if it cannot tell the two apart.
 
 ## Publishing
 

@@ -140,10 +140,6 @@ function normalizeTools(body, protocol) {
   // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
   // often than descriptions do, so this survives a rewording that a pinned
   // User-Agent would not.
-  // Zen takes a request for one generation of OpenCode or the other, and the tools
-  // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
-  // often than descriptions do, so this survives a rewording that a pinned
-  // User-Agent would not.
   const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
   const profile = PROFILES[generation];
   const filled = [];
@@ -187,21 +183,22 @@ function normalizeTools(body, protocol) {
 // on the other two, and which one a host used is its own business: it is
 // matched by where the name was found, so a tool sent in the other shape still
 // has its wording read and replaced.
-function descriptionAt(tool) {
-  return tool?.function ? tool.function.description : tool?.description;
-}
-
 function setDescription(tool, description) {
   if (tool?.function) tool.function.description = description;
   else if (tool) tool.description = description;
 }
 
-const shapeOf = (definition, protocol) =>
-  protocol === "chat"
-    ? { type: "function", function: definition }
-    : protocol === "anthropic"
-      ? { name: definition.name, description: definition.description, input_schema: definition.parameters }
-      : { type: "function", ...definition };
+function shapeOf(definition, protocol) {
+  if (protocol === "chat") return { type: "function", function: definition };
+  if (protocol === "anthropic") {
+    return {
+      name: definition.name,
+      description: definition.description,
+      input_schema: definition.parameters,
+    };
+  }
+  return { type: "function", ...definition };
+}
 
 // Zen's own wording for a refusal says only that the request did not look like
 // OpenCode's, which sends people off to change headers. Everything the plugin
@@ -321,7 +318,10 @@ async function server(_input, options = {}) {
   );
   let metadata = bootstrapProvider;
   let protocols = { ...bootstrapProtocols };
-  let listed = false;
+  // When the list was last read, or last asked for: 0 until the first ask. A
+  // failed ask sets it too, so a host whose listing can't be read waits out the
+  // same interval as one whose listing can, instead of asking three times with
+  // a 15 s timeout each on every request that names a model it doesn't know.
   let listedAt = 0;
 
   async function discover(signal) {
@@ -346,6 +346,7 @@ async function server(_input, options = {}) {
       partial = true;
     }
     if (listing.status !== "fulfilled" || !Array.isArray(listing.value?.data)) {
+      listedAt = Date.now();
       const fallback = { ...known };
       fallback[Symbol.for("magpie.fellBack")] = true;
       return fallback;
@@ -368,7 +369,6 @@ async function server(_input, options = {}) {
       // list there was.
     }
     known = discovered;
-    listed = true;
     listedAt = Date.now();
     return discovered;
   }
@@ -416,10 +416,7 @@ async function server(_input, options = {}) {
             const body = await request.json();
             if (!body || typeof body !== "object" || Array.isArray(body))
               throw new Error("Expected a JSON request object");
-            if (
-              !Object.hasOwn(known, body.model) &&
-              (!listed || Date.now() - listedAt >= RELIST_AFTER)
-            ) {
+            if (!Object.hasOwn(known, body.model) && Date.now() - listedAt >= RELIST_AFTER) {
               await discover(request.signal);
             }
             const model = Object.hasOwn(known, body.model) ? known[body.model] : undefined;

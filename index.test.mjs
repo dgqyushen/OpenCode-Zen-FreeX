@@ -10,12 +10,32 @@ const subject = import("./index.mjs").then((module) => ({
   default: { server: module.ZenFreePlugin },
 }));
 
+// The names the HTTP stack adds on its own rather than the plugin choosing
+// them, in one place so the three tests that pin the outbound set cannot drift
+// apart from each other. `host` is only excluded where the request is held
+// against the gate's own copy of the headers, which does not carry one; the test
+// that pins the set by name sends the same list and includes `host` deliberately.
+const HTTP_STACK = ["host", "connection", "content-length", "accept-encoding"];
+const HTTP_STACK_WITHOUT_HOST = ["connection", "content-length", "accept-encoding"];
+const chosenByPlugin = (sent, transport) =>
+  Object.keys(sent).filter((name) => !transport.includes(name));
+
 async function fixture(t, input = {}) {
   const state = { calls: [], status: 200, modelsStatus: 200, docsStatus: 200, catalogStatus: 200 };
+  // A body that is not JSON is recorded as no body at all rather than thrown
+  // out of a request listener, where it would read as a hung request.
+  const parseBody = (text) => {
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+  };
   const server = createServer(async (req, res) => {
     let text = "";
     for await (const chunk of req) text += chunk;
-    state.calls.push({ url: req.url, headers: req.headers, body: text && JSON.parse(text) });
+    state.calls.push({ url: req.url, headers: req.headers, body: parseBody(text) });
     if (state.discoveryHang) {
       state.onDiscovery?.();
       return;
@@ -217,9 +237,7 @@ for (const [path, model, utils, key] of [
     const sent = state.calls.at(-1).headers;
     assert.equal(sent["user-agent"], `opencode/1.19.0 ai-sdk/provider-utils/${utils} runtime/bun/1.3.14`);
     assert.equal(sent.accept, "*/*");
-    const own = Object.keys(sent).filter(
-      (name) => !["host", "connection", "content-length", "accept-encoding"].includes(name),
-    );
+    const own = chosenByPlugin(sent, HTTP_STACK);
     assert.deepEqual(
       own.sort(),
       [
@@ -263,9 +281,7 @@ for (const [generation, profile] of Object.entries(PROFILES)) {
     await response.text();
 
     const sent = state.calls.at(-1).headers;
-    const wire = Object.keys(sent).filter(
-      (name) => !["host", "connection", "content-length", "accept-encoding"].includes(name),
-    );
+    const wire = chosenByPlugin(sent, HTTP_STACK);
     const gate = requestFor(generation, profile, names).headers;
     assert.deepEqual([...gate.keys()].sort(), wire.sort());
     assert.equal(gate.get("user-agent"), sent["user-agent"]);
@@ -289,7 +305,20 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
     body: JSON.stringify({ model: "chat-free", stream: true }),
   });
   const rejected = assert.rejects(request, /abort/i);
-  await started;
+  // A run in which the discovery request is never sent is a failure of what
+  // this test is about, and waiting on `started` alone would report it as a
+  // suite that never finishes: race it as well, so the regression fails here.
+  let pinged;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        pinged = setTimeout(() => reject(new Error("no discovery request was sent")), 500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(pinged);
+  }
   controller.abort();
   let timer;
   try {
@@ -473,11 +502,10 @@ test("sends exactly the headers one generation of OpenCode sends", async (t) => 
   });
   const sent = state.calls.at(-1).headers;
   // accept-encoding, connection and content-length are the HTTP stack's, not
-  // this plugin's, so what is pinned here is the set the plugin chooses.
-  const transport = ["accept-encoding", "connection", "content-length"];
-  const chosen = Object.keys(sent)
-    .filter((name) => !transport.includes(name))
-    .sort();
+  // this plugin's, so what is pinned here is the set the plugin chooses. `host`
+  // is left in on purpose: the stack adds it too, but this is the test that says
+  // by name which names go out, and it is one of them.
+  const chosen = chosenByPlugin(sent, HTTP_STACK_WITHOUT_HOST).sort();
   assert.deepEqual(chosen, [
     "accept",
     "authorization",
@@ -554,11 +582,12 @@ test("reads a tool's name out of either shape, so nothing is filled twice", asyn
     body: JSON.stringify({
       model: "responses-free",
       input: "hi",
-      // The chat shape, on the responses endpoint.
-      tools: PROFILES["2.x"].tools.shell ? [
+      // The chat shape, on the responses endpoint. `shell` is the 2.x `bash`,
+      // and the profile carries it, so there is no shape to fall back to.
+      tools: [
         { type: "function", function: PROFILES["2.x"].tools.shell },
         { type: "function", function: PROFILES["2.x"].tools.read },
-      ] : [],
+      ],
     }),
   });
   const tools = state.calls.at(-1).body.tools;
@@ -814,11 +843,10 @@ test("a model made free since the list was read is served after the list is aske
   const loader = await plugin.auth.loader(publicAuth);
   state.ids = ["chat-free", "late-free"];
   state.chatProtocol = "chat/completions";
+  // Scoped to this test by the runner, so the shift cannot outlive it however
+  // this file's hooks change later.
   const realNow = Date.now;
-  Date.now = () => realNow() + 61_000;
-  t.after(() => {
-    Date.now = realNow;
-  });
+  t.mock.method(Date, "now", () => realNow() + 61_000);
   const response = await loader.fetch(`${origin}/v1/chat/completions`, {
     method: "POST",
     body: JSON.stringify({ model: "late-free", stream: true }),

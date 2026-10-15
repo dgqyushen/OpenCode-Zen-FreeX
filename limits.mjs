@@ -158,17 +158,24 @@ function namedNumber(pattern, text) {
 // responses are read, and only the first `limit` characters of one: this is an
 // error path on the request's way to a caller that is waiting, so it must never
 // be able to fail a request, change a response, or buffer a body that is not
-// small. Returns undefined when the body names nothing attributable, otherwise
-// whichever axes it named.
+// small. A number the read cut in half names nothing either, since half of one
+// is a smaller limit that looks like a whole one. Returns undefined when the
+// body names nothing attributable, otherwise whichever axes it named.
 export async function observeRouteStatement(id, response, limit = 4096) {
   try {
     if (typeof id !== "string" || !id || response?.ok !== false) return undefined;
-    const text = await response
-      .clone()
-      .text()
-      .catch(() => "");
-    const context = namedContextWindow(text.slice(0, limit));
-    const output = namedOutputCap(text.slice(0, limit));
+    const text = await readPrefix(response, limit);
+    // `readPrefix` stops at `limit`, so the last character read may be the first
+    // half of a longer number. Both words this reads are numbers inside prose —
+    // the window's ends in the literal "tokens", but the second ceiling wording
+    // ends with the digits it captured, so `/max_tokens: 1000000 is not less or
+    // equal to 2621` carved out of 262144 reads as a ceiling Zen stated. Live
+    // values are taken as they stand, past the staleness check and the guard
+    // below, so that half a number would become the applied max_tokens. A match
+    // that runs up to the cut is therefore not evidence, on either axis: asking
+    // again over one character less only finds the same number one digit
+    // shorter, and reading the rest of the body is what this path must not do.
+    const { context, output } = namedAxes(text, limit, text.length > limit);
     if (context === undefined && output === undefined) return undefined;
     if (context !== undefined) OBSERVED.set(id, context);
     if (output !== undefined) OBSERVED_OUTPUT.set(id, output);
@@ -176,6 +183,42 @@ export async function observeRouteStatement(id, response, limit = 4096) {
   } catch {
     return undefined;
   }
+}
+
+// Read at most `limit` characters of a refusal without buffering the rest: this
+// is an error path on a request whose caller is waiting, so a body that is not
+// small is dropped as soon as the part that is read is in hand.
+async function readPrefix(response, limit) {
+  const body = response.clone().body;
+  if (typeof body?.getReader !== "function") return response.clone().text().catch(() => "");
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    // A body that fails halfway is still worth what was read of it.
+  }
+  await reader.cancel().catch(() => {});
+  return text;
+}
+
+// The axes the first `limit` characters of `text` name. `cut` says the body went
+// on past that point, so a match ending on the last character read may have been
+// a longer number: that axis is left unread rather than reported a digit short.
+function namedAxes(text, limit, cut) {
+  const head = text.slice(0, limit);
+  const contextMatch = NAMED_CONTEXT.exec(head);
+  const outputMatch = NAMED_OUTPUT.map((pattern) => pattern.exec(head)).find(Boolean);
+  const onCut = (match) => cut && Boolean(match) && match.index + match[0].length >= limit;
+  return {
+    context: onCut(contextMatch) ? undefined : namedContextWindow(head),
+    output: onCut(outputMatch) ? undefined : namedOutputCap(head),
+  };
 }
 
 const ROUTE_TIERS = new Set(["route", "route-twin"]);
@@ -199,12 +242,26 @@ export function limitOverrides(
     const live = (axis === "context" ? observed : observedOutput)?.get(id);
     // A route statement made while this process was running is the same tier as
     // the table and newer than it, so it is taken as it stands. Everything else
-    // has to have been measured against the catalogue in front of us now.
-    const value =
-      live !== undefined ? live : entry && entry.declaredAt === declaredValue ? entry.value : undefined;
+    // has to have been measured against the catalogue in front of us now: the
+    // value it was measured against has to exist and still be the declaration,
+    // and one that names no such value was measured against nothing.
+    let value;
+    if (live !== undefined) {
+      value = live;
+    } else if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) {
+      value = entry.value;
+    }
     if (value === undefined || !Number.isSafeInteger(value) || value <= 0) continue;
     if (value === declaredValue) continue;
-    if (entry && !ROUTE_TIERS.has(entry.source) && Number.isSafeInteger(declaredValue) && value < declaredValue)
+    // Weaker evidence may only raise, and that holds for the table alone: a live
+    // refusal is the route itself and is taken as it stands, entry or no entry.
+    if (
+      live === undefined &&
+      entry &&
+      !ROUTE_TIERS.has(entry.source) &&
+      Number.isSafeInteger(declaredValue) &&
+      value < declaredValue
+    )
       continue;
     overrides[axis] = value;
   }

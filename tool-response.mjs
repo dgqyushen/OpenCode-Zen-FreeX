@@ -1,21 +1,33 @@
+import { STALE_BODY_HEADERS } from "./stream.mjs";
+
 const MAX_BYTES = 32 * 1024 * 1024;
+// The limit as a failure's message names it, from the one place it is set.
+const LIMIT = `${MAX_BYTES / (1024 * 1024)} MiB`;
 const encoder = new TextEncoder();
 
-class GuardError extends Error {}
+class GuardError extends Error {
+  constructor(message, code = "upstream_error") {
+    super(message);
+    this.code = code;
+  }
+}
 
 function headersFor(response) {
   const headers = new Headers(response.headers);
-  headers.delete("content-length");
-  headers.delete("content-encoding");
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
   return headers;
 }
 
-function failure(protocol, message, stream = false) {
+// failure answers the error a client reads. `code` says what went wrong
+// where the shape has room for it: only a call of no tool the agent has is
+// an undeclared one, and a limit, a truncation or a malformed upstream is
+// not.
+function failure(protocol, message, stream = false, code = "upstream_error") {
   if (protocol === "anthropic") return { type: "error", error: { type: "api_error", message } };
   if (protocol === "responses") {
     return stream
-      ? { type: "error", code: "undeclared_tool", message }
-      : { error: { type: "upstream_error", code: "undeclared_tool", message } };
+      ? { type: "error", code, message }
+      : { error: { type: "upstream_error", code, message } };
   }
   return { error: { message, type: "upstream_error" } };
 }
@@ -198,7 +210,7 @@ function checkSnapshots(data, protocol, checkName) {
     if (isCall(protocol, value)) {
       const name = checkName(value.name);
       if (name == null) {
-        if (!holder) throw new GuardError(droppedNote(value.name));
+        if (!holder) throw new GuardError(droppedNote(value.name), "undeclared_tool");
         holder[key] = inPlaceOf(protocol, value, droppedNote(value.name));
         changed = true;
         left++;
@@ -267,7 +279,7 @@ function chatBuffer(checkName) {
     bytes += size;
     state.bytes += size;
     if (bytes > MAX_BYTES)
-      throw new GuardError("Pending upstream tools exceed the 32 MiB buffer limit");
+      throw new GuardError(`Pending upstream tools exceed the ${LIMIT} buffer limit`);
   }
   function stateFor(index, data) {
     if (!pending.has(index)) {
@@ -485,6 +497,35 @@ function snapshotStream(protocol, checkName) {
   };
 }
 
+// A reply that is not a stream is read whole before it is checked, so it is
+// read through the same limit a streamed reply's events are: a body past it
+// is a 502, rather than the whole of it sitting in memory first.
+async function readBounded(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const parts = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_BYTES)
+        throw new GuardError(`Upstream response exceeds the ${LIMIT} buffer limit`);
+      parts.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(bytes);
+  let offset = 0;
+  for (const part of parts) {
+    all.set(part, offset);
+    offset += part.length;
+  }
+  return new TextDecoder().decode(all);
+}
+
 function parseJSON(text) {
   let value;
   try {
@@ -519,7 +560,7 @@ async function* framesFrom(reader) {
   function append(value) {
     eventBytes += value.byteLength;
     if (eventBytes > MAX_BYTES)
-      throw new GuardError("Upstream SSE event exceeds the 32 MiB buffer limit");
+      throw new GuardError(`Upstream SSE event exceeds the ${LIMIT} buffer limit`);
     if (value.byteLength) {
       parts.push(value);
       lineBytes += value.byteLength;
@@ -546,7 +587,7 @@ async function* framesFrom(reader) {
         start = 1;
       }
       if (eventBytes > MAX_BYTES)
-        throw new GuardError("Upstream SSE event exceeds the 32 MiB buffer limit");
+        throw new GuardError(`Upstream SSE event exceeds the ${LIMIT} buffer limit`);
       skipLF = false;
       if (pendingFrame) {
         const frame = pendingFrame;
@@ -559,7 +600,7 @@ async function* framesFrom(reader) {
       if (value[offset] !== 10 && value[offset] !== 13) continue;
       append(value.subarray(start, offset));
       if (++eventBytes > MAX_BYTES)
-        throw new GuardError("Upstream SSE event exceeds the 32 MiB buffer limit");
+        throw new GuardError(`Upstream SSE event exceeds the ${LIMIT} buffer limit`);
       const bytes = new Uint8Array(lineBytes);
       let cursor = 0;
       for (const part of parts) {
@@ -584,7 +625,7 @@ async function* framesFrom(reader) {
           rawLine += "\n";
           offset++;
           if (++eventBytes > MAX_BYTES)
-            throw new GuardError("Upstream SSE event exceeds the 32 MiB buffer limit");
+            throw new GuardError(`Upstream SSE event exceeds the ${LIMIT} buffer limit`);
         } else if (offset + 1 === value.length) skipLF = true;
       }
       start = offset + 1;
@@ -826,7 +867,7 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             controller.enqueue(
               encoder.encode(
                 encodeEvent(
-                  failure(protocol, error.message, true),
+                  failure(protocol, error.message, true, error.code),
                   protocol === "chat" ? "" : "error",
                 ),
               ),
@@ -865,16 +906,15 @@ export async function guardToolResponse(response, protocol, policy, options = {}
       headers,
     });
   }
-  const text = await response.text();
   let value;
   let status = response.status;
   try {
-    value = parseJSON(text);
+    value = parseJSON(await readBounded(response));
     checkSnapshots(value, protocol, checkName);
   } catch (error) {
     if (!(error instanceof GuardError)) throw error;
     status = 502;
-    value = failure(protocol, error.message);
+    value = failure(protocol, error.message, false, error.code);
   }
   headers.set("content-type", "application/json");
   return new Response(JSON.stringify(value), { status, headers });

@@ -7,17 +7,21 @@ export const SDK = {
   anthropic: "@ai-sdk/anthropic",
 };
 
+// The endpoint each table row names, as this file's names for them. A row that
+// names one outside this set is not a protocol this plugin can ask.
+const PROTOCOLS = {
+  "chat/completions": "chat",
+  responses: "responses",
+  messages: "anthropic",
+  systemone: "systemone",
+};
+
 export function parseProtocolDocs(text) {
   const protocols = {};
   const pattern =
     /\|[^|]+\|\s*`?([^|`\s]+)`?\s*\|\s*`[^`]+\/v1\/(chat\/completions|responses|messages|systemone)`/g;
   for (const match of text.matchAll(pattern)) {
-    protocols[match[1]] = {
-      "chat/completions": "chat",
-      responses: "responses",
-      messages: "anthropic",
-      systemone: "systemone",
-    }[match[2]];
+    protocols[match[1]] = PROTOCOLS[match[2]];
   }
   return protocols;
 }
@@ -28,18 +32,22 @@ function sdkProtocol(npm) {
   if (npm?.includes("openai-compatible")) return "chat";
 }
 
+// Set, and not merely present: the catalogue writes both a missing date and an
+// explicit null, and neither retires a model.
+const hasValue = (value) => value !== null && value !== undefined;
+
 function isRetired(model) {
   return (
     model.deprecated === true ||
     ["deprecated", "retired", "disabled"].includes(model.status ?? model.lifecycle) ||
-    model.deprecated_at != null ||
-    model.retirement_date != null
+    hasValue(model.deprecated_at) ||
+    hasValue(model.retirement_date)
   );
 }
 
 export function isFree(id, model = {}) {
   return (
-    !isRetired(model) && (/free/i.test(id) || (model.cost?.input === 0 && model.cost?.output === 0))
+    !isRetired(model) && (/-free$/i.test(id) || (model.cost?.input === 0 && model.cost?.output === 0))
   );
 }
 
@@ -55,26 +63,39 @@ function listedFree(id) {
   return /-free$/.test(id);
 }
 
+// Which protocol a model is asked at, in the order the answer is trusted: the
+// console docs' own endpoint first, then the package the catalogue gives the
+// model (or its provider), and last the provider's own protocol for an id that
+// names itself free and neither of those describes. Nothing here is a guess at
+// an endpoint — the fallback is openai-compatible, which is what the provider
+// speaks. A protocol outside `SDK` leaves the model out below rather than
+// sending it somewhere it is not served: `systemone` and a model the catalogue
+// drops do not appear.
+function protocolFor(id, model, raw, provider, protocols) {
+  if (protocols[id]) return protocols[id];
+  if (raw) return sdkProtocol(model.provider?.npm ?? provider.npm);
+  if (listedFree(id)) return sdkProtocol(provider.npm) ?? "chat";
+  return undefined;
+}
+
+const modalities = (values) =>
+  Object.fromEntries(
+    ["text", "image", "audio", "video", "pdf"].map((name) => [
+      name,
+      Array.isArray(values) && values.includes(name),
+    ]),
+  );
+
 export function buildModels(ids, provider, protocols, baseURL) {
   const result = {};
   for (const id of ids) {
     if (typeof id !== "string" || !id || id === "__proto__") continue;
     const raw = provider.models?.[id];
     const model = raw ?? {};
-    const protocol =
-      protocols[id] ??
-      (raw
-        ? sdkProtocol(model.provider?.npm ?? provider.npm)
-        : listedFree(id)
-          ? (sdkProtocol(provider.npm) ?? "chat")
-          : undefined);
+    const protocol = protocolFor(id, model, raw, provider, protocols);
     if (!isFree(id, model) || !Object.hasOwn(SDK, protocol)) continue;
     const input = model.modalities?.input ?? ["text"];
     const output = model.modalities?.output ?? ["text"];
-    const modalities = (values) =>
-      Object.fromEntries(
-        ["text", "image", "audio", "video", "pdf"].map((name) => [name, values.includes(name)]),
-      );
     const efforts = (model.reasoning_options ?? [])
       .filter((option) => option.type === "effort")
       .flatMap((option) => option.values ?? []);

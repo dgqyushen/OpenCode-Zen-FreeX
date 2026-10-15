@@ -1,9 +1,25 @@
 const MAX_BYTES = 32 * 1024 * 1024;
 
+// The headers that describe the bytes a reply arrived as. A reply whose body
+// is written again — a stream collapsed into one JSON document, or a guarded
+// stream whose frames may be rewritten or added to — no longer describes
+// those bytes: a length, an encoding, hop-by-hop framing, and the validators
+// a cache or a conditional request would compare against all describe the
+// old ones only. What says something about the reply itself (a retry-after,
+// a request id) is left alone. One list, so the two places that write a body
+// again cannot drift apart.
+export const STALE_BODY_HEADERS = [
+  "content-length",
+  "content-encoding",
+  "transfer-encoding",
+  "content-md5",
+  "etag",
+  "last-modified",
+];
+
 function jsonResponse(source, protocol, value, error) {
   const headers = new Headers(source.headers);
-  headers.delete("content-length");
-  headers.delete("content-encoding");
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
   headers.set("content-type", "application/json");
   if (error) {
     const detail = { type: "upstream_error", message: error };
@@ -108,12 +124,15 @@ function responsesAccumulator() {
   let body = { object: "response", output: [] };
   let final;
   const output = new Map();
+  // The slot a frame belongs to: the output_index it carries, or the slot
+  // of the item it names when the upstream left output_index out.
+  function slot(data, id) {
+    if (data.output_index !== undefined) return index(data.output_index);
+    const position = id ? [...output].find(([, value]) => value.id === id)?.[0] : undefined;
+    return index(position);
+  }
   function item(data, type = "message") {
-    let position = data.output_index;
-    if (position === undefined && data.item_id) {
-      position = [...output].find(([, value]) => value.id === data.item_id)?.[0];
-    }
-    position = index(position);
+    const position = slot(data, data.item_id);
     if (!output.has(position)) {
       const value = { type };
       if (data.item_id) value.id = data.item_id;
@@ -133,7 +152,7 @@ function responsesAccumulator() {
             output.set(position, value);
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
-        if (data.item) output.set(index(data.output_index), data.item);
+        if (data.item) output.set(slot(data, data.item.id), data.item);
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
         value.content ??= [];
@@ -239,8 +258,14 @@ function anthropicAccumulator() {
     },
     finish() {
       for (const [position, value] of argumentsJSON) {
+        // An upstream may send an empty delta set for a call that takes no
+        // arguments: there are no bytes to parse, and the block's own input
+        // stands. JSON.parse("") would fail a valid call.
+        if (!value.trim()) continue;
+        const block = blocks.get(position);
+        if (!block) throw new Error("Tool input for no content block in upstream stream");
         try {
-          blocks.get(position).input = JSON.parse(value);
+          block.input = JSON.parse(value);
         } catch {
           throw new Error("Invalid tool input JSON in upstream stream");
         }
@@ -370,7 +395,7 @@ export async function collapseResponse(response, protocol) {
         if (done) break;
         bytes += value.byteLength;
         if (bytes > MAX_BYTES) {
-          failure = "Upstream SSE exceeds the 32 MiB buffer limit";
+          failure = `Upstream SSE exceeds the ${MAX_BYTES / (1024 * 1024)} MiB limit`;
           await reader.cancel();
           break;
         }

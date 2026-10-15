@@ -17,6 +17,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROFILES } from "./core-tools.mjs";
@@ -26,8 +27,12 @@ const DRY = process.argv.includes("--dry");
 const HERE = import.meta.dir;
 const FINGERPRINT = join(HERE, "fingerprint.json");
 
-// The names Zen reads. Everything else a host declares is ignored by it.
-const READ = ["bash", "glob", "grep", "read", "write", "edit"];
+// The names Zen reads, by generation: 2.x sends `shell` where 1.x sends `bash`
+// and carries none of the others. Everything else a host declares is ignored.
+const READ = {
+  "1.x": ["bash", "glob", "grep", "read", "write", "edit"],
+  "2.x": ["shell", "read"],
+};
 
 // The capture host's own scratch directory and OS banner belong to the machine
 // the capture ran on, not to the tool. These are put back to something neutral
@@ -42,6 +47,15 @@ const NEUTRALISE = [
 const KEEP = 1200;
 
 const capturedPath = join(tmpdir(), `zen-capture-${process.pid}.json`);
+// A run that was killed leaves its file behind and a PID comes round again, so
+// this one is removed rather than read back as if it were this run's capture.
+rmSync(capturedPath, { force: true });
+// OpenCode makes more than one request (a short one for the title, then the
+// real one). The one worth reading is the longest, since it is the one that
+// carries the full toolset. It is kept here rather than written from the handler
+// as it arrives: two requests in flight at once would both be writing this one
+// file, and the writes interleave into it.
+let longest = { agent: null, body: "" };
 const server = Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
@@ -49,16 +63,8 @@ const server = Bun.serve({
     const url = new URL(request.url);
     if (url.pathname.endsWith("/models"))
       return Response.json({ object: "list", data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }] });
-    // OpenCode makes more than one request (a short one for the title, then the
-    // real one). The one worth reading is the longest, since it is the one that
-    // carries the full toolset.
     const body = await request.text();
-    let previous = { agent: null, body: "" };
-    try {
-      previous = JSON.parse(readFileSync(capturedPath, "utf8"));
-    } catch {}
-    if (body.length > previous.body.length)
-      await Bun.write(capturedPath, JSON.stringify({ agent: request.headers.get("user-agent"), body }));
+    if (body.length > longest.body.length) longest = { agent: request.headers.get("user-agent"), body };
     return new Response(
       [
         'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"big-pickle","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}',
@@ -101,6 +107,8 @@ const code = await new Promise((done) => {
 });
 server.stop(true);
 if (!ran) process.exit(1);
+// Written here, once nothing else can be writing it.
+if (longest.body.length) await Bun.write(capturedPath, JSON.stringify(longest));
 
 let request;
 try {
@@ -110,11 +118,25 @@ try {
   process.exit(1);
 }
 
-const body = JSON.parse(request.body);
+let body;
+try {
+  body = JSON.parse(request.body);
+} catch {
+  console.error("the captured request body is not JSON; nothing to read");
+  process.exit(1);
+}
+
+// Which generation this client is: the names it sends say so. It is read
+// before the tools are, since the two generations do not send the same names
+// and 2.x has to be recognised by `shell` rather than judged against 1.x's.
+const names = new Set((body.tools ?? []).map((raw) => (raw.function ?? raw)?.name));
+const generation = names.has("shell") ? "2.x" : "1.x";
+const read = READ[generation];
+
 const tools = {};
 for (const raw of body.tools ?? []) {
   const tool = raw.function ?? raw;
-  if (!tool?.name || !READ.includes(tool.name) || !tool.description) continue;
+  if (!tool?.name || !read.includes(tool.name) || !tool.description) continue;
   tools[tool.name] = {
     name: tool.name,
     description: NEUTRALISE.reduce((text, [find, to]) => text.replace(find, to), tool.description).slice(0, KEEP),
@@ -122,7 +144,7 @@ for (const raw of body.tools ?? []) {
   };
 }
 
-const missing = READ.filter((name) => !tools[name]);
+const missing = read.filter((name) => !tools[name]);
 if (missing.length) {
   console.error(
     `the captured request has no ${missing.join(", ")}; this OpenCode no longer sends them, so it cannot be captured this way`,
@@ -135,8 +157,6 @@ for (const [name, tool] of Object.entries(tools))
     process.exit(1);
 }
 
-// Which generation this client is: the names it sends say so.
-const generation = body.tools.some((t) => (t.function ?? t).name === "shell") ? "2.x" : "1.x";
 const required = generation === "2.x" ? ["shell", "read"] : ["bash", "glob", "grep", "read"];
 const absent = required.filter((name) => !tools[name]);
 if (absent.length) {
@@ -146,6 +166,14 @@ if (absent.length) {
 
 // Which protocol was captured, since each of 1.x's protocols bundles its own
 // provider-utils and a capture must not overwrite the ones it did not observe.
+// Anthropic is not one this can read: its tools carry `input_schema` where the
+// other two carry `parameters`, so read as the chat one it would write every
+// tool without its parameters and take the chat slot's provider-utils from an
+// anthropic client. Refused rather than written.
+if ((body.tools ?? []).some((raw) => (raw.function ?? raw)?.input_schema !== undefined)) {
+  console.error("the captured request is in the anthropic shape, which this script cannot read; nothing written");
+  process.exit(1);
+}
 const protocol = body.input !== undefined && body.messages === undefined ? "responses" : "chat";
 
 console.log(`\nagent:  ${request.agent}`);

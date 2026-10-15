@@ -35,9 +35,10 @@
 // Exit code is 0 when at least one offered id answered, 1 when none did: being
 // unable to ask is not a finding about limits.
 
+import { fileURLToPath } from "node:url";
 import { PROFILES } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedContextWindow, namedOutputCap } from "./limits.mjs";
-import { SDK, bootstrapProtocols } from "./models.mjs";
+import { SDK, bootstrapProtocols, isFree } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
@@ -46,6 +47,10 @@ const CATALOG_URL = process.env.ZEN_CATALOG_URL ?? CATALOG;
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
 const READ_BUDGET = 4096;
 const ASKED_CEILING = 1_000_000;
+// How many ids are asked at once. Each ask stops as soon as the answer starts,
+// so the connection and the upstream load stay modest while the 45 s abort of
+// one id no longer holds up every id behind it.
+const POOL = 4;
 
 // The ids the plugin would offer: the listing's, kept where the catalogue calls
 // them free — or, for an id neither the catalogue nor the docs describe, where
@@ -53,14 +58,15 @@ const ASKED_CEILING = 1_000_000;
 // models.mjs offers on its own say-so. An id the snapshot already calls
 // something this plugin has no SDK for is not offered by anyone: `jev-1.13-free`
 // is SystemOne, and stays out here for the same reason buildModels leaves it out.
-// Exported for the tests.
+// "Free" is models.mjs's own answer, retirement included, so the audited set and
+// the offered set cannot drift apart. Exported for the tests.
 export function offeredIds(listing, catalog, snapshot = bootstrapProtocols) {
   return listing.filter((id) => {
     const protocol = snapshot?.[id];
     if (protocol !== undefined && !Object.hasOwn(SDK, protocol)) return false;
     const model = catalog?.[id];
     if (!model) return /-free$/.test(id);
-    return /free/i.test(id) || (model.cost?.input === 0 && model.cost?.output === 0);
+    return isFree(id, model);
   });
 }
 
@@ -100,8 +106,11 @@ export function findings(rows, covered = new Set()) {
     // finding and must not sit in this list for ever: it is said once, beside the
     // ids that were not asked at all.
     if (protocolScoped(row)) continue;
-    if (row.status !== 200 && !named) {
-      // What is left is worth reading: a 410, and a 400 that named nothing.
+    if (row.status !== 200 && row.status !== 0 && !named) {
+      // What is left is worth reading: a 410, and a 400 that named nothing. A 0
+      // is a question that was never answered — timeout, DNS, a closed socket —
+      // and the audit's own rule is that being unable to ask is not a finding
+      // about limits, so the id, its status and its message stay in the table.
       out.push(`${row.id}: HTTP ${row.status}${row.says ? ` — ${row.says}` : ""}`);
     }
   }
@@ -136,9 +145,15 @@ function says(text) {
 
 // A refusal that names the protocol rather than a limit. This audit asks the
 // chat shape, so a model that speaks Responses or Messages answers by saying so;
-// that is the host's business, not a limit to measure.
+// that is the host's business, not a limit to measure. The wording has to name
+// another shape or say it cannot be spoken at all: `format` alone is how an
+// ordinary `invalid request format` is worded, which is a question that was
+// asked and refused and belongs in the candidate list, not beside the ids that
+// were never asked.
+const OTHER_SHAPE = /protocol|\b(?:responses|messages)\b|anthropic/i;
+
 export function protocolScoped(row) {
-  return /protocol|format/i.test(row?.says ?? "");
+  return OTHER_SHAPE.test(row?.says ?? "");
 }
 
 async function getJSON(url) {
@@ -183,12 +198,17 @@ async function ask(id, names) {
     }
     const upstream = response.headers.get("x-opencode-upstream-model-id") ?? undefined;
     const endpoint = response.headers.get("x-opencode-endpoint-id") ?? undefined;
+    // limits.mjs reads refusals, and a refusal is the only place this route
+    // states a limit. The body of a 200 is the model's own prose, which an
+    // answer about token limits — or one that merely mentions them — would turn
+    // into a ceiling nobody stated, and a `named` row then skips its status line
+    // in findings() as well.
     return {
       status: response.status,
       upstream,
       endpoint,
-      window: namedContextWindow(text),
-      ceiling: namedOutputCap(text),
+      window: response.ok ? undefined : namedContextWindow(text),
+      ceiling: response.ok ? undefined : namedOutputCap(text),
       says: response.ok ? "" : says(text),
     };
   } catch (error) {
@@ -199,9 +219,54 @@ async function ask(id, names) {
   }
 }
 
+// Whether this module is the file that was run rather than one the tests
+// import. `import.meta.main` is the direct answer and the one Bun gives, but it
+// arrived in Node 22.18 and nothing before that has it — and an audit that cannot
+// tell whether it was run is an audit that reports success without asking.
+function invokedDirectly() {
+  // `typeof` rather than `??`: a runtime without the property throws on the
+  // member access itself, where there is nothing to fall back from.
+  if (typeof import.meta.main === "boolean") return import.meta.main;
+  try {
+    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+  } catch {
+    return undefined;
+  }
+}
+
 // Only a run asks the route. The tests import the helpers above and must not
 // reach the network.
-if (import.meta.main) {
+const entry = invokedDirectly();
+if (entry === undefined) {
+  console.error(
+    "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:audit`.",
+  );
+  process.exit(1);
+}
+
+if (entry) {
+  // A generation nobody captured is a typo or a Zen that has moved on, and is
+  // worth saying in one line rather than throwing a TypeError out of the first
+  // line of the run.
+  if (!Object.hasOwn(PROFILES, GENERATION)) {
+    console.error(
+      `limits audit — ZEN_GENERATION "${GENERATION}" is not a captured generation (${Object.keys(PROFILES).join(", ")})`,
+    );
+    process.exitCode = 1;
+  } else {
+    try {
+      await run();
+    } catch (error) {
+      // Being unable to ask is not a finding about limits, so it is a sentence
+      // and an exit code rather than a stack trace about a fetch that failed.
+      console.error(`\nlimits audit — unable to ask: ${error?.message ?? error}`);
+      console.error("The route or the catalogue could not be read. Check the network and ZEN_BASE_URL, then ask again.");
+      process.exitCode = 1;
+    }
+  }
+}
+
+async function run() {
   const names = [...PROFILES[GENERATION].required];
   const [listing, catalog] = await Promise.all([getJSON(`${BASE}/models`), getJSON(CATALOG_URL)]);
   const models = catalog?.opencode?.models ?? {};
@@ -221,13 +286,24 @@ if (import.meta.main) {
   // finding it cannot be.
   const asked = ids.filter((id) => (bootstrapProtocols[id] ?? "chat") === "chat");
   const elsewhere = ids.filter((id) => !asked.includes(id));
-  for (const id of asked) {
-    const answer = await ask(id, names);
-    const declared = models[id]?.limit ?? {};
-    rows.push({ id, declared, ...answer });
-    // What the plugin declares is the catalogue's limit with limits.mjs over it,
-    // so that is what is printed; the catalogue's own pair is shown beside it
-    // when the two differ, since that is the under-report being answered.
+  // The asks are independent, and each one can sit until its 45 s abort, so a
+  // few run together: 4 at a time overlaps the waiting without opening a
+  // connection per id. Answers are gathered first and printed in `asked` order,
+  // which is the order the listing gave.
+  for (let at = 0; at < asked.length; at += POOL) {
+    const batch = await Promise.all(
+      asked.slice(at, at + POOL).map(async (id) => {
+        const answer = await ask(id, names);
+        return { id, declared: models[id]?.limit ?? {}, ...answer };
+      }),
+    );
+    rows.push(...batch);
+  }
+
+  // What the plugin declares is the catalogue's limit with limits.mjs over it,
+  // so that is what is printed; the catalogue's own pair is shown beside it when
+  // the two differ, since that is the under-report being answered.
+  for (const { id, declared, ...answer } of rows) {
     const effective = { ...declared, ...limitOverrides(id, declared) };
     const moved = effective.context !== declared.context || effective.output !== declared.output;
     const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
@@ -255,7 +331,9 @@ if (import.meta.main) {
 
   if (!answered.length) {
     console.log(
-      "\nNothing answered, so this says nothing about limits. Check the network or ZEN_BASE_URL and ask again.",
+      asked.length
+        ? "\nNothing answered, so this says nothing about limits. Check the network or ZEN_BASE_URL and ask again."
+        : "\nNo offered id speaks the chat shape, so nothing was asked and this says nothing about limits.",
     );
     process.exitCode = 1;
   }
