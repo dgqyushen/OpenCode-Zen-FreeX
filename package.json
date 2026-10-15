@@ -17,9 +17,9 @@
   ],
   "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/opencode-zen-freex.git" },
-  "bugs": { "url": "https://github.com/tkhs101/opencode-zen-freex/issues" },
-  "homepage": "https://github.com/tkhs101/opencode-zen-freex#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/OpenCode-Zen-FreeX.git" },
+  "bugs": { "url": "https://github.com/tkhs101/OpenCode-Zen-FreeX/issues" },
+  "homepage": "https://github.com/tkhs101/OpenCode-Zen-FreeX#readme",
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",
