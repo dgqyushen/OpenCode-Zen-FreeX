@@ -21,7 +21,8 @@ ids the catalogue is wrong in the one direction nothing complains about: too
 small. `deepseek-v4.1-flash-free` is declared 200000/32000 while
 `deepseek-v4.1-flash` — the paid id serving the same upstream model, which
 `x-opencode-upstream-model-id` confirms — is declared 1000000/384000 in that
-same catalogue.
+same catalogue, and `mimo-v2.6-flash-free` is declared 200000/32000 against a
+model whose own vendor publishes 1048576/131072.
 
 Both numbers are acted on. The window decides when a conversation is compacted
 and how much of it is ever sent; the output cap is sent as `max_tokens` on every
@@ -32,10 +33,12 @@ quietly never used, which is why this stayed invisible for so long.
 `limits.mjs` holds what was measured, per axis, with the catalogue value it was
 measured against. Each axis carries `samples` and `how`; the short of it:
 
-| axis | value | from |
-| --- | --- | --- |
-| context | 1048576 | the route's own refusal, in its own words |
-| output | 384000 | what this route declares for the same upstream model |
+| id | axis | value | from |
+| --- | --- | --- | --- |
+| `deepseek-v4.1-flash-free` | context | 1048576 | the route's own refusal, in its own words |
+| `deepseek-v4.1-flash-free` | output | 384000 | what this route declares for the same upstream model |
+| `mimo-v2.6-flash-free` | context | 1048576 | the route's own refusal, in its own words |
+| `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
 
 A prompt sized just over the window is refused with
 
@@ -53,10 +56,20 @@ published what that model does; a single reply of 306,880 completion tokens
 number out of the refusal, three times, interleaved, per the rule below. The
 filler measured 4.887 characters per token with about 1700 tokens of fixed
 request overhead, and a request that is *served* says nothing about where the
-wall is. The output: re-read the paid id's `limit` in
-`https://models.opencode.ai/api.json`. A value Zen accepts is not evidence —
-`max_tokens: 2000000` under a short prompt answers 200 and writes nothing like
-it — and neither is a generation nobody watched finish.
+wall is — it is what the calibration is checked against, since
+`usage.prompt_tokens` is the real count while the refusal's "requested about"
+figure is a rough one (characters, not tokens) and must not be read as a count.
+A second upstream words the same fact as "This endpoint's maximum context length
+is …" and breaks the request into text input, tool input and output.
+
+The output: a paid twin's `limit` in `https://models.opencode.ai/api.json` is
+the stronger source, and re-reading it is the whole job. With no twin — `mimo`
+has none — the figure rests on the vendor's own entry, which is weaker evidence
+and has to say so in `samples`: what is declared is what a vendor publishes, not
+something watched. A value Zen accepts is not evidence — `max_tokens: 2000000`
+under a short prompt answers 200 and writes nothing like it, and `mimo`'s refusal
+came back with the 200000 it was asked for rather than with a ceiling — and
+neither is a generation nobody watched finish.
 
 **What voids it.** Each axis records the catalogue value it was measured
 against, and an axis whose declaration moved is dropped rather than kept: a
@@ -71,10 +84,24 @@ start and hourly after, so a route that changes the window it enforces is
 followed without anyone editing this file. Nothing is persisted: a restart falls
 back to what is measured here.
 
-**A lead, not evidence.** `mimo-v2.6-flash-free` is declared 200000/32000 here
-too, and another plugin on this route has reported Zen answering that id with
-`maximum context length is 1048576 tokens`. That is somebody else's measurement
-of a different id, so it is not in `limits.mjs`: measure it before adding it.
+**The same shape on a second upstream.** `mimo-v2.6-flash-free` is declared
+200000/32000 here too, and its window is a route figure like the one above — an
+850,249 token prompt was served first, its needle echoed back, and then a prompt
+just over the wall was refused with
+
+```
+This endpoint's maximum context length is 1048576 tokens. However, you requested
+about 1496523 tokens (1295079 of text input, 1444 of tool input, 200000 in the
+output).
+```
+
+which is the route naming its own window, on an upstream that words it
+differently from the DeepSeek ids. Its output is the first figure in this file
+resting on a vendor page: that same refusal came back with the 200000 it was
+asked for, unclamped, so this route states no completion ceiling of its own, and
+131072 is Xiaomi's entry for `mimo-v2.6-flash` (`api.xiaomimimo.com`, and its
+China token plan). Nothing above 32000 has been watched on this route, and
+`samples` says that rather than implying a witness.
 
 ## The loop
 

@@ -48,14 +48,37 @@ export const LIMITS = {
       how: "deepseek-v4.1-flash, the paid id serving the same upstream model, is declared 384000 in this same catalogue; DeepSeek's own page says 384K, which is 393216 read as binary K",
     },
   },
+  "mimo-v2.6-flash-free": {
+    context: {
+      value: 1048576,
+      source: "route",
+      declaredAt: 200000,
+      measured: "2026-10-15",
+      samples: "an 850,249 token prompt served, its needle echoed back; a prompt just over the window refused 400",
+      how: "a different upstream from the DeepSeek ids, and it says so in its own words: \"This endpoint's maximum context length is 1048576 tokens. However, you requested about 1496523 tokens (1295079 of text input, 1444 of tool input, 200000 in the output).\"",
+    },
+    output: {
+      value: 131072,
+      source: "vendor",
+      declaredAt: 32000,
+      measured: "2026-10-15",
+      samples: "nothing above 32000 watched on this route; that same refusal came back with the requested 200000 unclamped",
+      how: "Xiaomi's own entry for mimo-v2.6-flash, api.xiaomimimo.com and its China token plan, declares 1048576/131072, as do DeepInfra and nan; this route declares 32000 for the free id and states no completion ceiling of its own",
+    },
+  },
 };
 
 // "This model's maximum context length is 1048576 tokens. However, you
 // requested 1422278 tokens (1038278 in the messages, 384000 in the
 // completion)." — the route's own words, and the only sentence seen on this
-// route that states a window. A generic 400 says nothing attributable and is
-// left alone; §7 of the measured notes has a context overflow and an invalid
-// parameter answering with byte-identical 400s on another Zen model.
+// route that states a window. A second upstream phrases the same fact as "This
+// endpoint's maximum context length is ...", with the request broken into text
+// input, tool input and output; both are the route naming its own window, and
+// its "requested about" figure is a rough one (chars, not tokens) rather than
+// the count a served request reports in `usage.prompt_tokens`. A generic 400
+// says nothing attributable and is left alone; §7 of the measured notes has a
+// context overflow and an invalid parameter answering with byte-identical 400s
+// on another Zen model.
 const NAMED_CONTEXT = /maximum context length is (\d+) tokens/i;
 
 // Windows named by a refusal while this process is running, by model id. Not

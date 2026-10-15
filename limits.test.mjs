@@ -26,6 +26,16 @@ test("a free id Zen under-reports is declared at what the route says", async () 
   });
 });
 
+test("a second id on another upstream, whose axes rest on different tiers, is declared the same way", async () => {
+  const { limitOverrides } = await subject;
+  // its window is the route's own sentence; its output is the vendor's
+  // catalogue entry, because this upstream names no completion ceiling
+  assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
+    context: 1048576,
+    output: 131072,
+  });
+});
+
 test("evidence measured against another catalogue is void, and only on its own axis", async () => {
   const { limitOverrides } = await subject;
   // Zen moved the window it declares: the measured window is an answer to a
@@ -42,7 +52,7 @@ test("evidence measured against another catalogue is void, and only on its own a
 
 test("a model with no evidence keeps exactly what the catalogue declared", async () => {
   const { limitOverrides } = await subject;
-  assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {});
+  assert.deepEqual(limitOverrides("nemotron-3.5-lightning-free", DECLARED), {});
   assert.deepEqual(limitOverrides("big-pickle", {}), {});
   assert.deepEqual(limitOverrides("__proto__", DECLARED), {});
 });
@@ -106,7 +116,7 @@ test("only a refusal that names a window is read, and only its first few KiB", a
   assert.equal(await observeRouteStatement("", new Response(REFUSAL, { status: 400 })), undefined);
 });
 
-test("discovery declares the aligned limit for the id Zen under-reports, and only that id", async () => {
+test("discovery declares the aligned limits for the ids with evidence, and leaves the rest alone", async () => {
   const { buildModels } = await import("./models.mjs");
   const provider = {
     npm: "@ai-sdk/openai-compatible",
@@ -121,6 +131,11 @@ test("discovery declares the aligned limit for the id Zen under-reports, and onl
         cost: { input: 0, output: 0 },
         limit: { context: 200000, output: 32000 },
       },
+      "big-pickle": {
+        name: "Big Pickle",
+        cost: { input: 0, output: 0 },
+        limit: { context: 200000, input: 160000, output: 32000 },
+      },
     },
   };
   const models = buildModels(
@@ -130,5 +145,7 @@ test("discovery declares the aligned limit for the id Zen under-reports, and onl
     "https://opencode.ai/inference/v1",
   );
   assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
-  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 200000, output: 32000 });
+  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 1048576, output: 131072 });
+  // no evidence for this one, and the catalogue's own `input` survives untouched
+  assert.deepEqual(models["big-pickle"].limit, { context: 200000, input: 160000, output: 32000 });
 });
