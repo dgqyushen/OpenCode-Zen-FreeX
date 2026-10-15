@@ -4,7 +4,7 @@
 
 ## 为什么有这个分支
 
-上游 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free) 是这个插件的前身。它一直在维护，修bug也不慢，但对「给免费模型适配」这件事的态度摇摆不定，时而维护而放弃维护故催生本分支
+上游 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free) 是这个插件的前身。它一直在维护，修bug也不慢，但对「给免费模型适配」这件事的态度摇摆不定，时而维护而放弃维护故催生本分支：
 
 | UTC | 提交 | 那一下说了什么 |
 | --- | --- | --- |
