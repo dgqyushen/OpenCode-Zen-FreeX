@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -10,6 +10,7 @@
     "core-tools.mjs",
     "fingerprint.json",
     "limits.mjs",
+    "limits-audit.mjs",
     "models.mjs",
     "stream.mjs",
     "tool-response.mjs",
@@ -27,6 +28,7 @@
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",
+    "limits:audit": "bun limits-audit.mjs",
     "capture": "bun capture.mjs"
   },
   "magpie": { "icon": "https://opencode.ai/favicon-v3.ico", "maxConcurrency": 2 }

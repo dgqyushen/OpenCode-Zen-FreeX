@@ -15,8 +15,8 @@ import { guardToolResponse } from "./tool-response.mjs";
 
 // Zen moved behind opencode.ai/inference; everything under /zen/ answers 403
 // FreeTierError now, however the request is made.
-const DEFAULT_BASE = "https://opencode.ai/inference/v1";
-const CATALOG = "https://models.opencode.ai/api.json";
+export const DEFAULT_BASE = "https://opencode.ai/inference/v1";
+export const CATALOG = "https://models.opencode.ai/api.json";
 const DOCS =
   "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx";
 const PATHS = { chat: "/chat/completions", responses: "/responses", anthropic: "/messages" };

@@ -66,6 +66,36 @@ export const LIMITS = {
       how: "Xiaomi's own entry for mimo-v2.6-flash, api.xiaomimimo.com and its China token plan, declares 1048576/131072, as do DeepInfra and nan; this route declares 32000 for the free id and states no completion ceiling of its own",
     },
   },
+  "big-pickle": {
+    output: {
+      value: 131072,
+      source: "route",
+      declaredAt: 32000,
+      measured: "2026-10-15",
+      samples: "the endpoint refused the request asking for 200000 and named its own ceiling; nothing watched above 32000",
+      how: "\"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.\" — an upstream that validates the requested ceiling and states its own. No context entry: this id is the same upstream model as mimo-v2.6-flash-free (x-opencode-upstream-model-id answers mimo-v2.6-flash) on a different endpoint, and two endpoints of one model are not one window — the attempt to measure this one answered 200 with an empty body, which is not an answer, so that axis stays with the catalogue.",
+    },
+  },
+  "nemotron-3.5-lightning-free": {
+    context: {
+      value: 1000000,
+      source: "route",
+      declaredAt: 262144,
+      measured: "2026-10-15",
+      samples: "a refusal that named the window, which is what `bun run limits:audit` asks for; nothing near the wall has been served yet",
+      how: "\"This endpoint's maximum context length is 1000000 tokens. However, you requested about …\" — read from the refusal the audit provoked by asking for more completion tokens than the window leaves, on the same upstream that words it as the mimo entry above. The catalogue declares 262144 for this id.",
+    },
+  },
+  "longcat-2.5-preview-free": {
+    output: {
+      value: 262144,
+      source: "route",
+      declaredAt: 131072,
+      measured: "2026-10-15",
+      samples: "the ceiling named by a refusal, from the same audit run; nothing above 131072 watched on this route",
+      how: "\"Upstream request failed: [invalid_parameter] 参数校验失败: /max_tokens: 1000000 is not less or equal to 262144\" — the second wording namedOutputCap reads, where the ceiling is the number max_tokens has to stay under. Its context needs nothing: the catalogue's 1000000 is what that same refusal calls the endpoint's window.",
+    },
+  },
 };
 
 // "This model's maximum context length is 1048576 tokens. However, you
@@ -81,24 +111,55 @@ export const LIMITS = {
 // on another Zen model.
 const NAMED_CONTEXT = /maximum context length is (\d+) tokens/i;
 
-// Windows named by a refusal while this process is running, by model id. Not
-// persisted: it is the same kind of fact as LIMITS, only newer, and a restart
-// falls back to what was measured last.
+// "max_tokens is too large: 200000. This model supports at most 131072 completion
+// tokens, whereas you provided 200000." — an upstream that validates the ceiling
+// it was asked for and names its own, which is the only sentence seen on this
+// route that states a completion ceiling at all. It is worth knowing that the
+// DeepSeek upstream does not validate: `max_tokens: 2000000` under a short prompt
+// answers 200 there, so silence from this one says nothing about a model, and a
+// request that is served is not evidence of a ceiling either way.
+const NAMED_OUTPUT = [
+  /supports at most (\d+) completion tokens/i,
+  // "/max_tokens: 1000000 is not less or equal to 262144" — LongCat's wording for
+  // the same fact, where the ceiling is the number it has to stay under.
+  /max_tokens:?\s*\d+\s+is not less or equal to\s+(\d+)/i,
+];
+
+// Names a refusal made while this process is running, by model id. Not
+// persisted: the same kind of fact as LIMITS, only newer, so a restart falls
+// back to what was measured last.
 const OBSERVED = new Map();
+const OBSERVED_OUTPUT = new Map();
 
 // The window a refusal names, or undefined when the body says nothing
 // attributable. Exported for the tests and for anyone reading a capture.
 export function namedContextWindow(text) {
-  const match = NAMED_CONTEXT.exec(typeof text === "string" ? text : "");
+  return namedNumber(NAMED_CONTEXT, text);
+}
+
+// The completion ceiling a refusal names, or undefined. Same rule as the window:
+// the body has to name the parameter and a number, or it says nothing.
+export function namedOutputCap(text) {
+  for (const pattern of NAMED_OUTPUT) {
+    const value = namedNumber(pattern, text);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function namedNumber(pattern, text) {
+  const match = pattern.exec(typeof text === "string" ? text : "");
   if (!match) return undefined;
   const tokens = Number.parseInt(match[1], 10);
   return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
 }
 
-// Read a refusal for a window it names. Only non-2xx responses are read, and
-// only the first `limit` characters of one: this is an error path on the
-// request's way to a caller that is waiting, so it must never be able to fail a
-// request, change a response, or buffer a body that is not small.
+// Read a refusal for the names it makes about this model's limits. Only non-2xx
+// responses are read, and only the first `limit` characters of one: this is an
+// error path on the request's way to a caller that is waiting, so it must never
+// be able to fail a request, change a response, or buffer a body that is not
+// small. Returns undefined when the body names nothing attributable, otherwise
+// whichever axes it named.
 export async function observeRouteStatement(id, response, limit = 4096) {
   try {
     if (typeof id !== "string" || !id || response?.ok !== false) return undefined;
@@ -106,9 +167,12 @@ export async function observeRouteStatement(id, response, limit = 4096) {
       .clone()
       .text()
       .catch(() => "");
-    const tokens = namedContextWindow(text.slice(0, limit));
-    if (tokens !== undefined) OBSERVED.set(id, tokens);
-    return tokens;
+    const context = namedContextWindow(text.slice(0, limit));
+    const output = namedOutputCap(text.slice(0, limit));
+    if (context === undefined && output === undefined) return undefined;
+    if (context !== undefined) OBSERVED.set(id, context);
+    if (output !== undefined) OBSERVED_OUTPUT.set(id, output);
+    return { context, output };
   } catch {
     return undefined;
   }
@@ -120,22 +184,24 @@ const ROUTE_TIERS = new Set(["route", "route-twin"]);
 // a plain object to spread over the catalogue's own limit. Empty when there is
 // no evidence, when the evidence was measured against a different catalogue, or
 // when it would change nothing.
-export function limitOverrides(id, declared = {}, table = LIMITS, observed = OBSERVED) {
+export function limitOverrides(
+  id,
+  declared = {},
+  table = LIMITS,
+  observed = OBSERVED,
+  observedOutput = OBSERVED_OUTPUT,
+) {
   const overrides = {};
   const record = table?.[id];
-  const live = observed?.get(id);
   for (const axis of ["context", "output"]) {
     const declaredValue = declared?.[axis];
     const entry = record?.[axis];
+    const live = (axis === "context" ? observed : observedOutput)?.get(id);
     // A route statement made while this process was running is the same tier as
     // the table and newer than it, so it is taken as it stands. Everything else
     // has to have been measured against the catalogue in front of us now.
     const value =
-      axis === "context" && live !== undefined
-        ? live
-        : entry && entry.declaredAt === declaredValue
-          ? entry.value
-          : undefined;
+      live !== undefined ? live : entry && entry.declaredAt === declaredValue ? entry.value : undefined;
     if (value === undefined || !Number.isSafeInteger(value) || value <= 0) continue;
     if (value === declaredValue) continue;
     if (entry && !ROUTE_TIERS.has(entry.source) && Number.isSafeInteger(declaredValue) && value < declaredValue)

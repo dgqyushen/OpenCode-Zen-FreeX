@@ -76,18 +76,68 @@ test("weaker evidence may raise a limit but never lower one", async () => {
 test("a refusal naming a window while the process runs outranks the shipped table forever after", async () => {
   const { observeRouteStatement, namedContextWindow, limitOverrides } = await subject;
   assert.equal(namedContextWindow(REFUSAL), 1048576);
-  assert.equal(
+  assert.deepEqual(
     await observeRouteStatement(
       "deepseek-v4.1-flash-free",
       new Response(REFUSAL, { status: 400, headers: { "content-type": "application/json" } }),
     ),
-    1048576,
+    { context: 1048576, output: undefined },
   );
   const live = new Map([["deepseek-v4.1-flash-free", 900000]]);
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED, undefined, live), {
     context: 900000,
     output: 384000,
   });
+});
+
+// An upstream that validates the ceiling it was asked for says what the ceiling
+// is, which is the one place a completion limit has been named by this route at
+// all — the DeepSeek upstream accepts max_tokens 2000000 in silence.
+const CEILING =
+  '{"param":"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.","type":"server_error"}';
+
+test("a refusal that names a completion ceiling is read on the output axis too", async () => {
+  const { namedOutputCap, namedContextWindow, observeRouteStatement, limitOverrides } = await subject;
+  assert.equal(namedOutputCap(CEILING), 131072);
+  assert.equal(namedContextWindow(CEILING), undefined);
+  assert.deepEqual(await observeRouteStatement("x-free", new Response(CEILING, { status: 400 })), {
+    context: undefined,
+    output: 131072,
+  });
+  const liveOutput = new Map([["x-free", 131072]]);
+  assert.deepEqual(
+    limitOverrides("x-free", { context: 200000, output: 32000 }, undefined, undefined, liveOutput),
+    { output: 131072 },
+  );
+  assert.equal(namedOutputCap('{"error":{"message":"supports at most 0 completion tokens"}}'), undefined);
+});
+
+test("an id with a route-stated ceiling and an unmeasured window is aligned on one axis only", async () => {
+  const { limitOverrides } = await subject;
+  // big-pickle: the ceiling is the route's own sentence; its window was not
+  // measured, and being the same upstream model as another id is not a window
+  assert.deepEqual(limitOverrides("big-pickle", { context: 200000, input: 160000, output: 32000 }), {
+    output: 131072,
+  });
+  // and the untouched axis is left exactly as the catalogue declared it
+  assert.deepEqual(limitOverrides("big-pickle", { context: 250000, output: 32000 }), { output: 131072 });
+});
+
+test("the audit's first run named two more, each on the axis its refusal named", async () => {
+  const { limitOverrides, namedOutputCap } = await subject;
+  // a window named by a refusal, against a catalogue that declares a quarter of it
+  assert.deepEqual(
+    limitOverrides("nemotron-3.5-lightning-free", { context: 262144, output: 262144 }),
+    { context: 1000000 },
+  );
+  // a ceiling named in the second wording, where the catalogue declares half of it
+  const longcat =
+    "Upstream request failed: [invalid_parameter] 参数校验失败: \n/max_tokens: 1000000 is not less or equal to 262144\n";
+  assert.equal(namedOutputCap(longcat), 262144);
+  assert.deepEqual(
+    limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }),
+    { output: 262144 },
+  );
 });
 
 test("only a refusal that names a window is read, and only its first few KiB", async () => {
@@ -136,6 +186,11 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
         cost: { input: 0, output: 0 },
         limit: { context: 200000, input: 160000, output: 32000 },
       },
+      "space-bunny-free": {
+        name: "Space Bunny Free",
+        cost: { input: 0, output: 0 },
+        limit: { context: 1048576, input: 524288, output: 524288 },
+      },
     },
   };
   const models = buildModels(
@@ -146,6 +201,13 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
   );
   assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
   assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 1048576, output: 131072 });
-  // no evidence for this one, and the catalogue's own `input` survives untouched
-  assert.deepEqual(models["big-pickle"].limit, { context: 200000, input: 160000, output: 32000 });
+  // one axis has evidence for this one and the other does not, so only its
+  // output moves and the catalogue's own `input` survives untouched
+  assert.deepEqual(models["big-pickle"].limit, { context: 200000, input: 160000, output: 131072 });
+  // no evidence at all here: everything the catalogue declared survives
+  assert.deepEqual(models["space-bunny-free"].limit, {
+    context: 1048576,
+    input: 524288,
+    output: 524288,
+  });
 });

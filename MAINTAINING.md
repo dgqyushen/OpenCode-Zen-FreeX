@@ -39,6 +39,9 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | `deepseek-v4.1-flash-free` | output | 384000 | what this route declares for the same upstream model |
 | `mimo-v2.6-flash-free` | context | 1048576 | the route's own refusal, in its own words |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
+| `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much |
+| `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
+| `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
 
 A prompt sized just over the window is refused with
 
@@ -61,6 +64,16 @@ wall is — it is what the calibration is checked against, since
 figure is a rough one (characters, not tokens) and must not be read as a count.
 A second upstream words the same fact as "This endpoint's maximum context length
 is …" and breaks the request into text input, tool input and output.
+
+The ceiling, which is cheaper than the window: ask for `max_tokens: 1000000` on a
+short prompt and stop reading as soon as the answer starts. An upstream that
+validates the ceiling refuses and names it — `max_tokens is too large: 1000000.
+This model supports at most 131072 completion tokens`, or LongCat's
+`/max_tokens: 1000000 is not less or equal to 262144` — and one that does not
+just begins to answer, so the cost of asking every model is a few tokens each.
+Both wordings are in `limits.mjs` (`namedOutputCap`) and both are read from
+production refusals as well, which is how a ceiling that moves gets noticed
+without anyone running anything.
 
 The output: a paid twin's `limit` in `https://models.opencode.ai/api.json` is
 the stronger source, and re-reading it is the whole job. With no twin — `mimo`
@@ -103,10 +116,24 @@ asked for, unclamped, so this route states no completion ceiling of its own, and
 China token plan). Nothing above 32000 has been watched on this route, and
 `samples` says that rather than implying a witness.
 
+**Looking for the next one, instead of waiting to notice it.** `bun run
+limits:audit` asks the route which free models it still offers — the listing's
+ten, not the forty the catalogue still describes — and asks each one the cheap
+question above. It groups them by the `x-opencode-upstream-model-id` the route
+answers with, because two ids naming one upstream model are one capability, so a
+declaration that differs inside a group is the question worth asking. It prints
+those, the ceilings it was told, the windows a refusal named, and the ids that
+are gone (410) or unavailable (400); it writes nothing and measures no window.
+Its first run named
+`big-pickle`'s ceiling and two ids declared below what the route says
+(`nemotron-3.5-lightning-free` at a quarter of its window, `longcat-2.5-preview-free`
+at half its ceiling), which is the whole argument for having it.
+
 ## The loop
 
 ```sh
 bun test              # the unit tests; these never touch the network
+bun run limits:audit  # what the route offers, what limits it states, what to measure
 bun run check:gate    # asks Zen which generations are still accepted
 bun run capture -- --dry   # takes a fresh capture and reports the difference
 bun run capture            # writes it

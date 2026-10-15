@@ -72,8 +72,14 @@ function says(text) {
 }
 
 // The request a shape is asked with. It is its own function so index.test.mjs
-// can hold it against the request the plugin was observed to send, offline.
+// can hold it against the request the plugin was observed to send, offline, and
+// so limits-audit.mjs asks with the same shape this gate does instead of a copy
+// of it — a copy is what drifted before (it was missing `accept`).
 export function requestFor(generation, profile, names) {
+  return chatRequest({ model: MODEL, generation, profile, names, maxTokens: 40 });
+}
+
+export function chatRequest({ model, generation, profile, names, maxTokens = 40, messages }) {
   return {
     headers: outboundHeaders({
       session: sessionID(),
@@ -82,12 +88,12 @@ export function requestFor(generation, profile, names) {
       protocol: "chat",
     }),
     body: {
-      model: MODEL,
-      messages: [{ role: "user", content: "hi" }],
+      model,
+      messages: messages ?? [{ role: "user", content: "hi" }],
       tools: names.map((name) => ({ type: "function", function: profile.tools[name] })),
       stream: true,
       stream_options: { include_usage: true },
-      max_tokens: 40,
+      max_tokens: maxTokens,
     },
   };
 }
