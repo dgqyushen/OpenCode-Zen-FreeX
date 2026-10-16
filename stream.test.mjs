@@ -157,7 +157,10 @@ test("chat preserves text, reasoning, indexed choices, tool arguments, usage and
               reasoning_content: "法",
               tool_calls: [
                 { index: 0, function: { arguments: "1}" } },
-                { index: 1, function: { arguments: "2}" } },
+                // The id on a continuation frame: this route puts `"id": null`
+                // there (measured 2026-10-17), and it must not take call-b's
+                // away.
+                { index: 1, id: null, function: { arguments: "2}" } },
               ],
             },
             finish_reason: "tool_calls",

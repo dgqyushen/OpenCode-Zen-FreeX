@@ -194,6 +194,25 @@ function inPlaceOf(protocol, call, note, at) {
   };
 }
 
+// A tool call needs an id its host can key the result by, and this route has
+// been measured leaving calls without one: 2026-10-17, through this plugin, a
+// reply's flushed frame carried `{"index":0,"id":null,"name":"bash"}` — the
+// route puts `"id": null` on a continuation frame of a call it named on the
+// first one, and a reply can also leave the call unnamed to the end. OpenAI's
+// shape requires the field, and a host it reaches has nothing to match its
+// result against without it: dsh keys its tool/result records by this id and
+// fails the whole turn — and then the whole session, on reload — when the id
+// is empty ("toolCallId matching its tool source"). So a call that reaches
+// the wire leaves with an id: the last-resort kind, process-unique under the
+// same counter the invented item ids use, so two invented calls cannot share
+// one.
+function ensureCallIDs(calls) {
+  for (const call of calls) {
+    if (typeof call.id === "string" && call.id !== "") continue;
+    call.id = `call_${++synthesized}`;
+  }
+}
+
 // checkSnapshots checks every call in a reply or event: renamed to the
 // agent's tool, or (Responses, Messages) put in place of by a note. It
 // answers whether data changed, how many calls it kept and how many it
@@ -342,6 +361,7 @@ function chatBuffer(checkName) {
     }
     if (state.legacy) delta.function_call = state.legacy;
     const { notes } = checkChatMessage(delta, checkName);
+    if (Array.isArray(delta.tool_calls)) ensureCallIDs(delta.tool_calls);
     if (notes.length) {
       delta.tool_calls?.forEach((call, i) => {
         call.index = i;
@@ -399,6 +419,16 @@ function chatBuffer(checkName) {
           const index = position(fragment.index);
           const previous = state.calls.get(index) ?? { index, function: {} };
           const value = { ...previous, ...fragment, index, function: previous.function };
+          // A continuation frame may carry `"id": null` — measured on this
+          // route — and a spread would let it clobber the id that named the
+          // call. A fragment that says nothing about the id leaves the one
+          // already there; one that carries a real id still wins, as it did.
+          if (
+            (typeof value.id !== "string" || value.id === "") &&
+            typeof previous.id === "string" &&
+            previous.id !== ""
+          )
+            value.id = previous.id;
           if (fragment.function != null) appendFunction(value.function, fragment.function);
           state.calls.set(index, value);
         }
@@ -1016,6 +1046,12 @@ export async function guardToolResponse(response, protocol, policy, options = {}
   try {
     value = parseJSON(await readBounded(response));
     checkSnapshots(value, protocol, checkName);
+    if (protocol === "chat") {
+      for (const choice of list(value.choices)) {
+        const message = object(choice) ? choice.message : undefined;
+        if (object(message)) ensureCallIDs(list(message.tool_calls));
+      }
+    }
   } catch (error) {
     if (!(error instanceof GuardError)) throw error;
     status = 502;

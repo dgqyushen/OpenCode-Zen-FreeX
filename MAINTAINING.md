@@ -296,6 +296,17 @@ it. Rewriting the parameters as well looks tidier and breaks the agent.
 **Replacing the wording with something of your own.** That is what 0.1.5 and
 earlier did, and it is a guaranteed refusal.
 
+**Merging a tool call's frames over its id.** The route puts `"id": null` on
+the continuation frames of a call whose first frame named it (measured
+2026-10-17 on `deepseek-v4.1-flash-free`), and a host that keys a tool result
+by the id — dsh writes `tool/result` records keyed by it — fails its turn on
+an empty one and cannot reload the session afterwards ("tool call id requires
+a nonempty string"). Merging frames must read the id as a name that only
+replaces itself, and a call the route never names has to leave with an
+invented one. Both live in `tool-response.mjs` — the merge's keep, and
+`ensureCallIDs` at the two places a call is published — and `stream.mjs`'s
+collapse reads the same rule.
+
 **Trusting one observation.** The gate is not steady: it moved more than once in
 a day while this was being worked out, and identical requests were answered both
 ways minutes apart. Anything measured once is not a fact. Measure it three times,

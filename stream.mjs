@@ -132,7 +132,13 @@ function chatAccumulator() {
             calls.set(toolIndex, { type: "function", function: { name: "", arguments: "" } });
           const call = calls.get(toolIndex);
           for (const key of ["id", "type"]) {
-            if (fragment[key] !== undefined) call[key] = fragment[key];
+            // `"id": null` arrives on the continuation frames of a call this
+            // route named on the first one (see ensureCallIDs in
+            // tool-response.mjs): a fragment may leave the id as it stands,
+            // but a null or empty one does not take it away.
+            if (fragment[key] === undefined) continue;
+            if (key === "id" && (fragment[key] === null || fragment[key] === "")) continue;
+            call[key] = fragment[key];
           }
           if (fragment.function) appendFunction(call.function, fragment.function);
         }

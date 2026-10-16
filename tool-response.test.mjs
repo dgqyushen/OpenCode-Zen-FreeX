@@ -1511,6 +1511,79 @@ test("chat: buffered calls flushed at [DONE] say the turn ended in tool use", as
   assert.equal(dropped.delta.content, droppedNote("bedit"));
 });
 
+// 2026-10-17, measured through this plugin: deepseek-v4.1-flash-free's reply
+// named a call on its first frame and put `"id": null` on a continuation
+// frame, and the flushed call reached its host id-less. dsh then keyed a
+// tool/result record by the empty id — failing that turn ("toolCallId
+// matching its tool source"), and the whole session on the next reload. What
+// the first frame gave is not a later frame's to take away.
+test("chat: a later frame's `\"id\": null` does not take the id the first frame gave", async () => {
+  const first = { index: 0, id: "call-0", type: "function", function: { name: "bash", arguments: "" } };
+  const continuation = { index: 0, id: null, function: { arguments: "{}" } };
+  const text =
+    event(chat({ tool_calls: [first] })) +
+    event(chat({ tool_calls: [continuation] })) +
+    terminal("chat");
+  const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+  const calls = values
+    .flatMap((data) => data.choices ?? [])
+    .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].id, "call-0");
+  assert.equal(calls[0].function.arguments, "{}", "the continuation still contributed");
+});
+
+// The other half of the same malformed shape: a reply that never names the
+// call at all (the same flush carried `{"index":0,"id":null,"name":"bash"}`).
+// OpenAI's shape requires an id, and a host that matches a result by it has
+// nothing to match: a call that reaches the wire leaves with one — invented
+// when the route gave none, and never shared between two calls of one reply.
+test("chat: a call the route never named still leaves with an id of its own", async () => {
+  const flush = async (deltas) => {
+    const text = deltas.map((delta) => event(chat(delta))).join("") + terminal("chat");
+    const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+    return values
+      .flatMap((data) => data.choices ?? [])
+      .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  };
+  const [unnamed] = await flush([
+    { tool_calls: [{ index: 0, id: null, type: "function", function: { name: "bash", arguments: "{}" } }] },
+  ]);
+  assert.equal(typeof unnamed.id, "string");
+  assert.notEqual(unnamed.id, "");
+  const both = await flush([
+    {
+      tool_calls: [
+        { index: 0, type: "function", function: { name: "bash", arguments: "{}" } },
+        { index: 1, type: "function", function: { name: "read", arguments: "{}" } },
+      ],
+    },
+  ]);
+  assert.equal(both.length, 2, "both calls kept");
+  assert.notEqual(both[0].id, both[1].id, "two invented ids are two ids");
+  for (const kept of both) assert.ok(typeof kept.id === "string" && kept.id !== "");
+});
+
+// The same rule where a whole message arrives at once instead of a stream.
+test("chat: a call without an id gets one in a whole message too", async () => {
+  const body = {
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          tool_calls: [
+            { index: 0, id: null, type: "function", function: { name: "bash", arguments: "{}" } },
+          ],
+        },
+      },
+    ],
+  };
+  const out = await (await guardToolResponse(Response.json(body), "chat", policy)).json();
+  const kept = out.choices[0].message.tool_calls[0];
+  assert.equal(kept.function.name, "Bash", "the rename still happens");
+  assert.ok(typeof kept.id === "string" && kept.id !== "", "and the id is a name a result can carry");
+});
+
 test("chat: the note follows the text the model wrote before its call", async () => {
   const text =
     event(chat({ content: "Fixing the stray heredoc marker." })) +
