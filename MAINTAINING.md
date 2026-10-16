@@ -181,6 +181,17 @@ part of a run answered and part of it did not.
 locally and reads the request it makes, so nothing is sent to Zen and no key is
 involved.
 
+The wording it reads is the host's, so the host's own details are put back to
+something neutral before the capture is written: the OS banner, the scratch
+directory, and now the shell's version. That last one was live — opencode 1.19.0
+words `bash`'s description after the machine it runs on, one host saying
+"Executes a given Windows PowerShell (5.1) command…" and another "PowerShell
+(7+)…", and Zen reads those bytes out of the request, so two machines disagreed
+about a description that belongs to neither. The version is dropped, which is
+also what a capture on Linux already says; the live gate answered the neutral
+wording four times running on 2026-10-16. What any wording is worth is settled by
+`check:gate`, never by this file.
+
 ## Reading a failure
 
 **Every `floor` `refused`.** OpenCode reworded its tools, or moved the endpoint.

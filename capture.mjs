@@ -47,13 +47,25 @@ const REQUIRED = {
   "2.x": ["shell", "read"],
 };
 
-// The capture host's own scratch directory and OS banner belong to the machine
-// the capture ran on, not to the tool. These are put back to something neutral
-// so the capture is not tied to one machine.
+// The capture host's own shell, scratch directory and OS banner belong to the
+// machine the capture ran on, not to the tool. These are put back to something
+// neutral so the capture is not tied to one machine.
+//
+// The shell's version is the one these can get wrong: opencode 1.19.0 words
+// `bash`'s description after the host it runs on — "Executes a given Windows
+// PowerShell (5.1) command…" on one machine, "PowerShell (7+)…" on another —
+// and every one of those bytes is sent upstream, because Zen reads the wording
+// out of the request. Measured 2026-10-16 on the same pinned release, both
+// versions answered, so the difference was never Zen's to insist on; it was two
+// machines disagreeing about a description that belongs to neither. The version
+// is dropped, which is also the wording a run on any host converges to — a
+// capture on Linux says "Shell: bash" and carries no such clause at all. What
+// the neutral wording is worth is settled by `bun run check:gate`, not here.
 const NEUTRALISE = [
   [/Be aware: OS: [^\n]*/g, "Be aware: OS: linux, Shell: bash"],
   [/Use `[^`]*` for temporary work outside the workspace\./g, "Use `/tmp` for temporary work outside the workspace."],
   [/Use `[A-Za-z]:\\[^`]*`/g, "Use `/tmp`"],
+  [/\b(?:Windows )?PowerShell \(\d[^)]*\)/g, "PowerShell"],
 ];
 // Zen compares roughly the first 700 characters and ignores the rest; 1200
 // leaves margin, and the tail is where a note to the model goes.
