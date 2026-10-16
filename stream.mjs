@@ -187,14 +187,19 @@ function responsesAccumulator() {
   // naming an item the stream never opened has no slot at all — slot 0 is
   // only for a frame that names nothing, which a stream that never indexed
   // its items means as the first one. Merging an unknown item into slot 0
-  // was measured handing a function_call there the text of a message.
-  function slot(data, id) {
+  // was measured handing a function_call there the text of a message. An
+  // `added` frame opens an item, so the id it names is new there by
+  // definition and takes the next free slot; a frame that has to find an
+  // item that is already open still throws.
+  function slot(data, id, fresh = false) {
     if (data.output_index !== undefined) return index(data.output_index);
     if (id === undefined || id === null || id === "") return index(undefined);
     const position = [...output].find(([, value]) => value.id === id)?.[0];
-    if (position === undefined)
-      throw new Error("Upstream frame names an unknown item without an output index");
-    return index(position);
+    if (position !== undefined) return index(position);
+    if (!fresh) throw new Error("Upstream frame names an unknown item without an output index");
+    let next = 0;
+    for (const held of output.keys()) next = Math.max(next, held + 1);
+    return index(next);
   }
   // A snapshot replaces the item in its slot only when it is a whole view of
   // it; a partial one leaves what the deltas delivered standing.
@@ -225,11 +230,19 @@ function responsesAccumulator() {
             keep(position, value);
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
-        if (data.item) keep(slot(data, data.item.id), data.item);
+        if (data.item)
+          keep(slot(data, data.item.id, type === "response.output_item.added"), data.item);
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
         value.content ??= [];
-        value.content[index(data.content_index)] = data.part;
+        // A re-emitted opening part carries an empty text where the deltas
+        // have already filled the slot — the partial-snapshot hazard the item
+        // guard above and content_block_start exist for, so the same test.
+        // `refusal` is weighed too: a part whose only content is a refusal
+        // weighs nothing on text alone and would be taken for an empty one.
+        const at = index(data.content_index);
+        if (carries(data.part, value.content[at], ["text", "refusal"]))
+          value.content[at] = data.part;
       } else if (
         type === "response.output_text.delta" ||
         type === "response.output_text.done" ||
@@ -258,7 +271,9 @@ function responsesAccumulator() {
       ) {
         const value = item(data, "reasoning");
         value.summary ??= [];
-        value.summary[index(data.summary_index)] = data.part;
+        // The same re-emitted-opening-frame hazard as content_part above.
+        const at = index(data.summary_index);
+        if (carries(data.part, value.summary[at], ["text"])) value.summary[at] = data.part;
       } else if (/^response\.reasoning_(summary_)?text\.(delta|done)$/.test(type)) {
         const value = item(data, "reasoning");
         const summary = type.includes("summary");
@@ -301,8 +316,18 @@ function responsesAccumulator() {
       const whole = Array.isArray(final.output)
         ? final.output.length > 0
         : final.output !== null && final.output !== undefined;
-      if (whole || !kept.length || Array.isArray(final)) return final;
-      return { ...final, output: kept };
+      // An array is not a reply object at all, and is returned as it came.
+      if (Array.isArray(final)) return final;
+      // The terminal is not the whole reply either. What apply merged onto
+      // the body from the events' top level — usage, status,
+      // incomplete_details, finish_reason, and the object this reply is — is
+      // the upstream's too, and answering with the terminal alone dropped it:
+      // a terminal carrying its whole response beside a top-level usage, or
+      // one that omits object, answered without them. The body is the base,
+      // the terminal overrides what it carries, and the items it lost come
+      // back from the accumulation.
+      if (whole || !kept.length) return { ...body, ...final };
+      return { ...body, ...final, output: kept };
     },
   };
 }

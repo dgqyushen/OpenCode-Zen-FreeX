@@ -158,22 +158,33 @@ function isCall(protocol, value) {
   );
 }
 
-// Counts the ids invented for calls that came without one, so that no two of
-// them can be handed the same id (see inPlaceOf).
+// Counts the ids invented for calls the reply gives nothing to place: a
+// counter cannot be stable, but it is the only thing that keeps two of them
+// apart (see inPlaceOf).
 let synthesized = 0;
 
 // What a call left out of a Responses or Messages reply becomes: text
-// saying so, in the call's place, so no later index moves.
-function inPlaceOf(protocol, call, note) {
+// saying so, in the call's place, so no later index moves. `at` is where the
+// call sits in the reply as far as the caller can tell — a frame's
+// output_index, or the index the walk found it at.
+function inPlaceOf(protocol, call, note, at) {
   if (protocol === "anthropic") return { type: "text", text: note };
   // An item id is what a Responses client keys the item by, and what the
-  // streaming path suppresses arguments by: two calls that arrived without
-  // one and shared the id invented here would be one item to the client, and
-  // the arguments of one would be read as the other's.
+  // streaming path suppresses arguments by. One call is replaced more than
+  // once — its output_item.added, its output_item.done, and the copy inside
+  // the terminal response's output — so the invented id has to be the same
+  // every time: a counter made one call into several items to the client, and
+  // left leftIDs unable to match its arguments frames. A call's place is the
+  // same in all three, and two calls cannot share one, so the id names it.
+  //
+  // A call the reply places nowhere keeps the counter — and names it under a
+  // different word, because both arms are inventing ids in one reply: a counter
+  // that happened to reach another call's index would hand two unrelated calls
+  // the same item, which is the failure the counter was introduced to prevent.
   const id =
     typeof call.id === "string" && call.id
       ? call.id
-      : `msg_${call.call_id ?? `dropped_${++synthesized}`}`;
+      : `msg_${call.call_id ?? (at === undefined ? `anon_${++synthesized}` : `dropped_${at}`)}`;
   return {
     type: "message",
     id,
@@ -206,10 +217,15 @@ function checkSnapshots(data, protocol, checkName) {
   let kept = 0;
   let left = 0;
   if (!object(data)) throw new GuardError("Invalid upstream tool snapshot");
-  // Each entry is a value and where it sits, so a call can be replaced.
-  const stack = [[data, null, null]];
+  // Each entry is a value, where it sits, and the place it holds in the reply
+  // as far as the walk knows: an item of an output array is at its index, and
+  // anything reached through an object — a frame's own `item` — keeps the
+  // output_index the frame carries, which is where that item sits. A call
+  // left out is replaced by an item whose invented id names that place, so
+  // the added, done and terminal copies of one call are one item (inPlaceOf).
+  const stack = [[data, null, null, object(data) ? data.output_index : undefined]];
   while (stack.length) {
-    const [value, holder, key] = stack.pop();
+    const [value, holder, key, at] = stack.pop();
     if (!object(value)) throw new GuardError("Invalid upstream tool snapshot");
     if (
       protocol === "responses" &&
@@ -223,7 +239,7 @@ function checkSnapshots(data, protocol, checkName) {
       const name = checkName(value.name);
       if (name == null) {
         if (!holder) throw new GuardError(droppedNote(value.name), "undeclared_tool");
-        holder[key] = inPlaceOf(protocol, value, droppedNote(value.name));
+        holder[key] = inPlaceOf(protocol, value, droppedNote(value.name), at);
         changed = true;
         left++;
         continue;
@@ -241,10 +257,10 @@ function checkSnapshots(data, protocol, checkName) {
       // Text content is not a snapshot container.
       if (typeof value[name] === "string") continue;
       const items = list(value[name]);
-      for (let i = 0; i < items.length; i++) stack.push([items[i], items, i]);
+      for (let i = 0; i < items.length; i++) stack.push([items[i], items, i, i]);
     }
     for (const name of objects) {
-      if (value[name] != null) stack.push([value[name], value, name]);
+      if (value[name] != null) stack.push([value[name], value, name, at]);
     }
   }
   if (
@@ -463,7 +479,10 @@ function snapshotStream(protocol, checkName) {
           checkName(item.name) == null
         ) {
           const note = droppedNote(item.name);
-          const message = inPlaceOf(protocol, item, note);
+          // The frame's output_index is this call's place in the reply, which
+          // is the id its later frames (done, the terminal's output) invent
+          // for it again (inPlaceOf).
+          const message = inPlaceOf(protocol, item, note, data.output_index);
           left.set(data.output_index, true);
           leftIDs.add(message.id);
           if (typeof item.id === "string") leftIDs.add(item.id);
@@ -544,6 +563,7 @@ async function readBounded(response) {
   if (!reader) return "";
   const parts = [];
   let bytes = 0;
+  let failure;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -553,20 +573,28 @@ async function readBounded(response) {
         throw new GuardError(`Upstream response exceeds the ${LIMIT} buffer limit`);
       parts.push(value);
     }
-  } finally {
-    // Whatever ended the read — the limit, a malformed body, or the end of
-    // it — this body is never read again, so the reader is loosed and the
-    // stream cancelled. This was the one place in the package that abandoned
-    // a body without cancelling it (measured: no cancellation past the limit,
-    // and the source still pulled after the 502), which leaves an upstream
-    // writing into a socket nobody reads. The cancel's own failure is not
-    // swallowed, and the lock is released whether it threw or not.
-    try {
-      await reader.cancel();
-    } finally {
-      reader.releaseLock();
-    }
+  } catch (error) {
+    failure = error;
   }
+  // Whatever ended the read — the limit, a malformed body, or the end of it —
+  // this body is never read again, so the stream is cancelled and the reader
+  // loosed. This was the one place in the package that abandoned a body
+  // without cancelling it (measured: no cancellation past the limit, and the
+  // source still pulled after the 502), which leaves an upstream writing into
+  // a socket nobody reads. A cancel that fails must not stand in for what
+  // ended the read: an oversized body is the 502 this function promises, not
+  // an opaque transport error, so the cancel's failure is kept as that
+  // error's cause — and is thrown itself only when nothing else went wrong.
+  // The lock is released either way.
+  try {
+    await reader.cancel();
+  } catch (error) {
+    if (!failure) throw error;
+    if (failure instanceof Error && !("cause" in failure)) failure.cause = error;
+  } finally {
+    reader.releaseLock();
+  }
+  if (failure) throw failure;
   const all = new Uint8Array(bytes);
   let offset = 0;
   for (const part of parts) {
@@ -755,7 +783,14 @@ function chatTrack() {
         if (choice.finish_reason != null) {
           finished.add(index);
           open.delete(index);
-        } else if (!finished.has(index)) open.add(index);
+        } else {
+          // A frame for this choice after it finished opens a new round of it
+          // (chatBuffer.apply judges a later round the same way), so the
+          // choice is open again: latching it shut for good left a round cut
+          // short with no note and no finish_reason, only a bare [DONE].
+          finished.delete(index);
+          open.add(index);
+        }
       }
     },
     // ending answers the frames that end the reply as cut short, or null

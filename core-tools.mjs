@@ -106,7 +106,12 @@ export function generationOf(tools) {
 // `.agent` with a TypeError that names nothing. Ownership of the key is half of
 // it — a capture holding `{"1.x": null}` owns the key and still has no profile,
 // and the `.agent` of that is the same unnamed TypeError.
-function profileFor(generation) {
+//
+// Exported, because the same two mistakes are reachable from outside this file
+// and are made there: `provider.mjs` indexes `PROFILES[...]` directly to read a
+// profile's `tools`, and a capture missing that generation then fails with
+// "Cannot read properties of undefined" instead of the sentence below.
+export function profileFor(generation) {
   if (!Object.hasOwn(PROFILES, generation)) {
     throw new Error(
       `core-tools: no profile for generation ${JSON.stringify(generation)}; ` +

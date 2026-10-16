@@ -18,9 +18,7 @@
 // child is given before it is ended.
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
-import { rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,22 +27,29 @@ import { PROFILES } from "./core-tools.mjs";
 const PORT = Number(process.env.CAPTURE_PORT ?? 8791);
 const HERE = import.meta.dir;
 // Where the capture is written, which is this directory unless something else
-// says so: `--fingerprint <path>` and `CAPTURE_FINGERPRINT` exist so a test can
-// point the write at a scratch file, since the alternative — importing this
-// module and letting it write the real one — is what made it untestable. The
-// flag wins over the environment, and both are resolved against the working
-// directory the way a path on a command line usually is. Exported, with the
-// argv and environment it reads as parameters, so the one decision that can
-// send a write somewhere unexpected is a test's to pin rather than a reader's
-// to trust.
+// says so: `--fingerprint <path>`, `--fingerprint=<path>` and
+// `CAPTURE_FINGERPRINT` exist so a test can point the write at a scratch file,
+// since the alternative — importing this module and letting it write the real
+// one — is what made it untestable. The flag wins over the environment, and both
+// are resolved against the working directory the way a path on a command line
+// usually is. Exported, with the argv and environment it reads as parameters, so
+// the one decision that can send a write somewhere unexpected is a test's to pin
+// rather than a reader's to trust.
 const FINGERPRINT = resolve(fingerprintTarget());
 export function fingerprintTarget(argv = process.argv, env = process.env) {
+  // Both spellings a command line accepts for an option with a value. Reading
+  // only the space-separated one was worse than a missing feature: `=` matched
+  // no element, so the flag was ignored and the write landed on the shipped
+  // fingerprint.json — the exact outcome the flag exists to prevent, arrived at
+  // silently.
   const flag = argv.indexOf("--fingerprint");
+  const inline = argv.find((arg) => arg.startsWith("--fingerprint="));
   // A value that is another flag is not a value: `--fingerprint --dry` would
   // otherwise resolve to a file named `--dry`, which reads as a missing path
-  // rather than as the typo it is. The default is the safe answer either way,
-  // since a mistake must not be the thing that decides where a write goes.
-  const value = flag === -1 ? undefined : argv[flag + 1];
+  // rather than as the typo it is. It is also what an empty `--fingerprint=`
+  // names. The default is the safe answer either way, since a mistake must not
+  // be the thing that decides where a write goes.
+  const value = inline !== undefined ? inline.slice("--fingerprint=".length) : flag === -1 ? undefined : argv[flag + 1];
   if (value && !value.startsWith("-")) return value;
   // `||` rather than `??` for the environment: an exported-but-empty variable
   // is not a path, and `resolve("")` is the working directory — a write aimed
@@ -151,6 +156,17 @@ export async function capture(intro, start) {
       console.error(`opencode did not finish within ${CHILD_TIMEOUT_MS} ms; ending it`);
       child.kill("SIGKILL");
     }, CHILD_TIMEOUT_MS);
+    // What both endings have to do before they settle the promise: nothing else
+    // is going to fire for this child, so the watchdog would later log an ending
+    // for a run that already ended, and a `process.once` left armed swallows one
+    // Ctrl-C. A spawn failure (`error`, ENOENT) ends here too — the path the
+    // shipped script only survived because it happens to exit soon after.
+    const settle = (code) => {
+      clearTimeout(timer);
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+      done({ code, ran });
+    };
     // Ctrl-C has to take the child with it: nothing else would end it, and the
     // next run would find the port still held. It is also a failed run — the
     // request may never have been made — so it must not walk into the compare
@@ -158,7 +174,7 @@ export async function capture(intro, start) {
     const interrupted = (signal) => () => {
       ran = false;
       child.kill(signal);
-      done({ code: 1, ran });
+      settle(1);
     };
     const onInterrupt = interrupted("SIGINT");
     const onTerminate = interrupted("SIGTERM");
@@ -167,16 +183,11 @@ export async function capture(intro, start) {
     child.on("error", () => {
       console.error("could not run opencode; install it from https://opencode.ai and put it on PATH");
       ran = false;
-      done({ code: 1, ran });
+      settle(1);
     });
     child.on("exit", (value, signal) => {
-      clearTimeout(timer);
-      // The child is gone, so there is nothing left to kill: keeping these
-      // would turn a later Ctrl-C into a no-op on an already settled promise.
-      process.off("SIGINT", onInterrupt);
-      process.off("SIGTERM", onTerminate);
       if (signal) ran = false;
-      done({ code: signal ? 1 : (value ?? 0), ran });
+      settle(signal ? 1 : (value ?? 0));
     });
   });
 }
@@ -238,6 +249,19 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   if (missing.length) {
     console.error(
       `the captured request has no ${missing.join(", ")}; this OpenCode no longer sends them, so it cannot be captured this way`,
+    );
+    process.exit(1);
+  }
+  // The other half of the same question, and the one reading `sent` alone left
+  // open: a required name that was sent but has no description to capture is in
+  // `sent` and not in `tools`. Writing it into `required` would name a tool the
+  // profile does not carry, which is the shape `bun run check:gate` refuses —
+  // and the wording that would have said so is reported as GONE below, about a
+  // tool that was sent. The two lists are held together here instead.
+  const uncaptured = required.filter((name) => !tools[name]);
+  if (uncaptured.length) {
+    console.error(
+      `the captured request carries ${uncaptured.join(", ")} without a description to capture; not writing`,
     );
     process.exit(1);
   }
@@ -318,8 +342,29 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     process.exit(1);
   }
   next.profiles[generation] = nextProfile;
-  return Bun.write(fingerprint, JSON.stringify(next, null, 2) + "\n").then(() =>
-    console.log(`\nwrote ${fingerprint} for ${generation}. Now run \`bun run check:gate\` and commit if it passes.`),
+  // Written beside the target and renamed over it: a rename within one directory
+  // is atomic, so the window in which an interruption can leave a half-written
+  // file is the temp file's, not the shipped capture's. Writing in place left a
+  // truncated fingerprint.json behind when the Ctrl-C these handlers exist for
+  // arrived mid-write — and the remedy every consumer names is `bun run capture`,
+  // the command that had just failed. The temp name is fixed and sits next to its
+  // target, so it is on the same filesystem (a rename across devices is not
+  // atomic, and here is not even allowed).
+  const scratch = `${fingerprint}.tmp`;
+  return Bun.write(scratch, JSON.stringify(next, null, 2) + "\n").then(
+    () => {
+      renameSync(scratch, fingerprint);
+      console.log(
+        `\nwrote ${fingerprint} for ${generation}. Now run \`bun run check:gate\` and commit if it passes.`,
+      );
+    },
+    (cause) => {
+      // A write that failed leaves its temp file where nothing reads it, and the
+      // next run would find it stale: the capture that could not be written is
+      // not one to be picked up later.
+      rmSync(scratch, { force: true });
+      throw cause;
+    },
   );
 }
 

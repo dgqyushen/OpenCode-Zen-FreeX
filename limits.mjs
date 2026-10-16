@@ -109,7 +109,7 @@ export const LIMITS = {
 // says nothing attributable and is left alone; §7 of the measured notes has a
 // context overflow and an invalid parameter answering with byte-identical 400s
 // on another Zen model.
-const NAMED_CONTEXT = /maximum context length is (\d+) tokens/i;
+const NAMED_CONTEXT = /maximum context length is (\d+) tokens/id;
 
 // "max_tokens is too large: 200000. This model supports at most 131072 completion
 // tokens, whereas you provided 200000." — an upstream that validates the ceiling
@@ -119,10 +119,10 @@ const NAMED_CONTEXT = /maximum context length is (\d+) tokens/i;
 // answers 200 there, so silence from this one says nothing about a model, and a
 // request that is served is not evidence of a ceiling either way.
 const NAMED_OUTPUT = [
-  /supports at most (\d+) completion tokens/i,
+  /supports at most (\d+) completion tokens/id,
   // "/max_tokens: 1000000 is not less or equal to 262144" — LongCat's wording for
   // the same fact, where the ceiling is the number it has to stay under.
-  /max_tokens:?\s*\d+\s+is not less or equal to\s+(\d+)/i,
+  /max_tokens:?\s*\d+\s+is not less or equal to\s+(\d+)/id,
 ];
 
 // Names a refusal made while this process is running, by model id. Not
@@ -349,25 +349,33 @@ export async function observeRouteStatement(id, response, limit = 4096, { signal
   }
 }
 
-// How close to the end of what was read a match has to end before a truncated
-// body makes it unusable. A number ending inside this margin of the last
-// character read may have had digits past it — `2621` where the body said
-// `262144` — and a smaller limit that looks like a real one is the one failure
-// this guard exists to prevent. Numbers further back are inside the buffer
-// entirely and are read as they stand.
-const CUT_MARGIN = 8;
+// Where the number a match named ends, in the text it was matched against. The
+// `d` flag is what makes this exact: `NAMED_CONTEXT` and the first
+// `NAMED_OUTPUT` run on past the digits (" completion tokens"), so judging the
+// cut by the match's own end threw away numbers that were provably whole — the
+// digits ended well before the read did, with text after them that the greedy
+// `(\d+)` had refused to consume.
+function digitsEnd(found) {
+  const at = found?.match?.indices?.[1]?.[1];
+  // The match's own end is the conservative answer when the pattern cannot say
+  // where the digits are: it drops a whole number rather than reading a cut one,
+  // which is the direction this guard has to fail in.
+  return Number.isSafeInteger(at) ? at : found.match.index + found.match[0].length;
+}
 
 // The axes the first `limit` characters of `text` name. `cut` says the read
-// stopped at the budget with the body going on, so a match ending at the margin
-// may have been a longer number: that axis is left unread rather than reported a
-// digit short. Each axis is read from the match its number came from, so the
-// match the guard judges and the number that is returned cannot be two answers.
+// stopped before the body did, so a number whose own digits reach the last
+// character read may have had digits past it: that axis is left unread rather
+// than reported a digit short. Any character after the digits inside the head
+// proves the number ended, since a greedy `\d+` would have taken it — only
+// digits touching the boundary are ambiguous. Each axis is read from the match
+// its number came from, so the match the guard judges and the number that is
+// returned cannot be two answers.
 function namedAxes(text, limit, cut) {
   const head = text.slice(0, limit);
   const context = namedFrom([NAMED_CONTEXT], head);
   const output = namedFrom(NAMED_OUTPUT, head);
-  const onCut = (found) =>
-    cut && Boolean(found) && found.match.index + found.match[0].length >= head.length - CUT_MARGIN;
+  const onCut = (found) => cut && found !== undefined && digitsEnd(found) >= head.length;
   return {
     context: onCut(context) ? undefined : context?.value,
     output: onCut(output) ? undefined : output?.value,
@@ -394,7 +402,12 @@ export function limitOverrides(
   // declared, from a table that never named it.
   const record = table && Object.hasOwn(table, id) ? table[id] : undefined;
   for (const axis of ["context", "output"]) {
-    const declaredValue = declared?.[axis];
+    // Own property, like the table lookup two lines up: `declared` is handed in
+    // by a caller, and a `context` inherited from a custom prototype — or from a
+    // polluted `Object.prototype` — would otherwise be read as a declaration the
+    // catalogue never made, feeding the staleness compare and the raise-only
+    // check with a number nobody declared.
+    const declaredValue = declared && Object.hasOwn(declared, axis) ? declared[axis] : undefined;
     const entry = record?.[axis];
     const live = (axis === "context" ? observed : observedOutput)?.get(id);
     // A route statement made while this process was running is the same tier as

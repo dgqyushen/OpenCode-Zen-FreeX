@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
+import { agentFor, generationOf, profileFor } from "./core-tools.mjs";
 import {
   PROVIDER,
   SDK,
@@ -158,6 +158,22 @@ function relayedRefusal(response, observed) {
   );
 }
 
+// The response this path hands on, from what the limits reader made of the one
+// that arrived: the same response when it never read it — the reader touches no
+// 2xx body, so that is the common branch — the bytes it read under headers
+// corrected for them when it read the whole body, and a refusal that says so
+// when it stopped short. One decision, written once, so the three outcomes
+// cannot be read as a chain of ternaries at the call site.
+function relayed(response, observed) {
+  if (observed === undefined) return response;
+  if (!observed.ended) return relayedRefusal(response, observed);
+  return new Response(observed.text, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: relayedHeaders(response),
+  });
+}
+
 // How long a request for a model the last list didn't have waits before it
 // asks Zen's list again: a model Zen made free since is served at once,
 // and a model typed in by hand doesn't ask the list on every request.
@@ -210,20 +226,23 @@ function normalizeTools(body, protocol) {
   const declared = new Set([...present].filter((value) => typeof value === "string"));
   // The legacy top-level `functions` array is the older way of declaring the
   // same tools, and one a chat host may still use. Its names are declarations,
-  // so they count as declared — and, since they are not in `body.tools`, they
-  // are also remembered as "do not stand in for this name": the fill loop
-  // below looks at where a name already sits, and a name that only arrived
-  // through `functions` has no index there. Without this the same tool would go
-  // out twice, which is what the note on `nameOf` says must not happen.
+  // so they count as declared, and the fill loop below finds them by name: a
+  // name that only arrived through `functions` has no index in `body.tools`, so
+  // it is looked up in the array itself and reworded where it sits rather than
+  // being stood in for. Without that the same tool would go out twice, which is
+  // what the note on `nameOf` says must not happen.
   const legacy = Array.isArray(body.functions) && protocol === "chat" ? body.functions : [];
   for (const tool of legacy) if (typeof tool?.name === "string") declared.add(tool.name);
-  const declaredElsewhere = new Set(legacy.map((tool) => tool?.name));
   // Zen takes a request for one generation of OpenCode or the other, and the tools
   // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
   // often than descriptions do, so this survives a rewording that a pinned
   // User-Agent would not.
   const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
-  const profile = PROFILES[generation];
+  // Through `profileFor`, not `PROFILES[generation]`: a capture that holds one
+  // generation leaves the other key absent, and the direct read fails below on
+  // `profile.tools` with a TypeError that names nothing — the capture is what
+  // has to change, and it is the one thing that error does not say.
+  const profile = profileFor(generation);
   const filled = [];
   const at = new Map();
   body.tools.forEach((tool, index) => {
@@ -252,8 +271,17 @@ function normalizeTools(body, protocol) {
     // tightened check would otherwise find missing.
     if (!profile.required.includes(name)) continue;
     // Declared through `functions` rather than `tools`: this host does have the
-    // tool, so it is not one to stand in for.
-    if (declaredElsewhere.has(name)) continue;
+    // tool, so it is not one to stand in for. Its wording is still the host's,
+    // though, and Zen reads the wording of a tool it knows by name whichever
+    // array carried it — leaving that one entry as the host wrote it is the
+    // refusal this loop exists to prevent, and it is the entry `explain()`
+    // would then describe wrongly. The legacy shape carries `description` at
+    // the top level, which `setDescription` already handles.
+    const throughFunctions = legacy.find((tool) => tool?.name === name);
+    if (throughFunctions) {
+      setDescription(throughFunctions, spoken.description);
+      continue;
+    }
     filled.push(name);
     // A tool added here has nothing behind it: the agent has no such tool and
     // a call to it is dropped. Describing it as OpenCode describes it is what
@@ -308,7 +336,10 @@ function explain(text, source, toolPolicy) {
   // A 403 that is not Zen's free tier is somebody else's; it is left as sent —
   // its bytes are what arrived, and so are the headers describing them.
   if (source.status === 403 && !text.includes("FreeTierError")) return source;
-  const profile = PROFILES[toolPolicy.generation];
+  // The same lookup `normalizeTools` made, through the same owner: the refusal
+  // this message explains is about the generation that request was sent as, and
+  // a capture that lost that profile has to say so rather than fail on `.tools`.
+  const profile = profileFor(toolPolicy.generation);
   const names = Object.keys(profile.tools).join(", ");
   const { filled } = toolPolicy;
   // 426 is not a refusal of the wording: it is this plugin presenting itself as
@@ -588,28 +619,16 @@ async function server(_input, options = {}) {
             // quietly never used.
             //
             // A response body can only be read once, so what the limits reader
-            // took is handed on as the response the rest of the path works with:
-            // never the upstream's own headers over bytes this package wrote
-            // again, and never a prefix presented as the whole reply. A read
-            // that reached the end of the body is that body, relayed under
-            // headers corrected for it; one that stopped short is answered with
-            // a refusal that says so (see `relayedRefusal`). A response the
-            // reader did not consume is used as it arrived.
+            // took is handed on as the response the rest of the path works with
+            // (see `relayed`): never the upstream's own headers over bytes this
+            // package wrote again, and never a prefix presented as the whole
+            // reply. A response the reader did not consume is used as it arrived.
             const observed = await observeRouteStatement(body.model, response, undefined, {
               // The caller's own cancellation reaches this read as well: a host
               // that has given up is not waiting for a number out of a refusal.
               signal: request.signal,
             });
-            const answered =
-              observed === undefined
-                ? response
-                : observed.ended
-                  ? new Response(observed.text, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: relayedHeaders(response),
-                    })
-                  : relayedRefusal(response, observed);
+            const answered = relayed(response, observed);
             const guarded = await guardToolResponse(
               explain(observed?.text ?? null, answered, toolPolicy),
               protocol,

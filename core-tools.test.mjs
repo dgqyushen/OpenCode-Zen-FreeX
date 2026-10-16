@@ -165,6 +165,17 @@ test("an uncaptured generation is named, with the profiles the capture holds", (
 // provider-utils version, and a protocol the capture did not observe used to be
 // interpolated as the literal `undefined` — a malformed fingerprint sent to Zen,
 // which answers with something that says nothing about where it came from.
+// The lookup itself is exported, because the same mistake is reachable from
+// outside this file: `provider.mjs` reads a profile's `tools` on two paths of
+// its own, and indexing `PROFILES[...]` there answered `undefined` for a
+// generation the capture does not hold, failing on `.tools` with a TypeError
+// that names nothing — where the message below names the capture to fix.
+test("the profile lookup is exported, and a miss names the generation", async () => {
+  const { profileFor } = await import("./core-tools.mjs");
+  assert.equal(profileFor("1.x"), PROFILES["1.x"]);
+  assert.throws(() => profileFor("9.x"), /no profile for generation "9\.x"/);
+});
+
 test("a protocol with no captured provider-utils is named", () => {
   const { generation, profile, protocols } = perProtocolProfile();
   for (const protocol of ["systemone", "constructor", "toString"]) {

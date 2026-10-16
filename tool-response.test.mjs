@@ -932,6 +932,76 @@ test("Responses: dropped calls without ids are replaced by items with distinct i
   assert.equal(new Set(added.map((data) => data.item.id)).size, 2, "two added items shared one id");
 });
 
+// One call is replaced more than once — the frame that opens it, the frame that
+// closes it, and the copy inside the terminal response's output — and a client
+// keys an item by its id. A counter that gave every replacement a fresh id made
+// one call into several items and left the arguments frames of it unmatched: the
+// call's place in the reply is the same in all three, so that is what the
+// invented id names.
+test("Responses: one dropped call keeps one id across its added, done and terminal copies", async () => {
+  const call = { type: "function_call", name: "nonexistent", arguments: "{}" };
+  const streamed = await guardToolResponse(
+    sse(
+      event({ type: "response.output_item.added", output_index: 0, item: call }) +
+        event({ type: "response.output_item.done", output_index: 0, item: call }) +
+        event({ type: "response.completed", response: { output: [call] } }, "response.completed"),
+    ),
+    "responses",
+    policy,
+  );
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const replaced = data
+    .filter(
+      (value) =>
+        value.type === "response.output_item.added" ||
+        value.type === "response.output_item.done",
+    )
+    .map((value) => value.item.id);
+  const terminal = data.find((value) => value.type === "response.completed");
+  assert.equal(replaced.length, 2, "both item frames are answered");
+  assert.equal(new Set(replaced).size, 1, "one call became several items");
+  assert.equal(
+    terminal.response.output[0].id,
+    replaced[0],
+    "and the terminal's copy is that same item",
+  );
+});
+
+// Both arms invent ids within one reply, so they cannot share a word: a counter
+// that reached another call's index handed two unrelated calls the same item —
+// the failure the counter itself exists to prevent — and a client that keys by
+// id then reads one call's arguments as the other's.
+test("Responses: a call the reply places nowhere never shares an id with a placed one", async () => {
+  const placed = Array.from({ length: 64 }, (_, index) => ({
+    type: "function_call",
+    name: `nonexistent-${index}`,
+    arguments: "{}",
+  }));
+  const response = await guardToolResponse(
+    Response.json({
+      item: { type: "function_call", name: "nonexistent-placeless", arguments: "{}" },
+      output: placed,
+    }),
+    "responses",
+    policy,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const ids = [body.item, ...body.output].map((item) => item.id);
+  assert.equal(ids.length, placed.length + 1);
+  assert.equal(
+    new Set(ids).size,
+    ids.length,
+    `two dropped calls shared an id: ${ids.filter((id, at) => ids.indexOf(id) !== at).join(", ")}`,
+  );
+  assert.match(
+    body.item.id,
+    /^msg_anon_\d+$/,
+    "the placeless call is the counter's, under a word of its own",
+  );
+});
+
 // [DONE] is the sentinel a Chat stream ends with, and a Responses or Messages
 // stream may be handed one after it has reported its own terminal event — a
 // gateway in front of the upstream appends it. That is an ending. Before the
@@ -1315,10 +1385,14 @@ test("a non-streaming reply is read through the 32 MiB limit", { timeout: 60_000
   assert.equal(source.body.locked, false);
 });
 
-// A body abandoned without its cancel being awaited leaves an upstream
-// writing into a socket nobody reads; a cancel that fails is the caller's
-// failure, not something to swallow (the collapse path pins the same).
-test("a non-streaming reply abandoned past the limit cancels, and a cancel failure is not swallowed", async () => {
+// A body abandoned without its cancel being awaited leaves an upstream writing
+// into a socket nobody reads. A cancel that then fails must not stand in for
+// what ended the read: the oversized body is the 502 this path promises, and an
+// opaque transport error in its place is the failure [#4] was about — the
+// caller cannot tell a limit from a dead connection, and the documented answer
+// disappears. The cancel's own failure rides along as that error's cause, so
+// nothing is swallowed, and the lock is released either way.
+test("a cancel failure does not replace the 502 an oversized body becomes", async () => {
   const cause = new DOMException("cancel failed", "AbortError");
   const bytes = encoder.encode("x".repeat(1024 * 1024));
   const { response } = upstream((controller) => controller.enqueue(bytes), {
@@ -1328,7 +1402,9 @@ test("a non-streaming reply abandoned past the limit cancels, and a cancel failu
       throw cause;
     },
   });
-  await assert.rejects(guardToolResponse(response, "chat", policy), (error) => error === cause);
+  const result = await guardToolResponse(response, "chat", policy);
+  assert.equal(result.status, 502, "the limit is still the answer, not the cancel");
+  assert.match((await result.json()).error.message, /32 MiB|limit/i);
   assert.equal(response.body.locked, false);
 });
 
@@ -1641,6 +1717,11 @@ test("text streams larger than 32 MiB are not subject to the pending-tool limit"
   const source = new Response(
     new ReadableStream({
       pull(controller) {
+        // 34 chunks of a MiB each is what puts this stream past `MAX_BYTES`,
+        // which the assertion below reads from that constant rather than from a
+        // literal. If the constant ever grows past 34 MiB, this count is what
+        // has to grow with it — growing the constant alone fails loudly instead
+        // of quietly sending fewer bytes than the boundary and testing nothing.
         if (count < 34) {
           count++;
           return controller.enqueue(bytes);
@@ -1690,6 +1771,26 @@ test("chat: a stream cut short after its text ends as one, with a note and [DONE
       { index: 0, delta: { content: `\n\n${cutShortNote}` }, finish_reason: "stop" },
     ]);
   }
+});
+
+// A choice that finished and then started another round is open again: the
+// buffer judges a later round for the same choice on what that round holds, and
+// the tracker has to agree. Latching the choice shut left a round opened
+// afterwards, and cut short, with no note and no `finish_reason` at all — a bare
+// `[DONE]` for a choice the client had already been told had stopped.
+test("chat: a round opened after a choice finished is still ended by a cut (#91)", async () => {
+  const text =
+    event(chat({ role: "assistant", content: "one" })) +
+    event(chat({}, "stop")) +
+    event(chat({ content: "two" }));
+  const result = await guardToolResponse(sse(text), "chat", policy, streaming);
+  const frames = parse(await result.text());
+  assert.equal(frames.at(-1).data, "[DONE]", "the cut is still reported as an ending");
+  assert.deepEqual(
+    frames.at(-2).data.choices,
+    [{ index: 0, delta: { content: `\n\n${cutShortNote}` }, finish_reason: "stop" }],
+    "the reopened choice gets the note",
+  );
 });
 
 test("chat: a stream cut short in its reasoning ends as one too, the note its text (#91)", async () => {

@@ -168,6 +168,32 @@ test("a record carried only by the table's prototype is not evidence", async () 
   assert.deepEqual(limitOverrides("bare-free", DECLARED, bare), { context: 1000000 });
 });
 
+test("a declaration carried only by the caller's prototype is not a declaration", async () => {
+  const { limitOverrides } = await subject;
+  const table = {
+    "prototype-declared-free": {
+      context: { value: 1000000, source: "route", declaredAt: 200000 },
+    },
+  };
+  // The other half of the same rule: `declared` is handed in by a caller, and an
+  // axis inherited from its prototype — or from a polluted `Object.prototype` —
+  // would be read as the number the catalogue declared. That number feeds the
+  // staleness compare, so an inherited one can void a real entry through the
+  // drift note, or suppress an override meant for the model.
+  const inherited = Object.create({ context: 200000 });
+  inherited.output = 32000;
+  assert.deepEqual(
+    limitOverrides("prototype-declared-free", inherited, table),
+    {},
+    "an inherited context is not a declaration to measure against",
+  );
+  // the same pair declared as own properties is evidence, as it always was
+  assert.deepEqual(
+    limitOverrides("prototype-declared-free", { context: 200000, output: 32000 }, table),
+    { context: 1000000 },
+  );
+});
+
 test("weaker evidence may raise a limit but never lower one", async () => {
   const { limitOverrides } = await subject;
   const table = {
@@ -372,6 +398,44 @@ test("a chunked body cut inside a number stores nothing, and the same body whole
   );
   assert.deepEqual(whole, { context: undefined, output: 262144, text: CEILING_WORDING, ended: true });
   assert.deepEqual(limitOverrides(id, { context: 1000000, output: 131072 }), { output: 262144 });
+});
+
+test("a number the read stopped after is read when the text after it proves it ended", async () => {
+  const { observeRouteStatement } = await subject;
+  // The guard is about digits that reach the last character read. A number whose
+  // digits are followed, inside the head, by a character the greedy `(\d+)`
+  // refused to consume ended there — a match running on past the digits is not
+  // evidence they were cut. Judging the cut by the match's own end threw away
+  // numbers that were provably whole, and with them the under-declaration this
+  // table exists to correct.
+  const at = CEILING_WORDING.indexOf("262144");
+  const ceiling = await within(
+    1000,
+    observeRouteStatement(
+      "whole-number-free",
+      refusal(`${CEILING_WORDING}${" ".repeat(50)}`, { status: 400 }),
+      at + 7,
+    ),
+    "the refusal read one character past the ceiling",
+  );
+  assert.equal(ceiling.output, 262144, "the newline after the digits proves they ended");
+  assert.equal(ceiling.ended, false, "and the body did not end there");
+
+  // The same for the wording whose match runs on into " completion tokens": the
+  // digits end well before the read does, with words after them.
+  const window = "this endpoint's maximum context length is 1048576 tokens, and further text follows";
+  const digits = window.indexOf("1048576") + "1048576".length;
+  const context = await within(
+    1000,
+    observeRouteStatement(
+      "whole-window-free",
+      refusal(window, { status: 400 }),
+      digits + " tokens".length,
+    ),
+    "the refusal read through the words after the window",
+  );
+  assert.equal(context.context, 1048576, "the words after the digits are not part of the number");
+  assert.equal(context.ended, false);
 });
 
 test("only a refusal that names a window is read, and only its first few KiB", async () => {

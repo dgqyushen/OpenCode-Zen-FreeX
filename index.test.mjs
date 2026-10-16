@@ -700,6 +700,15 @@ test("a tool declared through the legacy functions array is not filled in again"
   // The names the host did not declare are still filled, as they are for any
   // host that is not OpenCode.
   assert.deepEqual(names, ["glob", "grep", "read"]);
+  // And the wording is Zen's wherever the tool was declared. An entry carried by
+  // `functions` is read by Zen the same way one in `tools` is, so leaving the
+  // host's own words there is a refusal this plugin could have prevented — and
+  // it is the entry `explain()` would otherwise describe as rewritten.
+  assert.equal(
+    lastCall(state).body.functions[0].description,
+    PROFILES["1.x"].tools.bash.description,
+    "the legacy entry is reworded too",
+  );
 });
 // A host that is not OpenCode describes its tools in its own words, and Zen
 // reads the wording of the tools it knows by name. The tool itself is the

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -87,11 +87,15 @@ function fakeChild() {
 
 // `report` ends in process.exit for every path a case pins, so the exit is
 // stubbed and the lines it printed are collected. The stub is not where a
-// subprocess would end; it is how the branch is read.
-function offline(body) {
+// subprocess would end; it is how the branch is read. `timers`, when a case asks
+// for it, is where a spy on `setTimeout` records the watchdog `capture` arms,
+// with the flag that says whether the run cleared it again.
+function offline(body, { timers } = {}) {
   const exit = process.exit;
   const log = console.log;
   const error = console.error;
+  const setTimer = globalThis.setTimeout;
+  const clearTimer = globalThis.clearTimeout;
   const lines = [];
   let code;
   process.exit = (value) => {
@@ -100,6 +104,17 @@ function offline(body) {
   };
   console.log = (line) => lines.push(String(line));
   console.error = (line) => lines.push(String(line));
+  if (timers) {
+    globalThis.setTimeout = (fn, ms, ...rest) => {
+      const handle = setTimer(fn, ms, ...rest);
+      timers.push(Object.assign(handle, { cleared: false }));
+      return handle;
+    };
+    globalThis.clearTimeout = (handle) => {
+      if (handle) handle.cleared = true;
+      return clearTimer(handle);
+    };
+  }
   return {
     lines,
     get code() {
@@ -117,6 +132,10 @@ function offline(body) {
         process.exit = exit;
         console.log = log;
         console.error = error;
+        if (timers) {
+          globalThis.setTimeout = setTimer;
+          globalThis.clearTimeout = clearTimer;
+        }
       }
     },
   };
@@ -144,6 +163,27 @@ test("a --fingerprint value that is another flag is not a path", () => {
     fallback,
     "an exported-but-empty variable names nothing, so the default stands",
   );
+});
+
+test("--fingerprint=<path> is read, not silently ignored", () => {
+  // The space-separated form was the only one read, so `=` matched no argv
+  // element, the flag fell back to the default, and the write landed on the
+  // repository's own fingerprint.json — the one outcome the flag exists to
+  // prevent, arrived at without a word. Both spellings name the same thing.
+  const fallback = join(import.meta.dir, "fingerprint.json");
+  const argv = (...rest) => ["bun", "capture.mjs", ...rest];
+  assert.equal(fingerprintTarget(argv("--fingerprint=/tmp/x.json"), {}), "/tmp/x.json");
+  // An `=` with nothing after it names nothing, exactly as the bare flag does.
+  assert.equal(fingerprintTarget(argv("--fingerprint="), {}), fallback);
+  assert.equal(
+    fingerprintTarget(argv("--fingerprint="), { CAPTURE_FINGERPRINT: "/tmp/env.json" }),
+    "/tmp/env.json",
+    "an environment value is still read when the inline form named nothing",
+  );
+  // Both spellings at once is a command line that says two things; the `=` form
+  // is the more specific of them and is the one read.
+  assert.equal(fingerprintTarget(argv("--fingerprint=/tmp/inline.json", "--fingerprint", "/tmp/space.json"), {}), "/tmp/inline.json");
+  assert.equal(fingerprintTarget(argv("--fingerprint", "/tmp/space.json", "--fingerprint=/tmp/inline.json"), {}), "/tmp/inline.json");
 });
 
 test("the guard that keeps an import from running the capture", () => {
@@ -192,6 +232,35 @@ test("a child that could not be started is a failed run", async () => {
   assert.deepEqual(await pending, { code: 1, ran: false });
 });
 
+test("a spawn failure takes the watchdog and the signal handlers with it", async () => {
+  // The `error` path settled the promise and nothing else: the 120 s watchdog
+  // stayed pending, so it would later log an ending for a child that never
+  // started, and both `process.once` handlers stayed armed, so they would swallow
+  // a Ctrl-C. `setTimeout` is spied on rather than trusted to be noticed: what is
+  // asked is whether the handler this module armed was cleared, which a real
+  // 120 s wait cannot answer inside a test either way.
+  const timers = [];
+  const run = fakeChild();
+  const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+  const captureRun = offline(async () => {
+    const pending = capture("probe", run.spawn);
+    run.emit("error", new Error("ENOENT"));
+    assert.deepEqual(await pending, { code: 1, ran: false });
+  }, { timers });
+  try {
+    await captureRun.run();
+  } finally {
+    for (const handle of timers) clearTimeout(handle);
+  }
+  assert.equal(timers.length, 1, "the watchdog is the one timer this path arms");
+  assert.equal(timers[0].cleared, true, "and the spawn failure must clear it");
+  assert.deepEqual(
+    [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
+    before,
+    "a spawn failure must leave no signal handler armed",
+  );
+});
+
 test("the signal handlers are dropped once the child is gone", async () => {
   // A `process.once` that has not fired stays armed, and settling an already
   // settled promise is a no-op: a Ctrl-C during the write phase would be
@@ -208,12 +277,17 @@ test("the signal handlers are dropped once the child is gone", async () => {
   );
 });
 
-test("a required name that arrived without a description is not a name this OpenCode stopped sending", async () => {
-  // `tools` only holds names that arrived with a non-empty description, so
-  // reading `missing` off it reported a tool that *was* sent as one this
-  // OpenCode no longer sends. `read` has a description here and is captured;
-  // `grep` is sent with none, which is the case the fix is about.
+test("a required name that arrived without a description is refused as that, not as one this OpenCode stopped sending", async () => {
+  // Two defects in one path. First: `tools` only holds names that arrived with a
+  // non-empty description, so reading `missing` off it reported a tool that *was*
+  // sent as one this OpenCode no longer sends. Second, and open until the check
+  // below existed: such a name passed the `sent` test and was then written into
+  // `required`, naming a tool the written `tools` does not carry — the shape
+  // `bun run check:gate` refuses, produced by the tool that keeps that file
+  // honest. `grep` is sent with no description; `bash`, `glob` and `read` are
+  // captured normally.
   const scratch = scratchFingerprint();
+  const before = JSON.stringify(scratch.read());
   const captureRun = offline(() =>
     report({
       request: requestFor(
@@ -225,16 +299,22 @@ test("a required name that arrived without a description is not a name this Open
   );
   try {
     await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(captureRun.code, 1, `an uncapturable required tool must refuse:\n  ${said}`);
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("no longer sends")),
+      false,
+      `a tool that was sent must not be reported as one this OpenCode stopped sending:\n  ${said}`,
+    );
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("grep") && line.includes("without a description")),
+      true,
+      `the refusal has to name the tool and what is wrong with it:\n  ${said}`,
+    );
+    assert.equal(JSON.stringify(scratch.read()), before, "a refused capture must not write");
   } finally {
     scratch.remove();
   }
-  // It did not exit at the missing check: the capture got past it, and what it
-  // then made of the wording is not what this pins.
-  assert.equal(
-    captureRun.lines.some((line) => line.includes("no longer sends")),
-    false,
-    `a tool that was sent must not be reported as one this OpenCode stopped sending:\n  ${captureRun.lines.join("\n  ")}`,
-  );
 });
 
 test("the anthropic shape is refused for what it is, before the per-tool schema check", async () => {
@@ -367,7 +447,51 @@ test("a changed capture writes the scratch fingerprint, and only there", async (
       `the write must be reported:\n  ${captureRun.lines.join("\n  ")}`,
     );
     assert.equal(scratch.read().profiles["1.x"].tools.read.description, wording.slice(0, 1200), "the scratch file got the capture");
+    // Nothing is left beside the target: the temporary the write went through is
+    // the one a rename consumes, so an interrupted run can never be picked up by
+    // the next one as a half-written capture.
+    assert.equal(existsSync(`${scratch.path}.tmp`), false, "the write must not leave its temporary behind");
   } finally {
     scratch.remove();
   }
+});
+
+test("a write that cannot land leaves the target alone and cleans up after itself", async () => {
+  // The write goes to `${fingerprint}.tmp` and is renamed over the target, so a
+  // run that cannot write fails on a file nobody reads. This is what that looks
+  // like: a directory sits where the temporary would go, so the write raises —
+  // and the shipped capture is byte-for-byte what it was. Writing in place would
+  // have opened the target itself, which is the truncation this pins against.
+  const scratch = scratchFingerprint();
+  const wording = "A different wording for this tool, long enough to be read. ".repeat(4);
+  const before = readFileSync(scratch.path, "utf8");
+  mkdirSync(`${scratch.path}.tmp`);
+  const captureRun = offline(() =>
+    report({
+      request: requestFor(bodyFor(NAMES.map((name) => toolFor(name, { description: wording })))),
+      code: 0,
+      fingerprint: scratch.path,
+    }),
+  );
+  let raised;
+  let after;
+  try {
+    try {
+      await captureRun.run();
+    } catch (cause) {
+      raised = cause;
+    }
+    // Read before the directory goes: what the target holds afterwards is the
+    // whole point of this case.
+    after = readFileSync(scratch.path, "utf8");
+  } finally {
+    scratch.remove();
+  }
+  assert.notEqual(raised, undefined, "a write that cannot be made must be raised, not swallowed");
+  assert.equal(after, before, "the target must be exactly what it was");
+  assert.equal(
+    captureRun.lines.some((line) => line.includes("wrote")),
+    false,
+    "a failed write must not be reported as a write",
+  );
 });

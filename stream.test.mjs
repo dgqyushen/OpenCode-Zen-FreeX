@@ -449,6 +449,103 @@ test("Responses aggregates fallback text, reasoning, function arguments and usag
   assert.deepEqual(body.usage, { input_tokens: 2, output_tokens: 4, total_tokens: 6 });
 });
 
+// A terminal event is not the whole reply either. `apply` merges what that event
+// carries at its own top level onto the accumulated body — `usage` above all,
+// and `status`, `object`, `incomplete_details`, `finish_reason` — and answering
+// with the terminal's `response` alone dropped them: the reply came back without
+// the usage the same event had just stated.
+test("Responses: a terminal carrying a whole response keeps the fields beside it", async () => {
+  const text =
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "hi",
+    }) +
+    event(
+      {
+        type: "response.completed",
+        usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+        response: {
+          id: "resp-3",
+          object: "response",
+          status: "completed",
+          output: [
+            {
+              id: "m",
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "hi", annotations: [] }],
+            },
+          ],
+        },
+      },
+      "response.completed",
+    );
+  const body = await json(text, "responses");
+  assert.equal(body.id, "resp-3");
+  assert.equal(body.output[0].content[0].text, "hi");
+  assert.deepEqual(
+    body.usage,
+    { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+    "the usage the terminal stated is part of the reply",
+  );
+});
+
+// A gateway re-emitting an opening frame carries a part whose text is empty
+// where the deltas have already filled the slot, and writing it in
+// unconditionally discarded what had been delivered — the same
+// partial-snapshot hazard the item guard above and `content_block_start` in the
+// Messages accumulator exist for.
+test("Responses: a re-emitted content part does not discard the text before it", async () => {
+  const opening = {
+    type: "response.content_part.added",
+    output_index: 0,
+    content_index: 0,
+    part: { type: "output_text", text: "", annotations: [] },
+  };
+  const text =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "m", type: "message", role: "assistant", content: [] },
+    }) +
+    event(opening) +
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "kept",
+    }) +
+    event(opening) +
+    event(
+      { type: "response.completed", response: { id: "r", object: "response", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const body = await json(text, "responses");
+  assert.equal(body.output[0].content[0].text, "kept", "the re-emitted opening carried nothing");
+});
+
+// An `added` frame opens an item, so the id it names is new by definition — and
+// a stream that never indexed its items, which `slot` above is written to
+// tolerate, used to 502 on its very first item because the lookup demanded the
+// item already be open. It takes the next free slot instead, and the frames that
+// name it by id find it there.
+test("Responses: an item frame that omits its output index still opens the item", async () => {
+  const text =
+    event({
+      type: "response.output_item.added",
+      item: { id: "f", type: "function_call", call_id: "call", name: "lookup", arguments: "" },
+    }) +
+    event({ type: "response.function_call_arguments.delta", item_id: "f", delta: '{"q":1}' }) +
+    event(
+      { type: "response.completed", response: { id: "r", object: "response", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const body = await json(text, "responses");
+  assert.equal(body.output[0].arguments, '{"q":1}');
+});
+
 test("Responses done snapshots do not duplicate accumulated deltas", async () => {
   const item = {
     id: "f",
