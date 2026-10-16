@@ -120,6 +120,47 @@ test("a second id on another upstream, whose axes rest on different tiers, is de
   });
 });
 
+// The two the tier added on 2026-10-16, each measured that day. The declarations
+// they are measured against are the catalogue's, and the axis that moves is the
+// one the evidence is about — nothing else is touched.
+test("the ids the tier added last do not keep the ceilings the catalogue gave them", async () => {
+  const { limitOverrides } = await subject;
+  // ll-alpha-free: the route's own refusal names a completion ceiling four times
+  // what the catalogue declares, and its window is the catalogue's already.
+  assert.deepEqual(limitOverrides("ll-alpha-free", { context: 262144, output: 65536 }), {
+    output: 262144,
+  });
+  // glm-5.3-flash-free: both axes from the paid id serving the same upstream
+  // model, with a 232685-token prompt served as the witness that the declared
+  // window is too small.
+  assert.deepEqual(limitOverrides("glm-5.3-flash-free", { context: 200000, output: 32000 }), {
+    context: 1000000,
+    output: 131072,
+  });
+  // and the catalogue moving voids the axis it moved, as it does for every entry
+  assert.deepEqual(limitOverrides("ll-alpha-free", { context: 262144, output: 131072 }), {});
+});
+
+// The window wording measured on ll-alpha-free's upstream: the same fact as the
+// "maximum context length is N tokens" sentence, phrased as a parenthetical. A
+// window this module cannot read is a window the plugin keeps under-declaring.
+test("the second way a refusal states its window is read as the same fact", async () => {
+  const { namedContextWindow } = await subject;
+  assert.equal(
+    namedContextWindow("The input (341480 tokens) is longer than the model's context length (262144 tokens)."),
+    262144,
+  );
+  assert.equal(
+    namedContextWindow("\"This endpoint's maximum context length is 1048576 tokens. However, you requested about 1496523 tokens\""),
+    1048576,
+  );
+  // a sentence that names no window still names none
+  assert.equal(namedContextWindow("the model's context length is unbounded"), undefined);
+  // and a zero is not a window: the reader drops any number that is not usable,
+  // so a wording like this cannot declare a model unusable
+  assert.equal(namedContextWindow("context length (0 tokens)"), undefined);
+});
+
 test("evidence measured against another catalogue is void, and only on its own axis", async () => {
   const { limitOverrides } = await subject;
   // Zen moved the window it declares: the measured window is an answer to a

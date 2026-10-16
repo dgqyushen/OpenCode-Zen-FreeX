@@ -44,15 +44,23 @@ const hasValue = (value) => value !== null && value !== undefined;
 // offered. A status that is set — "active" included — is still read as itself.
 const isSet = (value) => hasValue(value) && String(value).trim() !== "";
 
+// A status ends a model when it says the model is gone: "retired" and
+// "disabled" are endings. "deprecated" is not one — it says the catalogue
+// expects the model to go, and what decides whether it is still there is the
+// list Zen serves, which discovery already reads: measured 2026-10-16,
+// `muse-spark-1.2-contributor-free` is marked deprecated in the catalogue while
+// Zen lists it and the free tier answers a request for it through this plugin,
+// so reading that status as an ending hid a model that was being served.
+const ENDED = ["retired", "disabled"];
+
 function isRetired(model) {
   return (
     model.deprecated === true ||
-    ["deprecated", "retired", "disabled"].includes(
-      isSet(model.status) ? model.status : model.lifecycle,
-    ) ||
+    ENDED.includes(isSet(model.status) ? model.status : model.lifecycle) ||
     // Read through `isSet`, not `hasValue`: a blank `deprecated_at` is the empty
     // string the catalogue writes for a date it does not have, and reading it as
-    // a date retired a model that was still on offer.
+    // a date retired a model that was still on offer. An effective date is an
+    // ending whatever the status beside it says.
     isSet(model.deprecated_at) ||
     isSet(model.retirement_date)
   );
@@ -191,10 +199,19 @@ export const bootstrapProtocols = {
   "nemotron-3.5-lightning-free": "chat",
   "muse-spark-1.3-contributor-free": "responses",
   "jev-1.13-free": "systemone",
+  // The free tier's list on 2026-10-16, when these five appeared: the four chat
+  // ones and the responses one below, whose paid twin the docs table names.
+  "deepseek-v4.1-flash-free": "chat",
+  "glm-5.3-flash-free": "chat",
+  "ll-alpha-free": "chat",
+  "nemotron-3.5-super-vl-free": "chat",
+  "muse-spark-1.2-contributor-free": "responses",
 };
 
-// Offline bootstrap metadata from the OpenCode catalog, 2026-10-06; the
-// free models listed since added on 2026-10-15.
+// Offline bootstrap metadata from the OpenCode catalog, 2026-10-06; the free
+// models listed since added on 2026-10-15, and the ids the tier was serving on
+// 2026-10-16 added then. A host that reaches nothing on its first run offers
+// these; the first discovery replaces the list.
 export const bootstrapProvider = {
   npm: SDK.chat,
   models: {
@@ -260,6 +277,66 @@ export const bootstrapProvider = {
     },
     "muse-spark-1.3-contributor-free": {
       name: "Muse Spark 1.3 Free",
+      cost: { input: 0, output: 0 },
+      provider: { npm: SDK.responses },
+      limit: { context: 1048576, output: 131072 },
+      reasoning: true,
+      tool_call: true,
+      modalities: { input: ["text", "image", "video", "pdf", "audio"], output: ["text"] },
+      reasoning_options: [
+        { type: "effort", values: ["minimal", "low", "medium", "high", "xhigh"] },
+      ],
+    },
+    // The free ids the tier was serving on 2026-10-16 and this snapshot did not
+    // carry. Their numbers are the catalogue's, as every other entry here is —
+    // `limits.mjs` is what corrects the ones the catalogue under-reports, and it
+    // carries entries for two of these.
+    "deepseek-v4.1-flash-free": {
+      name: "DeepSeek V4.1 Flash Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 200000, output: 32000 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+    },
+    "glm-5.3-flash-free": {
+      name: "GLM-5.3-Flash Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 200000, output: 32000 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image", "video", "pdf"], output: ["text"] },
+      reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+    },
+    "ll-alpha-free": {
+      name: "LL Alpha Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 262144, output: 65536 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text"], output: ["text"] },
+      reasoning_options: [
+        { type: "effort", values: ["low", "medium", "high", "xhigh", "max"] },
+      ],
+    },
+    "nemotron-3.5-super-vl-free": {
+      name: "Nemotron 3.5 Super VL Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 1048576, output: 131072 },
+      reasoning: true,
+      tool_call: true,
+      interleaved: { field: "reasoning_content" },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      reasoning_options: [
+        { type: "effort", values: ["none", "minimal", "low", "medium", "high", "xhigh"] },
+      ],
+    },
+    "muse-spark-1.2-contributor-free": {
+      name: "Muse Spark 1.2 Free",
       cost: { input: 0, output: 0 },
       provider: { npm: SDK.responses },
       limit: { context: 1048576, output: 131072 },

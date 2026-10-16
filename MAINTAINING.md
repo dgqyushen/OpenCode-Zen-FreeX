@@ -22,7 +22,13 @@ small. `deepseek-v4.1-flash-free` is declared 200000/32000 while
 `deepseek-v4.1-flash` — the paid id serving the same upstream model, which
 `x-opencode-upstream-model-id` confirms — is declared 1000000/384000 in that
 same catalogue, and `mimo-v2.6-flash-free` is declared 200000/32000 against a
-model whose own vendor publishes 1048576/131072.
+model whose own vendor publishes 1048576/131072. The ids the tier added on
+2026-10-16 were under-reported the same way on the day they appeared:
+`ll-alpha-free` names a 262144-token completion ceiling in its own refusal
+against a declared 65536, and `glm-5.3-flash-free` is declared 200000/32000
+while its paid twin `glm-5.3-flash` is declared 1000000/131072 in the same
+catalogue — and a 232685-token prompt was served through the free id, which the
+declared window does not allow.
 
 Both numbers are acted on. The window decides when a conversation is compacted
 and how much of it is ever sent; the output cap is sent as `max_tokens` on every
@@ -42,6 +48,9 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much |
 | `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
 | `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
+| `ll-alpha-free` | output | 262144 | the ceiling the route's own refusal names, against a declared 65536 |
+| `glm-5.3-flash-free` | context | 1000000 | what this route declares for the same upstream model, with a 232685-token prompt served as witness |
+| `glm-5.3-flash-free` | output | 131072 | what this route declares for the same upstream model |
 
 A prompt sized just over the window is refused with
 

@@ -64,11 +64,19 @@ test("the audit asks about the ids the listing offers, not every id the catalogu
   // a listing entry the catalogue marks retired is not offered by the plugin
   // either, so auditing it would report a model nobody can pick
   for (const model of [
-    { status: "deprecated", cost: { input: 0, output: 0 } },
+    { lifecycle: "retired", cost: { input: 0, output: 0 } },
     { retirement_date: "2026-10-01", cost: { input: 0, output: 0 } },
   ]) {
     assert.deepEqual(offeredIds(["dead-free"], { "dead-free": model }), [], JSON.stringify(model));
   }
+  // ...and the status that is a warning rather than an ending is audited, because
+  // the plugin offers it: `muse-spark-1.2-contributor-free` was marked deprecated
+  // and answered a free-tier request on 2026-10-16, so a model with this status
+  // is one an audit still has to speak for.
+  assert.deepEqual(
+    offeredIds(["warning-free"], { "warning-free": { status: "deprecated", cost: { input: 0, output: 0 } } }),
+    ["warning-free"],
+  );
 });
 
 test("ids are grouped by the upstream model the route names, and one that names none is left out", async () => {

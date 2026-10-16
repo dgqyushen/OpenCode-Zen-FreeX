@@ -96,20 +96,62 @@ export const LIMITS = {
       how: "\"Upstream request failed: [invalid_parameter] 参数校验失败: /max_tokens: 1000000 is not less or equal to 262144\" — the second wording namedOutputCap reads, where the ceiling is the number max_tokens has to stay under. Its context needs nothing: the catalogue's 1000000 is what that same refusal calls the endpoint's window.",
     },
   },
+  // The two the free tier added on 2026-10-16, each measured the day it was
+  // noticed. Both under-report in the catalogue the same way the older entries
+  // do, and both were checked on every axis: nothing below is what a refusal
+  // happened to say, it is all that was asked.
+  "ll-alpha-free": {
+    output: {
+      value: 262144,
+      source: "route",
+      declaredAt: 65536,
+      measured: "2026-10-16",
+      samples: "max_completion_tokens 1000000 and 300000 both refused, each naming 262144; nothing above 65536 watched — the ceiling is the route's own number, four times what the catalogue declares",
+      how: "\"Upstream request failed: [400] max_completion_tokens is too large: 300000.This model supports at most 262144 completion tokens.\" — the ceiling is the number the sentence names. Its context needs nothing: the same day's refusal, \"The input (341480 tokens) is longer than the model's context length (262144 tokens).\", is the window the catalogue already declares.",
+    },
+  },
+  "glm-5.3-flash-free": {
+    context: {
+      value: 1000000,
+      source: "route-twin",
+      declaredAt: 200000,
+      measured: "2026-10-16",
+      samples: "a 232685-token prompt was served and answered from (usage.prompt_tokens 232685), so the declared 200000 is already known to be small; nothing above it was refused, because this upstream refuses no max_tokens at all",
+      how: "glm-5.3-flash, the paid id serving the same upstream model — the catalogue's own canonical_model_id for this free id is zhipuai/glm-5.3-flash — is declared 1000000 in this same catalogue",
+    },
+    output: {
+      value: 131072,
+      source: "route-twin",
+      declaredAt: 32000,
+      measured: "2026-10-16",
+      samples: "max_tokens 4000000 was accepted with no refusal at all, which is the DeepSeek upstream's shape: silence here is not evidence of a ceiling either way, and nothing above 32000 was watched",
+      how: "the same paid twin declares 131072 on this axis",
+    },
+  },
 };
 
 // "This model's maximum context length is 1048576 tokens. However, you
 // requested 1422278 tokens (1038278 in the messages, 384000 in the
-// completion)." — the route's own words, and the only sentence seen on this
-// route that states a window. A second upstream phrases the same fact as "This
-// endpoint's maximum context length is ...", with the request broken into text
-// input, tool input and output; both are the route naming its own window, and
-// its "requested about" figure is a rough one (chars, not tokens) rather than
-// the count a served request reports in `usage.prompt_tokens`. A generic 400
-// says nothing attributable and is left alone; §7 of the measured notes has a
-// context overflow and an invalid parameter answering with byte-identical 400s
+// completion)." — the route's own words, and the sentence seen most often on
+// this route that states a window. A second upstream phrases the same fact as
+// "This endpoint's maximum context length is ...", with the request broken into
+// text input, tool input and output; both are the route naming its own window,
+// and its "requested about" figure is a rough one (chars, not tokens) rather
+// than the count a served request reports in `usage.prompt_tokens`. A generic
+// 400 says nothing attributable and is left alone; §7 of the measured notes has
+// a context overflow and an invalid parameter answering with byte-identical 400s
 // on another Zen model.
-const NAMED_CONTEXT = /maximum context length is (\d+) tokens/id;
+//
+// A third wording states the same fact as a parenthetical, and was missed until
+// it was measured: "The input (341480 tokens) is longer than the model's context
+// length (262144 tokens)." (`ll-alpha-free`, 2026-10-16). It names the same
+// number in the same sentence, so it is read the same way — a window this file
+// does not read is a window the plugin keeps under-declaring, which is the one
+// failure it exists to remove.
+const NAMED_CONTEXT = [
+  /maximum context length is (\d+) tokens/id,
+  /context length \((\d+) tokens?\)/id,
+];
 
 // "max_tokens is too large: 200000. This model supports at most 131072 completion
 // tokens, whereas you provided 200000." — an upstream that validates the ceiling
@@ -169,7 +211,7 @@ function describe({ kind, id, axis, value, measuredAgainst, declared }) {
 // The window a refusal names, or undefined when the body says nothing
 // attributable. Exported for the tests and for anyone reading a capture.
 export function namedContextWindow(text) {
-  return namedFrom([NAMED_CONTEXT], text)?.value;
+  return namedFrom(NAMED_CONTEXT, text)?.value;
 }
 
 // The completion ceiling a refusal names, or undefined. Same rule as the window:
@@ -373,7 +415,7 @@ function digitsEnd(found) {
 // returned cannot be two answers.
 function namedAxes(text, limit, cut) {
   const head = text.slice(0, limit);
-  const context = namedFrom([NAMED_CONTEXT], head);
+  const context = namedFrom(NAMED_CONTEXT, head);
   const output = namedFrom(NAMED_OUTPUT, head);
   const onCut = (found) => cut && found !== undefined && digitsEnd(found) >= head.length;
   return {

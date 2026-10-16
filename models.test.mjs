@@ -30,6 +30,12 @@ const provider = {
     // `-free` while the catalogue still prices it. The name wins — see the test
     // that pins it below.
     "late-free": { cost: { input: 5, output: 25 } },
+    // Deprecated, and still listed — which is offered. "deprecated" is the
+    // catalogue expecting a model to go, not a statement that it is gone: on
+    // 2026-10-16 `muse-spark-1.2-contributor-free` carried exactly this status
+    // while Zen listed it and the free tier answered a request for it, so
+    // reading the status as an ending hid a model that was being served. The
+    // endings are `lifecycle-free` below and the dated entries further down.
     "old-free": { status: "deprecated", cost: { input: 0, output: 0 } },
     // Retired through `lifecycle`, with a blank `status` written in front of it:
     // a blank status is not a status, so it must not hide the lifecycle.
@@ -57,6 +63,7 @@ test("lists only live free models with supported protocols and excludes retired 
     "coder-free",
     "late-free",
     "messages-free",
+    "old-free",
     "responses-free",
     "zero-cost",
   ]);
@@ -93,8 +100,38 @@ test("a blank status falls through to lifecycle, and retires nothing on its own"
   const { buildModels, isFree } = await subject;
   assert.equal(isFree("lifecycle-free", provider.models["lifecycle-free"]), false);
   assert.equal(isFree("blank-status-free", provider.models["blank-status-free"]), true);
-  const models = buildModels(["blank-status-free", "lifecycle-free", "old-free"], provider, {}, baseURL);
+  const models = buildModels(["blank-status-free", "lifecycle-free"], provider, {}, baseURL);
   assert.deepEqual(Object.keys(models), ["blank-status-free"]);
+});
+
+// The statuses that are endings, and the one that is not. `muse-spark-1.2-
+// contributor-free` is the measured case: the catalogue calls it deprecated, Zen
+// lists it, and the free tier answered a request for it through this plugin on
+// 2026-10-16 — so the list, which discovery reads, is what decides whether a
+// model is still there, and a deprecated-but-listed model stays offered. The
+// statuses that do end a model are read as they always were.
+test("a status ends a model only when it says the model is gone", async () => {
+  const { isFree } = await subject;
+  for (const status of ["retired", "disabled"]) {
+    assert.equal(isFree(`ended-${status}-free`, { status, cost: { input: 0, output: 0 } }), false, status);
+  }
+  for (const status of ["deprecated", "active"]) {
+    assert.equal(isFree(`live-${status}-free`, { status, cost: { input: 0, output: 0 } }), true, status);
+  }
+  // The lifecycle field is the same vocabulary in the same place...
+  assert.equal(isFree("ended-free", { lifecycle: "retired", cost: { input: 0, output: 0 } }), false);
+  assert.equal(
+    isFree("live-free", { lifecycle: "deprecated", cost: { input: 0, output: 0 } }),
+    true,
+    "deprecated through lifecycle is the same warning as through status",
+  );
+  // ...and an explicit flag or an effective date still ends one, whatever the
+  // status beside it says.
+  assert.equal(isFree("flagged-free", { deprecated: true, status: "active" }), false);
+  assert.equal(
+    isFree("scheduled-free", { status: "deprecated", retirement_date: "2026-11-01" }),
+    false,
+  );
 });
 
 // The date axes are read the same way the status is: the catalogue writes an
@@ -365,6 +402,14 @@ const consoleDocs = [
   chatRow("LongCat 2.5 Preview Free", "longcat-2.5-preview-free"),
   chatRow("MiMo-V2.6-Flash Free", "mimo-v2.6-flash-free"),
   chatRow("Nemotron 3.5 Lightning Free", "nemotron-3.5-lightning-free"),
+  // The free ids the tier was serving on 2026-10-16, whose snapshot entries the
+  // consistency check at the bottom holds against these rows. The docs table
+  // lists all four (the last one as its paid twin's endpoint, responses).
+  chatRow("DeepSeek V4.1 Flash Free", "deepseek-v4.1-flash-free"),
+  chatRow("GLM-5.3-Flash Free", "glm-5.3-flash-free"),
+  chatRow("LL Alpha Free", "ll-alpha-free"),
+  chatRow("Nemotron 3.5 Super VL Free", "nemotron-3.5-super-vl-free"),
+  "| Muse Spark 1.2 Contributor Free | muse-spark-1.2-contributor-free | `https://opencode.ai/inference/v1/responses`                    | `@ai-sdk/openai`            |",
   pricingRow,
 ].join("\n");
 
@@ -394,6 +439,11 @@ test("reads the console docs' endpoint table, and Jev stays out as SystemOne", a
     "longcat-2.5-preview-free": "chat",
     "mimo-v2.6-flash-free": "chat",
     "nemotron-3.5-lightning-free": "chat",
+    "deepseek-v4.1-flash-free": "chat",
+    "glm-5.3-flash-free": "chat",
+    "ll-alpha-free": "chat",
+    "nemotron-3.5-super-vl-free": "chat",
+    "muse-spark-1.2-contributor-free": "responses",
   });
   // the two rows that must not have produced a protocol, each on its own
   assert.deepEqual(parseProtocolDocs(pricingRow), {}, "a pricing row names no endpoint");
