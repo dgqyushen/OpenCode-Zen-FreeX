@@ -149,7 +149,6 @@ const frameData = (text) =>
   parse(text)
     .map((frame) => frame.data)
     .filter((data) => data && data !== "[DONE]");
-const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // One call streamed the way Zen streams it. Chat's is step-5-preview-free's
 // own shape (2026-10-11): the name whole in the first delta with empty
 // arguments, the arguments in pieces, and two tool_calls finishes.
@@ -293,6 +292,19 @@ function assertError(protocol, data, stream = true, code = "upstream_error") {
   }
   assert.equal(typeof (data.message ?? data.error?.message), "string");
 }
+// The shape of a reply that dropped a call, whichever protocol and whichever
+// path built it: no error in the reply, exactly the calls it kept, the note
+// standing in for the one it left out, and no trace of the dropped name in
+// the bytes. Written once, so a change to the note's text or to what counts
+// as a call cannot leave the suites disagreeing about the same behaviour.
+// The leak check is over the whole value on purpose: callsIn reads the call
+// shapes it knows, so a call of another kind would be a leak it cannot see.
+function assertOnlyDropped(protocol, values, name, kept) {
+  assert.ok(!values.some((data) => data.type === "error" || data.error));
+  assert.deepEqual(callsIn(protocol, values), kept);
+  assert.equal(textIn(protocol, values), droppedNote(name));
+  assert.ok(!JSON.stringify(values).includes(`"${name}"`), `${name} leaked in the reply`);
+}
 // A stream that never ends on its own is waited on with a budget: a hang is
 // then reported as one instead of stalling the run. A loaded machine can push
 // a real read past any fixed number, so the budget is per call and generous.
@@ -391,6 +403,33 @@ function endlessStream(chunk, { cancel = () => {} } = {}) {
     highWaterMark: 0,
   });
 }
+// A body whose read fails while the body itself stays alive. The guard uses
+// nothing of one but read/cancel/releaseLock, and a real stream errors itself
+// when its read rejects — where a cancel is a no-op against the error already
+// stored — so this is the only way to see whether that failure cancels what
+// is left of the body or only releases it (#47).
+function failingBody(cause, cancel = () => {}) {
+  const handle = { cancellations: [], released: false };
+  handle.response = {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers({ "content-type": "text/event-stream" }),
+    body: {
+      getReader: () => ({
+        read: () => Promise.reject(cause),
+        cancel: (reason) => {
+          handle.cancellations.push(reason);
+          return cancel(reason);
+        },
+        releaseLock: () => {
+          handle.released = true;
+        },
+      }),
+    },
+  };
+  return handle;
+}
 
 for (const protocol of protocols) {
   test(`${protocol}: JSON maps injected casing and retains declared names`, async () => {
@@ -426,58 +465,74 @@ for (const protocol of protocols) {
       );
       assert.equal(response.status, 200);
       const body = await response.json();
-      assert.deepEqual(callsIn(protocol, [body]), ["Read"]);
-      assert.equal(textIn(protocol, [body]), droppedNote(name));
-      // callsIn reads the call shapes it knows, so the whole body is checked
-      // too: a call of a kind it doesn't read would be a leak it can't see.
-      assert.ok(!JSON.stringify(body).includes(`"${name}"`), `${name} leaked in the reply`);
+      assertOnlyDropped(protocol, [body], name, ["Read"]);
     }
   });
 
   // #76, tkhs101's table of 2026-10-10: the names step-5-preview-free
   // called that DSH has no tool for, and no spelling of one either. Each
   // failed the whole turn; each is now left out with the turn going on.
+  //
+  // The last is the table's own spelling, doubled "cat" and all, kept
+  // verbatim rather than "fixed": it names a different server than the
+  // declared mcp__netcatty-external__list_hosts, and that is what the table
+  // recorded — a name with no spelling of a declared tool. The near miss
+  // beside it (that same server, a tool it does not have) is the test below.
+  const tableRules = {
+    declared: new Set([
+      "bash",
+      "read",
+      "edit",
+      "glob",
+      "grep",
+      "write",
+      "todo_write",
+      "mcp__netcatty-external__list_hosts",
+    ]),
+    injected: new Set(),
+  };
   test(`${protocol}: the names from #76's table are left out, not failed on`, async () => {
-    const rules = {
-      declared: new Set([
-        "bash",
-        "read",
-        "edit",
-        "glob",
-        "grep",
-        "write",
-        "todo_write",
-        "mcp__netcatty-external__list_hosts",
-      ]),
-      injected: new Set(),
-    };
     for (const name of ["bedit", "bcp", "ash", "mcp__netcatcatty__unused"]) {
       const json = await guardToolResponse(
         Response.json(snapshot(protocol, ["bash", name])),
         protocol,
-        rules,
+        tableRules,
       );
       assert.equal(json.status, 200);
-      const body = await json.json();
-      assert.deepEqual(callsIn(protocol, [body]), ["bash"]);
-      assert.equal(textIn(protocol, [body]), droppedNote(name));
+      assertOnlyDropped(protocol, [await json.json()], name, ["bash"]);
       for (const upstream of [
         event(streamSnapshot(protocol, [name])) + terminal(protocol),
         toolStream(protocol, name),
       ]) {
-        const streamed = await guardToolResponse(sse(upstream), protocol, rules);
+        const streamed = await guardToolResponse(sse(upstream), protocol, tableRules);
         assert.equal(streamed.status, 200);
         const values = frameData(await streamed.text());
-        assert.ok(!values.some((data) => data.type === "error" || data.error));
-        assert.deepEqual(callsIn(protocol, values), []);
-        assert.match(
-          textIn(protocol, values),
-          new RegExp(`^(\\n\\n)?${escape(droppedNote(name))}`),
-        );
-        assert.ok(!JSON.stringify(values).includes(`"${name}"`));
+        assertOnlyDropped(protocol, values, name, []);
         assert.doesNotMatch(JSON.stringify(values), /"(?:tool_calls|tool_use|function_call)"/);
       }
     }
+  });
+
+  // The near miss the table's mangled name cannot cover: the declared server,
+  // with a tool it does not have. A call is folded whole — case and
+  // separators only — so sharing a server prefix is never enough to answer it
+  // with another tool's name.
+  test(`${protocol}: a tool the declared server does not have is left out, not matched by prefix`, async () => {
+    const name = "mcp__netcatty-external__unused";
+    const json = await guardToolResponse(
+      Response.json(snapshot(protocol, ["bash", name])),
+      protocol,
+      tableRules,
+    );
+    assert.equal(json.status, 200);
+    assertOnlyDropped(protocol, [await json.json()], name, ["bash"]);
+    const streamed = await guardToolResponse(
+      sse(event(streamSnapshot(protocol, [name])) + terminal(protocol)),
+      protocol,
+      tableRules,
+    );
+    assert.equal(streamed.status, 200);
+    assertOnlyDropped(protocol, frameData(await streamed.text()), name, []);
   });
 
   // #76: DSH declares all five core tools (so nothing is injected) and
@@ -603,12 +658,7 @@ for (const protocol of protocols) {
         policy,
       );
       const values = frameData(await result.text());
-      assert.ok(!values.some((data) => data.type === "error" || data.error));
-      assert.deepEqual(callsIn(protocol, values), ["Read"]);
-      assert.equal(textIn(protocol, values), droppedNote(name));
-      // callsIn reads the call shapes it knows, so the frames are checked
-      // whole too: a call of another kind would be a leak it can't see.
-      assert.ok(!JSON.stringify(values).includes(`"${name}"`), `${name} leaked in the stream`);
+      assertOnlyDropped(protocol, values, name, ["Read"]);
     }
   });
 
@@ -685,6 +735,13 @@ for (const protocol of protocols) {
             `read ${source.pulls()} chunks for ${expected} chunks of bytes`,
           );
         }
+        // The open-stream half is skipped for CR-only endings, and this is
+        // why: the parser has to see the byte after a lone CR to know the
+        // frame ended (feed() looks one past it), and a source with
+        // highWaterMark 0 that is never pulled again cannot supply it — the
+        // guard would wait for an EOF that never comes (reproduced: it hung
+        // until the 5 s budget). The chunked half above closes its stream and
+        // so covers CR.
         if (newline === "\r") continue;
         let cancelled = false;
         const source = openSource(text, () => {
@@ -787,6 +844,27 @@ for (const protocol of protocols) {
     assert.equal(source.body.locked, false);
   });
 
+  test(`${protocol}: a transport failure cancels the body rather than only releasing it (#47)`, async () => {
+    const cause = new TypeError("terminated");
+    const body = failingBody(cause);
+    const result = await guardToolResponse(body.response, protocol, policy);
+    await assert.rejects(result.text(), (error) => error === cause);
+    // The release alone left what was left of the body writing into a socket
+    // nobody reads; the cancel is what stops it, and it carries the failure.
+    assert.deepEqual(body.cancellations, [cause]);
+    assert.equal(body.released, true);
+  });
+
+  test(`${protocol}: a failing cancel does not replace the transport error (#47)`, async () => {
+    const cause = new TypeError("terminated");
+    const body = failingBody(cause, () => {
+      throw new Error("cancel failed");
+    });
+    const result = await guardToolResponse(body.response, protocol, policy);
+    await assert.rejects(result.text(), (error) => error === cause);
+    assert.equal(body.released, true);
+  });
+
   test(`${protocol}: cancel failures propagate rather than being swallowed`, async () => {
     const cause = new Error("cancel failed");
     for (const badTool of [false, true]) {
@@ -812,6 +890,47 @@ for (const protocol of protocols) {
     assertError(protocol, await result.json(), false);
   });
 }
+
+test("an unsupported protocol is refused before the upstream's status is read (#48)", async () => {
+  // The check used to sit behind the !response.ok return, so the same caller
+  // mistake was a TypeError over a 200 and an untouched upstream error over a
+  // 500: the upstream's status decided whether the mistake was reported.
+  for (const status of [200, 500]) {
+    await assert.rejects(
+      guardToolResponse(Response.json({}, { status }), "bogus", policy),
+      (error) => error instanceof TypeError && /Unsupported protocol/.test(error.message),
+    );
+  }
+});
+
+// An item id stands in for the item, so two calls left out of one reply that
+// arrived without ids cannot be handed the same one: a Responses client keys
+// by it, and the streamed path suppresses arguments by it (#49).
+test("Responses: dropped calls without ids are replaced by items with distinct ids", async () => {
+  const output = ["one", "two"].map((name) => ({ type: "function_call", name, arguments: "{}" }));
+  const json = await guardToolResponse(Response.json({ output }), "responses", policy);
+  assert.equal(json.status, 200);
+  const items = (await json.json()).output;
+  assert.deepEqual(
+    items.map((item) => item.content[0].text),
+    [droppedNote("one"), droppedNote("two")],
+  );
+  assert.equal(new Set(items.map((item) => item.id)).size, 2, "two items shared one id");
+  const streamed = await guardToolResponse(
+    sse(
+      event({ type: "response.output_item.added", output_index: 0, item: output[0] }) +
+        event({ type: "response.output_item.added", output_index: 1, item: output[1] }) +
+        event({ type: "response.completed", response: { output } }, "response.completed"),
+    ),
+    "responses",
+    policy,
+  );
+  assert.equal(streamed.status, 200);
+  const added = frameData(await streamed.text()).filter(
+    (data) => data.type === "response.output_item.added",
+  );
+  assert.equal(new Set(added.map((data) => data.item.id)).size, 2, "two added items shared one id");
+});
 
 // [DONE] is the sentinel a Chat stream ends with, and a Responses or Messages
 // stream may be handed one after it has reported its own terminal event — a
@@ -1502,7 +1621,9 @@ test(
   async () => {
     const prefix = 'data: {"text":"';
     const suffix = '"}\r\n\r\n';
-    const text = prefix + "x".repeat(32 * 1024 * 1024 + 1 - prefix.length - suffix.length) + suffix;
+    // A byte over the limit the guard names, whatever MAX_BYTES is: a literal
+    // here would keep exercising the old boundary after a change to it.
+    const text = prefix + "x".repeat(MAX_BYTES + 1 - prefix.length - suffix.length) + suffix;
     for (const chunkSize of [1024 * 1024, text.length - 1]) {
       const result = await guardToolResponse(sse(text, { chunkSize }), "chat", policy);
       const frames = parse(await result.text());
@@ -1539,7 +1660,10 @@ test("text streams larger than 32 MiB are not subject to the pending-tool limit"
     total += value.byteLength;
     assert.ok(!new TextDecoder().decode(value).includes('"error"'));
   }
-  assert.ok(total > 32 * 1024 * 1024);
+  // More than the limit the guard reads through, taken from the constant: a
+  // literal here would keep passing against the old boundary after a change
+  // to it.
+  assert.ok(total > MAX_BYTES);
 });
 
 // #91: Zen closed space-bunny-free's Chat stream after these three frames,

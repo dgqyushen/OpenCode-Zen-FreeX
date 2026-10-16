@@ -4,21 +4,20 @@ export const protocols = [
   { protocol: "anthropic", path: "messages", model: "messages-free" },
 ];
 
-// The registry above is the one list of protocols. A typo, a renamed one, or
-// one added there and not here is an error, rather than a fixture of
-// whichever shape happens to be written last.
-function known(protocol) {
-  if (!protocols.some((entry) => entry.protocol === protocol))
-    throw new Error(`unknown protocol: ${protocol}`);
-  return protocol;
+// The registry above is the one list of protocols, and this is the one lookup
+// of it: a typo, a renamed one, or one added there and not here is an error,
+// rather than a fixture of whichever shape happens to be written last.
+function entryFor(protocol) {
+  const entry = protocols.find((value) => value.protocol === protocol);
+  if (!entry) throw new Error(`unknown protocol: ${protocol}`);
+  return entry;
 }
 
 // The model a protocol is asked as, read from the same registry every other
 // fixture gets its protocol from: a rename there cannot leave a fixture
 // naming a model the plugin no longer offers.
 export function modelFor(protocol) {
-  known(protocol);
-  return protocols.find((entry) => entry.protocol === protocol).model;
+  return entryFor(protocol).model;
 }
 
 // Where a call's arguments are cut into the two deltas a stream delivers
@@ -27,14 +26,16 @@ export function modelFor(protocol) {
 const argumentSplit = 12;
 
 export function declaredTools(protocol) {
-  known(protocol);
+  // The registry's answer, asked once and used as the guard: a protocol it
+  // does not have is an error rather than a nameless tool below.
+  entryFor(protocol);
   return ["Bash", "Read"].map((name) => {
     const schema = { type: "object", properties: { command: { type: "string" } } };
     const tool = { name, description: `Client ${name}` };
     if (protocol === "chat") return { type: "function", function: { ...tool, parameters: schema } };
     if (protocol === "anthropic") return { ...tool, input_schema: schema };
     if (protocol === "responses") return { type: "function", ...tool, parameters: schema };
-    // Unreachable while known() above holds the registry, and deliberate:
+    // Unreachable while entryFor() above holds the registry, and deliberate:
     // a protocol added to the registry and given no shape here is an error
     // rather than whichever fixture is written last.
     throw new Error(`unhandled protocol: ${protocol}`);
@@ -42,9 +43,20 @@ export function declaredTools(protocol) {
 }
 
 export function toolReply(protocol, name, sse = true) {
-  known(protocol);
+  // A fixture that fails loudly rather than emitting whichever shape is
+  // written last: JSON.stringify drops an undefined name, so a nameless call
+  // would quietly test the "left out for having no name" path instead of the
+  // name asked for.
+  if (typeof name !== "string" || !name)
+    throw new Error(`toolReply needs a tool name, got: ${name}`);
   const args = JSON.stringify({ command: "ls -la" });
-  const model = modelFor(protocol);
+  // The deltas below cut `args` at argumentSplit, and it is the second piece
+  // that makes them two deltas. A payload at or under the cut would make that
+  // piece the empty string and leave every fixture passing while the contract
+  // they exist to prove had degenerated.
+  if (args.length <= argumentSplit)
+    throw new Error(`arguments too short for a split at ${argumentSplit}: ${args}`);
+  const model = entryFor(protocol).model;
   const event = (value, type) =>
     `${type ? `event: ${type}\n` : ""}data: ${JSON.stringify(value)}\n\n`;
   if (protocol === "chat") {
@@ -91,25 +103,43 @@ export function toolReply(protocol, name, sse = true) {
     const response = { id: "r1", object: "response", status: "completed", output: [item] };
     if (!sse) return JSON.stringify(response);
     const where = { item_id: "fc1", output_index: 0 };
+    // Every frame carries the event name its type mirrors, as the Responses
+    // API sends it and the anthropic branch below already did: a consumer may
+    // route frames by that name alone.
     return (
-      event({
-        type: "response.output_item.added",
-        output_index: 0,
-        item: { ...item, arguments: "", status: "in_progress" },
-      }) +
-      event({
-        type: "response.function_call_arguments.delta",
-        ...where,
-        delta: args.slice(0, argumentSplit),
-      }) +
-      event({
-        type: "response.function_call_arguments.delta",
-        ...where,
-        delta: args.slice(argumentSplit),
-      }) +
-      event({ type: "response.function_call_arguments.done", ...where, arguments: args }) +
-      event({ type: "response.output_item.done", output_index: 0, item }) +
-      event({ type: "response.completed", response })
+      event(
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { ...item, arguments: "", status: "in_progress" },
+        },
+        "response.output_item.added",
+      ) +
+      event(
+        {
+          type: "response.function_call_arguments.delta",
+          ...where,
+          delta: args.slice(0, argumentSplit),
+        },
+        "response.function_call_arguments.delta",
+      ) +
+      event(
+        {
+          type: "response.function_call_arguments.delta",
+          ...where,
+          delta: args.slice(argumentSplit),
+        },
+        "response.function_call_arguments.delta",
+      ) +
+      event(
+        { type: "response.function_call_arguments.done", ...where, arguments: args },
+        "response.function_call_arguments.done",
+      ) +
+      event(
+        { type: "response.output_item.done", output_index: 0, item },
+        "response.output_item.done",
+      ) +
+      event({ type: "response.completed", response }, "response.completed")
     );
   }
   if (protocol !== "anthropic") throw new Error(`unhandled protocol: ${protocol}`);

@@ -33,7 +33,9 @@ function sdkProtocol(npm) {
 }
 
 // Set, and not merely present: the catalogue writes both a missing date and an
-// explicit null, and neither retires a model.
+// explicit null, and neither retires a model. A blank string is not a date
+// either — see `isSet` below, which is the same rule stated for the two axes
+// the retirement checks read.
 const hasValue = (value) => value !== null && value !== undefined;
 
 // A status has to say something to be one. The catalogue writes an empty string
@@ -48,8 +50,11 @@ function isRetired(model) {
     ["deprecated", "retired", "disabled"].includes(
       isSet(model.status) ? model.status : model.lifecycle,
     ) ||
-    hasValue(model.deprecated_at) ||
-    hasValue(model.retirement_date)
+    // Read through `isSet`, not `hasValue`: a blank `deprecated_at` is the empty
+    // string the catalogue writes for a date it does not have, and reading it as
+    // a date retired a model that was still on offer.
+    isSet(model.deprecated_at) ||
+    isSet(model.retirement_date)
   );
 }
 
@@ -67,8 +72,13 @@ export function isFree(id, model = {}) {
 // model is offered the hour Zen lists it rather than the hour the catalogue
 // catches up. An id that does not call itself free still needs the catalogue's
 // word (a paid one, or a zero-cost one Zen never named).
+//
+// The same question `isFree` asks, and answered the same way: case-insensitive.
+// Asked case-sensitively, an id like `new-model-FREE` passed the free gate above
+// and then found no protocol here, so it was dropped at the `SDK` lookup below —
+// silently, which is the one outcome the fallback exists to prevent.
 function listedFree(id) {
-  return /-free$/.test(id);
+  return /-free$/i.test(id);
 }
 
 // Which protocol a model is asked at, in the order the answer is trusted: the
@@ -99,6 +109,22 @@ const modalities = (values) =>
     ]),
   );
 
+// A window is a positive whole number of tokens. The catalogue writes an
+// explicit `null` — and an empty string, and a zero — for an axis it does not
+// have, and every one of those used to be copied over the 32768/4096 defaults by
+// the spread below, so the host was handed `context: null` as the model's window.
+const usable = (value) => Number.isSafeInteger(value) && value > 0;
+
+// The limit the model is offered with, from the axes that are usable: the
+// defaults first, then the catalogue's own numbers, then what the plugin has
+// evidence for — each level only contributing axes it can actually state.
+function limitFor(id, declared) {
+  const limit = { context: 32768, output: 4096 };
+  for (const [axis, value] of Object.entries(declared ?? {})) if (usable(value)) limit[axis] = value;
+  for (const [axis, value] of Object.entries(limitOverrides(id, declared))) limit[axis] = value;
+  return limit;
+}
+
 export function buildModels(ids, provider, protocols, baseURL) {
   const result = {};
   for (const id of ids) {
@@ -128,7 +154,7 @@ export function buildModels(ids, provider, protocols, baseURL) {
       providerID: PROVIDER,
       name: model.name ?? id,
       api: { id, url: baseURL, npm: SDK[protocol] },
-      limit: { context: 32768, output: 4096, ...model.limit, ...limitOverrides(id, model.limit) },
+      limit: limitFor(id, model.limit),
       capabilities: {
         temperature: model.temperature ?? true,
         reasoning: model.reasoning ?? false,

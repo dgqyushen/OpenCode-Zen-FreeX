@@ -125,6 +125,8 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 
 偶尔 Zen 会在发出 `[DONE]` 之前就结束一个流式的 Chat Completions 回复。如果回复已经说了内容、且其中没有未完成的工具调用，就以普通回答结束，正文里会说明它被截断了；再问一次就会接着往下走。如果是带着未完成的工具调用被截断、或者什么都没说就断了、或者被折叠给一个不支持流式的客户端，请求就会失败，错误信息里写明这个回复的 id 和收到了多少。走 Anthropic Messages 或 Responses 的回复被截断同样会失败：magpie 能把它和完整的回复区分开，并且在该模型支持的情况下继续往下走。
 
+失败回复的正文会被读一小段，用来找 Zen 自己说出的上下文窗口或输出上限（见下）。因此透传给你的错误正文有两个规矩：读完的按原样给，只去掉描述旧字节的长度、编码与校验头；**没读完的不会冒充完整正文**——状态码仍是上游的，正文换成一段说明（写明上游的状态、读到了多少），并把读到的开头放在 `upstream` 字段里。不这么做的话，超长的错误正文会被截断成一段解析不了的 JSON，看起来像是解析出错而不是 Zen 说了什么。
+
 ## 排查
 
 | 看到的现象 | 这是什么 | 怎么办 |
@@ -134,7 +136,7 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 | `404 … not available as an OpenCode Zen free model now` | Zen 不再免费开放这个模型 | 从错误信息列出的模型里换一个 |
 | `Model is not an available free model for this protocol` | 请求发来时列表变了 | 让宿主刷新模型列表再试 |
 | `uses the public credential` | 存的密钥不是 `public` | 用 `public` 重新登录 |
-| 不带 `FreeTierError` 的 403 | 是别的 403，原样透传 | 按 Zen 自己的错误来读，别当成这个插件的 |
+| 不带 `FreeTierError` 的 403 | 是别的 403：正文原样透传，只去掉描述旧字节的头（`content-length`、`content-encoding`、`transfer-encoding`、`content-md5`、`etag`、`last-modified`） | 按 Zen 自己的错误来读，别当成这个插件的 |
 
 这个插件给出的 403 会写明发出去的措辞来自哪个 OpenCode 版本。那正是 `check:gate` 在问的那份指纹，所以从它开始查，而不是从请求头开始查。
 
@@ -142,4 +144,4 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 
 ## 许可
 
-MIT，分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)。版权署名：`Copyright (c) 2026 xiaozhou26` 是上游原作者，本分支的贡献者另有署名。`LICENSE` 是原样的 MIT 正文，本分支的来源与维护缘由写在 [NOTICE](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/NOTICE)，这样许可证扫描器读到的是一份标准的 MIT 文件，而想知道这个分支为什么存在的人仍然找得到答案。
+MIT，分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)。`LICENSE` 的 MIT 正文原样未改，版权行有两条：上游原作者的 `Copyright (c) 2026 xiaozhou26`，和本分支贡献者的 `Copyright (c) 2026 OpenCode-Zen-FreeX contributors`。本分支的来源与维护缘由写在 [NOTICE](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/NOTICE)，这样许可证扫描器读到的是一份标准的 MIT 文件，而想知道这个分支为什么存在的人仍然找得到答案。

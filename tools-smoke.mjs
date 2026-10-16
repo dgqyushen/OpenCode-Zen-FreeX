@@ -46,31 +46,26 @@
 // not an answer either: it is a defect in fingerprint.json, and the gate names
 // that instead of sending the reader to the network.
 
-import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES, agentFor } from "./core-tools.mjs";
-import { outboundHeaders } from "./provider.mjs";
+import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
 
-const BASE = process.env.ZEN_BASE_URL ?? "https://opencode.ai/inference/v1";
+// The endpoint, from the one place that owns it: a copy here was a second answer
+// that drifted the moment the endpoint moved — this gate would probe the old host
+// and report `unreachable` while the plugin asked the new one. The trailing
+// slashes are stripped because the plugin puts the value through `httpURL`, which
+// does the same: `ZEN_BASE_URL=https://…/v1/` must not become `//chat/completions`.
+const BASE = (process.env.ZEN_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
 const MODEL = process.env.ZEN_CHECK_MODEL ?? "space-bunny-free";
-const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 // A session id of the shape OpenCode makes, since that is part of what is asked.
-let stamp = 0;
-let counter = 0;
+// It is provider.mjs's own `opencodeID` rather than a copy of it: the id is one
+// of the things Zen judges, and a second implementation of it is a second thing
+// to keep right.
 function sessionID() {
-  const now = Date.now();
-  if (now !== stamp) {
-    stamp = now;
-    counter = 0;
-  }
-  counter++;
-  const value = (~(BigInt(now) * 0x1000n + BigInt(counter))) & 0xffffffffffffn;
-  let tail = "";
-  for (const byte of randomBytes(14)) tail += ALPHABET[byte % 62];
-  return `ses_${value.toString(16).padStart(12, "0")}${tail}`;
+  return opencodeID("ses", true);
 }
 
 // Zen gives the same sentence whichever part of a request failed to look like
@@ -144,7 +139,12 @@ async function check(generation, profile, shape, namesOf) {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30000),
     });
-    const text = await response.text();
+    // The status is the verdict; the body only ever explains one. Reading it
+    // first made a 200 whose body was cut — a reset mid-stream, or the 30s
+    // timeout firing while it was still arriving — look like `unreachable`,
+    // "the free tier could not be reached at all", for a request Zen had
+    // answered. Nothing is read on the success path either: a body nobody reads
+    // is a body nobody has to receive.
     if (response.ok)
       return { generation, shape, verdict: "answered", detail: `as ${headers.get("user-agent")}` };
     if (response.status === 426)
@@ -154,6 +154,9 @@ async function check(generation, profile, shape, namesOf) {
         verdict: "superseded",
         detail: "Zen wants a newer OpenCode than this profile claims",
       };
+    // A body that cannot be read leaves the status standing: a 403 whose body
+    // was lost is still a 403, and `says` has nothing to add to it.
+    const text = await response.text().catch(() => "");
     // Only a 403 is the answer this gate reads: Zen quoting the fingerprint
     // back. A 5xx, a 429 or a 401 says something about the service or the way
     // it was asked, and reading any of them as "the fingerprint is stale" sends
@@ -259,6 +262,59 @@ if (entry === undefined) {
   process.exit(1);
 }
 
+// The one-line summary of a run in which the floor was not served everywhere it
+// was asked. `served` is how many floors were answered, `unbuilt` how many could
+// not be built, and `unserved` the verdicts of the rest — which are *not* all
+// refusals: a floor can come back `unreachable` or `failed`, and calling those
+// refused is what pointed the reader at the wording, and at `capture`, over an
+// outage. Exported so a test can pin the wording without asking Zen.
+export function refusedSummary({ served, total, unbuilt, unserved = [] }) {
+  if (!served) {
+    // Being unable to ask is not an answer. Saying the fingerprint has gone stale
+    // when nothing was reached sends the reader to `capture` over a dead network.
+    // Only 403 and 426 are Zen answering about the fingerprint at all: a 5xx or a
+    // 429 was answered by something that never judged it, and counting those as a
+    // verdict would blame the wording for an outage.
+    //
+    // Only the floor decides the exit code, so only the floor is read here: the
+    // `full` shape is reported, not asked on behalf of the plugin, and letting a
+    // stray 5xx on one turn a clean all-refused run into "check the network"
+    // points the reader at an outage the deciding shape never reported.
+    const fingerprint = (verdict) => verdict === "refused" || verdict === "superseded";
+    if (unbuilt.length) {
+      // A request that could not be built was never asked, so nothing about the
+      // network applies to it: the name in `required` with no tool behind it is
+      // in fingerprint.json, and so is the fix.
+      return `${unbuilt.length}/${total} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`;
+    }
+    if (unserved.every(fingerprint)) {
+      return "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.";
+    }
+    if (unserved.some(fingerprint)) {
+      return "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.";
+    }
+    if (!unserved.some((verdict) => verdict === "unreachable")) {
+      return "Zen answered every floor request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.";
+    }
+    return "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.";
+  }
+  // At least one generation works, so the rest are reported by what they
+  // actually were: only the ones Zen refused are called refused.
+  const refused = unserved.filter((verdict) => verdict === "refused" || verdict === "superseded").length;
+  const other = unserved.length - refused;
+  const what = [
+    refused ? `${refused} refused` : null,
+    other ? `${other} not served` : null,
+    unbuilt.length ? `${unbuilt.length} never asked` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const malformed = unbuilt.length
+    ? " The malformed lines above name what fingerprint.json has to gain before those can be asked."
+    : "";
+  return `At least one generation works, so the plugin still has a generation Zen will serve. ${what} of ${total}.${malformed}`;
+}
+
 if (entry) {
   // Each request is independent and every result is printed in order, so the
   // profiles are asked at once and, within each profile, so are its two shapes:
@@ -308,48 +364,23 @@ if (entry) {
   }
 
   if (!served.length) {
-    // Being unable to ask is not an answer. Saying the fingerprint has gone stale
-    // when nothing was reached sends the reader to `capture` over a dead network.
-    // Only 403 and 426 are Zen answering about the fingerprint at all: a 5xx or a
-    // 429 was answered by something that never judged it, and counting those as a
-    // verdict would blame the wording for an outage.
-    //
-    // Only the floor decides the exit code, so only the floor is read here: the
-    // `full` shape is reported, not asked on behalf of the plugin, and letting a
-    // stray 5xx on one turn a clean all-refused run into "check the network"
-    // points the reader at an outage the deciding shape never reported.
-    const answered = (result) => ["refused", "superseded"].includes(result.verdict);
-    const unreached = floor.filter((result) => result.verdict === "unreachable");
-    if (unbuilt.length) {
-      // A request that could not be built was never asked, so nothing about the
-      // network applies to it: the name in `required` with no tool behind it is
-      // in fingerprint.json, and so is the fix.
-      console.log(
-        `${unbuilt.length}/${floor.length} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`,
-      );
-    } else if (floor.every(answered)) {
-      console.log(
-        "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
-      );
-    } else if (floor.some(answered)) {
-      console.log(
-        "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.",
-      );
-    } else if (!unreached.length) {
-      console.log(
-        "Zen answered every floor request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.",
-      );
-    } else {
-      console.log(
-        "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.",
-      );
-    }
+    console.log(
+      refusedSummary({
+        served: 0,
+        total: floor.length,
+        unbuilt,
+        unserved: floor.filter((result) => result.verdict !== "malformed").map((result) => result.verdict),
+      }),
+    );
     process.exitCode = 1;
   } else if (served.length < floor.length) {
     console.log(
-      unbuilt.length
-        ? "Some are refused and some were never asked, but at least one works, so the plugin still has a generation Zen will serve. The malformed lines above name what fingerprint.json has to gain before those can be asked."
-        : "Some are refused but at least one works, so the plugin still has a generation Zen will serve.",
+      refusedSummary({
+        served: served.length,
+        total: floor.length,
+        unbuilt,
+        unserved: floor.filter((result) => result.verdict !== "answered").map((result) => result.verdict),
+      }),
     );
   }
 }

@@ -63,13 +63,17 @@ test("one conversation keeps one session, another gets its own", () => {
   assert.equal(signaled, sessionID(new Headers({ "conversation-id": "conversation-d" }), {}));
 });
 
-test("a request with no signal and no user message gets one id, not a new one a turn", () => {
-  // Nothing to key a conversation by: the id cannot be kept for a next turn,
-  // but it must still be the shape Zen checks rather than a bare made-up value.
+test("a request with no signal and no user message gets an id of its own, not a shared one", () => {
+  // Nothing to key a conversation by: the id cannot be kept for a next turn, so
+  // it is minted fresh — and it must still be the shape Zen checks rather than a
+  // bare made-up value. Two of them differ, which is the half a name like "one
+  // id, not a new one a turn" got wrong: a single constant here would fold every
+  // such request into whichever conversation happened to arrive first.
   const first = sessionID(new Headers(), {});
   const second = sessionID(new Headers(), {});
   assert.ok(realSessionID(first), first);
   assert.ok(realSessionID(second), second);
+  assert.notEqual(first, second, "nothing names this conversation, so nothing may be shared");
 });
 
 test("OpenCode's own session id is passed through, a hash cut to its shape is not", () => {
@@ -109,9 +113,17 @@ test("a burst that fills the counter field still makes OpenCode's ids", () => {
 });
 
 test("a session id is never minted from a signal that is not a string", () => {
-  // A body is the host's to fill in, so `metadata.session_id` is not
-  // guaranteed to be text; a number there is not a session the tier could have
-  // seen, and hashing it would throw out of the request path.
-  const id = sessionID(new Headers(), { metadata: { session_id: 42 } });
-  assert.ok(realSessionID(id), id);
+  // A body is the host's to fill in, so `metadata.session_id` is not guaranteed
+  // to be text; a number there is not a session the tier could have seen. The
+  // guard is not about throwing — the hash is a template literal, so it would
+  // coerce the number rather than fail — it is about not keying by it: with the
+  // guard gone, both calls below would answer one session, hashed from "42".
+  const first = sessionID(new Headers(), { metadata: { session_id: 42 } });
+  const second = sessionID(new Headers(), { metadata: { session_id: 42 } });
+  assert.ok(realSessionID(first), first);
+  // and it is not the text "42" either: the number is ignored rather than
+  // coerced, so what the string keys must not be what the number answered.
+  const text = sessionID(new Headers(), { metadata: { session_id: "42" } });
+  assert.notEqual(first, text, "42 is not \"42\"");
+  assert.notEqual(first, second, "a number is not a session to key a conversation by");
 });

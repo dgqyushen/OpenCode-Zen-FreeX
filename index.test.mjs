@@ -8,7 +8,21 @@ import { requestFor } from "./tools-smoke.mjs";
 
 const subject = import("./index.mjs").then((module) => ({
   default: { server: module.ZenFreePlugin },
+  module,
 }));
+
+// Which names a host may read the plugin off. magpie builds one from
+// `default.server`; the named exports stay for anything that imported one by
+// name. All three are the same read of provider.mjs's own export, so pinning
+// them here is what keeps a name that no test uses from being repointed or
+// dropped without anything noticing.
+test("the plugin is reached by every name this module offers, and the id comes with it", async () => {
+  const { module } = await subject;
+  assert.equal(typeof module.server, "function");
+  assert.equal(module.server, module.ZenFreePlugin);
+  assert.equal(module.server, module.default.server);
+  assert.equal(typeof module.default.id, "string");
+});
 
 // The names the HTTP stack adds on its own rather than the plugin choosing
 // them, in one place so the three tests that pin the outbound set cannot drift
@@ -36,7 +50,16 @@ const PLUGIN_HEADERS = [
 // How long a race against a loopback round-trip is given before it is read as
 // "it never happened". Generous on purpose: a loaded CI runner is slow, and a
 // false failure here says nothing about the behaviour under test.
-const WATCHDOG_MS = Number(process.env.TEST_WATCHDOG_MS ?? 5000);
+//
+// A configured value that is not a usable number of milliseconds is a mistake
+// the environment makes rather than anything about the plugin: `??` keeps an
+// exported-but-empty variable (`TEST_WATCHDOG_MS=` parses to 0) and a
+// non-numeric one parses to NaN, and either would let every watchdog fire at
+// once and fail these races for a reason that is not in this package. Neither
+// is trusted; both fall back to the default.
+const configuredWatchdog = Number(process.env.TEST_WATCHDOG_MS);
+const WATCHDOG_MS =
+  Number.isFinite(configuredWatchdog) && configuredWatchdog > 0 ? configuredWatchdog : 5000;
 
 // The User-Agent the capture composes for a generation and protocol
 // (core-tools.mjs builds that string). Read from fingerprint.json rather than
@@ -111,6 +134,16 @@ async function fixture(t, input = {}) {
         state.docsText ??
           `| Model | chat-free | \`https://opencode.ai/zen/v1/${state.chatProtocol ?? "chat/completions"}\` | sdk |`,
       );
+    } else if (state.hangBody) {
+      // Headers and a length, then silence: the read this plugin makes of a
+      // refusal is bounded in time as well as in size, and what it does when
+      // the boundary is a body that never arrives is what this branch pins.
+      res.writeHead(state.status ?? 403, {
+        "content-type": "application/json",
+        "content-length": "999",
+        ...upstreamHeaders(),
+      });
+      res.flushHeaders();
     } else if (state.body !== undefined) {
       res.writeHead(state.status ?? 403, { "content-type": "application/json", ...upstreamHeaders() });
       res.end(state.body);
@@ -581,7 +614,10 @@ test("presents the generation the tools say, and a host that names its own", asy
   // A host declaring 2.x tools is answered as 2.x, without a gap being filled.
   await send([tool("shell", "Execute a shell command and return its output."), tool("read", "Read the contents of a file or directory.")]);
   const two = lastCall(state);
-  assert.equal(two.headers["user-agent"], "opencode/latest/2.0.29/cli");
+  // Derived from the capture, not written out: the 2.x User-Agent is composed
+  // from fingerprint.json's own channel/version/client, so a re-capture moves
+  // this expectation with the code instead of leaving a literal behind.
+  assert.equal(two.headers["user-agent"], agentOf("2.x"));
   assert.deepEqual(
     two.body.tools.map((t) => t.function.name),
     ["shell", "read"],
@@ -834,23 +870,86 @@ test("a rewritten refusal carries headers for the body it actually returns", asy
   assert.match(error.message, /wording/i);
 });
 
-// A 403 that is not the free tier's is somebody else's answer, and it is left
-// as it arrived — including the headers describing its own bytes.
-test("a 403 that is not the free tier's is left as sent", async (t) => {
+// A 403 that is not the free tier's is somebody else's answer, and nothing here
+// invents a diagnosis for it: the message relayed is the one that arrived. Its
+// headers are another matter. By the time it is relayed the body has been read
+// once and written again, so the length, the encoding and the validators the
+// upstream sent describe bytes this package no longer has — "left as it
+// arrived" cannot include them, or a caller that trusted them would fail to
+// read a message that is perfectly readable.
+test("a 403 that is not the free tier's keeps its message, under headers for the bytes relayed", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
   state.status = 403;
-  state.responseHeaders = { etag: '"someone-elses"' };
+  state.responseHeaders = {
+    etag: '"someone-elses"',
+    "content-length": "999",
+    "content-encoding": "identity",
+  };
   state.body = JSON.stringify({ error: { message: "quota exhausted for this account" } });
   const response = await loader.fetch(`${origin}/v1/chat/completions`, {
     method: "POST",
     body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
   });
   assert.equal(response.status, 403);
-  assert.equal(response.headers.get("etag"), '"someone-elses"');
+  for (const name of ["etag", "content-length", "content-encoding"]) {
+    assert.equal(
+      response.headers.get(name),
+      null,
+      `${name} still describes the upstream's bytes, not the relayed ones`,
+    );
+  }
   assert.match(await response.text(), /quota exhausted for this account/);
 });
+
+// What is read of a refusal is bounded, and a body past that budget is not the
+// body: relaying the slice as though it were the reply hands a host a broken
+// JSON document with nothing saying anything is missing. The answer keeps the
+// upstream's status, says what happened, and carries the opening that was read.
+test("an error body past the read budget is relayed as a refusal that says so", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const long = `{"error":{"message":"${"x".repeat(5000)}"}}`;
+  state.status = 400;
+  state.responseHeaders = { etag: '"long-body"', "content-length": String(long.length) };
+  state.body = long;
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 400, "the upstream's status is the answer's status");
+  assert.equal(response.headers.get("etag"), null, "and its validator does not describe these bytes");
+  assert.equal(response.headers.get("content-type"), "application/json");
+  const { error } = await response.json();
+  assert.match(error.message, /HTTP 400/);
+  assert.match(error.message, /ran past the \d+ characters/);
+  assert.equal(error.upstream, long.slice(0, 512) + "…", "the opening that was read is carried along");
+});
+
+// A body that cannot be read at all is not an empty body. Handing the caller an
+// empty answer says the upstream replied with nothing, which is a different
+// fact and a misleading one — and the bytes cannot be gone back for, since this
+// read is the body's only reader.
+test(
+  "an error body that cannot be read is answered as unreadable, not as empty",
+  { timeout: 15_000 },
+  async (t) => {
+    const { plugin, state, origin } = await fixture(t);
+    await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    const loader = await plugin.auth.loader(publicAuth);
+    state.status = 403;
+    state.hangBody = true;
+    const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 403);
+    const { error } = await response.json();
+    assert.match(error.message, /could not be read at all/);
+  },
+);
 
 for (const [path, model, key] of [
   ["responses", "responses-free", "parameters"],

@@ -354,8 +354,9 @@ What ships is `package.json`'s `files` list, and it is deliberately narrower tha
 the repository: the three maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
 `limits-audit.mjs`) stay here, because a host never loads them and one of them
 rewrites the shipped `fingerprint.json` if it is ever imported. `LICENSE` is
-verbatim MIT; the fork's provenance is in `NOTICE`, so a licence scanner reads a
-standard MIT file and a reader still finds why this fork exists.
+MIT with its text unmodified and both copyright lines in place — upstream's and
+this fork's — so what a licence scanner reads is a standard MIT file; the fork's
+provenance is in `NOTICE`, which is where a reader finds why this fork exists.
 
 **The second factor is a browser, not a password.** Run `npm publish` in a
 terminal. When the account has 2FA on, the command stops and offers the whole

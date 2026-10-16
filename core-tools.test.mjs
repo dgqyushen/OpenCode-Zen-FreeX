@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,12 +17,14 @@ const MODULE = readFileSync(new URL("./core-tools.mjs", import.meta.url), "utf8"
 const CAPTURE = readFileSync(new URL("./fingerprint.json", import.meta.url), "utf8");
 
 // A loader for a scratch copy in a fresh directory. Passing no fingerprint is
-// the missing-file case; the directory is removed when the test ends.
+// the missing-file case, `true` is a directory standing where the file should
+// be (the unreadable one), and the directory is removed when the test ends.
 function scratch(t, fingerprint) {
   const dir = mkdtempSync(join(tmpdir(), "zenfree-core-tools-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   writeFileSync(join(dir, "core-tools.mjs"), MODULE);
-  if (fingerprint !== undefined) writeFileSync(join(dir, "fingerprint.json"), fingerprint);
+  if (fingerprint === true) mkdirSync(join(dir, "fingerprint.json"));
+  else if (fingerprint !== undefined) writeFileSync(join(dir, "fingerprint.json"), fingerprint);
   return () => import(pathToFileURL(join(dir, "core-tools.mjs")).href);
 }
 
@@ -35,6 +37,42 @@ function thrown(act) {
     return error;
   }
   return assert.fail("expected the call to throw");
+}
+
+// Every import-time failure names the file to fix and the command that writes it.
+// Spelled once because the module's remedy text is one string: if it is reworded
+// it has to be reworded here and nowhere else.
+function assertCaptureFailure(failure, what) {
+  assert.match(failure.message, /fingerprint\.json/, what);
+  assert.match(failure.message, /bun run capture/, what);
+}
+
+// The generation whose agent is composed per protocol, and its captured
+// provider-utils. Both tests around it need the same scan, and the guard is what
+// makes it mean something: `assert.ok(entry)` alone accepts a profile whose
+// provider-utils was captured as `{}`, and the loops below then iterate zero
+// times — the per-protocol composition would never be exercised, and this file
+// would go green without checking it. The predicate is guarded because a profile
+// without an `agent` is a shape the module deliberately accepts and loads (the
+// `{"9.x":{}}` case below pins that), so it must miss here rather than throw a
+// TypeError out of `find`.
+function perProtocolProfile() {
+  const entry = Object.entries(PROFILES).find(([, profile]) => profile.agent?.providerUtils);
+  assert.ok(entry, "the capture is expected to hold a per-protocol profile");
+  const [generation, profile] = entry;
+  const protocols = Object.keys(profile.agent.providerUtils);
+  assert.ok(protocols.length, "with at least one protocol in it");
+  return { generation, profile, protocols };
+}
+
+// The generation whose agent is the release shape, which composes its
+// User-Agent out of channel/version/client instead of a provider-utils version.
+function releaseProfile() {
+  const entry = Object.entries(PROFILES).find(
+    ([, profile]) => profile.agent && !profile.agent.providerUtils,
+  );
+  assert.ok(entry, "the capture is expected to hold a release-shaped profile");
+  return entry;
 }
 
 test("a scratch copy with the project's own capture reads it back", async (t) => {
@@ -51,8 +89,8 @@ test("a missing capture names the file and the remedy, keeping the cause", async
     () => assert.fail("importing a copy with no capture must fail"),
     (error) => error,
   );
-  assert.match(failure.message, /fingerprint\.json/);
-  assert.match(failure.message, /bun run capture/);
+  assertCaptureFailure(failure);
+  assert.match(failure.message, /missing/, "an absent file is what is wrong with it");
   assert.equal(failure.cause?.code, "ENOENT");
 });
 
@@ -61,9 +99,26 @@ test("a corrupt capture is named the same way, with the parse error as the cause
     () => assert.fail("importing a copy with a corrupt capture must fail"),
     (error) => error,
   );
-  assert.match(failure.message, /fingerprint\.json/);
-  assert.match(failure.message, /bun run capture/);
+  assertCaptureFailure(failure);
+  assert.match(failure.message, /invalid JSON/, "the parse failure is what is wrong with it");
   assert.ok(failure.cause instanceof SyntaxError, "the parse error is kept as the cause");
+});
+
+// A capture that cannot be read at all is neither absent nor corrupt, and the
+// remedy (`bun run capture`, which writes the file) cannot fix a permissions
+// problem. A directory standing where the capture belongs is the one such case
+// a test can build on every platform, and it is the same EISDIR an unreadable
+// file produces.
+test("an unreadable capture is not reported as missing or invalid JSON", async (t) => {
+  const failure = await scratch(t, true)().then(
+    () => assert.fail("importing a copy whose capture cannot be read must fail"),
+    (error) => error,
+  );
+  assertCaptureFailure(failure);
+  assert.doesNotMatch(failure.message, /missing/, "the file is there, it just cannot be read");
+  assert.doesNotMatch(failure.message, /invalid JSON/, "nothing was parsed, so nothing was invalid");
+  assert.match(failure.message, /EISDIR|EACCES|EPERM/, "the cause's own code is passed on");
+  assert.equal(failure.cause?.code, "EISDIR");
 });
 
 // A capture that lost every profile cannot tell one generation from another, so
@@ -81,8 +136,7 @@ test("a capture that carries no profile at all fails at import", async (t) => {
       () => assert.fail(`${what}: importing must fail`),
       (error) => error,
     );
-    assert.match(failure.message, /fingerprint\.json/, what);
-    assert.match(failure.message, /bun run capture/, what);
+    assertCaptureFailure(failure, what);
   }
 });
 
@@ -112,9 +166,7 @@ test("an uncaptured generation is named, with the profiles the capture holds", (
 // interpolated as the literal `undefined` — a malformed fingerprint sent to Zen,
 // which answers with something that says nothing about where it came from.
 test("a protocol with no captured provider-utils is named", () => {
-  const entry = Object.entries(PROFILES).find(([, profile]) => profile.agent.providerUtils);
-  assert.ok(entry, "the capture is expected to hold a per-protocol profile");
-  const [generation, profile] = entry;
+  const { generation, profile, protocols } = perProtocolProfile();
   for (const protocol of ["systemone", "constructor", "toString"]) {
     const failure = thrown(() => agentFor(generation, protocol));
     assert.ok(
@@ -125,7 +177,7 @@ test("a protocol with no captured provider-utils is named", () => {
       failure.message.includes(JSON.stringify(generation)),
       "the generation it was asked of",
     );
-    for (const captured of Object.keys(profile.agent.providerUtils))
+    for (const captured of protocols)
       assert.ok(failure.message.includes(captured), `the message names the captured ${captured}`);
   }
 });
@@ -133,13 +185,11 @@ test("a protocol with no captured provider-utils is named", () => {
 // The control for the two above: a protocol the capture did observe still
 // composes the User-Agent the capture describes, unchanged.
 test("a captured protocol still composes its own User-Agent", () => {
-  const entry = Object.entries(PROFILES).find(([, profile]) => profile.agent.providerUtils);
-  assert.ok(entry, "the capture is expected to hold a per-protocol profile");
-  const [generation, profile] = entry;
-  for (const [protocol, version] of Object.entries(profile.agent.providerUtils)) {
+  const { generation, profile, protocols } = perProtocolProfile();
+  for (const protocol of protocols) {
     assert.equal(
       agentFor(generation, protocol),
-      `opencode/${profile.agent.opencode} ai-sdk/provider-utils/${version} ${profile.agent.runtime}`,
+      `opencode/${profile.agent.opencode} ai-sdk/provider-utils/${profile.agent.providerUtils[protocol]} ${profile.agent.runtime}`,
     );
   }
 });
@@ -161,12 +211,79 @@ test("a differently named generation loads, and an empty profile is named", asyn
 // for — the protocol is not consulted there, and asking for one the capture has
 // no provider-utils for must not change what that branch sends.
 test("a generation without provider-utils keeps its release User-Agent", () => {
-  const entry = Object.entries(PROFILES).find(([, profile]) => !profile.agent.providerUtils);
-  assert.ok(entry, "the capture is expected to hold a release-shaped profile");
-  const [generation, { agent }] = entry;
+  const [generation, { agent }] = releaseProfile();
   const expected = `opencode/${agent.channel}/${agent.opencode}/${agent.client}`;
   assert.equal(agentFor(generation), expected);
   assert.equal(agentFor(generation, "systemone"), expected);
+});
+
+// The release branch is selected by the *absence* of provider-utils, so the
+// three fields it interpolates are the whole of what it sends: one missing or
+// mistyped used to compose `opencode/undefined/1.19.0/undefined`, and Zen
+// answers a header like that with a refusal saying nothing about the capture.
+test("a release profile that does not fill in its User-Agent is named", async (t) => {
+  for (const [what, agent] of [
+    ["a absent channel", { opencode: "2.0.29", client: "cli" }],
+    ["a blank channel", { channel: "", opencode: "2.0.29", client: "cli" }],
+    ["a numeric channel", { channel: 5, opencode: "2.0.29", client: "cli" }],
+    ["no client", { channel: "latest", opencode: "2.0.29" }],
+    ["no opencode version", { channel: "latest", client: "cli" }],
+  ]) {
+    const { agentFor: copied } = await scratch(t, JSON.stringify({ profiles: { "9.x": { agent } } }))();
+    const failure = thrown(() => copied("9.x"));
+    assert.ok(failure.message.includes("9.x"), `${what}: names the generation`);
+    assert.doesNotMatch(failure.message, /opencode\/(undefined|null|5)\//, what);
+    assert.doesNotMatch(failure.message, /\/undefined$/, what);
+  }
+});
+
+// Same gap on the per-protocol branch: `Object.hasOwn` proves the protocol key
+// is there, not that its version is a usable string, and `agent.runtime` was
+// interpolated with no check at all.
+test("a per-protocol profile with a field that is not a string is named", async (t) => {
+  for (const [what, agent] of [
+    [
+      "a null version",
+      { opencode: "1.19.0", providerUtils: { chat: null }, runtime: "runtime/bun/1.3.14" },
+    ],
+    [
+      "a blank version",
+      { opencode: "1.19.0", providerUtils: { chat: "" }, runtime: "runtime/bun/1.3.14" },
+    ],
+    [
+      "no runtime",
+      { opencode: "1.19.0", providerUtils: { chat: "4.0.23" } },
+    ],
+    [
+      "a provider-utils that is not a table",
+      { opencode: "1.19.0", providerUtils: "4.0.23", runtime: "runtime/bun/1.3.14" },
+    ],
+  ]) {
+    const { agentFor: copied } = await scratch(t, JSON.stringify({ profiles: { "9.x": { agent } } }))();
+    const failure = thrown(() => copied("9.x", "chat"));
+    assert.ok(failure.message.includes("9.x"), `${what}: names the generation`);
+    assert.doesNotMatch(failure.message, /provider-utils\/(null|undefined)/, what);
+    assert.doesNotMatch(failure.message, /\sundefined$/, what);
+  }
+});
+
+// Ownership of the key is only half of "the capture holds this generation": a
+// truncated or hand-edited capture can own it with a value that is not a profile
+// at all, and `Object.hasOwn` alone used to hand that back so the caller's
+// `.agent` threw the anonymous TypeError this function exists to prevent.
+test("a profile that is not an object is named rather than read", async (t) => {
+  for (const value of [null, 5, "1.x", [], true]) {
+    const { agentFor: copied } = await scratch(
+      t,
+      JSON.stringify({ profiles: { "9.x": value } }),
+    )();
+    const failure = thrown(() => copied("9.x"));
+    assert.ok(failure instanceof Error, `${JSON.stringify(value)}: an Error, not a TypeError`);
+    assert.ok(!(failure instanceof TypeError), `${JSON.stringify(value)}: not the anonymous one`);
+    assert.match(failure.message, /9\.x/, `${JSON.stringify(value)}: names the generation`);
+    assert.match(failure.message, /not an object/, `${JSON.stringify(value)}: says what is wrong`);
+    assert.match(failure.message, /bun run capture/);
+  }
 });
 
 // Tool names move far less often than descriptions do, which is what this reads.

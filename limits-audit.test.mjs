@@ -134,14 +134,23 @@ test("a 400 the audit provoked is not a candidate, and the ones it cannot explai
   ];
   const rowFor = (id) => rows.find((row) => row.id === id);
   const lines = findings(rows);
-  assert.equal(lines.filter((line) => line.startsWith("provoked-free")).length, 0);
+  // Anchored on the delimiter, as the rest of this file is: a bare prefix also
+  // matches a longer id that shares it, so the assertion would be talking about a
+  // row it never meant to. `lineFor` below says the same thing positively.
+  assert.equal(lines.filter((line) => line.startsWith("provoked-free:")).length, 0);
   assert.equal(lineFor(lines, "narrow-free"), "narrow-free: a refusal named a window of 1048576, the catalogue declares 200000");
   assert.equal(lineFor(lines, "silent-free"), "silent-free: HTTP 400 — invalid request");
   assert.equal(lineFor(lines, "dead-free"), "dead-free: HTTP 410 — Model has been deprecated.");
   // a model that speaks another protocol is said once, beside the ids that were
   // not asked, and never sits in this list as a finding. The rows are named, not
   // counted from the end: appending one must not retarget these assertions.
-  assert.equal(lines.filter((line) => line.startsWith("wrong-shape-free")).length, 0);
+  assert.equal(lines.filter((line) => line.startsWith("wrong-shape-free:")).length, 0);
+  // and the anchor is what makes that a statement about this id: a sibling whose
+  // id merely starts with the same string is a different row, and the bare-prefix
+  // form of this assertion used to trip on it
+  const sibling = findings([...rows, { id: "provoked-free-2", declared: {}, status: 410, says: "gone" }]);
+  assert.equal(sibling.filter((line) => line.startsWith("provoked-free:")).length, 0);
+  assert.equal(lineFor(sibling, "provoked-free-2"), "provoked-free-2: HTTP 410 — gone");
   assert.equal(protocolScoped(rowFor("wrong-shape-free")), true);
   assert.equal(lineFor(lines, "bad-format-free"), "bad-format-free: HTTP 400 — invalid request format");
   // the heuristic has to answer no for a row that names no other shape, or every
@@ -365,4 +374,59 @@ test("a refusal is read to the budget and no further, and the reader is released
   assert.equal(huge.seen.cancelled, true);
   // a body with no reader to cancel is small by construction and still bounded
   assert.equal(await readPrefix({ body: null, text: async () => "z".repeat(100) }, 10), "z".repeat(10));
+});
+
+test("a request that cannot be built is that id's own row, not the end of the run", async () => {
+  const { ask } = await subject();
+  // A name in `required` with no entry in that profile's `tools` makes
+  // `chatRequest` throw. Built outside the guard, that rejected the whole
+  // `Promise.all` batch: the audit asked nothing, and the entry point printed
+  // "unable to ask … check the network" — a broken fingerprint reported as a
+  // transport failure. Inside it, the id gets its own status-0 row. Nothing is
+  // sent: the request is refused before it exists.
+  const answer = await ask("any-free", ["no-such-tool-in-any-profile"]);
+  assert.equal(answer.status, 0);
+  assert.match(answer.says, /has no tool named "no-such-tool-in-any-profile" in fingerprint\.json/);
+  assert.equal(answer.upstream, undefined);
+  assert.equal(answer.ceiling, undefined);
+});
+
+test("the pair a row is judged by is the plugin's, not the catalogue's under it", async () => {
+  const { withEffective } = await subject();
+  // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue and
+  // 1048576/384000 by limits.mjs. The row has to carry the second pair, or the
+  // table would print one number and the findings would compare another.
+  const row = withEffective({
+    id: "deepseek-v4.1-flash-free",
+    declared: { context: 200000, output: 32000 },
+    status: 200,
+  });
+  assert.deepEqual(row.declared, { context: 200000, output: 32000 }, "the catalogue's own pair stays readable");
+  assert.equal(row.effective.context, 1048576);
+  assert.equal(row.effective.output, 384000);
+  // An id with no evidence is judged by its catalogue pair unchanged.
+  const plain = withEffective({ id: "nothing-measured-free", declared: { context: 1000, output: 100 }, status: 200 });
+  assert.deepEqual(plain.effective, { context: 1000, output: 100 });
+});
+
+test("a sibling is measured against the pair the plugin declares, not the catalogue's", async () => {
+  const { findings, withEffective } = await subject();
+  // Both rows share an upstream and the catalogue lists both at 200000/32000, so
+  // a comparison over `declared` sees one pair, skips the group, and never raises
+  // the sibling. The plugin's own pair is what the table prints and what a
+  // sibling has to be measured against: 1048576/384000 against 200000/32000 is
+  // the under-declaration this list exists to find.
+  const rows = [
+    withEffective({ id: "deepseek-v4.1-flash-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
+    withEffective({ id: "sibling-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
+  ];
+  assert.deepEqual(findings(rows), [
+    "sibling-free: declared 200000/32000, and up is also served as deepseek-v4.1-flash-free (1048576/384000)",
+  ]);
+  // and the pair printed beside it is the plugin's too, so the line cannot
+  // contradict the table it sits under
+  assert.equal(
+    findings([rows[1], rows[0]]).some((line) => line.includes("(200000/32000)")),
+    false,
+  );
 });

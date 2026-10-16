@@ -3,7 +3,9 @@
 This package is a maintained fork of the OpenCode Zen Free plugin from
 [magpie-community/plugins](https://github.com/magpie-community/plugins), which
 is MIT licensed. Upstream's notice, `Copyright (c) 2026 xiaozhou26`, is kept in
-[LICENSE](./LICENSE) alongside this fork's own.
+[LICENSE](./LICENSE) alongside this fork's own — the second copyright line
+there, `Copyright (c) 2026 OpenCode-Zen-FreeX contributors`. The license text
+itself is unmodified MIT.
 
 The fork is maintained separately from upstream under the name
 `opencode-zen-freex` (https://github.com/tkhs101/OpenCode-Zen-FreeX) because the

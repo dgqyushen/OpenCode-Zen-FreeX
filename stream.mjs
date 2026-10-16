@@ -143,10 +143,24 @@ function chatAccumulator() {
           choice.finish_reason = part.finish_reason;
         if (part.logprobs) {
           choice.logprobs ??= {};
+          // Written as a defined own property, and read back as one. A
+          // "__proto__" key arrives as an own property of the parsed object,
+          // and `choice.logprobs[key] = value` would take the inherited
+          // accessor instead: an object value silently re-parented the
+          // accumulated object and the key never reached the reply, while an
+          // array value read Object.prototype back and spread it, throwing
+          // "not iterable" — a 502 on an otherwise valid stream. The delta
+          // written by tool-response.mjs follows the same rule.
           for (const [key, value] of Object.entries(part.logprobs)) {
-            if (Array.isArray(value))
-              choice.logprobs[key] = [...(choice.logprobs[key] ?? []), ...value];
-            else choice.logprobs[key] = value;
+            const held = Object.hasOwn(choice.logprobs, key) ? choice.logprobs[key] : undefined;
+            Object.defineProperty(choice.logprobs, key, {
+              value: Array.isArray(value)
+                ? [...(Array.isArray(held) ? held : []), ...value]
+                : value,
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            });
           }
         }
       }
@@ -317,7 +331,15 @@ function anthropicAccumulator() {
         for (const [position, block] of (data.message?.content ?? []).entries())
           if (carries(block, blocks.get(position), fields)) blocks.set(position, block);
       } else if (type === "content_block_start") {
-        blocks.set(index(data.index), data.content_block);
+        // The same test message_start's blocks get, for the same reason: a
+        // gateway re-emitting a block's opening frame carries a block that
+        // was never filled in (a text one opens with text: ""), and taking
+        // it would discard the text, thinking or signature the deltas
+        // already delivered. A start with nothing accumulated applies, as
+        // does one that carries content of its own.
+        const position = index(data.index);
+        if (carries(data.content_block, blocks.get(position), fields))
+          blocks.set(position, data.content_block);
       } else if (type === "content_block_delta") {
         const position = index(data.index);
         const block = blocks.get(position);

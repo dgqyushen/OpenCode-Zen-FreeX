@@ -26,4 +26,16 @@ npmrc
 *.keystore
 *.der
 id_rsa*
+# The public halves are not secrets, and a fixture or a deploy note legitimately
+# carries one: `id_rsa*` above swallows them, so they are put back by name.
+!id_rsa.pub
 id_ed25519*
+!id_ed25519.pub
+# The rest of `ssh-keygen`'s types, and PuTTY's own key file — the one most
+# likely to be sitting in the working directory on the Windows setup this
+# project targets.
+id_ecdsa*
+!id_ecdsa.pub
+id_dsa*
+!id_dsa.pub
+*.ppk

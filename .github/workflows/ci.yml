@@ -31,6 +31,17 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # The two places the runtime is pinned are linked here: this env value and
+      # `packageManager` in package.json. Nothing else compares them, so an upgrade
+      # on one side alone would leave the suite and the gate running on a Bun the
+      # project no longer declares and nothing would fail.
+      - name: The pinned Bun is the one package.json declares
+        run: |
+          declared="$(node -p "require('./package.json').packageManager")"
+          if [ "$declared" != "bun@$BUN_VERSION" ]; then
+            echo "package.json declares $declared while this workflow pins $BUN_VERSION; bump both together." >&2
+            exit 1
+          fi
       # These never touch the network: they are the plugin's own behaviour.
       - run: bun test
 
@@ -75,4 +86,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Note a gate that did not pass
         if: steps.gate.outcome == 'failure'
-        run: echo "::warning title=Zen gate did not pass::The free tier may have moved; see the run summary for its report."
+        # The one exit code covers several unrelated diagnoses — Zen has moved past
+        # every generation, a `required` name has no tool behind it in
+        # fingerprint.json, or the floor was rate-limited/5xx'd and never judged —
+        # and the step outcome carries no cause. Naming one of them here is the
+        # misdirection the gate's own verdict lines exist to prevent, so this says
+        # where the cause is written instead of guessing at it.
+        run: echo "::warning title=Zen gate did not pass::The gate did not pass; read the run summary — its verdict lines say whether Zen moved, which profile is malformed, or whether the free tier could not be judged."

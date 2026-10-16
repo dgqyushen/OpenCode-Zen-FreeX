@@ -85,13 +85,28 @@ export function groupByUpstream(rows) {
   return groups;
 }
 
+// A row as `run` builds it: the catalogue's own pair under `declared`, which is
+// what the "catalogue says …" note prints, and the pair the plugin really puts on
+// the wire under `effective` — the catalogue's with limits.mjs over it. The two
+// are the same for every id with no evidence against it, which is most of them.
+export function withEffective(row, table = LIMITS) {
+  const declared = row.declared ?? {};
+  return { ...row, effective: { ...declared, ...limitOverrides(row.id, declared, table) } };
+}
+
+// The pair a row is judged by: what the plugin declares, not what the catalogue
+// lists under it. Reading `declared` here while the table printed `effective` is
+// how a sibling the plugin declares far below the numbers the evidence already
+// carries was never raised, and how a line could contradict the table above it.
+const judgement = (row) => row.effective ?? row.declared ?? {};
+
 // What is worth a measurement, in the order it should be read. `covered` are the
 // ids limits.mjs already carries evidence for, which are said once and not
 // raised again. Exported for the tests.
 export function findings(rows, covered = new Set()) {
   const out = [];
   for (const row of rows) {
-    const declared = row.declared ?? {};
+    const declared = judgement(row);
     // An id limits.mjs already carries evidence for is not asked for again: its
     // numbers are in the table and repeating them here would bury what is new.
     // Its status is still printed in the table above, so a model that dies is
@@ -129,19 +144,18 @@ export function findings(rows, covered = new Set()) {
     // were asked, and their numbers are already in the table.
     const spoke = list.filter((row) => !protocolScoped(row));
     if (spoke.length < 2) continue;
-    if (new Set(spoke.map((row) => `${row.declared?.context}/${row.declared?.output}`)).size < 2) continue;
-    const largest = (axis) => Math.max(...spoke.map((row) => row.declared?.[axis] ?? 0));
+    const pair = (row) => judgement(row);
+    if (new Set(spoke.map((row) => `${pair(row).context}/${pair(row).output}`)).size < 2) continue;
+    const largest = (axis) => Math.max(...spoke.map((row) => pair(row)[axis] ?? 0));
     for (const row of spoke) {
       if (covered.has(row.id)) continue;
-      if ((row.declared?.context ?? 0) >= largest("context") && (row.declared?.output ?? 0) >= largest("output"))
+      if ((pair(row).context ?? 0) >= largest("context") && (pair(row).output ?? 0) >= largest("output"))
         continue;
       const siblings = spoke
         .filter((other) => other.id !== row.id)
-        .map((other) => `${other.id} (${other.declared?.context}/${other.declared?.output})`)
+        .map((other) => `${other.id} (${pair(other).context}/${pair(other).output})`)
         .join(", ");
-      out.push(
-        `${row.id}: declared ${row.declared?.context}/${row.declared?.output}, and ${upstream} is also served as ${siblings}`,
-      );
+      out.push(`${row.id}: declared ${pair(row).context}/${pair(row).output}, and ${upstream} is also served as ${siblings}`);
     }
   }
   return out;
@@ -228,17 +242,26 @@ export async function readPrefix(response, limit = READ_BUDGET) {
 // One cheap question per id. The ceiling asked for is past anything this route
 // serves, so an upstream that validates it says what it allows, and the stream
 // is dropped as soon as it starts rather than paying for an answer nobody reads.
-async function ask(id, names) {
-  const { headers, body } = chatRequest({
-    model: id,
-    generation: GENERATION,
-    profile: PROFILES[GENERATION],
-    names,
-    maxTokens: ASKED_CEILING,
-  });
+// Exported so a test can hand it a broken request without asking the route: a
+// request that cannot be built is answered before anything is sent.
+export async function ask(id, names) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45000);
   try {
+    // Built inside the guard, because building it is the one thing here that can
+    // throw on its own: a name in `required` with no entry in that profile's
+    // `tools` raises before a request exists. Outside the guard that threw out of
+    // the whole `Promise.all` batch, so the audit asked nothing at all and the
+    // entry point reported "unable to ask … check the network" — a broken
+    // fingerprint read as an apparent transport failure, with every id's own
+    // status-0 row skipped. tools-smoke.mjs guards this same case the same way.
+    const { headers, body } = chatRequest({
+      model: id,
+      generation: GENERATION,
+      profile: PROFILES[GENERATION],
+      names,
+      maxTokens: ASKED_CEILING,
+    });
     const response = await fetch(`${BASE}/chat/completions`, {
       method: "POST",
       headers,
@@ -426,7 +449,10 @@ async function run() {
     const batch = await Promise.all(
       asked.slice(at, at + POOL).map(async (id) => {
         const answer = await ask(id, names);
-        return { id, declared: models[id]?.limit ?? {}, ...answer };
+        // The pair the plugin puts on the wire travels with the row, so the
+        // table, the sibling list and the candidates all read one number
+        // instead of three that can be computed from different things.
+        return withEffective({ id, declared: models[id]?.limit ?? {}, ...answer });
       }),
     );
     rows.push(...batch);
@@ -435,8 +461,7 @@ async function run() {
   // What the plugin declares is the catalogue's limit with limits.mjs over it,
   // so that is what is printed; the catalogue's own pair is shown beside it when
   // the two differ, since that is the under-report being answered.
-  for (const { id, declared, ...answer } of rows) {
-    const effective = { ...declared, ...limitOverrides(id, declared) };
+  for (const { id, declared, effective, ...answer } of rows) {
     const moved = effective.context !== declared.context || effective.output !== declared.output;
     const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
     const mark = answer.status === 200 ? "  " : "! ";

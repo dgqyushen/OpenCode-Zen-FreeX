@@ -187,24 +187,38 @@ test("weaker evidence may raise a limit but never lower one", async () => {
 test("a refusal naming a window while the process runs outranks the shipped table forever after", async () => {
   const { observeRouteStatement, namedContextWindow, limitOverrides } = await subject;
   assert.equal(namedContextWindow(REFUSAL), 1048576);
-  // the caller is still waiting on this response when the plugin reads it, so
+  // The observation is this case's own, under an id no other case asserts on:
+  // the map it lands in is module-global and outlives the case, so storing one
+  // for a shipped id would quietly change the answers later cases read instead
+  // of failing them. What the shipped ids resolve to is asserted separately,
+  // with nothing but the table in play.
+  const id = "observed-once-free";
+  // The caller is still waiting on this response when the plugin reads it, so
   // observing has to be non-destructive in what it does with what it read: the
   // bytes come back with the answer, and the body is read exactly once — there
-  // is no copy to hand out, and asking for one is what used to hang the request
+  // is no copy to hand out, and asking for one is what used to hang the request.
   const response = new Response(REFUSAL, {
     status: 400,
     headers: { "content-type": "application/json" },
   });
   const observed = await within(
     1000,
-    observeRouteStatement("deepseek-v4.1-flash-free", response),
+    observeRouteStatement(id, response),
     "a one-chunk refusal",
   );
-  assert.deepEqual(observed, { context: 1048576, output: undefined, text: REFUSAL });
+  assert.deepEqual(observed, { context: 1048576, output: undefined, text: REFUSAL, ended: true });
   assert.equal(response.bodyUsed, true, "the one read of the body is the reader's");
-  const live = new Map([["deepseek-v4.1-flash-free", 900000]]);
-  assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED, undefined, live), {
-    context: 900000,
+  // the live value is applied on the default path — no maps handed in — and it
+  // outranks the declaration it was measured against
+  assert.deepEqual(limitOverrides(id, DECLARED), { context: 1048576 });
+  // an injected observation still stands in for it...
+  const live = new Map([[id, 900000]]);
+  assert.deepEqual(limitOverrides(id, DECLARED, undefined, live), { context: 900000 });
+  // ...and an id the shipped table carries is answered from the table, which is
+  // the same answer the observation above would have given it, read from one
+  // place: the entry's own declared pair.
+  assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
+    context: 1048576,
     output: 384000,
   });
 });
@@ -223,6 +237,7 @@ test("a refusal that names a completion ceiling is read on the output axis too",
     context: undefined,
     output: 131072,
     text: CEILING,
+    ended: true,
   });
   const liveOutput = new Map([["x-free", 131072]]);
   assert.deepEqual(
@@ -268,6 +283,34 @@ test("the audit's first run named two more, each on the axis its refusal named",
 const CEILING_WORDING =
   "Upstream request failed: [invalid_parameter] 参数校验失败: \n/max_tokens: 1000000 is not less or equal to 262144\n";
 
+// The cut guard has two homes in this file — the one-chunk shapes and the same
+// body read a character at a time — so both go through one helper: each asserts
+// the same three things (no axis read, and the bytes that came back), and a
+// later edit cannot leave one of the two homes checking less than the other.
+async function readCutAt(observe, id, limit, shape, size) {
+  const at = CEILING_WORDING.indexOf("262144");
+  const read = await within(
+    1000,
+    observe(id, refusal(CEILING_WORDING, { size, status: 400 }), limit),
+    `the refusal cut at ${limit} (${shape})`,
+  );
+  assert.equal(
+    read.output,
+    undefined,
+    `a read that stops inside 262144 must not be taken as a ceiling (limit ${limit}, ${shape}, would read "${CEILING_WORDING.slice(at, limit)}")`,
+  );
+  assert.equal(read.context, undefined, `and it names no window either (limit ${limit}, ${shape})`);
+  // what comes back is what was consumed: one character past the budget is
+  // read to learn the body went on, and handed on with the rest of it
+  assert.equal(
+    read.text,
+    CEILING_WORDING.slice(0, limit + 1),
+    `the bytes read (limit ${limit}, ${shape})`,
+  );
+  assert.equal(read.ended, false, `and it says the body did not end there (limit ${limit}, ${shape})`);
+  return read;
+}
+
 test("a body cut inside the ceiling it names is not read as a smaller ceiling", async () => {
   const { observeRouteStatement, limitOverrides, namedOutputCap } = await subject;
   const at = CEILING_WORDING.indexOf("262144");
@@ -275,7 +318,7 @@ test("a body cut inside the ceiling it names is not read as a smaller ceiling", 
   assert.equal(namedOutputCap(CEILING_WORDING), 262144);
   assert.deepEqual(
     await observeRouteStatement("longcat-2.5-preview-free", new Response(CEILING_WORDING, { status: 400 })),
-    { context: undefined, output: 262144, text: CEILING_WORDING },
+    { context: undefined, output: 262144, text: CEILING_WORDING, ended: true },
   );
   // cut inside it: no axis is read at all, so nothing reaches the declaration.
   // The read that ends on the last digit counts too — there is no way to tell it
@@ -287,24 +330,7 @@ test("a body cut inside the ceiling it names is not read as a smaller ceiling", 
       ["one chunk", undefined],
       ["one character per read", 1],
     ]) {
-      const read = await within(
-        1000,
-        observeRouteStatement(
-          "longcat-2.5-preview-free",
-          refusal(CEILING_WORDING, { size, status: 400 }),
-          limit,
-        ),
-        `the refusal cut at ${limit} (${shape})`,
-      );
-      assert.equal(
-        read.output,
-        undefined,
-        `a read that stops inside 262144 must not be taken as a ceiling (limit ${limit}, ${shape}, would read "${CEILING_WORDING.slice(at, limit)}")`,
-      );
-      assert.equal(read.context, undefined, `and it names no window either (limit ${limit}, ${shape})`);
-      // what comes back is what was consumed: one character past the budget is
-      // read to learn the body went on, and handed on with the rest of it
-      assert.equal(read.text, CEILING_WORDING.slice(0, limit + 1), `the bytes read (limit ${limit}, ${shape})`);
+      await readCutAt(observeRouteStatement, "longcat-2.5-preview-free", limit, shape, size);
     }
   }
   // a refusal that dies before it finishes is not a whole one either, and this
@@ -334,12 +360,7 @@ test("a chunked body cut inside a number stores nothing, and the same body whole
   // declaration below, which is exactly where 2621 used to appear
   const id = "chunked-cut-free";
   for (let limit = at + 1; limit <= at + 6; limit++) {
-    const read = await within(
-      1000,
-      observeRouteStatement(id, refusal(CEILING_WORDING, { size: 1, status: 400 }), limit),
-      `the read cut at ${limit}`,
-    );
-    assert.equal(read.output, undefined, `limit ${limit} stops inside the ceiling the body names`);
+    await readCutAt(observeRouteStatement, id, limit, "one character per read", 1);
   }
   assert.deepEqual(limitOverrides(id, { context: 1000000, output: 131072 }), {});
   // the same body in five-character reads, with room for all of it: the ceiling
@@ -349,7 +370,7 @@ test("a chunked body cut inside a number stores nothing, and the same body whole
     observeRouteStatement(id, refusal(CEILING_WORDING, { size: 5, status: 400 })),
     "the chunked refusal read whole",
   );
-  assert.deepEqual(whole, { context: undefined, output: 262144, text: CEILING_WORDING });
+  assert.deepEqual(whole, { context: undefined, output: 262144, text: CEILING_WORDING, ended: true });
   assert.deepEqual(limitOverrides(id, { context: 1000000, output: 131072 }), { output: 262144 });
 });
 
@@ -359,11 +380,13 @@ test("only a refusal that names a window is read, and only its first few KiB", a
   assert.equal(namedContextWindow('{"error":{"message":"invalid request"}}'), undefined);
   assert.equal(namedContextWindow(undefined), undefined);
   assert.equal(namedContextWindow('{"error":{"message":"maximum context length is 0 tokens"}}'), undefined);
-  // a refusal is read; the answer to a served request is not
-  assert.equal(
-    await observeRouteStatement("x-free", new Response(REFUSAL, { status: 200 })),
-    undefined,
-  );
+  // a refusal is read; the answer to a served request is not — and "not read"
+  // has to mean the body is still there for its caller, since a drained 2xx
+  // body is an answer nobody can read any more, which is the failure this whole
+  // reading path was rebuilt around
+  const served = new Response(REFUSAL, { status: 200 });
+  assert.equal(await observeRouteStatement("x-free", served), undefined);
+  assert.equal(served.bodyUsed, false, "a served answer is left for its caller to read");
   // a refusal that names nothing is read all the same — the caller has to be
   // able to hand the body on — and it says so by naming no axis
   const namesNothing = '{"error":{"message":"Upstream failed"}}';
@@ -371,18 +394,39 @@ test("only a refusal that names a window is read, and only its first few KiB", a
     context: undefined,
     output: undefined,
     text: namesNothing,
+    ended: true,
   });
   // a 4xx that says what it wants only past the read budget names nothing, and
   // what was read comes back: the budget and the one character past it that
-  // says the body went on
+  // says the body went on — with `ended` saying it did not end there, which is
+  // what a caller has to know before handing those bytes on as the reply
   assert.deepEqual(
     await observeRouteStatement("x-free", new Response(" ".repeat(5000) + REFUSAL, { status: 400 })),
-    { context: undefined, output: undefined, text: " ".repeat(4097) },
+    { context: undefined, output: undefined, text: " ".repeat(4097), ended: false },
   );
   // nothing here may throw into a request that is on its way to a caller
   assert.equal(await observeRouteStatement("x-free", undefined), undefined);
   assert.equal(await observeRouteStatement("x-free", new Response(null, { status: 400 })), undefined);
   assert.equal(await observeRouteStatement("", new Response(REFUSAL, { status: 400 })), undefined);
+});
+
+test("a refusal whose body cannot be read says so, rather than reading as empty", async () => {
+  const { observeRouteStatement } = await subject;
+  // A body that fails before it delivers anything: there are no bytes to hand
+  // on, and `ended` is the only thing that says so. A defined observation with
+  // an empty `text` and no such flag reads exactly like a body that arrived
+  // empty, and the caller relays one of those two facts to the host.
+  const broken = new ReadableStream({
+    start(controller) {
+      controller.error(new Error("connection reset"));
+    },
+  });
+  const read = await within(
+    1000,
+    observeRouteStatement("broken-body-free", new Response(broken, { status: 400 })),
+    "the refusal whose body failed",
+  );
+  assert.deepEqual(read, { context: undefined, output: undefined, text: "", ended: false });
 });
 
 test("discovery declares the aligned limits for the ids with evidence, and leaves the rest alone", async () => {
@@ -656,7 +700,10 @@ test("a caller's own signal ends the wait and keeps what was read", async () => 
       observeRouteStatement("stalled-signal-free", stalled(REFUSAL), 4096, { signal: controller.signal }),
       "the read of a body a caller gave up on",
     );
-    assert.ok(Date.now() - started < 1500, "a caller who gave up is not waited on for the deadline");
+    assert.ok(
+      Date.now() - started < 1000,
+      "a caller who gave up is not waited on for the module's own 3000 ms deadline",
+    );
     assert.equal(read.text, REFUSAL, "the partial text is returned, not thrown away");
     assert.equal(read.context, 1048576, "and it is still read for what it says");
   } finally {

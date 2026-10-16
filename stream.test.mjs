@@ -226,6 +226,25 @@ test("chat retains null content for tool-only replies and legacy function_call f
   assert.deepEqual(body.choices[0].message.function_call, { name: "lookup", arguments: '{"x":1}' });
 });
 
+test("chat merges logprobs as own properties, so an upstream __proto__ neither throws nor re-parents", async () => {
+  // JSON.parse makes "__proto__" an own key where an object literal would set
+  // a prototype, so these frames are written as bytes. Merging with [[Set]]
+  // reached the inherited accessor instead: an array value spread
+  // Object.prototype and threw "not iterable" — which dispatch turns into a
+  // 502 on an otherwise valid stream — and an object value silently
+  // re-parented the accumulated object, losing the key.
+  const merge = (logprobs) =>
+    `data: {"choices":[{"index":0,"delta":{"content":"a"},"logprobs":${logprobs}}]}\n\ndata: [DONE]\n\n`;
+  const array = await json(merge('{"__proto__":["x"]}'), "chat");
+  assert.equal(array.choices[0].message.content, "a");
+  assert.deepEqual(array.choices[0].logprobs["__proto__"], ["x"]);
+  // Read on the bytes. JSON.parse hands every object Object.prototype, so a
+  // re-parented accumulated object reads back exactly like a sound one.
+  const response = await collapseResponse(sse(merge('{"__proto__":{"polluted":true}}')), "chat");
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /"__proto__":\{"polluted":true\}/);
+});
+
 test("SSE supports BOM, comments, CRLF, multiple data lines and arbitrary byte boundaries", async () => {
   const text =
     '\uFEFF: keepalive\r\nid: 3\r\nevent: message\r\ndata: {"choices":\r\ndata: [{"index":0,"delta":{"content":"中文🙂"},"finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n';
@@ -580,6 +599,47 @@ test("Anthropic takes only the fields a message_delta may carry", async () => {
   // being accumulated, and any other key in it overwrote the message's own
   // id, role, type or content. The delta is written as bytes here because an
   // object literal's "__proto__" sets a prototype rather than a key.
+  const text =
+    event(
+      {
+        type: "message_start",
+        message: { id: "m", type: "message", role: "assistant", content: [] },
+      },
+      "message_start",
+    ) +
+    event(
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+      "content_block_start",
+    ) +
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"__proto__":{"polluted":true},"id":"replaced","role":"user","content":[{"type":"text","text":"replaced"}],"stop_reason":"end_turn","stop_sequence":"END"},"usage":{"output_tokens":3}}\n\n' +
+    event({ type: "message_stop" }, "message_stop");
+  const response = await collapseResponse(sse(text), "anthropic");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json");
+  // Read on the bytes, not on the parsed body. JSON.parse wires every object
+  // to Object.prototype and makes "__proto__" an own property, so the
+  // re-parenting this guards against reads back from a parsed body exactly
+  // like a sound one: an assertion on the prototype could only fail for an
+  // absurd body, never for the regression.
+  const raw = await response.text();
+  assert.doesNotMatch(raw, /__proto__|polluted/);
+  const body = JSON.parse(raw);
+  assert.equal(body.id, "m");
+  assert.equal(body.role, "assistant");
+  assert.equal(body.type, "message");
+  assert.equal(body.content[0].text, "kept");
+  // What a message_delta is defined to carry is taken, and reaches the body.
+  assert.equal(body.stop_reason, "end_turn");
+  assert.equal(body.stop_sequence, "END");
+  assert.equal(body.usage.output_tokens, 3);
+});
+
+test("Anthropic keeps what a repeated empty content_block_start would discard", async () => {
+  // A gateway may re-emit a block's opening frame beside the deltas it
+  // opened. A text block opens with text: "", so an unconditional start
+  // replaced the block the deltas had been filling and the reply lost it
+  // while still answering 200 — the shape message_start's blocks already
+  // refuse, for the same reason.
   const body = await json(
     event(
       {
@@ -589,23 +649,59 @@ test("Anthropic takes only the fields a message_delta may carry", async () => {
       "message_start",
     ) +
       event(
-        { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
         "content_block_start",
       ) +
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"__proto__":{"polluted":true},"id":"replaced","role":"user","content":[{"type":"text","text":"replaced"}],"stop_reason":"end_turn","stop_sequence":"END"},"usage":{"output_tokens":3}}\n\n' +
+      event(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "kept" } },
+        "content_block_delta",
+      ) +
+      event(
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        "content_block_start",
+      ) +
+      event(
+        {
+          type: "content_block_start",
+          index: 1,
+          content_block: { type: "thinking", thinking: "", signature: "" },
+        },
+        "content_block_start",
+      ) +
+      event(
+        {
+          type: "content_block_delta",
+          index: 1,
+          delta: { type: "thinking_delta", thinking: "想" },
+        },
+        "content_block_delta",
+      ) +
+      event(
+        {
+          type: "content_block_delta",
+          index: 1,
+          delta: { type: "signature_delta", signature: "sig" },
+        },
+        "content_block_delta",
+      ) +
+      event(
+        {
+          type: "content_block_start",
+          index: 1,
+          content_block: { type: "thinking", thinking: "", signature: "" },
+        },
+        "content_block_start",
+      ) +
+      event(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " and more" } },
+        "content_block_delta",
+      ) +
       event({ type: "message_stop" }, "message_stop"),
     "anthropic",
   );
-  assert.equal(Object.getPrototypeOf(body), Object.prototype);
-  assert.equal(body.id, "m");
-  assert.equal(body.role, "assistant");
-  assert.equal(body.type, "message");
-  assert.equal(body.content[0].text, "kept");
-  // What a message_delta is defined to carry is taken, and reaches the body.
-  assert.equal(body.stop_reason, "end_turn");
-  assert.equal(body.stop_sequence, "END");
-  assert.equal(body.usage.output_tokens, 3);
-  assert.doesNotMatch(JSON.stringify(body), /__proto__|polluted/);
+  assert.equal(body.content[0].text, "kept and more");
+  assert.equal(body.content[1].thinking, "想");
+  assert.equal(body.content[1].signature, "sig");
 });
 
 test("Anthropic preserves initial content, thinking, signatures, tool JSON, usage and stop reason", async () => {
@@ -959,9 +1055,14 @@ test("bounded buffering rejects oversized unterminated events and cancels the so
 });
 
 test("bounded buffering also counts many small completed events", async () => {
-  const chunk = encoder.encode(
-    event({ choices: [{ index: 0, delta: { content: "x".repeat(65536) } }] }),
-  );
+  // A different payload every pull, at a constant size: what the limit counts
+  // is the events, not the same bytes arriving over and over.
+  const content = 65536;
+  const chunk = (pull) =>
+    encoder.encode(
+      event({ choices: [{ index: 0, delta: { content: String(pull).padEnd(content, "x") } }] }),
+    );
+  const chunkBytes = chunk(0).byteLength;
   let cancelled = false;
   const source = endlessSse(chunk, {
     cancel() {
@@ -973,7 +1074,7 @@ test("bounded buffering also counts many small completed events", async () => {
   // Completed events count towards the limit too, so an upstream that never
   // stops sending them is cut off rather than read forever.
   assert.ok(
-    source.pulls() <= Math.ceil(MAX_BYTES / chunk.byteLength) + 3,
+    source.pulls() <= Math.ceil(MAX_BYTES / chunkBytes) + 3,
     `pulled ${source.pulls()} chunks before the buffer limit`,
   );
   assert.equal(cancelled, true);

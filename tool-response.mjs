@@ -158,13 +158,25 @@ function isCall(protocol, value) {
   );
 }
 
+// Counts the ids invented for calls that came without one, so that no two of
+// them can be handed the same id (see inPlaceOf).
+let synthesized = 0;
+
 // What a call left out of a Responses or Messages reply becomes: text
 // saying so, in the call's place, so no later index moves.
 function inPlaceOf(protocol, call, note) {
   if (protocol === "anthropic") return { type: "text", text: note };
+  // An item id is what a Responses client keys the item by, and what the
+  // streaming path suppresses arguments by: two calls that arrived without
+  // one and shared the id invented here would be one item to the client, and
+  // the arguments of one would be read as the other's.
+  const id =
+    typeof call.id === "string" && call.id
+      ? call.id
+      : `msg_${call.call_id ?? `dropped_${++synthesized}`}`;
   return {
     type: "message",
-    id: typeof call.id === "string" && call.id ? call.id : `msg_${call.call_id ?? "dropped"}`,
+    id,
     role: "assistant",
     status: call.status ?? "completed",
     content: [{ type: "output_text", text: note, annotations: [] }],
@@ -919,7 +931,17 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             );
             controller.close();
           } else {
-            release();
+            // A failure that is not the guard's own is a transport one: the
+            // stream is over either way, and what is left of the body is not
+            // something to keep writing into a socket nobody reads — the
+            // same rule readBounded follows. Cancel's own failure is not
+            // allowed to replace the error the client has to see, which is
+            // the one that got here.
+            try {
+              await cancel(error);
+            } catch {
+              /* the original error is the one the client must see */
+            }
             controller.error(error);
           }
         }
@@ -938,9 +960,12 @@ function guardedStream(response, protocol, checkName, endCutShort) {
 // collapsed for a client that doesn't stream fails instead, so it can be
 // asked again before anything reached the client.
 export async function guardToolResponse(response, protocol, policy, options = {}) {
-  if (!response.ok) return response;
+  // A protocol this guard has no rules for is the caller's mistake, and it
+  // is one whichever the upstream answered: checked before the status is
+  // read, so an error response cannot return it unexamined.
   if (!["chat", "responses", "anthropic"].includes(protocol))
     throw new TypeError(`Unsupported protocol: ${protocol}`);
+  if (!response.ok) return response;
   const checkName = nameGuard(policy);
   const headers = headersFor(response);
   const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();

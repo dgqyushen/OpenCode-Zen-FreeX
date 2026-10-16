@@ -114,6 +114,50 @@ function rewrittenHeaders(response) {
   return headers;
 }
 
+// The headers a body this package read once and writes again unchanged is
+// described by. The staleness rule is the same one `rewrittenHeaders` applies —
+// a length, an encoding and the validators all describe the bytes that arrived,
+// not the ones going out — but the content type is left as the upstream sent
+// it: a refusal relayed from a gateway may be HTML, and calling it JSON here
+// would be this package's word rather than the upstream's.
+function relayedHeaders(response) {
+  const headers = new Headers(response.headers);
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  return headers;
+}
+
+// What was read of a refusal is a prefix, not necessarily the refusal. Handing
+// that prefix on as the whole body is a lie the caller cannot see: a host that
+// parses it reports a JSON error of its own instead of Zen's, which is the one
+// message this path exists to keep readable. So a read that did not reach the
+// end of the body — one that got nothing at all included — is answered with a
+// refusal that says what happened, carries the opening that was read under
+// `upstream`, and keeps the status the upstream sent.
+const KEPT_PREFIX = 512;
+
+function relayedRefusal(response, observed) {
+  const read = typeof observed.text === "string" ? observed.text : "";
+  const why = read
+    ? `its body ran past the ${read.length} characters this plugin reads of a refusal, so only the opening of it came back`
+    : "its body could not be read at all";
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: {
+        type: "upstream_error",
+        message:
+          `Upstream answered HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}, and ${why}.`,
+        upstream: read.slice(0, KEPT_PREFIX) + (read.length > KEPT_PREFIX ? "…" : ""),
+      },
+    }),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: rewrittenHeaders(response),
+    },
+  );
+}
+
 // How long a request for a model the last list didn't have waits before it
 // asks Zen's list again: a model Zen made free since is served at once,
 // and a model typed in by hand doesn't ask the list on every request.
@@ -545,9 +589,12 @@ async function server(_input, options = {}) {
             //
             // A response body can only be read once, so what the limits reader
             // took is handed on as the response the rest of the path works with:
-            // the bytes are the ones that arrived, under headers that still
-            // describe them, and nothing re-reads a body that is already gone.
-            // A response the reader did not consume is used as it arrived.
+            // never the upstream's own headers over bytes this package wrote
+            // again, and never a prefix presented as the whole reply. A read
+            // that reached the end of the body is that body, relayed under
+            // headers corrected for it; one that stopped short is answered with
+            // a refusal that says so (see `relayedRefusal`). A response the
+            // reader did not consume is used as it arrived.
             const observed = await observeRouteStatement(body.model, response, undefined, {
               // The caller's own cancellation reaches this read as well: a host
               // that has given up is not waiting for a number out of a refusal.
@@ -556,11 +603,13 @@ async function server(_input, options = {}) {
             const answered =
               observed === undefined
                 ? response
-                : new Response(observed.text, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers,
-                  });
+                : observed.ended
+                  ? new Response(observed.text, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: relayedHeaders(response),
+                    })
+                  : relayedRefusal(response, observed);
             const guarded = await guardToolResponse(
               explain(observed?.text ?? null, answered, toolPolicy),
               protocol,

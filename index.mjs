@@ -11,9 +11,13 @@ import plugin from "./provider.mjs"
 //
 // The named export stays for anything that already imported it by name, and
 // `server` is offered as a name too, so `mod.default.server` and `mod.server`
-// both resolve.
-if (typeof plugin?.server !== "function") {
-  throw new TypeError("provider.mjs must default-export a plugin with a `server` factory")
+// both resolve. Both halves of what the object carries are checked here, the
+// `id` as well as the factory: a provider.mjs that lost either one would
+// otherwise load cleanly and hand the host a plugin it cannot key or start.
+if (typeof plugin?.server !== "function" || typeof plugin?.id !== "string" || !plugin.id) {
+  throw new TypeError(
+    "provider.mjs must default-export a plugin with a `server` factory and an `id`",
+  )
 }
 
 export const ZenFreePlugin = plugin.server

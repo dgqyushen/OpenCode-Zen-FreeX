@@ -318,6 +318,14 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
 // the stream is still going, and a number sliced there (`262144` read as
 // `2621`) must not be taken for a limit the route stated.
 //
+// `ended` is the read's own answer to "is this the whole body?": true when the
+// body was read to its end, false when the budget, the deadline or a failed
+// read stopped it short — a read that got nothing at all included, which is the
+// same answer for a different reason. A caller that hands these bytes on has to
+// know which of the two it holds: a prefix presented as the whole reply is a
+// lie the caller cannot see, and the bytes cannot be gone back for, since this
+// read is the body's one reader.
+//
 // Returns undefined only when nothing was read — a response that is not a
 // refusal, or one with no body to read — and otherwise whichever axes the text
 // named, with that text alongside them. An axis the body did not name is
@@ -327,13 +335,15 @@ export async function observeRouteStatement(id, response, limit = 4096, { signal
   try {
     if (typeof id !== "string" || !id || response?.ok !== false) return undefined;
     // A response with no body was not read and is not consumed: the caller
-    // still holds the one it had, and undefined says so.
-    if (response.body == null) return undefined;
-    const { text, over } = await readBoundedText(response, limit, { signal });
+    // still holds the one it had, and undefined says so. Written out rather
+    // than left to a loose comparison, which the project's rules do not allow
+    // and which would also answer for a body that is not one of these two.
+    if (response.body === null || response.body === undefined) return undefined;
+    const { text, over, ended } = await readBoundedText(response, limit, { signal });
     const { context, output } = namedAxes(text, limit, over);
     if (context !== undefined) OBSERVED.set(id, context);
     if (output !== undefined) OBSERVED_OUTPUT.set(id, output);
-    return { context, output, text };
+    return { context, output, text, ended };
   } catch {
     return undefined;
   }
