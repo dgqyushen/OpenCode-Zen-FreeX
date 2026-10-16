@@ -25,9 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      # Pinned to the commit v2.2.0 names: a tag can be moved under a workflow
-      # that holds a token, and this one runs in both jobs.
+      # Every action here is pinned to the commit its version names: a tag can be
+      # moved under a workflow that holds a token, and these run in both jobs.
+      # checkout v5 moved to Node 24, so v4 was also running on a runtime GitHub
+      # has deprecated; v7 needs a runner newer than v2.327.1, which a hosted one is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -53,7 +55,7 @@ jobs:
     needs: test
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
