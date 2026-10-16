@@ -10,7 +10,7 @@ import {
   parseProtocolDocs,
 } from "./models.mjs";
 import { observeRouteStatement } from "./limits.mjs";
-import { collapseResponse } from "./stream.mjs";
+import { STALE_BODY_HEADERS, collapseResponse } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
 
 // Zen moved behind opencode.ai/inference; everything under /zen/ answers 403
@@ -36,12 +36,28 @@ const PLACEHOLDER =
 // says which one it is, and that answer is above whatever floor Zen is holding,
 // so it is passed through; otherwise the generation is taken from the tools
 // the request actually carries, which is what the gate compares anyway.
-const RELEASE = /^opencode\/(?:latest|stable|beta)\/\d[^/]*\/[^/]+$/;
+//
+// Both current shapes answer to this: 1.x sends
+// `opencode/<version> ai-sdk/provider-utils/<version> runtime/bun/<version>`,
+// 2.x sends `opencode/<channel>/<version>/<client>`. Testing only the channel
+// form — which is what this did — silently re-pinned every 1.x host to the
+// version in fingerprint.json, so a host newer than the floor was told, on a
+// 426 or a refusal, that this package was too old to update. A host's own
+// answer is passed through whichever shape it comes in.
+//
+// The version has to start at 1-9 in both: that is what tells a release from a
+// development build (`opencode/dev/0.0.0-dev-1/cli`), whose word is not one Zen
+// would serve and so is not taken.
+const RELEASE = /^opencode\/(?:[a-z-]+\/[1-9][^/]*\/[^/]+|[1-9][^ ]*\s+ai-sdk\/\S+\s+\S+)$/;
 
-function agentForRequest(protocol, tools, given) {
+// The generation and the agent belong together: the agent says which OpenCode
+// this is, and the generation is what the tools in the request say. Deciding
+// them in one place is what `normalizeTools` reports back, so the User-Agent
+// cannot describe a generation the body does not.
+function agentForRequest(protocol, generation, given) {
   const said = given?.get("user-agent");
   if (said && RELEASE.test(said)) return said;
-  return agentFor(generationOf(tools) ?? DEFAULT_GENERATION, protocol);
+  return agentFor(generation, protocol);
 }
 
 // The complete set of headers that leaves here, and nothing else: one owner for
@@ -80,6 +96,21 @@ export function outboundHeaders({
   } else {
     headers.set("authorization", "Bearer public");
   }
+  return headers;
+}
+
+// The headers a reply's bytes are described by, for a reply whose body is
+// written again. A response rebuilt from a body this package read no longer is
+// the response that arrived: a length, an encoding and the validators a cache
+// or a conditional request compares against all describe the old bytes only.
+// `stream.mjs` keeps the list, and the two places that write an upstream body
+// again (here, and `tool-response.mjs`) must both use it — a body re-served
+// under the upstream's `content-encoding` cannot be read by the caller at all,
+// which for a refusal is the one message a user has to be able to read.
+function rewrittenHeaders(response) {
+  const headers = new Headers(response.headers);
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  headers.set("content-type", "application/json");
   return headers;
 }
 
@@ -133,9 +164,16 @@ function normalizeTools(body, protocol) {
   const nameOf = (tool) => tool?.function?.name ?? tool?.name;
   const present = new Set(body.tools.map(nameOf));
   const declared = new Set([...present].filter((value) => typeof value === "string"));
-  if (protocol === "chat" && Array.isArray(body.functions)) {
-    for (const tool of body.functions) if (typeof tool?.name === "string") declared.add(tool.name);
-  }
+  // The legacy top-level `functions` array is the older way of declaring the
+  // same tools, and one a chat host may still use. Its names are declarations,
+  // so they count as declared — and, since they are not in `body.tools`, they
+  // are also remembered as "do not stand in for this name": the fill loop
+  // below looks at where a name already sits, and a name that only arrived
+  // through `functions` has no index there. Without this the same tool would go
+  // out twice, which is what the note on `nameOf` says must not happen.
+  const legacy = Array.isArray(body.functions) && protocol === "chat" ? body.functions : [];
+  for (const tool of legacy) if (typeof tool?.name === "string") declared.add(tool.name);
+  const declaredElsewhere = new Set(legacy.map((tool) => tool?.name));
   // Zen takes a request for one generation of OpenCode or the other, and the tools
   // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
   // often than descriptions do, so this survives a rewording that a pinned
@@ -169,6 +207,9 @@ function normalizeTools(body, protocol) {
     // tokens of a tool it will not call, and they are the first thing a
     // tightened check would otherwise find missing.
     if (!profile.required.includes(name)) continue;
+    // Declared through `functions` rather than `tools`: this host does have the
+    // tool, so it is not one to stand in for.
+    if (declaredElsewhere.has(name)) continue;
     filled.push(name);
     // A tool added here has nothing behind it: the agent has no such tool and
     // a call to it is dropped. Describing it as OpenCode describes it is what
@@ -205,19 +246,31 @@ function shapeOf(definition, protocol) {
 // sends apart from the tool wording is what Zen expects — the endpoint, the
 // shape of the User-Agent, both session headers — so a refusal this far in is
 // about the wording, and this says so, and says which wording went out.
-async function explain(response, toolPolicy) {
-  if (response.status !== 403 && response.status !== 426) return response;
-  const text = await response.text().catch(() => "");
-  // A 403 that is not Zen's free tier is somebody else's; it is left as sent.
-  if (response.status === 403 && !text.includes("FreeTierError"))
-    return new Response(text, response);
+//
+// The body arrives already read: on this path the refusal has to be read for
+// the window it may name before the message that replaces it is built (see
+// limits.mjs), and a response body can only be read once. So the text is passed
+// in rather than read here, and every reply this function rebuilds is built
+// under headers that describe the bytes it returns. A refusal that is not this
+// route's — or one whose body could not be read at all — is handed on as it
+// arrived.
+function explain(text, source, toolPolicy) {
+  if (source.status !== 403 && source.status !== 426) return source;
+  // Zen's free tier names itself in the body. Without the body there is no way
+  // to tell its refusal from anybody else's 403, and this is an error path on a
+  // request whose caller is waiting, so the answer is passed on rather than
+  // guessed at.
+  if (text === null) return source;
+  // A 403 that is not Zen's free tier is somebody else's; it is left as sent —
+  // its bytes are what arrived, and so are the headers describing them.
+  if (source.status === 403 && !text.includes("FreeTierError")) return source;
   const profile = PROFILES[toolPolicy.generation];
   const names = Object.keys(profile.tools).join(", ");
   const { filled } = toolPolicy;
   // 426 is not a refusal of the wording: it is this plugin presenting itself as
   // an OpenCode older than Zen accepts, which only a newer copy of it answers.
   const message =
-    response.status === 426
+    source.status === 426
       ? `OpenCode Zen answered 426 Upgrade Required: this plugin presents itself as OpenCode ${profile.agent.opencode} and Zen now wants a newer one. Update the plugin, or run inside a newer OpenCode.`
       : [
           "OpenCode Zen's free tier refused this request as not coming from OpenCode.",
@@ -230,9 +283,9 @@ async function explain(response, toolPolicy) {
   return new Response(
     JSON.stringify({
       type: "error",
-      error: { type: response.status === 426 ? "upgrade_required" : "FreeTierError", message },
+      error: { type: source.status === 426 ? "upgrade_required" : "FreeTierError", message },
     }),
-    { status: response.status, statusText: response.statusText, headers: response.headers },
+    { status: source.status, statusText: source.statusText, headers: rewrittenHeaders(source) },
   );
 }
 
@@ -245,12 +298,19 @@ let counter = 0;
 // for a session, so newer sorts first), then 14 random base62 characters.
 // Zen's free tier checks a session id has this shape, a small counter
 // included, and answers 403 FreeTierError to one that doesn't (#100).
+//
+// The counter is the low 12 bits of the id and realSessionID reads it back as
+// a counter, so it is kept inside the 4 bits OpenCode's own counter lives in
+// and wraps there rather than carrying into the time field: the 16th id of one
+// millisecond would otherwise say it was made later than it was, and stop
+// reading as an id OpenCode could have made. A millisecond that produces
+// sixteen ids is a burst, and every id of it still has the shape Zen checks.
 export function opencodeID(prefix, descending, now = Date.now()) {
   if (now !== lastStamp) {
     lastStamp = now;
     counter = 0;
   }
-  counter++;
+  counter = counter >= 15 ? 1 : counter + 1;
   const current = BigInt(now) * 0x1000n + BigInt(counter);
   const value = (descending ? ~current : current) & 0xffffffffffffn;
   const random = randomBytes(14);
@@ -284,13 +344,18 @@ export function sessionID(headers, body) {
       break;
     }
   }
-  if (!signal && typeof body.metadata?.session_id === "string") signal = body.metadata.session_id;
+  if (typeof body.metadata?.session_id === "string") signal ??= body.metadata.session_id;
   if (realSessionID(signal)) return signal;
   if (!signal) {
     const messages = body.messages ?? body.input;
     const first = Array.isArray(messages)
       ? messages.find((message) => message.role === "user")?.content
       : messages;
+    // Nothing names this conversation: no session header, no metadata, and no
+    // user message to key one by. There is no identity to keep for the next
+    // turn, so this one gets an id of its own rather than being folded into
+    // whichever conversation happened to arrive first — but it is still an id
+    // of OpenCode's shape, because that shape is what the tier checks.
     if (!first) return opencodeID("ses", true);
     signal = JSON.stringify(first);
   }
@@ -456,7 +521,10 @@ async function server(_input, options = {}) {
             const project = _input?.project;
             const headers = outboundHeaders({
               session,
-              agent: agentForRequest(protocol, body.tools, given),
+              // The generation the tools in this request say, which is the one
+              // normalizeTools has already decided: deciding it twice is how a
+              // User-Agent and a body come to describe different generations.
+              agent: agentForRequest(protocol, toolPolicy.generation, given),
               protocol,
               given,
               project:
@@ -474,10 +542,31 @@ async function server(_input, options = {}) {
             // it has to be read before explain() replaces the body. See
             // limits.mjs: an under-declared window is never refused, it is just
             // quietly never used.
-            await observeRouteStatement(body.model, response);
-            const guarded = await guardToolResponse(await explain(response, toolPolicy), protocol, toolPolicy, {
-              endCutShort: streaming,
+            //
+            // A response body can only be read once, so what the limits reader
+            // took is handed on as the response the rest of the path works with:
+            // the bytes are the ones that arrived, under headers that still
+            // describe them, and nothing re-reads a body that is already gone.
+            // A response the reader did not consume is used as it arrived.
+            const observed = await observeRouteStatement(body.model, response, undefined, {
+              // The caller's own cancellation reaches this read as well: a host
+              // that has given up is not waiting for a number out of a refusal.
+              signal: request.signal,
             });
+            const answered =
+              observed === undefined
+                ? response
+                : new Response(observed.text, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                  });
+            const guarded = await guardToolResponse(
+              explain(observed?.text ?? null, answered, toolPolicy),
+              protocol,
+              toolPolicy,
+              { endCutShort: streaming },
+            );
             return streaming ? guarded : collapseResponse(guarded, protocol);
           },
         };

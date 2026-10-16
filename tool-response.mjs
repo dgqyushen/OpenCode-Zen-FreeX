@@ -1,7 +1,7 @@
-import { STALE_BODY_HEADERS } from "./stream.mjs";
+import { MAX_BYTES, STALE_BODY_HEADERS } from "./stream.mjs";
 
-const MAX_BYTES = 32 * 1024 * 1024;
-// The limit as a failure's message names it, from the one place it is set.
+// The limit as a failure's message names it, from the one place it is set:
+// stream.mjs owns the number, and this guard reads the same bytes through it.
 const LIMIT = `${MAX_BYTES / (1024 * 1024)} MiB`;
 const encoder = new TextEncoder();
 
@@ -301,7 +301,10 @@ function chatBuffer(checkName) {
     return pending.get(index);
   }
   // Choices that streamed text, and those whose every call was left out
-  // (whose later "tool_calls" finish is a stop).
+  // (whose later "tool_calls" finish is a stop). The second is per round: a
+  // later round that buffers a call for the same choice is judged on what it
+  // holds, not on the round before it, so the mark is dropped as soon as that
+  // call arrives.
   const wrote = new Set();
   const ended = new Set();
   function complete(state, index) {
@@ -320,6 +323,14 @@ function chatBuffer(checkName) {
     }
     return delta;
   }
+  // What a choice the buffer flushes at [DONE] ended as: tool use when the
+  // delta it publishes carries calls, the legacy field when it carries that,
+  // and a plain stop otherwise.
+  function ending(delta) {
+    if (delta.tool_calls?.length) return "tool_calls";
+    if (delta.function_call) return "function_call";
+    return "stop";
+  }
   function remove(index) {
     const state = pending.get(index);
     if (state) bytes -= state.bytes;
@@ -331,6 +342,10 @@ function chatBuffer(checkName) {
     },
     clear() {
       pending.clear();
+      // Everything this buffer holds, not only the bytes: a cleared buffer
+      // has no round to judge.
+      wrote.clear();
+      ended.clear();
       bytes = 0;
     },
     apply(data) {
@@ -342,7 +357,12 @@ function chatBuffer(checkName) {
         if (typeof delta.content === "string" && delta.content) wrote.add(position(choice.index));
         if (delta.tool_calls == null && delta.function_call == null) continue;
         changed = true;
-        const state = stateFor(position(choice.index), data);
+        // A call buffered now opens a round of its own for this choice: a
+        // choice that finished as a plain stop because every call of an
+        // earlier round was left out is judged again on what this one holds.
+        const at = position(choice.index);
+        ended.delete(at);
+        const state = stateFor(at, data);
         for (const fragment of list(delta.tool_calls)) {
           if (!object(fragment) || (fragment.type != null && fragment.type !== "function")) {
             throw new GuardError("Unsupported upstream tool delta");
@@ -393,9 +413,16 @@ function chatBuffer(checkName) {
     },
     finish() {
       if (!pending.size) return null;
-      const choices = [...pending]
-        .sort(([a], [b]) => a - b)
-        .map(([index, state]) => ({ index, delta: complete(state, index), finish_reason: null }));
+      const choices = [...pending].sort(([a], [b]) => a - b).map(([index, state]) => {
+        const delta = complete(state, index);
+        // The case this buffer exists for is an upstream that closes with
+        // [DONE] before sending a finish chunk: the calls it buffered are
+        // published here, and the choice has to say the turn ended in tool
+        // use. A null reason reads as no ending at all, and "stop" as a plain
+        // one — either way a client keyed on finish_reason never runs a call
+        // it was handed.
+        return { index, delta, finish_reason: ending(delta) };
+      });
       const metadata = pending.values().next().value.metadata;
       pending.clear();
       bytes = 0;
@@ -515,7 +542,18 @@ async function readBounded(response) {
       parts.push(value);
     }
   } finally {
-    reader.releaseLock();
+    // Whatever ended the read — the limit, a malformed body, or the end of
+    // it — this body is never read again, so the reader is loosed and the
+    // stream cancelled. This was the one place in the package that abandoned
+    // a body without cancelling it (measured: no cancellation past the limit,
+    // and the source still pulled after the 502), which leaves an upstream
+    // writing into a socket nobody reads. The cancel's own failure is not
+    // swallowed, and the lock is released whether it threw or not.
+    try {
+      await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
   }
   const all = new Uint8Array(bytes);
   let offset = 0;
@@ -809,9 +847,16 @@ function guardedStream(response, protocol, checkName, endCutShort) {
               return;
             }
             if (frame.name !== "error" && frame.text.trim() === "[DONE]") {
-              if (protocol !== "chat")
+              // [DONE] is what ends a Chat stream, and a valid end-of-stream
+              // sentinel for a Responses or Messages one that has already
+              // reported its own terminal event (response.completed,
+              // response.incomplete, message_stop) — a gateway in front of the
+              // upstream may append it. Before that event it claims an ending
+              // the protocol never reported, and the frame is refused; the
+              // collapse path reads the same bytes the same way.
+              if (protocol !== "chat" && !completed)
                 throw new GuardError("Unexpected upstream completion marker");
-              const final = chat.finish();
+              const final = chat ? chat.finish() : null;
               completed = true;
               controller.enqueue(encoder.encode((final ? encodeEvent(final) : "") + frame.raw));
               return;

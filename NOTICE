@@ -1,0 +1,18 @@
+# NOTICE
+
+This package is a maintained fork of the OpenCode Zen Free plugin from
+[magpie-community/plugins](https://github.com/magpie-community/plugins), which
+is MIT licensed. Upstream's notice, `Copyright (c) 2026 xiaozhou26`, is kept in
+[LICENSE](./LICENSE) alongside this fork's own.
+
+The fork is maintained separately from upstream under the name
+`opencode-zen-freex` (https://github.com/tkhs101/OpenCode-Zen-FreeX) because the
+free tier's request fingerprint moves faster than that repository follows it:
+the tool wording and User-Agent Zen accepts can be recaptured here with
+`bun run capture`, without waiting for a release upstream. `MAINTAINING.md`
+describes that loop.
+
+The provider id this package registers, `opencode-zen-free`, is deliberately the
+same one upstream's plugin registers — a model is written
+`opencode-zen-free/<model>` either way — so the two are mutually exclusive;
+install one.

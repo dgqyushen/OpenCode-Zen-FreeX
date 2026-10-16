@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collapseResponse } from "./stream.mjs";
+import { MAX_BYTES, collapseResponse } from "./stream.mjs";
 
 const encoder = new TextEncoder();
-// The guard's own SSE limit (MAX_BYTES in stream.mjs), for the tests that
-// measure how much of a stream it reads before stopping.
-const LIMIT_BYTES = 32 * 1024 * 1024;
 // Generous enough that a slow machine still reports a real hang rather than
 // a slow cancellation as one.
 const LIVENESS_MS = 5000;
@@ -28,11 +25,30 @@ function sse(text, { chunkSize = 23, headers = {}, status = 200 } = {}) {
   );
 }
 
+// An SSE source that never ends: `chunk` is the bytes of every pull, or a
+// function of the pull count when the payload has to differ each time. The
+// limit tests all hand out one chunk per pull and count how many it took to
+// be stopped.
+function endlessSse(chunk, { cancel = () => {} } = {}) {
+  const next = typeof chunk === "function" ? chunk : () => chunk;
+  let pulls = 0;
+  const response = new Response(
+    new ReadableStream({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(next(pulls - 1));
+      },
+      cancel,
+    }),
+    { headers: { "content-type": "text/event-stream" } },
+  );
+  return { response, pulls: () => pulls };
+}
+
 async function collapseOpenStream(text, protocol, cancel = () => {}) {
   let controller;
   let cancelled = false;
   let timer;
-  let timedOut = false;
   const bytes = encoder.encode(text);
   const response = new Response(
     new ReadableStream({
@@ -52,10 +68,7 @@ async function collapseOpenStream(text, protocol, cancel = () => {}) {
     const result = await Promise.race([
       collapseResponse(response, protocol),
       new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          reject(new Error("SSE error waited for EOF"));
-        }, LIVENESS_MS);
+        timer = setTimeout(() => reject(new Error("SSE error waited for EOF")), LIVENESS_MS);
       }),
     ]);
     assert.equal(cancelled, true);
@@ -63,9 +76,14 @@ async function collapseOpenStream(text, protocol, cancel = () => {}) {
     return result;
   } finally {
     clearTimeout(timer);
-    // The collapse is still reading when the timer wins, so the source is
-    // left alone rather than closed under a promise that lost the race.
-    if (!timedOut && !cancelled) controller.close();
+    // Close unconditionally. When the timer wins, the collapse is still
+    // waiting for EOF, and leaving the source open would keep the losing
+    // promise — and its locked reader — pending for the rest of the run. A
+    // source the collapse already cancelled throws from close(), and that
+    // must not replace the error on its way out.
+    try {
+      controller.close();
+    } catch {}
   }
 }
 
@@ -281,6 +299,77 @@ test("Responses incomplete keeps the original response and its usage", async () 
   );
 });
 
+test("a terminal response that carries no output keeps what was streamed", async () => {
+  // Measured through the whole pipeline: HTTP 200 with {"id":"resp_1",
+  // "status":"completed"} returned exactly that — the streamed text gone, no
+  // error, and nothing to tell it apart from a model that said nothing. A
+  // terminal that does carry its output still comes back as it arrived (the
+  // test above).
+  for (const last of [
+    { id: "resp_1", status: "completed" },
+    { id: "resp_1", status: "completed", output: [] },
+  ]) {
+    const body = await json(
+      event({ type: "response.created", response: { id: "resp_1", output: [] } }) +
+        event({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: "m", type: "message", role: "assistant", content: [] },
+        }) +
+        event({
+          type: "response.output_text.delta",
+          output_index: 0,
+          content_index: 0,
+          delta: "hello",
+        }) +
+        event({ type: "response.completed", response: last }, "response.completed"),
+      "responses",
+    );
+    assert.equal(body.id, "resp_1");
+    assert.equal(body.status, "completed");
+    assert.equal(body.output[0].content[0].text, "hello");
+  }
+});
+
+test("a partial snapshot does not overwrite the content already accumulated", async () => {
+  // A response.created that repeats beside the deltas it opened, carrying a
+  // message that is still empty, and a message_start whose block has not been
+  // filled in. Neither is a newer view of what the stream delivered, and
+  // taking either would discard it.
+  const responses = await json(
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "kept",
+    }) +
+      event({
+        type: "response.created",
+        response: { id: "r", output: [{ id: "m", type: "message", content: [] }] },
+      }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed", output: [] } }),
+    "responses",
+  );
+  assert.equal(responses.output[0].content[0].text, "kept");
+  const messages = await json(
+    event(
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+      "content_block_start",
+    ) +
+      event(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "!" } },
+        "content_block_delta",
+      ) +
+      event(
+        { type: "message_start", message: { id: "m", content: [{ type: "text", text: "" }] } },
+        "message_start",
+      ) +
+      event({ type: "message_stop" }, "message_stop"),
+    "anthropic",
+  );
+  assert.equal(messages.content[0].text, "kept!");
+});
+
 test("Responses aggregates fallback text, reasoning, function arguments and usage", async () => {
   const events = [
     {
@@ -373,6 +462,36 @@ test("Responses done snapshots do not duplicate accumulated deltas", async () =>
   assert.deepEqual(body.output, [expected]);
 });
 
+test("Responses reads a reasoning summary's done event from its own field", async () => {
+  // A summary's whole text arrives in `summary`, not in the `text` that
+  // response.reasoning_text.done carries. Reading `text` for a summary lost a
+  // done event that had no delta before it (measured: the summary came back
+  // empty while the delta-before-done shape looked right).
+  const body = await json(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "r", type: "reasoning", summary: [] },
+    }) +
+      event({
+        type: "response.reasoning_summary_text.delta",
+        output_index: 0,
+        summary_index: 0,
+        delta: "kept",
+      }) +
+      event({
+        type: "response.reasoning_summary_text.done",
+        output_index: 0,
+        summary_index: 1,
+        summary: "thought",
+      }) +
+      event({ type: "response.completed" }),
+    "responses",
+  );
+  assert.equal(body.output[0].summary[0].text, "kept");
+  assert.equal(body.output[0].summary[1].text, "thought");
+});
+
 test("Responses finds an item snapshot's slot by item_id when output_index is missing", async () => {
   const body = await json(
     event({ type: "response.created", response: { id: "r", output: [] } }) +
@@ -406,6 +525,87 @@ test("Responses finds an item snapshot's slot by item_id when output_index is mi
   );
   assert.equal(body.output[1].arguments, '{"a":1}');
   assert.deepEqual(body.output[0].content, []);
+});
+
+test("Responses refuses a frame that names an item the stream never opened", async () => {
+  // An out-of-order (or dropped) output_item.added leaves a frame naming an
+  // item no slot holds. Putting it in slot 0 merged it into the first item —
+  // measured: a function_call at slot 0 came back carrying a message's text —
+  // so it is an error instead. Only a frame that names nothing at all takes
+  // slot 0, which is what a stream that never indexed its items means.
+  await failure(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        id: "f",
+        type: "function_call",
+        call_id: "call",
+        name: "lookup",
+        arguments: "",
+      },
+    }) +
+      event({
+        type: "response.output_text.delta",
+        item_id: "m",
+        content_index: 0,
+        delta: "LEAKED TEXT",
+      }) +
+      event({ type: "response.completed" }),
+    "responses",
+    /unknown item/,
+  );
+  // A frame that names an item the stream did open still finds it by id.
+  const body = await json(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "inner", type: "message", role: "assistant", content: [] },
+    }) +
+      event({
+        type: "response.output_text.delta",
+        item_id: "inner",
+        content_index: 0,
+        delta: "named",
+      }) +
+      event({ type: "response.completed" }),
+    "responses",
+  );
+  assert.equal(body.output[0].content[0].text, "named");
+});
+
+test("Anthropic takes only the fields a message_delta may carry", async () => {
+  // Object.assign copies with [[Set]] semantics, and JSON.parse makes
+  // "__proto__" an own property: an upstream's delta re-parented the message
+  // being accumulated, and any other key in it overwrote the message's own
+  // id, role, type or content. The delta is written as bytes here because an
+  // object literal's "__proto__" sets a prototype rather than a key.
+  const body = await json(
+    event(
+      {
+        type: "message_start",
+        message: { id: "m", type: "message", role: "assistant", content: [] },
+      },
+      "message_start",
+    ) +
+      event(
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+        "content_block_start",
+      ) +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"__proto__":{"polluted":true},"id":"replaced","role":"user","content":[{"type":"text","text":"replaced"}],"stop_reason":"end_turn","stop_sequence":"END"},"usage":{"output_tokens":3}}\n\n' +
+      event({ type: "message_stop" }, "message_stop"),
+    "anthropic",
+  );
+  assert.equal(Object.getPrototypeOf(body), Object.prototype);
+  assert.equal(body.id, "m");
+  assert.equal(body.role, "assistant");
+  assert.equal(body.type, "message");
+  assert.equal(body.content[0].text, "kept");
+  // What a message_delta is defined to carry is taken, and reaches the body.
+  assert.equal(body.stop_reason, "end_turn");
+  assert.equal(body.stop_sequence, "END");
+  assert.equal(body.usage.output_tokens, 3);
+  assert.doesNotMatch(JSON.stringify(body), /__proto__|polluted/);
 });
 
 test("Anthropic preserves initial content, thinking, signatures, tool JSON, usage and stop reason", async () => {
@@ -623,6 +823,22 @@ test("protocol-specific finish reasons without terminal events remain truncated"
   await failure("data: [DONE]\n", "chat", /completion/);
 });
 
+test("a [DONE] marker ends a non-chat stream only where it already ended", async () => {
+  // [DONE] is how a Chat stream ends, and a Responses or Messages stream may
+  // be given one after it has reported its own terminal event (a gateway in
+  // front of the upstream appends it). Before that event it claims an ending
+  // the protocol never reported, and the guard refuses the same bytes with
+  // the same words — its half of this test is in tool-response.test.mjs.
+  const terminal = event(
+    { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+    "response.completed",
+  );
+  assert.equal((await json(terminal + event("[DONE]"), "responses")).id, "r1");
+  for (const protocol of ["responses", "anthropic"]) {
+    await failure(event("[DONE]"), protocol, /Unexpected upstream completion marker/);
+  }
+});
+
 test("upstream errors after terminal events are not successful responses", async () => {
   for (const [protocol, terminal] of [
     ["chat", "[DONE]"],
@@ -640,17 +856,11 @@ test("upstream errors after terminal events are not successful responses", async
 test("buffer-limit cancellation failures propagate instead of becoming JSON", async () => {
   const cause = new DOMException("cancel failed", "AbortError");
   const chunk = new Uint8Array(1024 * 1024);
-  const response = new Response(
-    new ReadableStream({
-      pull(controller) {
-        controller.enqueue(chunk);
-      },
-      cancel() {
-        throw cause;
-      },
-    }),
-    { headers: { "content-type": "text/event-stream" } },
-  );
+  const { response } = endlessSse(chunk, {
+    cancel() {
+      throw cause;
+    },
+  });
   await assert.rejects(collapseResponse(response, "chat"), (error) => error === cause);
 });
 
@@ -730,28 +940,20 @@ test("success and error JSON remove stale entity headers and preserve retry meta
 
 test("bounded buffering rejects oversized unterminated events and cancels the source", async () => {
   let cancelled = false;
-  let pulls = 0;
   const chunk = encoder.encode("x".repeat(1024 * 1024));
-  const response = new Response(
-    new ReadableStream({
-      pull(controller) {
-        pulls++;
-        controller.enqueue(chunk);
-      },
-      cancel() {
-        cancelled = true;
-      },
-    }),
-    { headers: { "content-type": "text/event-stream" } },
-  );
-  const result = await collapseResponse(response, "chat");
+  const source = endlessSse(chunk, {
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const result = await collapseResponse(source.response, "chat");
   assert.equal(result.status, 502);
   assert.match((await result.json()).error.message, /limit|large|buffer/i);
   // One chunk past the limit ends the read, and the stream may have handed
   // out a chunk or two ahead of the reader.
   assert.ok(
-    pulls <= LIMIT_BYTES / chunk.length + 3,
-    `pulled ${pulls} chunks before the buffer limit`,
+    source.pulls() <= MAX_BYTES / chunk.length + 3,
+    `pulled ${source.pulls()} chunks before the buffer limit`,
   );
   assert.equal(cancelled, true);
 });
@@ -761,26 +963,18 @@ test("bounded buffering also counts many small completed events", async () => {
     event({ choices: [{ index: 0, delta: { content: "x".repeat(65536) } }] }),
   );
   let cancelled = false;
-  let pulls = 0;
-  const response = new Response(
-    new ReadableStream({
-      pull(controller) {
-        pulls++;
-        controller.enqueue(chunk);
-      },
-      cancel() {
-        cancelled = true;
-      },
-    }),
-    { headers: { "content-type": "text/event-stream" } },
-  );
-  const result = await collapseResponse(response, "chat");
+  const source = endlessSse(chunk, {
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const result = await collapseResponse(source.response, "chat");
   assert.equal(result.status, 502);
   // Completed events count towards the limit too, so an upstream that never
   // stops sending them is cut off rather than read forever.
   assert.ok(
-    pulls <= Math.ceil(LIMIT_BYTES / chunk.byteLength) + 3,
-    `pulled ${pulls} chunks before the buffer limit`,
+    source.pulls() <= Math.ceil(MAX_BYTES / chunk.byteLength) + 3,
+    `pulled ${source.pulls()} chunks before the buffer limit`,
   );
   assert.equal(cancelled, true);
 });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { PROFILES, generationOf } from "./core-tools.mjs";
+import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
 import { requestFor } from "./tools-smoke.mjs";
 
@@ -20,8 +20,44 @@ const HTTP_STACK_WITHOUT_HOST = ["connection", "content-length", "accept-encodin
 const chosenByPlugin = (sent, transport) =>
   Object.keys(sent).filter((name) => !transport.includes(name));
 
+// The header names this plugin chooses for itself, in one place because two
+// tests pin the outbound set: a name added to one list and not the other would
+// otherwise go uncaught, which is the drift those tests exist to catch.
+const PLUGIN_HEADERS = [
+  "accept",
+  "content-type",
+  "user-agent",
+  "x-opencode-client",
+  "x-opencode-project",
+  "x-opencode-session",
+  "x-opencode-session-id",
+];
+
+// How long a race against a loopback round-trip is given before it is read as
+// "it never happened". Generous on purpose: a loaded CI runner is slow, and a
+// false failure here says nothing about the behaviour under test.
+const WATCHDOG_MS = Number(process.env.TEST_WATCHDOG_MS ?? 5000);
+
+// The User-Agent the capture composes for a generation and protocol
+// (core-tools.mjs builds that string). Read from fingerprint.json rather than
+// written out here: a re-capture that changes the captured OpenCode version
+// should not need several literals edited by hand in this file.
+const agentOf = (generation, protocol = "chat") => agentFor(generation, protocol);
+
+// Reading the last recorded call on a run where the plugin never reached
+// upstream is a TypeError that hides the real failure: say what is wrong.
+function lastCall(state) {
+  assert.ok(state.calls.length > 0, "no request reached upstream");
+  return state.calls[state.calls.length - 1];
+}
+
 async function fixture(t, input = {}) {
   const state = { calls: [], status: 200, modelsStatus: 200, docsStatus: 200, catalogStatus: 200 };
+  // Headers an upstream error is served with: a real refusal arrives with a
+  // length, an encoding and validators describing its own bytes, and what this
+  // plugin hands back is not those bytes.
+  const upstreamHeaders = () =>
+    state.responseHeaders ? { ...state.responseHeaders } : {};
   // A body that is not JSON is recorded as no body at all rather than thrown
   // out of a request listener, where it would read as a hung request.
   const parseBody = (text) => {
@@ -76,7 +112,7 @@ async function fixture(t, input = {}) {
           `| Model | chat-free | \`https://opencode.ai/zen/v1/${state.chatProtocol ?? "chat/completions"}\` | sdk |`,
       );
     } else if (state.body !== undefined) {
-      res.writeHead(state.status ?? 403, { "content-type": "application/json" });
+      res.writeHead(state.status ?? 403, { "content-type": "application/json", ...upstreamHeaders() });
       res.end(state.body);
     } else if (state.reply) {
       res.writeHead(200, { "content-type": state.contentType ?? "text/event-stream" });
@@ -85,7 +121,11 @@ async function fixture(t, input = {}) {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(": heartbeat\n\n");
     } else if (state.status !== 200) {
-      res.writeHead(state.status, { "content-type": "application/json", "retry-after": "30" });
+      res.writeHead(state.status, {
+        "content-type": "application/json",
+        "retry-after": "30",
+        ...upstreamHeaders(),
+      });
       res.end('{"error":{"message":"limited","type":"rate_limit_error"}}');
     } else {
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -139,7 +179,7 @@ for (const { protocol, path, model } of protocols) {
           assert.match(text, new RegExp(`"name"\\s*:\\s*"${expected}"`));
           assert.doesNotMatch(text, /"name"\s*:\s*"(?:bash|read)"/);
         }
-        const outbound = state.calls.at(-1).body.tools;
+        const outbound = lastCall(state).body.tools;
         assert.deepEqual(outbound.slice(0, tools.length), tools);
         for (const raw of outbound.slice(tools.length)) {
           const tool = protocol === "chat" ? raw.function : raw;
@@ -203,23 +243,27 @@ for (const [input, supplied, expected] of [
       body: JSON.stringify({ model: "chat-free", stream: true }),
     });
     await response.text();
-    assert.equal(state.calls.at(-1).headers["x-opencode-project"], expected);
-    assert.equal(
-      state.calls.at(-1).headers["user-agent"],
-      "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
-    );
+    assert.equal(lastCall(state).headers["x-opencode-project"], expected);
+    assert.equal(lastCall(state).headers["user-agent"], agentOf("1.x"));
   });
 }
 
-// The headers OpenCode 1.19.0's release binary sends to opencode.ai/zen/v1,
-// captured on each protocol: these and no others, whatever the caller sent.
-for (const [path, model, utils, key] of [
-  ["chat/completions", "chat-free", "4.0.23", ["authorization"]],
-  ["responses", "responses-free", "4.0.40", ["authorization"]],
-  ["messages", "messages-free", "4.0.46", ["anthropic-version", "x-api-key"]],
+// The headers OpenCode's release binary sends to opencode.ai/zen/v1, captured
+// on each protocol: these and no others, whatever the caller sent. The
+// User-Agent each protocol sends is composed from the capture rather than
+// written here, since the capture is what says which OpenCode it was taken from.
+for (const [path, model, protocol, key] of [
+  ["chat/completions", "chat-free", "chat", ["authorization"]],
+  ["responses", "responses-free", "responses", ["authorization"]],
+  ["messages", "messages-free", "anthropic", ["anthropic-version", "x-api-key"]],
 ]) {
   test(`${path}: sends OpenCode's own headers and none of the caller's`, async (t) => {
     const { plugin, state, origin } = await fixture(t);
+    // The names this protocol authenticates with are the test's premise, so
+    // they are checked against the request that actually went out: a name that
+    // stopped being sent would otherwise be asserted about nothing.
+    for (const name of key)
+      assert.ok(!HTTP_STACK.includes(name), `${name} is not one the transport adds`);
     await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
     const loader = await plugin.auth.loader(publicAuth);
     const response = await loader.fetch(`${origin}/v1/${path}`, {
@@ -234,22 +278,13 @@ for (const [path, model, utils, key] of [
       body: JSON.stringify({ model, stream: true }),
     });
     await response.text();
-    const sent = state.calls.at(-1).headers;
-    assert.equal(sent["user-agent"], `opencode/1.19.0 ai-sdk/provider-utils/${utils} runtime/bun/1.3.14`);
+    const sent = lastCall(state).headers;
+    assert.equal(sent["user-agent"], agentOf("1.x", protocol));
     assert.equal(sent.accept, "*/*");
     const own = chosenByPlugin(sent, HTTP_STACK);
     assert.deepEqual(
       own.sort(),
-      [
-        "accept",
-        "content-type",
-        "user-agent",
-        "x-opencode-client",
-        "x-opencode-project",
-        "x-opencode-session",
-        "x-opencode-session-id",
-        ...key,
-      ].sort(),
+      [...PLUGIN_HEADERS, ...key].sort(),
     );
     assert.equal(sent["x-opencode-session-id"], sent["x-opencode-session"]);
     // x-opencode-request, x-session-affinity and x-session-id are in OpenCode's
@@ -280,11 +315,14 @@ for (const [generation, profile] of Object.entries(PROFILES)) {
     });
     await response.text();
 
-    const sent = state.calls.at(-1).headers;
+    const sent = lastCall(state).headers;
     const wire = chosenByPlugin(sent, HTTP_STACK);
     const gate = requestFor(generation, profile, names).headers;
     assert.deepEqual([...gate.keys()].sort(), wire.sort());
     assert.equal(gate.get("user-agent"), sent["user-agent"]);
+    // Parity is only parity if each side sent something: an empty header set on
+    // one side would otherwise compare equal to nothing at all on the other.
+    assert.ok(wire.length > 0 && !gate.keys().next().done);
     // The tools the floor is asked with have to name the generation they came
     // from, or the plugin would present itself as the other one.
     assert.equal(generationOf(tools), generation);
@@ -313,7 +351,7 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
     await Promise.race([
       started,
       new Promise((_, reject) => {
-        pinged = setTimeout(() => reject(new Error("no discovery request was sent")), 500);
+        pinged = setTimeout(() => reject(new Error("no discovery request was sent")), WATCHDOG_MS);
       }),
     ]);
   } finally {
@@ -325,7 +363,7 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
     await Promise.race([
       rejected,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("discovery ignored caller cancellation")), 500);
+        timer = setTimeout(() => reject(new Error("discovery ignored caller cancellation")), WATCHDOG_MS);
       }),
     ]);
   } finally {
@@ -450,7 +488,7 @@ test("forces upstream streaming, preserves existing tools and returns the SSE bo
   });
   assert.match(response.headers.get("content-type"), /text\/event-stream/);
   assert.match(await response.text(), /\[DONE\]/);
-  const sent = state.calls.at(-1);
+  const sent = lastCall(state);
   assert.equal(sent.headers.authorization, "Bearer public");
   assert.match(sent.headers["x-opencode-session"], /^ses_[0-9a-f]{9}ff[0-9a-f][0-9A-Za-z]{14}$/);
   // OpenCode sends neither to its own gateway; a caller's never goes on.
@@ -500,23 +538,13 @@ test("sends exactly the headers one generation of OpenCode sends", async (t) => 
     method: "POST",
     body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
   });
-  const sent = state.calls.at(-1).headers;
+  const sent = lastCall(state).headers;
   // accept-encoding, connection and content-length are the HTTP stack's, not
   // this plugin's, so what is pinned here is the set the plugin chooses. `host`
   // is left in on purpose: the stack adds it too, but this is the test that says
   // by name which names go out, and it is one of them.
   const chosen = chosenByPlugin(sent, HTTP_STACK_WITHOUT_HOST).sort();
-  assert.deepEqual(chosen, [
-    "accept",
-    "authorization",
-    "content-type",
-    "host",
-    "user-agent",
-    "x-opencode-client",
-    "x-opencode-project",
-    "x-opencode-session",
-    "x-opencode-session-id",
-  ]);
+  assert.deepEqual(chosen, [...PLUGIN_HEADERS, "authorization", "host"].sort());
   // x-opencode-request is not needed either: measured 2026-10-15, it answers on
   // its own and it is the pair x-opencode-request + x-session-affinity that is
   // refused, so the set above has to stay a strict subset of what has been seen
@@ -546,13 +574,13 @@ test("presents the generation the tools say, and a host that names its own", asy
 
   await send();
   assert.match(
-    state.calls.at(-1).headers["user-agent"],
+    lastCall(state).headers["user-agent"],
     /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\S+ runtime\/bun\//,
   );
 
   // A host declaring 2.x tools is answered as 2.x, without a gap being filled.
   await send([tool("shell", "Execute a shell command and return its output."), tool("read", "Read the contents of a file or directory.")]);
-  const two = state.calls.at(-1);
+  const two = lastCall(state);
   assert.equal(two.headers["user-agent"], "opencode/latest/2.0.29/cli");
   assert.deepEqual(
     two.body.tools.map((t) => t.function.name),
@@ -562,12 +590,26 @@ test("presents the generation the tools say, and a host that names its own", asy
   // A host that is OpenCode itself already says which it is; that is above
   // whatever floor Zen is holding, so it is passed on rather than pinned.
   await send(undefined, { "user-agent": "opencode/stable/1.2.3/desktop" });
-  assert.equal(state.calls.at(-1).headers["user-agent"], "opencode/stable/1.2.3/desktop");
+  assert.equal(lastCall(state).headers["user-agent"], "opencode/stable/1.2.3/desktop");
 
   // A host on a development build is not something Zen accepts, so its word is
   // not taken.
   await send(undefined, { "user-agent": "opencode/dev/0.0.0-dev-1/cli" });
-  assert.match(state.calls.at(-1).headers["user-agent"], /^opencode\/\d+\.\d+\.\d+ ai-sdk\//);
+  assert.match(lastCall(state).headers["user-agent"], /^opencode\/\d+\.\d+\.\d+ ai-sdk\//);
+
+  // The pass-through above is not a 2.x privilege: a 1.x host says which it is
+  // in its own shape, and pinning that one back to the captured version is how
+  // a host newer than Zen's floor ends up being told the plugin is too old.
+  const oneX = "opencode/1.20.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+  await send(undefined, { "user-agent": oneX });
+  assert.equal(lastCall(state).headers["user-agent"], oneX);
+  // Whatever a host says about itself, it is not its word that decides which
+  // generation the body belongs to: the tools still do, and a host that is not
+  // OpenCode carries none of them by name, so the 1.x names go out.
+  assert.deepEqual(
+    lastCall(state).body.tools.map((tool) => tool.function.name),
+    ["bash", "glob", "grep", "read"],
+  );
 });
 
 // A host that sent one protocol's tool shape to another's endpoint has still
@@ -590,12 +632,38 @@ test("reads a tool's name out of either shape, so nothing is filled twice", asyn
       ],
     }),
   });
-  const tools = state.calls.at(-1).body.tools;
+  const tools = lastCall(state).body.tools;
   assert.equal(tools.length, 2, "the host's tools go out once each, not once each and again filled");
   assert.deepEqual(
     tools.map((tool) => tool.function.name),
     ["shell", "read"],
   );
+});
+
+// A chat host may still declare its tools the legacy way, in the top-level
+// `functions` array. Those tools are declared — the host has them — so none of
+// them may be stood in for, and the same tool must not go out twice (#131).
+test("a tool declared through the legacy functions array is not filled in again", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      messages: [{ role: "user", content: "hi" }],
+      functions: [{ name: "bash", description: "the host's own", parameters: { type: "object", properties: {} } }],
+    }),
+  });
+  const names = lastCall(state).body.tools.map((tool) => tool.function.name);
+  assert.deepEqual(
+    names.filter((name) => name === "bash"),
+    [],
+    "the legacy declaration is a declaration: nothing is stood in for this name",
+  );
+  // The names the host did not declare are still filled, as they are for any
+  // host that is not OpenCode.
+  assert.deepEqual(names, ["glob", "grep", "read"]);
 });
 // A host that is not OpenCode describes its tools in its own words, and Zen
 // reads the wording of the tools it knows by name. The tool itself is the
@@ -623,12 +691,12 @@ test("keeps the host's tools and sends OpenCode's wording for the names Zen read
 
   assert.equal((await send()).status, 200);
   assert.deepEqual(
-    state.calls.at(-1).body.tools.map((tool) => tool.function.name),
+    lastCall(state).body.tools.map((tool) => tool.function.name),
     ["bash", "glob", "grep", "read"],
   );
 
   assert.equal((await send(own)).status, 200);
-  const sent = state.calls.at(-1).body.tools;
+  const sent = lastCall(state).body.tools;
   assert.deepEqual(
     sent.map((tool) => tool.function.name),
     ["bash", "read", "glob", "grep", "write"],
@@ -648,7 +716,7 @@ test("keeps the host's tools and sends OpenCode's wording for the names Zen read
   for (const tool of sent) assert.equal(tool.function.required, undefined);
   const added = (await (async () => {
     await send();
-    return state.calls.at(-1).body.tools;
+    return lastCall(state).body.tools;
   })()).filter((tool) => !own.some((declared) => declared.function.name === tool.function.name));
   for (const tool of added) assert.equal(tool.function.required, undefined);
 });
@@ -669,7 +737,7 @@ test("replaces the wording of a tool sent in the other shape", async (t) => {
       tools: [{ type: "function", name: "bash", description: "Run a command.", parameters: { type: "object", properties: { cmd: { type: "string" } } } }],
     }),
   });
-  const bash = state.calls.at(-1).body.tools[0];
+  const bash = lastCall(state).body.tools[0];
   // Left in the shape it arrived in, with the wording replaced where the
   // description sits in that shape.
   assert.equal(bash.function, undefined);
@@ -690,7 +758,7 @@ test("marks an added tool as a placeholder without touching the host's own", asy
     });
 
   await send();
-  for (const tool of state.calls.at(-1).body.tools) {
+  for (const tool of lastCall(state).body.tools) {
     const spoken = PROFILES["1.x"].tools[tool.function.name];
     assert.ok(
       tool.function.description.startsWith(spoken.description),
@@ -704,7 +772,7 @@ test("marks an added tool as a placeholder without touching the host's own", asy
   // that runs, so nothing may tell the model to leave it.
   const own = { type: "function", function: { name: "read", description: "Load a file.", parameters: { type: "object", properties: { path: { type: "string" } } } } };
   await send([own]);
-  const read = state.calls.at(-1).body.tools.find((tool) => tool.function.name === "read");
+  const read = lastCall(state).body.tools.find((tool) => tool.function.name === "read");
   assert.equal(read.function.description, PROFILES["1.x"].tools.read.description);
 });
 
@@ -726,9 +794,62 @@ test("a refusal names the wording to update rather than the headers", async (t) 
   assert.equal(error.type, "FreeTierError");
   assert.match(error.message, /wording/i);
   assert.match(error.message, /bash, glob, grep, read/);
-  assert.match(error.message, /1\.19\.0/);
+  assert.match(error.message, new RegExp(PROFILES["1.x"].agent.opencode.replace(/\./g, "\\.")));
   // Zen's own wording, which sends people off to change headers, is replaced.
   assert.doesNotMatch(error.message, /can only be used from within OpenCode/);
+});
+
+// The bytes a refusal is replaced with are not the bytes that arrived, so the
+// headers describing them have to be the new ones. This is the message a user
+// reads when the free tier stops answering, and a body re-served under the
+// upstream's `content-encoding` cannot be read at all — the caller that honours
+// the header fails to decompress it.
+test("a rewritten refusal carries headers for the body it actually returns", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 403;
+  state.responseHeaders = {
+    "content-encoding": "identity",
+    "content-length": "999",
+    etag: '"stale-validator"',
+    "last-modified": "Wed, 01 Oct 2026 00:00:00 GMT",
+  };
+  state.body = JSON.stringify({
+    type: "error",
+    error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." },
+  });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 403);
+  for (const name of ["content-length", "content-encoding", "transfer-encoding", "etag", "last-modified"]) {
+    assert.equal(response.headers.get(name), null, `${name} still describes the old body`);
+  }
+  assert.equal(response.headers.get("content-type"), "application/json");
+  // And the body is the diagnostic, readable as JSON by a caller that trusted
+  // the headers it was given.
+  const { error } = await response.json();
+  assert.match(error.message, /wording/i);
+});
+
+// A 403 that is not the free tier's is somebody else's answer, and it is left
+// as it arrived — including the headers describing its own bytes.
+test("a 403 that is not the free tier's is left as sent", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 403;
+  state.responseHeaders = { etag: '"someone-elses"' };
+  state.body = JSON.stringify({ error: { message: "quota exhausted for this account" } });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("etag"), '"someone-elses"');
+  assert.match(await response.text(), /quota exhausted for this account/);
 });
 
 for (const [path, model, key] of [
@@ -744,7 +865,7 @@ for (const [path, model, key] of [
       body: JSON.stringify({ model, stream: true }),
     });
     await response.text();
-    const sent = state.calls.at(-1);
+    const sent = lastCall(state);
     assert.equal(sent.body.tools[0].name, "bash");
     assert.equal(sent.body.tools[0][key].type, "object");
     if (path === "messages") {
@@ -790,7 +911,20 @@ test("accepts Request input and aborts a streaming request", async (t) => {
   const response = await loader.fetch(req);
   const body = response.text();
   controller.abort();
-  await assert.rejects(body, /abort/i);
+  // The fixture never ends this response, so a regression in abort propagation
+  // leaves `body` neither settled nor rejected — and node:test has no default
+  // timeout, so the whole suite would hang instead of failing here.
+  let timer;
+  try {
+    await Promise.race([
+      assert.rejects(body, /abort/i),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("abort did not reach the stream")), WATCHDOG_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 });
 
 test("chat headers name the session the way the free tier wants", async (t) => {
@@ -852,7 +986,7 @@ test("a model made free since the list was read is served after the list is aske
     body: JSON.stringify({ model: "late-free", stream: true }),
   });
   assert.equal(response.status, 200);
-  assert.equal(state.calls.at(-1).body.model, "late-free");
+  assert.equal(lastCall(state).body.model, "late-free");
 });
 
 test("a Chat stream Zen closes before its [DONE] ends cut short for a streaming client and fails for one that doesn't (#91)", async (t) => {
@@ -906,4 +1040,60 @@ test("a refusal that names a window reaches the declaration, not only the caller
   assert.match(await response.text(), /maximum context length is 900000 tokens/);
   const { limitOverrides } = await import("./limits.mjs");
   assert.equal(limitOverrides("chat-free", { context: 200000, output: 8192 }).context, 900000);
+});
+
+// One turn end to end, over the paths a real host walks in order: register,
+// discover, ask, be refused as not-OpenCode, and be told which wording to
+// update — with the refusal readable and carrying headers for the bytes it
+// returns. Each piece is covered above on its own; this is the wiring between
+// them, which is what a refactor of any one module breaks.
+test("one turn end to end: discover, ask, be refused, be told what to update", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  const config = {};
+  await plugin.config(config);
+  assert.equal(config.provider["opencode-zen-free"].api, `${origin}/v1`);
+
+  const listed = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.ok(listed["chat-free"], "the listing's free model is offered");
+
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 403;
+  // A refusal as a proxy serves it: compressed, with a length and a validator
+  // that describe bytes this plugin replaces before the caller sees them.
+  state.responseHeaders = {
+    "content-encoding": "identity",
+    etag: '"stale"',
+    "last-modified": "Wed, 01 Oct 2026 00:00:00 GMT",
+  };
+  state.body = JSON.stringify({
+    type: "error",
+    error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." },
+  });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      stream: false,
+      messages: [{ role: "user", content: "hi" }],
+      tools: declaredTools("chat"),
+    }),
+  });
+  assert.equal(response.status, 403);
+  for (const name of ["content-encoding", "content-length", "etag", "last-modified"])
+    assert.equal(response.headers.get(name), null, `${name} describes bytes that were replaced`);
+  const { error } = await response.json();
+  assert.equal(error.type, "FreeTierError");
+  assert.match(error.message, /wording/i);
+  assert.match(error.message, /this package's, for OpenCode \d/);
+
+  // The request that was refused is still the request the plugin makes: the
+  // tools it sent are OpenCode's own wording for the names Zen reads, with the
+  // host's declarations kept alongside.
+  const sent = lastCall(state);
+  assert.ok(sent.headers["user-agent"].startsWith("opencode/"), sent.headers["user-agent"]);
+  assert.equal(sent.headers["x-opencode-session"], sent.headers["x-opencode-session-id"]);
+  const names = sent.body.tools.map((tool) => tool.function.name);
+  assert.deepEqual(names, [...declaredTools("chat").map((tool) => tool.function.name), "bash", "glob", "grep", "read"]);
+  assert.equal(new Set(names).size, names.length, "no name goes out twice");
+  assert.equal(sent.body.stream, true, "upstream streaming is forced even for a client that does not stream");
 });

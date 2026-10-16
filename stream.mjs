@@ -1,4 +1,8 @@
-const MAX_BYTES = 32 * 1024 * 1024;
+// The one byte limit a reply held in memory is read through: a streamed one
+// event by event, a whole one in one read. Exported because tool-response.mjs
+// reads the same bytes through the same limit and names the same number in its
+// failures — a second copy of it is a second thing to keep in step.
+export const MAX_BYTES = 32 * 1024 * 1024;
 
 // The headers that describe the bytes a reply arrived as. A reply whose body
 // is written again — a stream collapsed into one JSON document, or a guarded
@@ -57,6 +61,39 @@ function appendFunction(target, delta) {
   }
 }
 
+// The rule every streamed text field follows: a .delta appends to what came
+// before it, a .done replaces it with the whole text. Written once, so a
+// protocol tweak is applied to all of them together rather than five times.
+function applyText(target, field, value, isDelta) {
+  if (isDelta) target[field] = (target[field] ?? "") + (value ?? "");
+  else if (value !== undefined) target[field] = value;
+}
+
+// How much of a streamed reply a snapshot carries, counted over the fields a
+// stream fills in.
+function weight(snapshot, fields) {
+  let total = 0;
+  for (const field of fields) {
+    const value = snapshot?.[field];
+    if (typeof value === "string") total += value.length;
+    else if (Array.isArray(value)) total += value.length;
+    else if (value && typeof value === "object") total += Object.keys(value).length;
+  }
+  return total;
+}
+
+// Whether a snapshot may stand in for what was accumulated. An upstream puts
+// snapshots beside the deltas they describe — a repeated response.created, a
+// message_start whose block has not been filled in, a terminal response — and
+// one that carries nothing where the accumulation has content is a partial
+// view of it rather than a newer one: taking it would discard what the stream
+// already delivered. One that does carry the collection settles it, which is
+// how response.output_item.done and a whole terminal response replace
+// accumulated arguments with the complete ones.
+function carries(snapshot, accumulated, fields) {
+  return weight(snapshot, fields) > 0 || weight(accumulated, fields) === 0;
+}
+
 function chatAccumulator() {
   const body = { object: "chat.completion", choices: [] };
   const choices = new Map();
@@ -99,7 +136,11 @@ function chatAccumulator() {
           }
           if (fragment.function) appendFunction(call.function, fragment.function);
         }
-        if (part.finish_reason != null) choice.finish_reason = part.finish_reason;
+        // Both null and undefined are "this chunk carried no finish reason";
+        // a loose comparison is the only way to say that in one test, and the
+        // project's rules do not allow it.
+        if (part.finish_reason !== null && part.finish_reason !== undefined)
+          choice.finish_reason = part.finish_reason;
         if (part.logprobs) {
           choice.logprobs ??= {};
           for (const [key, value] of Object.entries(part.logprobs)) {
@@ -124,12 +165,27 @@ function responsesAccumulator() {
   let body = { object: "response", output: [] };
   let final;
   const output = new Map();
+  // The fields a streamed item fills in: a message its content, a call its
+  // arguments, a reasoning item its summary.
+  const fields = ["content", "arguments", "summary", "text"];
   // The slot a frame belongs to: the output_index it carries, or the slot
-  // of the item it names when the upstream left output_index out.
+  // of the item it names when the upstream left output_index out. A frame
+  // naming an item the stream never opened has no slot at all — slot 0 is
+  // only for a frame that names nothing, which a stream that never indexed
+  // its items means as the first one. Merging an unknown item into slot 0
+  // was measured handing a function_call there the text of a message.
   function slot(data, id) {
     if (data.output_index !== undefined) return index(data.output_index);
-    const position = id ? [...output].find(([, value]) => value.id === id)?.[0] : undefined;
+    if (id === undefined || id === null || id === "") return index(undefined);
+    const position = [...output].find(([, value]) => value.id === id)?.[0];
+    if (position === undefined)
+      throw new Error("Upstream frame names an unknown item without an output index");
     return index(position);
+  }
+  // A snapshot replaces the item in its slot only when it is a whole view of
+  // it; a partial one leaves what the deltas delivered standing.
+  function keep(position, value) {
+    if (carries(value, output.get(position), fields)) output.set(position, value);
   }
   function item(data, type = "message") {
     const position = slot(data, data.item_id);
@@ -148,11 +204,14 @@ function responsesAccumulator() {
       if (type === "response.created" || type === "response.in_progress") {
         if (data.response) {
           body = { ...body, ...data.response };
+          // A snapshot that carries an item where the reply already has one
+          // adds only what it actually carries: the accumulated items stand
+          // against an output list it does not carry, or carries empty.
           for (const [position, value] of (data.response.output ?? []).entries())
-            output.set(position, value);
+            keep(position, value);
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
-        if (data.item) output.set(slot(data, data.item.id), data.item);
+        if (data.item) keep(slot(data, data.item.id), data.item);
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
         value.content ??= [];
@@ -170,15 +229,15 @@ function responsesAccumulator() {
         const part = (value.content[index(data.content_index)] ??= refusal
           ? { type: "refusal", refusal: "" }
           : { type: "output_text", text: "", annotations: [] });
-        if (type.endsWith(".delta")) part[field] = (part[field] ?? "") + (data.delta ?? "");
-        else if (data[field] !== undefined) part[field] = data[field];
+        const isDelta = type.endsWith(".delta");
+        applyText(part, field, isDelta ? data.delta : data[field], isDelta);
       } else if (
         type === "response.function_call_arguments.delta" ||
         type === "response.function_call_arguments.done"
       ) {
         const value = item(data, "function_call");
-        if (type.endsWith(".delta")) value.arguments = (value.arguments ?? "") + (data.delta ?? "");
-        else if (data.arguments !== undefined) value.arguments = data.arguments;
+        const isDelta = type.endsWith(".delta");
+        applyText(value, "arguments", isDelta ? data.delta : data.arguments, isDelta);
       } else if (
         type === "response.reasoning_summary_part.added" ||
         type === "response.reasoning_summary_part.done"
@@ -189,14 +248,18 @@ function responsesAccumulator() {
       } else if (/^response\.reasoning_(summary_)?text\.(delta|done)$/.test(type)) {
         const value = item(data, "reasoning");
         const summary = type.includes("summary");
-        const field = summary ? "summary" : "content";
-        value[field] ??= [];
-        const part = (value[field][index(summary ? data.summary_index : data.content_index)] ??= {
+        const collection = summary ? "summary" : "content";
+        value[collection] ??= [];
+        const at = index(summary ? data.summary_index : data.content_index);
+        const part = (value[collection][at] ??= {
           type: summary ? "summary_text" : "reasoning_text",
           text: "",
         });
-        if (type.endsWith(".delta")) part.text += data.delta ?? "";
-        else if (data.text !== undefined) part.text = data.text;
+        // A summary's whole text arrives in `summary` and a reasoning text's
+        // in `text`. Reading `text` for a summary lost a done event that had
+        // no delta before it (measured: the summary came back empty).
+        const isDelta = type.endsWith(".delta");
+        applyText(part, "text", isDelta ? data.delta : summary ? data.summary : data.text, isDelta);
       } else if (type === "response.reasoning_content.delta") {
         body.reasoning_content = (body.reasoning_content ?? "") + (data.delta ?? "");
       } else if (type === "response.completed" || type === "response.incomplete") {
@@ -209,9 +272,23 @@ function responsesAccumulator() {
       if (data.usage) body.usage = { ...body.usage, ...data.usage };
     },
     finish() {
-      if (final) return final;
-      body.output = sorted(output);
-      return body;
+      if (!final) {
+        body.output = sorted(output);
+        return body;
+      }
+      const kept = sorted(output);
+      // A terminal object that carries no output of its own — absent, or
+      // empty while the stream accumulated some — is not a whole view of the
+      // reply: returning it verbatim discards every delta already delivered,
+      // and the client reads a 200 as a model that said nothing. The
+      // accumulation stands in for the collection it lost; everything else
+      // about the terminal is what the upstream said last, and comes back
+      // exactly as it arrived.
+      const whole = Array.isArray(final.output)
+        ? final.output.length > 0
+        : final.output !== null && final.output !== undefined;
+      if (whole || !kept.length || Array.isArray(final)) return final;
+      return { ...final, output: kept };
     },
   };
 }
@@ -226,12 +303,19 @@ function anthropicAccumulator() {
   };
   const blocks = new Map();
   const argumentsJSON = new Map();
+  // The fields a Messages block fills in: its text, thinking, signature, or
+  // the input a tool call opened with.
+  const fields = ["text", "thinking", "signature", "partial_json", "input"];
   return {
     apply(data, type) {
       if (type === "message_start") {
         body = { ...body, ...data.message };
+        // A message_start that repeats beside the deltas it opened, or one
+        // whose block has not been filled in yet, is a partial view of the
+        // reply: a block that carries nothing where the accumulated one has
+        // content leaves it standing.
         for (const [position, block] of (data.message?.content ?? []).entries())
-          blocks.set(position, block);
+          if (carries(block, blocks.get(position), fields)) blocks.set(position, block);
       } else if (type === "content_block_start") {
         blocks.set(index(data.index), data.content_block);
       } else if (type === "content_block_delta") {
@@ -244,7 +328,7 @@ function anthropicAccumulator() {
           thinking_delta: "thinking",
           signature_delta: "signature",
         }[delta.type];
-        if (field) block[field] = (block[field] ?? "") + (delta[field] ?? "");
+        if (field) applyText(block, field, delta[field], true);
         if (delta.type === "input_json_delta") {
           argumentsJSON.set(
             position,
@@ -252,7 +336,13 @@ function anthropicAccumulator() {
           );
         }
       } else if (type === "message_delta") {
-        Object.assign(body, data.delta);
+        // Only the fields a message_delta is defined to carry are taken from
+        // it. Object.assign copied with [[Set]] semantics: a "__proto__" key
+        // in the upstream's delta re-parented the message being accumulated,
+        // and any other key silently overwrote its id, role, type or content.
+        for (const field of ["stop_reason", "stop_sequence"]) {
+          if (data.delta?.[field] !== undefined) body[field] = data.delta[field];
+        }
         if (data.usage) body.usage = { ...body.usage, ...data.usage };
       }
     },
@@ -312,7 +402,15 @@ export async function collapseResponse(response, protocol) {
     }
     if (!text.trim()) return;
     if (text.trim() === "[DONE]") {
+      // [DONE] is what ends a Chat stream, and it is a valid end-of-stream
+      // sentinel for a Responses or Messages one that has already reported
+      // its own terminal event (response.completed, response.incomplete,
+      // message_stop) — a gateway in front of the upstream may append it.
+      // Before that event it is an ending the protocol never reported, so
+      // what was streamed is not a whole reply: the guard refuses the same
+      // bytes with the same words rather than reading them as a success.
       if (protocol === "chat") completed = true;
+      else if (!completed) failure = "Unexpected upstream completion marker";
       return;
     }
     let data;

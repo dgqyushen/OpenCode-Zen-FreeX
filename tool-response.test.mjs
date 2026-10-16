@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { MAX_BYTES } from "./stream.mjs";
 import { cutShortNote, droppedNote, guardToolResponse } from "./tool-response.mjs";
 
 const encoder = new TextEncoder();
-// The guard's own SSE event limit (MAX_BYTES in tool-response.mjs), for the
-// tests that measure how much of a stream it reads before stopping.
-const LIMIT_BYTES = 32 * 1024 * 1024;
-// Shared by the loops below as well as by the tests: a `const` read from a
-// test body that ran during module evaluation would be in its dead zone.
+// The policy every test in this file guards against, at module scope so the
+// loops that build the tests and the tests themselves share one value. A test
+// body runs after module evaluation, so a `const` read from one is
+// initialized by then whatever order the callbacks were registered in.
 const policy = {
   declared: new Set(["Bash", "Read"]),
   injected: new Set(["bash", "read", "shell"]),
@@ -88,6 +88,13 @@ function namesIn(protocol, data) {
     protocol === "responses" ? (data.response ?? data).output : (data.message ?? data).content
   ).map((value) => value.name);
 }
+// Every item shaped like a call, whichever kind it is: the three names the
+// guard reads, and the shapes it rejects or replaces (custom_tool_call,
+// local_shell_call, mcp_call, apply_patch_call, and whatever is added next).
+// A leak assertion that only knew the three would not see the others.
+const callShaped = (type) =>
+  typeof type === "string" &&
+  (type.endsWith("_call") || type === "tool_use" || type === "server_tool_use");
 // The calls a reply (JSON, or every SSE frame's data) hands the agent, and
 // the text it says.
 function callsIn(protocol, values) {
@@ -95,7 +102,7 @@ function callsIn(protocol, values) {
     if (protocol === "chat")
       return (data.choices ?? [])
         .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
-        .map((value) => value.function.name);
+        .map((value) => value.function?.name);
     const items =
       protocol === "responses"
         ? [...((data.response ?? data).output ?? []), ...(data.item ? [data.item] : [])]
@@ -103,9 +110,7 @@ function callsIn(protocol, values) {
             ...((data.message ?? data).content ?? []),
             ...(data.content_block ? [data.content_block] : []),
           ];
-    return items
-      .filter((item) => ["function_call", "tool_use", "server_tool_use"].includes(item.type))
-      .map((item) => item.name);
+    return items.filter((item) => callShaped(item.type)).map((item) => item.name);
   });
 }
 function textIn(protocol, values) {
@@ -249,21 +254,6 @@ function badMixed(protocol) {
     };
   return { type: "message_start", message: { content: [tool(protocol, "Read"), 5] } };
 }
-function sse(text, { chunkSize = 31, headers = {}, status = 200 } = {}) {
-  const bytes = encoder.encode(text);
-  let offset = 0;
-  return new Response(
-    new ReadableStream({
-      pull(controller) {
-        if (offset === bytes.length) return controller.close();
-        const end = Math.min(offset + chunkSize, bytes.length);
-        controller.enqueue(bytes.slice(offset, end));
-        offset = end;
-      },
-    }),
-    { status, headers: { "content-type": "text/event-stream", ...headers } },
-  );
-}
 function parse(text) {
   return text
     .replace(/^\uFEFF/, "")
@@ -303,20 +293,30 @@ function assertError(protocol, data, stream = true, code = "upstream_error") {
   }
   assert.equal(typeof (data.message ?? data.error?.message), "string");
 }
-async function withTimeout(promise) {
+// A stream that never ends on its own is waited on with a budget: a hang is
+// then reported as one instead of stalling the run. A loaded machine can push
+// a real read past any fixed number, so the budget is per call and generous.
+async function withTimeout(promise, ms = 5000) {
   let timer;
   try {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("stream waited for EOF")), 1500);
+        timer = setTimeout(() => reject(new Error("stream waited for EOF")), ms);
       }),
     ]);
   } finally {
     clearTimeout(timer);
   }
 }
-function openSource(text, cancel = () => {}) {
+// One factory for every upstream mock below: a Response whose body is a
+// stream built from `pull`, the chunks it handed out counted, and the handles
+// a test needs to push into it or close it. The scaffolding is written once,
+// so a fix to it applies to all of the mocks at once.
+function upstream(
+  pull,
+  { cancel = () => {}, headers = {}, status = 200, highWaterMark = 1 } = {},
+) {
   let controller;
   let pulls = 0;
   const response = new Response(
@@ -327,64 +327,69 @@ function openSource(text, cancel = () => {}) {
         },
         pull(value) {
           pulls++;
-          if (pulls === 1) value.enqueue(encoder.encode(text));
+          return pull(value, pulls);
         },
         cancel,
       },
-      { highWaterMark: 0 },
+      { highWaterMark },
     ),
-    { headers: { "content-type": "text/event-stream" } },
+    { status, headers: { "content-type": "text/event-stream", ...headers } },
   );
   return {
     response,
+    pulls: () => pulls,
     push: (value) => controller.enqueue(encoder.encode(value)),
     close: () => controller.close(),
-    pulls: () => pulls,
   };
+}
+function sse(text, { chunkSize = 31, headers = {}, status = 200 } = {}) {
+  const bytes = encoder.encode(text);
+  let offset = 0;
+  return upstream(
+    (controller) => {
+      if (offset === bytes.length) return controller.close();
+      const end = Math.min(offset + chunkSize, bytes.length);
+      controller.enqueue(bytes.slice(offset, end));
+      offset = end;
+    },
+    { status, headers },
+  ).response;
+}
+function openSource(text, cancel = () => {}) {
+  let first = true;
+  return upstream(
+    (controller) => {
+      if (!first) return;
+      first = false;
+      controller.enqueue(encoder.encode(text));
+    },
+    { cancel, highWaterMark: 0 },
+  );
 }
 // A chunked upstream the guard has to stop reading itself: it hands out
 // `bytes` in `chunkSize` pieces, then leaves the stream open. `pulls` is how
 // many chunks it took to be stopped.
 function chunkedStream(bytes, { chunkSize = bytes.length, cancel = () => {} } = {}) {
   let offset = 0;
-  let pulls = 0;
-  const response = new Response(
-    new ReadableStream(
-      {
-        pull(controller) {
-          pulls++;
-          if (offset === bytes.length) return;
-          const end = Math.min(offset + chunkSize, bytes.length);
-          controller.enqueue(bytes.slice(offset, end));
-          offset = end;
-        },
-        cancel,
-      },
-      { highWaterMark: 0 },
-    ),
-    { headers: { "content-type": "text/event-stream" } },
+  return upstream(
+    (controller) => {
+      if (offset === bytes.length) return;
+      const end = Math.min(offset + chunkSize, bytes.length);
+      controller.enqueue(bytes.slice(offset, end));
+      offset = end;
+    },
+    { cancel, highWaterMark: 0 },
   );
-  return { response, pulls: () => pulls };
 }
 // The same, for an upstream that never runs out: `chunk` is the bytes of
 // every pull, or a function of the pull count when the payload has to differ
 // each time.
 function endlessStream(chunk, { cancel = () => {} } = {}) {
   const next = typeof chunk === "function" ? chunk : () => chunk;
-  let pulls = 0;
-  const response = new Response(
-    new ReadableStream(
-      {
-        pull(controller) {
-          controller.enqueue(next(pulls++));
-        },
-        cancel,
-      },
-      { highWaterMark: 0 },
-    ),
-    { headers: { "content-type": "text/event-stream" } },
-  );
-  return { response, pulls: () => pulls };
+  return upstream((controller, pulls) => controller.enqueue(next(pulls - 1)), {
+    cancel,
+    highWaterMark: 0,
+  });
 }
 
 for (const protocol of protocols) {
@@ -665,7 +670,10 @@ for (const protocol of protocols) {
             },
           });
           const result = await guardToolResponse(source.response, protocol, policy);
-          const actual = new Uint8Array(await withTimeout(result.arrayBuffer()));
+          // One guard run per chunk size in this loop, on a machine that may
+          // be running the 32 MiB tests beside it: more headroom than the
+          // default budget, so a slow read is not reported as a hang.
+          const actual = new Uint8Array(await withTimeout(result.arrayBuffer(), 15_000));
           assert.deepEqual(actual, bytes);
           assert.equal(cancellations, 1);
           assert.equal(source.response.body.locked, false);
@@ -804,6 +812,41 @@ for (const protocol of protocols) {
     assertError(protocol, await result.json(), false);
   });
 }
+
+// [DONE] is the sentinel a Chat stream ends with, and a Responses or Messages
+// stream may be handed one after it has reported its own terminal event — a
+// gateway in front of the upstream appends it. That is an ending. Before the
+// terminal event it claims an ending the protocol never reported, and the
+// reply is refused. The collapse path reads the same bytes the same way (its
+// half of this test is in stream.test.mjs).
+test("a [DONE] marker is an ending only where the reply already ended", async () => {
+  for (const protocol of ["responses", "anthropic"]) {
+    const terminal =
+      protocol === "responses"
+        ? event(
+            { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+            "response.completed",
+          )
+        : event({ type: "message_stop" }, "message_stop");
+    const marker = "data: [DONE]\n\n";
+    const good = await guardToolResponse(sse(terminal + marker), protocol, policy);
+    const out = await good.text();
+    assert.equal(good.status, 200);
+    assert.ok(out.endsWith(marker), "the marker is forwarded as it arrived");
+    assert.ok(
+      !parse(out).some((frame) => frame.data?.type === "error" || frame.data?.error),
+      "an ending the protocol reported is not an error",
+    );
+    const bare = await guardToolResponse(sse(marker), protocol, policy);
+    const frames = parse(await bare.text());
+    assert.equal(frames.length, 1);
+    assertError(protocol, frames[0].data);
+    assert.equal(
+      frames[0].data.message ?? frames[0].data.error.message,
+      "Unexpected upstream completion marker",
+    );
+  }
+});
 
 test("Responses codes a call of no declared tool as an undeclared one, and nothing else", async () => {
   // A call where a snapshot was expected, so it cannot be put in place of
@@ -1094,7 +1137,7 @@ test("single SSE event limit is 32 MiB and cancels an unterminated upstream", { 
   // The 33rd chunk is the one that carries the count past the limit, and the
   // source queues nothing ahead of the reader.
   assert.ok(
-    source.pulls() <= LIMIT_BYTES / bytes.length + 1,
+    source.pulls() <= MAX_BYTES / bytes.length + 1,
     `pulled ${source.pulls()} chunks before the limit`,
   );
 });
@@ -1123,19 +1166,25 @@ test("cumulative pending chat tools are limited across choices and calls", { tim
   // Each event's arguments are charged whole, so the limit falls within a
   // chunk or two of 32 MiB of them, and the source queues nothing ahead.
   assert.ok(
-    source.pulls() <= LIMIT_BYTES / argumentsChunk.length + 1,
+    source.pulls() <= MAX_BYTES / argumentsChunk.length + 1,
     `pulled ${source.pulls()} chunks before the pending-tool limit`,
   );
 });
 
 // 32+ MiB through the guard, not held to bun's 5 s default: a reply that is
-// not a stream is read through the same limit a streamed one's events are.
+// not a stream is read through the same limit a streamed one's events are,
+// and the body it abandons is cancelled rather than left writing into a
+// socket nobody reads.
 test("a non-streaming reply is read through the 32 MiB limit", { timeout: 60_000 }, async () => {
   const bytes = encoder.encode("x".repeat(1024 * 1024));
+  let cancelled = 0;
   const source = new Response(
     new ReadableStream({
       pull(controller) {
         controller.enqueue(bytes);
+      },
+      cancel() {
+        cancelled++;
       },
     }),
     { headers: { "content-type": "application/json" } },
@@ -1143,6 +1192,25 @@ test("a non-streaming reply is read through the 32 MiB limit", { timeout: 60_000
   const result = await guardToolResponse(source, "chat", policy);
   assert.equal(result.status, 502);
   assert.match((await result.json()).error.message, /32 MiB|limit/i);
+  assert.equal(cancelled, 1);
+  assert.equal(source.body.locked, false);
+});
+
+// A body abandoned without its cancel being awaited leaves an upstream
+// writing into a socket nobody reads; a cancel that fails is the caller's
+// failure, not something to swallow (the collapse path pins the same).
+test("a non-streaming reply abandoned past the limit cancels, and a cancel failure is not swallowed", async () => {
+  const cause = new DOMException("cancel failed", "AbortError");
+  const bytes = encoder.encode("x".repeat(1024 * 1024));
+  const { response } = upstream((controller) => controller.enqueue(bytes), {
+    headers: { "content-type": "application/json" },
+    highWaterMark: 0,
+    cancel() {
+      throw cause;
+    },
+  });
+  await assert.rejects(guardToolResponse(response, "chat", policy), (error) => error === cause);
+  assert.equal(response.body.locked, false);
 });
 
 test("chat: each pending choice is settled on its own, an unknown or missing final name left out", async () => {
@@ -1192,6 +1260,60 @@ test("chat: a choice whose every call was left out finishes as a stop, again and
   assert.deepEqual(finishes, ["stop", "stop"]);
   assert.equal(textIn("chat", values), droppedNote("bedit"));
   assert.ok(values.some((data) => data.usage?.completion_tokens === 5));
+});
+
+test("chat: a round whose only call was left out does not decide the round after it (#76)", async () => {
+  // Round 1 calls a tool this agent has no name for and ends in tool use;
+  // round 2, in the same stream, calls a declared one. The first round ends
+  // as a plain stop (#76) — and the second is judged on its own, not on the
+  // round before it: a client that keys execution off finish_reason never
+  // runs a call published under "stop".
+  const round = (name) => event(chat({ tool_calls: [call(name)] }, "tool_calls"));
+  const two = await guardToolResponse(
+    sse(round("bedit") + round("bash") + terminal("chat")),
+    "chat",
+    policy,
+  );
+  const choices = frameData(await two.text()).flatMap((data) => data.choices ?? []);
+  assert.deepEqual(
+    choices.map((choice) => choice.finish_reason),
+    ["stop", "tool_calls"],
+  );
+  assert.deepEqual(callsIn("chat", [{ choices }]), ["Bash"]);
+  assert.equal(textIn("chat", [{ choices }]), droppedNote("bedit"));
+  // The control: the same round on its own, where nothing preceded it.
+  const one = await guardToolResponse(sse(round("bash") + terminal("chat")), "chat", policy);
+  assert.deepEqual(
+    frameData(await one.text())
+      .flatMap((data) => data.choices ?? [])
+      .map((choice) => choice.finish_reason),
+    ["tool_calls"],
+  );
+});
+
+test("chat: buffered calls flushed at [DONE] say the turn ended in tool use", async () => {
+  // The case this buffer exists for: an upstream that closes with [DONE]
+  // before sending a finish chunk. A null finish_reason reads as no ending at
+  // all, so the reason is derived from what the flush publishes.
+  const flush = async (delta) => {
+    const text = event(chat(delta)) + terminal("chat");
+    const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+    return values.flatMap((data) => data.choices ?? [])[0];
+  };
+  const calls = await flush({ tool_calls: [call("bash")] });
+  assert.equal(calls.finish_reason, "tool_calls");
+  assert.deepEqual(
+    calls.delta.tool_calls.map((value) => value.function.name),
+    ["Bash"],
+  );
+  const legacy = await flush({ function_call: { name: "bash", arguments: "{}" } });
+  assert.equal(legacy.finish_reason, "function_call");
+  assert.equal(legacy.delta.function_call.name, "Bash");
+  // A call of no declared tool is left out, and what is left is a plain stop.
+  const dropped = await flush({ tool_calls: [call("bedit")] });
+  assert.equal(dropped.finish_reason, "stop");
+  assert.equal(dropped.delta.tool_calls, undefined);
+  assert.equal(dropped.delta.content, droppedNote("bedit"));
 });
 
 test("chat: the note follows the text the model wrote before its call", async () => {

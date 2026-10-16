@@ -36,10 +36,18 @@ function sdkProtocol(npm) {
 // explicit null, and neither retires a model.
 const hasValue = (value) => value !== null && value !== undefined;
 
+// A status has to say something to be one. The catalogue writes an empty string
+// as well as a null, and either one used to stand in front of the `lifecycle`
+// that does retire the model, so a model retired through `lifecycle` kept being
+// offered. A status that is set — "active" included — is still read as itself.
+const isSet = (value) => hasValue(value) && String(value).trim() !== "";
+
 function isRetired(model) {
   return (
     model.deprecated === true ||
-    ["deprecated", "retired", "disabled"].includes(model.status ?? model.lifecycle) ||
+    ["deprecated", "retired", "disabled"].includes(
+      isSet(model.status) ? model.status : model.lifecycle,
+    ) ||
     hasValue(model.deprecated_at) ||
     hasValue(model.retirement_date)
   );
@@ -72,7 +80,12 @@ function listedFree(id) {
 // sending it somewhere it is not served: `systemone` and a model the catalogue
 // drops do not appear.
 function protocolFor(id, model, raw, provider, protocols) {
-  if (protocols[id]) return protocols[id];
+  // Own properties only. `protocols` is a plain object, so `protocols["toString"]`
+  // is a truthy function — the model would be dropped for naming a protocol
+  // outside `SDK` instead of being resolved from the catalogue or its `-free`
+  // name, and `protocols["__proto__"]` would be an inherited protocol nobody
+  // wrote. What the docs actually say about an id is an own property or nothing.
+  if (Object.hasOwn(protocols, id)) return protocols[id];
   if (raw) return sdkProtocol(model.provider?.npm ?? provider.npm);
   if (listedFree(id)) return sdkProtocol(provider.npm) ?? "chat";
   return undefined;
@@ -89,8 +102,19 @@ const modalities = (values) =>
 export function buildModels(ids, provider, protocols, baseURL) {
   const result = {};
   for (const id of ids) {
+    // `__proto__` is skipped where the id is first known to be a string: it can
+    // never be an entry in the catalogue's own map, since on a plain object the
+    // write side of it is the prototype. The own-property read below leaves it
+    // unresolved for that same reason, so this is the redundant half of a pair —
+    // kept because it states the rule at the point the rule is about.
     if (typeof id !== "string" || !id || id === "__proto__") continue;
-    const raw = provider.models?.[id];
+    // The catalogue's own entry for the id, not whatever Object.prototype has
+    // under that name: `models?.["toString"]` is a function, and reading it as a
+    // description of the model would invent a protocol for an id nothing
+    // describes. An id with no entry here is one the catalogue has not caught up
+    // with, which the `-free` rule below is for.
+    const catalogue = provider.models ?? {};
+    const raw = Object.hasOwn(catalogue, id) ? catalogue[id] : undefined;
     const model = raw ?? {};
     const protocol = protocolFor(id, model, raw, provider, protocols);
     if (!isFree(id, model) || !Object.hasOwn(SDK, protocol)) continue;

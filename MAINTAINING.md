@@ -156,13 +156,21 @@ It reports each request as:
 | `refused` | Zen did not recognise it (403) |
 | `superseded` | Zen wants a newer OpenCode than the profile claims (426) |
 | `failed` | Zen answered with something other than a 403, so it never judged the fingerprint |
+| `malformed` | the request could not be built: a name in `required` has no tool behind it in `fingerprint.json`. Zen was never asked, and the line names the generation, the shape and the name |
 | `unreachable` | Zen could not be asked at all |
+
+A `malformed` row is a `fingerprint.json` problem, not a network one, and the
+summary says so rather than sending the reader to `capture`. It is deliberately
+not counted as `answered`: a run whose floors are all `malformed` exits non-zero.
 
 The `floor` decides the exit code, because it is the shape this plugin exists to
 send. The `full` is reported for what it says about a wording that has gone
 stale. Asking only the full shape left a real gap: `read` alone is `answered` and
 everything but `read` is `refused`, so a Zen that began insisting on one more
-name would keep `full` passing while the shape actually sent was refused.
+name would keep `full` passing while the shape actually sent was refused. The
+diagnosis at the end reads the floor rows only: a stray 5xx on a `full` request
+says something about that request and nothing about whether the wording is
+current, so it must not turn "nothing was served" into "check the network".
 
 Only a 403 and a 426 are Zen answering about the fingerprint. A 5xx, a 429 or a
 401 says nothing about the wording, and the gate says so rather than sending the
@@ -194,6 +202,13 @@ name is served either way, which is why only the `floor` shows this.
 `agent.opencode` in `fingerprint.json` above what it asks for. 426 is Zen saying
 "your client is too old", which is a different problem from 403 and is not fixed
 by changing tools.
+
+**`malformed`.** `fingerprint.json` names a tool in `required` that the same
+profile does not carry under `tools`, so the gate could not build the request it
+wants to ask with. This is not a network problem and not something Zen said: the
+line names the generation, the shape and the missing name. Fix the file — a
+capture from a current OpenCode is the usual way — and ask again. The run exits
+non-zero, and the summary says the same thing in one sentence.
 
 **`unreachable`.** Not a fingerprint problem. Check the network, and whether
 repeated refusals from this address have put it in a cooldown — they can, and
@@ -261,8 +276,17 @@ that passes under the stricter of them, since the looser one will not last.
 | `models.mjs` | which models are free, and what protocol each speaks |
 | `limits.mjs` | what a model's limits are, where the catalogue under-reports them |
 | `stream.mjs`, `tool-response.mjs` | replies Zen cuts short, and tool calls |
+| `limits-audit.mjs` | asks the route which ids it still offers and which look under-declared (`limits:audit`) |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
+
+`capture.mjs`, `limits-audit.mjs` and `tools-smoke.mjs` are maintenance tools for
+this repository, not part of what a host loads: they are not in `package.json`'s
+`files`, so a published tarball carries only the modules a host imports plus
+`fingerprint.json`. `package.json`'s `exports` names those public modules one by
+one rather than mapping `./*`, so a file that was never meant to be imported
+cannot be reached as a subpath — `capture.mjs` in particular starts a server and
+rewrites `fingerprint.json` the moment it is imported.
 
 ## Which copy of the icon and the concurrency is authoritative
 
@@ -288,8 +312,18 @@ about the commit rather than about whatever Bun was newest that morning.
 Nothing here is installed with Bun — there are no dependencies — so Bun is the
 tools only. `import.meta.main` is what decides whether `tools-smoke.mjs` runs its
 gate or is being imported by a test, and a Node older than 22.18 does not define
-it: the gate falls back to comparing the entry path, and exits non-zero saying
-nothing was asked if it cannot tell the two apart.
+it: the gate falls back to comparing the entry path. That comparison resolves
+both paths and then their real paths, so a symlink or a junction naming this file
+is still recognised as this file, and a hard link is compared by device and inode
+(only where the filesystem reports an inode at all). A question it cannot answer
+exits non-zero saying nothing was asked — never a silent success, which is the
+one outcome a release gate must not have.
+
+Both scripts read their endpoint and model from the environment when the
+defaults are wrong: `ZEN_BASE_URL`, `ZEN_CHECK_MODEL` (gate), `ZEN_CATALOG_URL`,
+`ZEN_GENERATION` (audit) and `CAPTURE_PORT` (capture). `.env.example` lists them
+with their defaults. Nothing loads a file by itself, so export them or copy that
+file to `.env` and export from it.
 
 ## Publishing
 
@@ -304,6 +338,13 @@ To publish: bump `version`, commit, `npm publish` in a terminal, and tag — in
 that order, so the tarball, the commit the tag names, and the tree both were
 built from are one thing. `magpie plugin add opencode-zen-freex` installs it by
 that name.
+
+What ships is `package.json`'s `files` list, and it is deliberately narrower than
+the repository: the three maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
+`limits-audit.mjs`) stay here, because a host never loads them and one of them
+rewrites the shipped `fingerprint.json` if it is ever imported. `LICENSE` is
+verbatim MIT; the fork's provenance is in `NOTICE`, so a licence scanner reads a
+standard MIT file and a reader still finds why this fork exists.
 
 **The second factor is a browser, not a password.** Run `npm publish` in a
 terminal. When the account has 2FA on, the command stops and offers the whole

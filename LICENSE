@@ -1,14 +1,7 @@
 MIT License
 
 Copyright (c) 2026 xiaozhou26
-Copyright (c) 2026 opencode-zen-free contributors
-
-This is a maintained fork of the OpenCode Zen Free plugin from
-magpie-community/plugins, which is MIT licensed and carries the notice above:
-the `Copyright (c) 2026 xiaozhou26` line is upstream's and has to be kept with
-it, and the `opencode-zen-free contributors` line covers this fork.
-The fork is maintained separately because the free tier's request fingerprint
-moves faster than that repository follows it.
+Copyright (c) 2026 OpenCode-Zen-FreeX contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

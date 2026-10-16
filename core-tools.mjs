@@ -18,21 +18,81 @@
 // because those belong to the machine the capture ran on.
 
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const captured = JSON.parse(readFileSync(new URL("./fingerprint.json", import.meta.url), "utf8"));
+const CAPTURE = new URL("./fingerprint.json", import.meta.url);
 
-export const PROFILES = captured.profiles;
+// Read once, here, because every answer in this module comes out of it. Guarded
+// because the failure this replaces is a bare ENOENT or SyntaxError thrown out of
+// whichever module imported this one, which reads as *that* module being broken
+// and never names the file to fix. One message covers both, since the remedy is
+// the same for either: only a capture writes this file.
+function readProfiles() {
+  let captured;
+  try {
+    captured = JSON.parse(readFileSync(CAPTURE, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `core-tools: could not load the capture at ${fileURLToPath(CAPTURE)}; ` +
+        "missing or invalid JSON — run `bun run capture` to write a new one",
+      { cause: error },
+    );
+  }
+  // An object carrying a non-empty map of profiles, and nothing more specific:
+  // which generations those are is the capture's to say — capture.mjs writes
+  // next.profiles[generation] — so the keys are never named here. A capture that
+  // lost every profile cannot tell one generation from another and fails now
+  // rather than at the first request.
+  const profiles = captured?.profiles;
+  if (
+    typeof profiles !== "object" ||
+    profiles === null ||
+    Array.isArray(profiles) ||
+    !Object.keys(profiles).length
+  ) {
+    throw new Error(
+      `core-tools: the capture at ${fileURLToPath(CAPTURE)} has no profiles; ` +
+        "run `bun run capture` to write a new one",
+    );
+  }
+  return profiles;
+}
+
+export const PROFILES = readProfiles();
 
 /**
  * The generation a request belongs to, told by the tools it carries. Tool names
  * move far less often than descriptions do, so this survives a rewording that a
  * pinned User-Agent would not.
+ *
+ * `undefined` is a normal return: it says neither generation's names were there,
+ * and the callers default it themselves (`provider.mjs` uses `?? DEFAULT_GENERATION`).
+ * A body whose `tools` is not an array is the same answer as an empty one — the
+ * body is client-supplied, so it can carry any shape at all, and "no generation
+ * recognised" is the only honest reading of one that is not a list of tools.
  */
 export function generationOf(tools) {
-  const names = new Set((tools ?? []).map((tool) => tool?.function?.name ?? tool?.name));
+  const names = new Set(
+    (Array.isArray(tools) ? tools : []).map((tool) => tool?.function?.name ?? tool?.name),
+  );
   if (names.has("shell")) return "2.x";
   if (names.has("bash")) return "1.x";
   return undefined;
+}
+
+// The profile a generation was captured into, or an Error naming both what was
+// asked for and what the capture holds. Ownership rather than truthiness: a
+// plain object answers `constructor` and `toString` out of Object.prototype, so
+// `PROFILES[generation]` alone would hand back a function and then fail on its
+// `.agent` with a TypeError that names nothing.
+function profileFor(generation) {
+  if (!Object.hasOwn(PROFILES, generation)) {
+    throw new Error(
+      `core-tools: no profile for generation ${JSON.stringify(generation)}; ` +
+        `the capture holds ${Object.keys(PROFILES).join(", ")}`,
+    );
+  }
+  return PROFILES[generation];
 }
 
 /**
@@ -41,8 +101,26 @@ export function generationOf(tools) {
  * protocol and 2.x does not.
  */
 export function agentFor(generation, protocol = "chat") {
-  const agent = PROFILES[generation].agent;
-  return agent.providerUtils
-    ? `opencode/${agent.opencode} ai-sdk/provider-utils/${agent.providerUtils[protocol]} ${agent.runtime}`
-    : `opencode/${agent.channel}/${agent.opencode}/${agent.client}`;
+  const agent = profileFor(generation).agent;
+  if (typeof agent !== "object" || agent === null) {
+    throw new Error(
+      `core-tools: the ${JSON.stringify(generation)} profile in the capture has no agent; ` +
+        "run `bun run capture` to write a new one",
+    );
+  }
+  // The release shape carries no provider-utils at all, and is composed the same
+  // way whatever protocol was asked for.
+  if (!agent.providerUtils) return `opencode/${agent.channel}/${agent.opencode}/${agent.client}`;
+  // `?? "undefined"` used to be interpolated here for a protocol the capture has
+  // no provider-utils for, and a prototype member (`toString`) as the version.
+  // Zen reads this header, so a malformed one is rejected upstream with an error
+  // that says nothing about where it came from; name the miss instead.
+  if (!Object.hasOwn(agent.providerUtils, protocol)) {
+    throw new Error(
+      `core-tools: generation ${JSON.stringify(generation)} composes its User-Agent ` +
+        `per protocol, and the capture has no provider-utils for ${JSON.stringify(protocol)}; ` +
+        `it holds ${Object.keys(agent.providerUtils).join(", ")}`,
+    );
+  }
+  return `opencode/${agent.opencode} ai-sdk/provider-utils/${agent.providerUtils[protocol]} ${agent.runtime}`;
 }

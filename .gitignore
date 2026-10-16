@@ -1,13 +1,29 @@
 node_modules/
-/*.log
+*.log
 .DS_Store
+# `npm pack` writes the tarball it reports into the working directory.
+*.tgz
+
+# Working notes for this fork's own review rounds, kept out of the tree.
 /zenfree-audit/
 
 # Secrets. Nothing here is written by this repository, and none of it belongs in
 # a commit: the npm token MAINTAINING.md describes lives in an npmrc outside it.
+# `*.log` above is deliberately unanchored, because npm's debug logs record the
+# whole command line and a log written from a subdirectory is the same leak.
 .env
 .env.*
 !.env.example
 .npmrc
+# The publish recipe in MAINTAINING.md writes its token to a file named `npmrc`,
+# which `.npmrc` does not match.
+npmrc
 *.pem
 *.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.der
+id_rsa*
+id_ed25519*

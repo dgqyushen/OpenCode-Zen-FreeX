@@ -36,12 +36,19 @@
 //   superseded Zen wants a newer OpenCode than the one this profile claims (426)
 //   failed     Zen answered something other than 403: the request was made, and
 //              what came back is not a verdict on the fingerprint
+//   malformed  the request could not be built, because a name in `required` has
+//              no entry in that profile's `tools`: nothing was asked about the
+//              fingerprint, and fingerprint.json is what has to change
 //   unreachable the free tier could not be asked at all
 //
 // Exit code is 0 when at least one generation's floor is answered. A generation
-// being refused is not a failure while another still works.
+// being refused is not a failure while another still works, and `malformed` is
+// not an answer either: it is a defect in fingerprint.json, and the gate names
+// that instead of sending the reader to the network.
 
 import { randomBytes } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES, agentFor } from "./core-tools.mjs";
 import { outboundHeaders } from "./provider.mjs";
@@ -109,8 +116,27 @@ export function chatRequest({ model, generation, profile, names, maxTokens = 40,
   };
 }
 
-async function check(generation, profile, shape, names) {
-  const { headers, body } = requestFor(generation, profile, names);
+// A request that could not be built at all: a name in `required` with no entry
+// in that profile's `tools`, or a profile that cannot even name its shapes. It
+// is reported as a verdict rather than thrown, because one broken profile must
+// not silence the report — the other generations still have to be asked, and
+// what is wrong with this one is a file rather than a service.
+function malformed(generation, shape, error) {
+  return { generation, shape, verdict: "malformed", detail: `${shape}: ${error.message}` };
+}
+
+// `namesOf` is a function because naming the tools is part of building the
+// request, and building it is what the guarded region is for: a profile that
+// names a tool it does not carry is this generation+shape's verdict rather than
+// a rejection into the fan-out that would leave every other generation unasked.
+async function check(generation, profile, shape, namesOf) {
+  let request;
+  try {
+    request = requestFor(generation, profile, namesOf());
+  } catch (error) {
+    return malformed(generation, shape, error);
+  }
+  const { headers, body } = request;
   try {
     const response = await fetch(`${BASE}/chat/completions`, {
       method: "POST",
@@ -148,15 +174,83 @@ function invokedDirectly() {
   // `typeof` rather than `??`: a runtime without the property throws on the
   // member access itself, where there is nothing to fall back from.
   if (typeof import.meta.main === "boolean") return import.meta.main;
+  // The runtime gave no answer, so the paths have to. Both sides are arguments
+  // to `isEntryPoint` below, which is where the question is actually decided.
+  return isEntryPoint({ argv1: process.argv[1], moduleUrl: import.meta.url });
+}
+
+/**
+ * Whether `moduleUrl` is the file `argv1` named: `true` it was run, `false` it
+ * was not, `undefined` that could not be told. Both sides are arguments so
+ * tools-smoke.test.mjs can pin the shapes that would otherwise need a second
+ * process — a junction, a hard link, an entry that is gone — against the same
+ * code a real run takes rather than a copy of it.
+ *
+ * The invariant this file exists to protect is that no path through it asks
+ * nothing and exits 0, which is a gate reporting success without asking. So
+ * `false` is only for a *proven* different file, and everything this cannot
+ * settle is `undefined`, which prints the message and exits non-zero: an
+ * uncertain answer must never be read as "this file was not run".
+ */
+export function isEntryPoint({ argv1, moduleUrl }) {
+  // Nothing was named as a script, so there is no run for this module to be
+  // part of: this is `node -e` or a REPL importing it, which is the one case
+  // where asking nothing is the right answer.
+  if (argv1 === undefined) return false;
+
+  let self;
+  let run;
   try {
-    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+    self = resolve(fileURLToPath(moduleUrl));
+    run = resolve(argv1);
+  } catch {
+    // A module URL that names nothing on disk (`data:`, an eval), or an entry
+    // that is not a path at all: there is nothing to compare.
+    return undefined;
+  }
+  if (self === run) return true;
+
+  // A path is a spelling, and one file has several. `import.meta.url` is already
+  // resolved by the loader while `argv[1]` is whatever was typed, so a symlink
+  // or a Windows directory junction arrives here as two different strings while
+  // this is still the file that was run. Comparing what both point at is what
+  // tells a junction from a test import.
+  let resolved;
+  try {
+    resolved = [realpathSync(self), realpathSync(run)];
+  } catch {
+    // Either path could not be resolved — an entry that is gone, a URL that is
+    // not a file — so which file was run is not a question this can answer.
+    return undefined;
+  }
+  if (resolved[0] === resolved[1]) return true;
+
+  // Two names for one file that realpath cannot join: a hard link has no target
+  // to resolve, so it stays two paths on disk. File identity is what is left to
+  // tell it from a different file, and it is only read when both sides report
+  // one: an `ino` of 0 is a filesystem saying it has no identity to give (some
+  // FUSE and network mounts), and comparing those would call two different files
+  // one file — a `true` that makes an import ask Zen. Where the identity cannot
+  // be read at all, the question stays open rather than answered "different
+  // file", because after this branch a differing realpath is not proof either.
+  const identity = (at) => {
+    const stats = statSync(at, { bigint: true });
+    return stats.ino === 0n ? undefined : `${stats.dev}:${stats.ino}`;
+  };
+  let ids;
+  try {
+    ids = [identity(self), identity(run)];
   } catch {
     return undefined;
   }
+  if (ids[0] === undefined || ids[1] === undefined) return undefined;
+  return ids[0] === ids[1];
 }
 
 // Only a run asks Zen. index.test.mjs imports this module to hold its request
-// against the plugin's, and an import must not reach the network.
+// against the plugin's, and an import must not reach the network. That import is
+// the only way past this line that asks nothing: a run is `true`, and anything
+// this could not settle (`undefined`) exits above rather than reaching it.
 const entry = invokedDirectly();
 if (entry === undefined) {
   console.error(
@@ -167,14 +261,20 @@ if (entry === undefined) {
 
 if (entry) {
   // Each request is independent and every result is printed in order, so the
-  // two shapes of every profile are asked at once rather than one abort's
-  // worth of waiting after another.
+  // profiles are asked at once and, within each profile, so are its two shapes:
+  // awaiting the floor before its own full pushed that full request back by
+  // whatever the floor spent, up to its 30s timeout.
   const results = (
     await Promise.all(
-      Object.entries(PROFILES).map(async ([generation, profile]) => [
-        await check(generation, profile, "floor", [...profile.required]),
-        await check(generation, profile, "full", Object.keys(profile.tools)),
-      ]),
+      Object.entries(PROFILES).map(async ([generation, profile]) => {
+        // Both are started before either is awaited, and the array keeps the
+        // printed order floor then full. `check` reports its own failures, so
+        // neither promise can reject out of this fan-out.
+        return Promise.all([
+          check(generation, profile, "floor", () => [...profile.required]),
+          check(generation, profile, "full", () => Object.keys(profile.tools)),
+        ]);
+      }),
     )
   ).flat();
 
@@ -186,13 +286,18 @@ if (entry) {
 
   const floor = results.filter((result) => result.shape === "floor");
   const served = floor.filter((result) => result.verdict === "answered");
+  // A floor request that could not be built was never asked, so it is not one of
+  // the refusals the summary talks about, and it is the one outcome whose fix is
+  // in `fingerprint.json` rather than in the network or the wording.
+  const unbuilt = floor.filter((result) => result.verdict === "malformed");
   console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${BASE}`);
 
   // A generation whose full shape is served while its floor is not is the case
   // this gate was widened to see: the plugin would work for a host bringing its
-  // own OpenCode tools and be refused for the host it was written for.
+  // own OpenCode tools and be refused for the host it was written for. A floor
+  // that was never asked says nothing about that, and its own line says why.
   for (const result of floor) {
-    if (result.verdict === "answered") continue;
+    if (result.verdict === "answered" || result.verdict === "malformed") continue;
     const full = results.find(
       (other) => other.generation === result.generation && other.shape === "full",
     );
@@ -208,19 +313,31 @@ if (entry) {
     // Only 403 and 426 are Zen answering about the fingerprint at all: a 5xx or a
     // 429 was answered by something that never judged it, and counting those as a
     // verdict would blame the wording for an outage.
+    //
+    // Only the floor decides the exit code, so only the floor is read here: the
+    // `full` shape is reported, not asked on behalf of the plugin, and letting a
+    // stray 5xx on one turn a clean all-refused run into "check the network"
+    // points the reader at an outage the deciding shape never reported.
     const answered = (result) => ["refused", "superseded"].includes(result.verdict);
-    const unreached = results.filter((result) => result.verdict === "unreachable");
-    if (results.every(answered)) {
+    const unreached = floor.filter((result) => result.verdict === "unreachable");
+    if (unbuilt.length) {
+      // A request that could not be built was never asked, so nothing about the
+      // network applies to it: the name in `required` with no tool behind it is
+      // in fingerprint.json, and so is the fix.
+      console.log(
+        `${unbuilt.length}/${floor.length} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`,
+      );
+    } else if (floor.every(answered)) {
       console.log(
         "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.",
       );
-    } else if (results.some(answered)) {
+    } else if (floor.some(answered)) {
       console.log(
-        "Some of this run was answered about the fingerprint and some of it was not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.",
+        "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.",
       );
     } else if (!unreached.length) {
       console.log(
-        "Zen answered every request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.",
+        "Zen answered every floor request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.",
       );
     } else {
       console.log(
@@ -229,6 +346,10 @@ if (entry) {
     }
     process.exitCode = 1;
   } else if (served.length < floor.length) {
-    console.log("Some are refused but at least one works, so the plugin still has a generation Zen will serve.");
+    console.log(
+      unbuilt.length
+        ? "Some are refused and some were never asked, but at least one works, so the plugin still has a generation Zen will serve. The malformed lines above name what fingerprint.json has to gain before those can be asked."
+        : "Some are refused but at least one works, so the plugin still has a generation Zen will serve.",
+    );
   }
 }

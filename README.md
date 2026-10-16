@@ -66,7 +66,9 @@ bun run check:gate
 | `floor` | `required` 里的名字 | 宿主一个都没有时，插件替它补上的那几个。**这才是插件真实发出的形状，退出码由它决定** |
 | `full` | 这一代携带的全部工具 | 宿主本来就是 OpenCode 时发出来的形状。用来看措辞有没有过期，不决定退出码 |
 
-每一代的结论是 `answered`（正常应答）、`refused`（被拒，403）、`superseded`（426——Zen 要求的 OpenCode 比这份指纹声称的更新）或 `unreachable`（根本联系不上）。只要还有一代的 `floor` 被应答，退出码就是 0。某个 `floor` 被拒、而它自己的 `full` 被应答时会单独点出来：那意味着带着自己那套 OpenCode 工具来的宿主能用，而插件真正要服务的那种宿主会被拒。全部联系不上时它不会说指纹过期，只会说问不到——这两件事得分开。
+每一代的结论是 `answered`（正常应答）、`refused`（被拒，403）、`superseded`（426——Zen 要求的 OpenCode 比这份指纹声称的更新）、`failed`（Zen 答了，但不是 403，所以它没有对指纹表态）、`malformed`（请求根本没法构造：`required` 里的某个名字在 `fingerprint.json` 里没有对应的工具。Zen 没被问到，那一行会点名是哪一代、哪种形状、缺的是哪个名字）或 `unreachable`（根本联系不上）。只要还有一代的 `floor` 被应答，退出码就是 0；`malformed` 不算应答，所以整轮都是它的时候退出码非 0，并且会说明这是指纹文件的问题、不是网络的问题。
+
+某个 `floor` 被拒、而它自己的 `full` 被应答时会单独点出来：那意味着带着自己那套 OpenCode 工具来的宿主能用，而插件真正要服务的那种宿主会被拒。全部联系不上时它不会说指纹过期，只会说问不到——这两件事得分开，而且最后的判断只读 `floor` 那几行：某个 `full` 请求拿到 5xx 说明的是那次请求，不足以把「没有一代被服务」说成「去查网络」。
 
 闸门问的时候用的就是插件自己那份请求：请求头的名字来自 `provider.mjs` 里的 `outboundHeaders`，工具来自插件所顶替的同一份 `required`。所以它绿了是在说「插件真发的那个请求」被应答了，而不是在说「照抄的一份」被应答了——照抄的那一份曾经少发一个 `accept`，而且没有任何东西因此报错。
 
@@ -105,7 +107,7 @@ Zen 的免费层读请求体，也读请求头，只有当整个请求都属于 
 | `x-opencode-client` | `cli` |
 | `authorization` | `Bearer public`；走 Messages 时是 `x-api-key: public` |
 
-`anthropic-version` 和 `anthropic-beta` 也会发出去，但只在走 Messages 时，而且只在宿主自己设了它们的时候。
+`anthropic-version` 在走 Messages 时总是发出去（宿主设了就用它的，没设就是 `2023-06-01`）；`anthropic-beta` 只在宿主自己设了的时候才发。
 
 `x-opencode-request`、`x-session-affinity` 和 `x-session-id` 都在 OpenCode 自己的请求头集合里，但没有一个是必需的，所以都不发——不过进来的同名请求头仍然会被读，用来判断这次请求属于哪个会话。这不是「一个个试过不行」得出的结论，2026-10-15 实测（1.x，其余不动）：
 
@@ -119,7 +121,7 @@ Zen 的免费层读请求体，也读请求头，只有当整个请求都属于 
 
 两个各自无害的头放在一起会被拒，所以「某个头能不能加」不能靠单个试出来。测试按名字钉住了发出的这组请求头，因为多加一个请求头是弄坏这个插件最容易的方式。
 
-Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时间戳加每毫秒计数器截成十二位十六进制，后面接十四个随机的 base62 字符；session 的那一种还会把低位取反。宿主给的 id 如果本来就是这个形状，就原样传出去；否则按会话的首条消息生成一个并记住，这样同一会话的各轮请求会共用一个 session id。
+Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时间戳加每毫秒计数器截成十二位十六进制，后面接十四个随机的 base62 字符；session 的那一种还会把低位取反。宿主给的 id 如果本来就是这个形状，就原样传出去；否则按会话的首条消息生成一个并记住，这样同一会话的各轮请求会共用一个 session id。宿主既不声明会话、又没有可作依据的用户消息时，这一轮就拿一个自己的 id——没有东西可以据以记住它，所以它不会被并进另一个会话里去。
 
 偶尔 Zen 会在发出 `[DONE]` 之前就结束一个流式的 Chat Completions 回复。如果回复已经说了内容、且其中没有未完成的工具调用，就以普通回答结束，正文里会说明它被截断了；再问一次就会接着往下走。如果是带着未完成的工具调用被截断、或者什么都没说就断了、或者被折叠给一个不支持流式的客户端，请求就会失败，错误信息里写明这个回复的 id 和收到了多少。走 Anthropic Messages 或 Responses 的回复被截断同样会失败：magpie 能把它和完整的回复区分开，并且在该模型支持的情况下继续往下走。
 
@@ -140,4 +142,4 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 
 ## 许可
 
-MIT，分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)。版权署名见 [LICENSE](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/LICENSE)：`Copyright (c) 2026 xiaozhou26` 是上游原作者，本分支的贡献者另有署名。
+MIT，分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)。版权署名：`Copyright (c) 2026 xiaozhou26` 是上游原作者，本分支的贡献者另有署名。`LICENSE` 是原样的 MIT 正文，本分支的来源与维护缘由写在 [NOTICE](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/NOTICE)，这样许可证扫描器读到的是一份标准的 MIT 文件，而想知道这个分支为什么存在的人仍然找得到答案。

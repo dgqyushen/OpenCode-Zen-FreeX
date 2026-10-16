@@ -1,25 +1,32 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
-  "exports": { ".": "./index.mjs", "./*": "./*" },
+  "exports": {
+    ".": "./index.mjs",
+    "./index.mjs": "./index.mjs",
+    "./provider.mjs": "./provider.mjs",
+    "./core-tools.mjs": "./core-tools.mjs",
+    "./models.mjs": "./models.mjs",
+    "./limits.mjs": "./limits.mjs",
+    "./stream.mjs": "./stream.mjs",
+    "./tool-response.mjs": "./tool-response.mjs"
+  },
   "files": [
     "index.mjs",
     "provider.mjs",
     "core-tools.mjs",
     "fingerprint.json",
     "limits.mjs",
-    "limits-audit.mjs",
     "models.mjs",
     "stream.mjs",
     "tool-response.mjs",
-    "tools-smoke.mjs",
-    "capture.mjs",
     "README.md",
     "MAINTAINING.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
   "license": "MIT",
@@ -32,5 +39,6 @@
     "limits:audit": "bun limits-audit.mjs",
     "capture": "bun capture.mjs"
   },
+  "packageManager": "bun@1.4.3",
   "magpie": { "icon": "https://opencode.ai/favicon-v3.ico", "maxConcurrency": 2 }
 }

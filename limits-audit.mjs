@@ -21,7 +21,9 @@
 // ceiling refuses and names its own; one that does not just begins to answer and
 // is cut off after the first chunk. Either way the cost is a handful of tokens,
 // and a 410 or a 400 for a model that is gone is visible in the same request.
-// An id the snapshot places on another protocol is listed and not asked.
+// An id the snapshot places on another protocol is listed and not asked, and an
+// id that answers by naming another shape is listed as asked and refused for it:
+// the two are different facts and are said as two lines.
 //
 // The offered set is the listing's, not the catalogue's: Zen's /v1/models
 // carries 10 of the 40 free ids the catalogue still describes, and a plugin
@@ -35,6 +37,8 @@
 // Exit code is 0 when at least one offered id answered, 1 when none did: being
 // unable to ask is not a finding about limits.
 
+import { realpathSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedContextWindow, namedOutputCap } from "./limits.mjs";
@@ -115,14 +119,23 @@ export function findings(rows, covered = new Set()) {
     }
   }
   for (const [upstream, list] of groupByUpstream(rows)) {
-    const largest = (axis) => Math.max(...list.map((row) => row.declared?.[axis] ?? 0));
-    if (list.length < 2) continue;
-    if (new Set(list.map((row) => `${row.declared?.context}/${row.declared?.output}`)).size < 2) continue;
-    for (const row of list) {
+    // Only the rows this audit could speak for take part, in the comparison and
+    // in what is printed beside it. A row refused for its shape still carries
+    // `x-opencode-upstream-model-id`, but it was asked the chat shape and said
+    // no, so its catalogue pair is the free id's declaration rather than
+    // anything the route confirmed: a sibling measured against it is picked up
+    // as an under-declaration candidate off a row that was never really asked,
+    // while run() lists that same id as refused. `covered` rows stay in — those
+    // were asked, and their numbers are already in the table.
+    const spoke = list.filter((row) => !protocolScoped(row));
+    if (spoke.length < 2) continue;
+    if (new Set(spoke.map((row) => `${row.declared?.context}/${row.declared?.output}`)).size < 2) continue;
+    const largest = (axis) => Math.max(...spoke.map((row) => row.declared?.[axis] ?? 0));
+    for (const row of spoke) {
       if (covered.has(row.id)) continue;
       if ((row.declared?.context ?? 0) >= largest("context") && (row.declared?.output ?? 0) >= largest("output"))
         continue;
-      const siblings = list
+      const siblings = spoke
         .filter((other) => other.id !== row.id)
         .map((other) => `${other.id} (${other.declared?.context}/${other.declared?.output})`)
         .join(", ");
@@ -145,12 +158,19 @@ function says(text) {
 
 // A refusal that names the protocol rather than a limit. This audit asks the
 // chat shape, so a model that speaks Responses or Messages answers by saying so;
-// that is the host's business, not a limit to measure. The wording has to name
-// another shape or say it cannot be spoken at all: `format` alone is how an
-// ordinary `invalid request format` is worded, which is a question that was
-// asked and refused and belongs in the candidate list, not beside the ids that
-// were never asked.
-const OTHER_SHAPE = /protocol|\b(?:responses|messages)\b|anthropic/i;
+// that is the host's business, not a limit to measure. What counts is a shape
+// word tied to protocol or endpoint wording, because the words on their own are
+// ordinary parts of an ordinary refusal: `protocol` itself, an endpoint path
+// such as `/v1/messages`, a pairing like `messages api` or `responses endpoint`,
+// or `anthropic` beside a protocol or endpoint noun. "messages: at least one
+// message is required" and "too many messages in the request" are 400s about the
+// request's own content — questions this audit asked and was refused — and a
+// candidate list that dropped them would be the silent false negative the list
+// exists to avoid. `format` is deliberately not a shape word here: `invalid
+// request format` is how an ordinary refusal is worded and belongs in the
+// candidate list, not beside the ids that were never asked.
+const OTHER_SHAPE =
+  /\bprotocol\b|\/(?:v\d+\/)?(?:messages|responses)\b|\b(?:messages|responses)\s+(?:api|protocol|endpoint)s?\b|\banthropic\s+(?:protocol|endpoint|messages)\b/i;
 
 export function protocolScoped(row) {
   return OTHER_SHAPE.test(row?.says ?? "");
@@ -160,6 +180,49 @@ async function getJSON(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
   if (!response.ok) throw new Error(`${url} answered HTTP ${response.status}`);
   return response.json();
+}
+
+// At most `limit` characters of a body, and no more of the body read than that.
+// A refusal can be a proxy's HTML page, a 5xx dump, or an echo of the
+// million-token request this audit sent, and this path exists to read a few
+// hundred characters cheaply: the reader is released as soon as the part that is
+// read is in hand, so the rest of the body is dropped rather than buffered.
+// Exported so the tests can hand it a body that says how much of itself was
+// read, since only a direct run may ask the route.
+export async function readPrefix(response, limit = READ_BUDGET) {
+  const stream = response.body;
+  if (typeof stream?.getReader !== "function") {
+    // No reader to stop: a body that is not a stream (a 204, a synthetic
+    // response) is small by construction, so reading it is already the bound.
+    return ((await response.text()) ?? "").slice(0, limit);
+  }
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const missing = limit - text.length;
+      // One chunk can be the whole body. Decoding it whole would materialise
+      // exactly the megabytes this function exists to avoid, so a chunk larger
+      // than what is still missing is decoded only as far as the budget and ends
+      // the read: cutting the bytes can split a character, and reading on past a
+      // byte that was dropped would mis-decode everything after it, which is
+      // worse than a prefix a character short.
+      if (value.byteLength > missing) {
+        text += decoder.decode(value.subarray(0, missing), { stream: true });
+        break;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    // A body that fails halfway is still worth what was read of it, and a
+    // refusal nobody can finish reading is not a reason to fail the audit.
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return text;
 }
 
 // One cheap question per id. The ceiling asked for is past anything this route
@@ -182,20 +245,10 @@ async function ask(id, names) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    let text = "";
-    if (response.ok) {
-      const reader = response.body?.getReader();
-      if (reader) {
-        const decoder = new TextDecoder();
-        while (text.length < READ_BUDGET) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          text += decoder.decode(value, { stream: true });
-        }
-      }
-    } else {
-      text = (await response.text()).slice(0, READ_BUDGET);
-    }
+    // A refusal is read for the limits it names; a 200 is the model's own prose,
+    // which is not a limit, so it is read only far enough to stop the answer and
+    // then dropped by the reader rather than left to the abort in `finally`.
+    const text = await readPrefix(response);
     const upstream = response.headers.get("x-opencode-upstream-model-id") ?? undefined;
     const endpoint = response.headers.get("x-opencode-endpoint-id") ?? undefined;
     // limits.mjs reads refusals, and a refusal is the only place this route
@@ -219,30 +272,109 @@ async function ask(id, names) {
   }
 }
 
+// What is said when the run/import question has no answer. Exported so a test
+// can pin the sentence and an importer can recognise it.
+export const UNDETERMINED_ENTRY =
+  "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:audit`.";
+
 // Whether this module is the file that was run rather than one the tests
 // import. `import.meta.main` is the direct answer and the one Bun gives, but it
 // arrived in Node 22.18 and nothing before that has it — and an audit that cannot
 // tell whether it was run is an audit that reports success without asking.
-function invokedDirectly() {
-  // `typeof` rather than `??`: a runtime without the property throws on the
-  // member access itself, where there is nothing to fall back from.
-  if (typeof import.meta.main === "boolean") return import.meta.main;
+//
+// The three facts are arguments so the question can be asked about paths other
+// than this module's own: the tests hand it a junctioned path on purpose. The
+// answer is three-state. `true` and `false` are the verdicts; `undefined` means
+// the question genuinely cannot be answered — no entry point was named at all,
+// or the module is not a `file:` URL — and a caller must treat that as "nothing
+// was asked" rather than as "imported", which is the silent success this
+// function exists to prevent.
+export function entryVerdict({ main, url, argv }) {
+  // A runtime that offers the flag has answered the question; nothing else is
+  // consulted, and its `false` really does mean this module was imported.
+  if (main === true || main === false) return main;
+
+  const asked = argv?.[1];
+  if (asked === undefined || asked === "") return undefined;
+
+  let here;
   try {
-    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+    here = fileURLToPath(url);
+  } catch {
+    // Not a `file:` URL — a `data:`, an `http:`, a loader's virtual module — so
+    // there are not two paths to compare, whatever argv[1] says.
+    return undefined;
+  }
+
+  // Resolved first, because that is free and answers the ordinary case: the same
+  // spelling of the same path. A symlink, a Windows junction, a differently
+  // cased path or a hard link makes one file answer to several spellings and
+  // defeats a raw string comparison, so the paths are compared as files rather
+  // than as strings — and `false` means "asked nothing, exit 0", which is
+  // exactly the wrong answer to give about this very file.
+  return sameFile(resolve(here), resolve(asked));
+}
+
+// Whether two resolved paths name one file, or undefined when that cannot be
+// settled. `false` is only for a file system that has proven it: it means
+// "asked nothing, exit 0", the one answer that must never be given about this
+// very file, so every step that cannot answer leaves the question open instead.
+//
+// `stat` is a parameter so a test can hand this an identity the local file
+// system will not give — an `ino` of 0, or a stat that throws.
+export function sameFile(left, right, stat = statSync) {
+  if (left === right) return true;
+
+  let a;
+  let b;
+  try {
+    a = realpathSync(left);
+    b = realpathSync(right);
+  } catch {
+    // Either path could not be resolved — an entry that is gone, a URL that is
+    // not a file — so which file was run is not a question this can answer.
+    return undefined;
+  }
+  if (a === b) return true;
+
+  // Two names for one file that realpath cannot join: a hard link has no target
+  // to resolve, so it stays two paths on disk and a differing realpath is no
+  // proof of a different file. Identity is what is left to tell it from a
+  // different file, and it is only read when both sides report one: an `ino` of
+  // 0 is a file system saying it has no identity to give (some FUSE and network
+  // mounts), and comparing those would call two different files one file — a
+  // `true` that would make an import ask the route. Where the identity cannot be
+  // read at all, the question stays open rather than answered "different file".
+  const identity = (at) => {
+    const stats = stat(at, { bigint: true });
+    return stats.ino === 0n ? undefined : `${stats.dev}:${stats.ino}`;
+  };
+  let ids;
+  try {
+    ids = [identity(left), identity(right)];
   } catch {
     return undefined;
   }
+  if (ids[0] === undefined || ids[1] === undefined) return undefined;
+  return ids[0] === ids[1];
+}
+
+function invokedDirectly() {
+  // `typeof` rather than `??`: a runtime without the property throws on the
+  // member access itself, where there is nothing to fall back from.
+  const main = typeof import.meta.main === "boolean" ? import.meta.main : undefined;
+  return entryVerdict({ main, url: import.meta.url, argv: process.argv });
 }
 
 // Only a run asks the route. The tests import the helpers above and must not
-// reach the network.
+// reach the network. An undeterminable answer is thrown rather than exited on,
+// because this is module evaluation: a `process.exit(1)` here would kill the
+// importer — a test runner, a loader, anything that asked for these helpers —
+// instead of telling it what happened. Throwing leaves the report and the exit
+// code to the caller, so a run that reaches it still dies non-zero with the
+// sentence above, and an importer can catch it and say so itself.
 const entry = invokedDirectly();
-if (entry === undefined) {
-  console.error(
-    "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:audit`.",
-  );
-  process.exit(1);
-}
+if (entry === undefined) throw new Error(UNDETERMINED_ENTRY);
 
 if (entry) {
   // A generation nobody captured is a typo or a Zen that has moved on, and is
@@ -319,11 +451,19 @@ async function run() {
 
   const answered = rows.filter((row) => row.status === 200);
   const candidates = findings(rows, new Set(Object.keys(LIMITS)));
-  const skipped = [...elsewhere, ...rows.filter(protocolScoped).map((row) => row.id)];
-  if (skipped.length)
+  // Two different kinds of id, said as two lines. `elsewhere` was never asked —
+  // the snapshot places it on a protocol this audit does not speak, and the
+  // protocol it names is worth printing. A row refused for its shape was asked
+  // and said no, and its snapshot entry is necessarily `chat`: printing that
+  // under "not asked, this audit asks the chat shape only" would contradict the
+  // line it sits on.
+  if (elsewhere.length)
     console.log(
-      `\nnot asked, this audit asks the chat shape only: ${skipped.map((id) => `${id}${bootstrapProtocols[id] ? ` (${bootstrapProtocols[id]})` : ""}`).join(", ")}`,
+      `\nnot asked, this audit asks the chat shape only: ${elsewhere.map((id) => `${id}${bootstrapProtocols[id] ? ` (${bootstrapProtocols[id]})` : ""}`).join(", ")}`,
     );
+  const refusedShape = rows.filter(protocolScoped).map((row) => row.id);
+  if (refusedShape.length)
+    console.log(`\nasked, and refused for its shape: ${refusedShape.join(", ")}`);
   console.log(`\nlimits.mjs already carries evidence for: ${Object.keys(LIMITS).join(", ")}`);
   console.log(`\n${candidates.length} candidate${candidates.length === 1 ? "" : "s"}:`);
   for (const line of candidates) console.log(`  ${line}`);

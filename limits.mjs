@@ -131,93 +131,236 @@ const NAMED_OUTPUT = [
 const OBSERVED = new Map();
 const OBSERVED_OUTPUT = new Map();
 
+// Two decisions this file makes leave no trace of themselves: a live value
+// taken from a refusal is applied past the staleness guard and past the
+// raise-only rule, and an entry the catalogue has moved past is void in a way
+// that reads exactly like an axis nobody ever measured. Neither is worth a line
+// while the plugin is working — an error path that chats is its own kind of
+// failure — so both are only reported when they are asked for: a host hands in
+// a sink with `limitDiagnostics`, or sets this variable and reads stderr.
+// Nothing a note does may reach a request: not the sink, not what it prints.
+export const LIMITS_DEBUG_ENV = "OPENCODE_ZEN_FREE_LIMITS_DEBUG";
+let diagnostic = null;
+
+// Install the sink these notes are handed to, and return the one it replaced
+// (null when there was none) so a caller can put back what it found.
+export function limitDiagnostics(sink) {
+  const previous = diagnostic;
+  diagnostic = typeof sink === "function" ? sink : null;
+  return previous;
+}
+
+function note(entry) {
+  try {
+    if (diagnostic) diagnostic(entry);
+    else if (globalThis.process?.env?.[LIMITS_DEBUG_ENV])
+      console.warn(`[opencode-zen-freex] ${describe(entry)}`);
+  } catch {
+    // A note is not worth a failed request.
+  }
+}
+
+function describe({ kind, id, axis, value, measuredAgainst, declared }) {
+  if (kind === "route-statement")
+    return `${id} ${axis}=${value} — named by a refusal this process saw, so it is applied as it stands (the catalogue declares ${declared === undefined ? "nothing for this axis" : declared})`;
+  return `${id} ${axis}=${value} was measured against a catalogue that declared ${measuredAgainst}, and this one declares ${declared === undefined ? "nothing for this axis" : declared}: not applied`;
+}
+
 // The window a refusal names, or undefined when the body says nothing
 // attributable. Exported for the tests and for anyone reading a capture.
 export function namedContextWindow(text) {
-  return namedNumber(NAMED_CONTEXT, text);
+  return namedFrom([NAMED_CONTEXT], text)?.value;
 }
 
 // The completion ceiling a refusal names, or undefined. Same rule as the window:
-// the body has to name the parameter and a number, or it says nothing.
+// the body has to name the parameter and a number, or it says nothing. Two
+// wordings state it, and one that matches but names no usable number — "supports
+// at most 0 completion tokens" — is not an answer; the next wording may be.
 export function namedOutputCap(text) {
-  for (const pattern of NAMED_OUTPUT) {
-    const value = namedNumber(pattern, text);
-    if (value !== undefined) return value;
+  return namedFrom(NAMED_OUTPUT, text)?.value;
+}
+
+// The first of `patterns` that names a usable number, with the match it was read
+// from. The match and the number have to be the same one: a caller that guards a
+// match and then reads its number elsewhere is judging one sentence and
+// returning another.
+function namedFrom(patterns, text) {
+  const subject = typeof text === "string" ? text : "";
+  for (const pattern of patterns) {
+    const match = pattern.exec(subject);
+    const value = numberFrom(match);
+    if (value !== undefined) return { match, value };
   }
   return undefined;
 }
 
-function namedNumber(pattern, text) {
-  const match = pattern.exec(typeof text === "string" ? text : "");
+// The number a match names, or undefined when it names nothing usable: a
+// sentence about a parameter that happens to mention zero names no ceiling.
+function numberFrom(match) {
   if (!match) return undefined;
   const tokens = Number.parseInt(match[1], 10);
   return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined;
 }
 
+// Read at most `limit` characters of a response without buffering the rest:
+// this is an error path on a request whose caller is waiting, so a body that is
+// not small is dropped as soon as the part that is read is in hand. Returns the
+// text, and whether the read stopped because the body ended (`ended`) or because
+// the budget was reached (`over`).
+//
+// It reads the response's own body, not a copy of it. `response.clone()` tees a
+// body, and cancelling one branch of a tee settles only once the other branch is
+// drained or cancelled — which for the caller's path is never, because the
+// sibling branch is read later, after this returns. A clone here hangs the whole
+// request on any refusal larger than the budget that arrives in more than one
+// read (measured: a 7 KB 400 in 1400-character chunks never settles, and an
+// abort does not unwedge it). The body is read once and the bytes go back to
+// the caller, so nothing needs a second copy.
+//
+// The read is bounded in time as well as in size, because a body can stall as
+// well as be large. Measured: a 403 whose `content-length` promised 999 bytes
+// and delivered 120 left `read()` pending for good, which hung the request just
+// as surely as the clone did — an upstream that dies mid-body, or a proxy that
+// pads a length, is the same shape. `signal` is the caller's own cancellation;
+// without one the budget below is all the wait this evidence is worth, since a
+// number out of a refusal that is not arriving is not worth a caller's turn.
+//
+// A body that fails halfway is still worth what was read of it, and a read that
+// throws is not an error about the request: the callers of this are error paths
+// themselves.
+const READ_DEADLINE_MS = 3000;
+
+export async function readBoundedText(response, limit = 4096, { signal } = {}) {
+  let reader;
+  try {
+    reader = response?.body?.getReader?.();
+  } catch {
+    // A body somebody else is holding cannot be read, and nothing of it was
+    // read: what came back is not the whole of a body, and says so.
+    return { text: "", ended: false, over: true };
+  }
+  // A response with no stream has no body to read and none to buffer — which is
+  // why the fallback that read one whole is gone: the only responses that
+  // reached it were body-less, and a body-less response's text is empty either
+  // way.
+  if (!reader) return { text: "", ended: true, over: false };
+  const deadline = AbortSignal.timeout(READ_DEADLINE_MS);
+  const bound = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  // The wait ending is this read's to remember, not the reader's: cancelling a
+  // stream resolves its pending `read()` as done, so a body cut short by the
+  // deadline would come back looking like one that ended — and a number at the
+  // end of it like a whole one. Measured before this flag existed: a stalled
+  // refusal whose last characters were `...is not less or equal to 2621`, out of
+  // `262144`, was stored and applied as a completion ceiling.
+  let cut = false;
+  const abort = () => {
+    // The wait is over and the bytes already read are all this evidence is
+    // going to be; stop pulling on a body that is not answering.
+    cut = true;
+    reader.cancel().catch(() => {});
+  };
+  if (bound.aborted) abort();
+  else bound.addEventListener("abort", abort, { once: true });
+  const decoder = new TextDecoder();
+  let text = "";
+  let ended = false;
+  try {
+    // The loop runs while the budget has room for one more character, so a body
+    // that lands exactly on the budget still gets the read that says it ended,
+    // and one that goes on is caught by the buffer stopping a character past it.
+    while (text.length <= limit) {
+      const { value, done } = await reader.read();
+      if (done) {
+        ended = true;
+        break;
+      }
+      // At most one character past the budget: enough to know the body went on,
+      // and the rest of the chunk is dropped rather than materialised.
+      text += decoder.decode(value, { stream: true }).slice(0, limit + 1 - text.length);
+    }
+  } catch {
+    // Keep what was read; a failed read names nothing new. A read that was
+    // cancelled by the deadline lands here too, which is the point of it.
+  }
+  bound.removeEventListener("abort", abort);
+  // A read the wait cut short saw no end of body, whatever the cancelled reader
+  // said about it.
+  if (cut) ended = false;
+  // The reader is this function's to release, and the body is abandoned rather
+  // than left open: the caller has what it needs and will not read on.
+  //
+  // The cancel is deliberately not awaited. It stops the upstream either way,
+  // but the promise it returns settles only once the source reacts — and this
+  // path is an error body on a request whose caller is waiting. A body that
+  // never ends (a stalled upstream, or headers promising more bytes than the
+  // response delivers: measured, a 403 with `content-length: 999` over a 120-byte
+  // body) would leave the await pending for good, which is the same hang this
+  // function was rewritten to remove. Nothing downstream reads this body again,
+  // so its release is nobody's to wait for.
+  reader.cancel().catch(() => {});
+  // `over` is the read having stopped before the body did — the budget reached,
+  // or the read failed, or the deadline passing — which is the only honest
+  // source for "this may be cut".
+  return { text, ended, over: !ended };
+}
+
 // Read a refusal for the names it makes about this model's limits. Only non-2xx
-// responses are read, and only the first `limit` characters of one: this is an
-// error path on the request's way to a caller that is waiting, so it must never
-// be able to fail a request, change a response, or buffer a body that is not
-// small. A number the read cut in half names nothing either, since half of one
-// is a smaller limit that looks like a whole one. Returns undefined when the
-// body names nothing attributable, otherwise whichever axes it named.
-export async function observeRouteStatement(id, response, limit = 4096) {
+// responses are read, and only the first `limit` characters of one.
+//
+// A response body can only be read once, and the response handed in is treated
+// as read once this returns: the bytes come back as `text` so that a caller
+// which has to keep them (provider.mjs rebuilds the message a user reads) can
+// do so without a second read of a body that no longer exists.
+//
+// `cut` says the read stopped at the budget rather than at the end of the body.
+// It is the read that says so, not the length of what was read: a body whose
+// first read lands exactly on the budget leaves `text.length === limit` while
+// the stream is still going, and a number sliced there (`262144` read as
+// `2621`) must not be taken for a limit the route stated.
+//
+// Returns undefined only when nothing was read — a response that is not a
+// refusal, or one with no body to read — and otherwise whichever axes the text
+// named, with that text alongside them. An axis the body did not name is
+// undefined; a body that named nothing still comes back, because a caller that
+// has to hand it on has nowhere else to get it from.
+export async function observeRouteStatement(id, response, limit = 4096, { signal } = {}) {
   try {
     if (typeof id !== "string" || !id || response?.ok !== false) return undefined;
-    const text = await readPrefix(response, limit);
-    // `readPrefix` stops at `limit`, so the last character read may be the first
-    // half of a longer number. Both words this reads are numbers inside prose —
-    // the window's ends in the literal "tokens", but the second ceiling wording
-    // ends with the digits it captured, so `/max_tokens: 1000000 is not less or
-    // equal to 2621` carved out of 262144 reads as a ceiling Zen stated. Live
-    // values are taken as they stand, past the staleness check and the guard
-    // below, so that half a number would become the applied max_tokens. A match
-    // that runs up to the cut is therefore not evidence, on either axis: asking
-    // again over one character less only finds the same number one digit
-    // shorter, and reading the rest of the body is what this path must not do.
-    const { context, output } = namedAxes(text, limit, text.length > limit);
-    if (context === undefined && output === undefined) return undefined;
+    // A response with no body was not read and is not consumed: the caller
+    // still holds the one it had, and undefined says so.
+    if (response.body == null) return undefined;
+    const { text, over } = await readBoundedText(response, limit, { signal });
+    const { context, output } = namedAxes(text, limit, over);
     if (context !== undefined) OBSERVED.set(id, context);
     if (output !== undefined) OBSERVED_OUTPUT.set(id, output);
-    return { context, output };
+    return { context, output, text };
   } catch {
     return undefined;
   }
 }
 
-// Read at most `limit` characters of a refusal without buffering the rest: this
-// is an error path on a request whose caller is waiting, so a body that is not
-// small is dropped as soon as the part that is read is in hand.
-async function readPrefix(response, limit) {
-  const body = response.clone().body;
-  if (typeof body?.getReader !== "function") return response.clone().text().catch(() => "");
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  try {
-    while (text.length < limit) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      text += decoder.decode(value, { stream: true });
-    }
-  } catch {
-    // A body that fails halfway is still worth what was read of it.
-  }
-  await reader.cancel().catch(() => {});
-  return text;
-}
+// How close to the end of what was read a match has to end before a truncated
+// body makes it unusable. A number ending inside this margin of the last
+// character read may have had digits past it — `2621` where the body said
+// `262144` — and a smaller limit that looks like a real one is the one failure
+// this guard exists to prevent. Numbers further back are inside the buffer
+// entirely and are read as they stand.
+const CUT_MARGIN = 8;
 
-// The axes the first `limit` characters of `text` name. `cut` says the body went
-// on past that point, so a match ending on the last character read may have been
-// a longer number: that axis is left unread rather than reported a digit short.
+// The axes the first `limit` characters of `text` name. `cut` says the read
+// stopped at the budget with the body going on, so a match ending at the margin
+// may have been a longer number: that axis is left unread rather than reported a
+// digit short. Each axis is read from the match its number came from, so the
+// match the guard judges and the number that is returned cannot be two answers.
 function namedAxes(text, limit, cut) {
   const head = text.slice(0, limit);
-  const contextMatch = NAMED_CONTEXT.exec(head);
-  const outputMatch = NAMED_OUTPUT.map((pattern) => pattern.exec(head)).find(Boolean);
-  const onCut = (match) => cut && Boolean(match) && match.index + match[0].length >= limit;
+  const context = namedFrom([NAMED_CONTEXT], head);
+  const output = namedFrom(NAMED_OUTPUT, head);
+  const onCut = (found) =>
+    cut && Boolean(found) && found.match.index + found.match[0].length >= head.length - CUT_MARGIN;
   return {
-    context: onCut(contextMatch) ? undefined : namedContextWindow(head),
-    output: onCut(outputMatch) ? undefined : namedOutputCap(head),
+    context: onCut(context) ? undefined : context?.value,
+    output: onCut(output) ? undefined : output?.value,
   };
 }
 
@@ -235,7 +378,11 @@ export function limitOverrides(
   observedOutput = OBSERVED_OUTPUT,
 ) {
   const overrides = {};
-  const record = table?.[id];
+  // A record has to be this table's own. `table[id]` otherwise answers out of
+  // Object.prototype for `toString` and the rest, and out of whatever prototype
+  // an object handed in as `table` carries — evidence for a model nobody
+  // declared, from a table that never named it.
+  const record = table && Object.hasOwn(table, id) ? table[id] : undefined;
   for (const axis of ["context", "output"]) {
     const declaredValue = declared?.[axis];
     const entry = record?.[axis];
@@ -250,6 +397,19 @@ export function limitOverrides(
       value = live;
     } else if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) {
       value = entry.value;
+    } else if (entry) {
+      // Measured against a catalogue that has moved, or against an axis the
+      // catalogue no longer declares. Its value is void, and saying so is the
+      // whole point of the note: otherwise this is indistinguishable from a
+      // model nothing was ever measured for.
+      note({
+        kind: "catalogue-drift",
+        id,
+        axis,
+        value: entry.value,
+        measuredAgainst: entry.declaredAt,
+        declared: declaredValue,
+      });
     }
     if (value === undefined || !Number.isSafeInteger(value) || value <= 0) continue;
     if (value === declaredValue) continue;
@@ -264,6 +424,10 @@ export function limitOverrides(
     )
       continue;
     overrides[axis] = value;
+    // A live value is the one override taken past the staleness guard and past
+    // the raise-only rule, so it is the one nobody can account for afterwards:
+    // say what was applied and what it stands in for.
+    if (live !== undefined) note({ kind: "route-statement", id, axis, value, declared: declaredValue });
   }
   return overrides;
 }
