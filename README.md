@@ -149,6 +149,15 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 - 本插件前身：[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)
 - 插件载体：[magpie](https://github.com/yetone/magpie)
 
+**模型提供者**
+
+- [anomalyco/opencode](https://github.com/anomalyco/opencode)
+
+**本仓库常用 Agent**
+
+- [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
+- [hermes-agent](https://github.com/NousResearch/hermes-agent)
+
 **灵感来源**
 
 - [9router](https://github.com/decolua/9router)
