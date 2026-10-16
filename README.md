@@ -142,6 +142,19 @@ Zen 的免费层会检查 session id 是否是 OpenCode 能生成的那种：时
 
 模型的可用性和限流归 Zen 管，插件拿不到剩余额度可显示。同一个地址反复被拒，也可能被放进一个冷却期，表现得和被拒很像。
 
+## 鸣谢
+
+**插件强相关**
+
+- 本插件前身：[zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)
+- 插件载体：[magpie](https://github.com/yetone/magpie)
+
+**灵感来源**
+
+- [9router](https://github.com/decolua/9router)
+- [opencode2api](https://github.com/jasonxu114514/opencode2api)
+- [zen-gate](https://github.com/LAGcomcom/zen-gate)
+
 ## 许可
 
 MIT，分叉自 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free)。`LICENSE` 的 MIT 正文原样未改，版权行有两条：上游原作者的 `Copyright (c) 2026 xiaozhou26`，和本分支贡献者的 `Copyright (c) 2026 OpenCode-Zen-FreeX contributors`。本分支的来源与维护缘由写在 [NOTICE](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/NOTICE)，这样许可证扫描器读到的是一份标准的 MIT 文件，而想知道这个分支为什么存在的人仍然找得到答案。
