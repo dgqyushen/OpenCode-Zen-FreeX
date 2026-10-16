@@ -45,7 +45,7 @@ magpie plugin login opencode-zen-free
 
 插件会去发现 Zen 当前的免费模型，包括它们的上下文窗口和思考（reasoning）等级。用 `opencode-zen-free/<模型名>`，例如 `opencode-zen-free/big-pickle`。
 
-免费模型的目录上限有时被 Zen 少报，而少报的那一边没有谁会报错：`deepseek-v4.1-flash-free` 在目录里是 20 万上下文 / 3.2 万输出，而同一上游模型的付费 id 是 100 万 / 38.4 万。上下文窗口太小只会让宿主安静地早点压缩，输出上限太小会把回复截断成看起来像模型自己停下的样子，所以插件对这类模型按实测与路由自述对齐（依据与复测方法见 `MAINTAINING.md` 的 “Limits Zen under-reports”），并在运行中采用上游自报的窗口。
+免费模型的目录上限有时被 Zen 少报，而少报的那一边没有谁会报错：`deepseek-v4.1-flash-free` 在目录里是 20 万上下文 / 3.2 万输出，而同一上游模型的付费 id 是 100 万 / 38.4 万。上下文窗口太小只会让宿主安静地早点压缩，输出上限太小会把回复截断成看起来像模型自己停下的样子；`input` 这一轴同样会被少报——有些宿主显示的「上下文窗口」取的就是它（magpie 如此），而 `space-bunny-free` 的 `input` 是目录自己按 `context − output` 推出的 52.4 万，实测 97.9 万 token 的 prompt 都被完整服务、结尾的暗号原样复述。所以插件对这类模型按实测与路由自述对齐（依据与复测方法见 `MAINTAINING.md` 的 “Limits Zen under-reports”），并在运行中采用上游自报的窗口。
 
 已下线的模型和 SystemOne 模型会被排除：「下线」指的是状态写着 `retired`/`disabled`，或带着已生效的退役日期。目录里标了 `deprecated` 但 Zen 的列表里还在的模型**照常提供**——`deprecated` 是预告，而「还在不在」由列表说了算（实测 2026-10-16：`muse-spark-1.2-contributor-free` 在目录里是 `deprecated`，Zen 仍在服务它，把它当退役就把一个能用的免费模型藏掉了）。这份列表在宿主每次列举模型时重新获取（magpie 在启动时做一次，之后每小时一次）：Zen 不再免费开放的模型会退出列表，新转为免费的模型会加入列表——**不等** OpenCode 的目录或文档写到它：只要 Zen 的列表里有、id 里带 `-free`，就按 provider 自己的协议（OpenAI 兼容 / chat）提供，目录晚一步也不影响。
 

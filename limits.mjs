@@ -12,9 +12,17 @@
 // output cap that is too small cuts replies off with a finish reason that looks
 // like the model's own decision.
 //
+// The input axis is the third, and it fails the same way one layer out. A host
+// that plans what to send reads it as the room a prompt has; a host that shows a
+// model's window reads it as the window itself — measured 2026-10-16, magpie's
+// `context_window` and `max_input_tokens` both follow `limit.input` when one is
+// declared. So an input axis that under-reports is not only never used, it is
+// what a user is shown as the model's size.
+//
 // Only evidence moves a value here, and evidence is sorted:
 //
-//   route       the route's own refusal, in its own words
+//   route       the route's own answer about its own limit: the words of a
+//               refusal, or what its own service demonstrates
 //   route-twin  what this route declares for the same upstream model
 //   vendor      the model vendor's published page
 //   witnessed   a generation somebody watched finish
@@ -126,6 +134,19 @@ export const LIMITS = {
       measured: "2026-10-16",
       samples: "max_tokens 4000000 was accepted with no refusal at all, which is the DeepSeek upstream's shape: silence here is not evidence of a ceiling either way, and nothing above 32000 was watched",
       how: "the same paid twin declares 131072 on this axis",
+    },
+  },
+  // Measured the day a host's window for this id was reported half its size.
+  // Only the input axis moves: the window and the ceiling are what this route
+  // declares, and what was served agrees with both.
+  "space-bunny-free": {
+    input: {
+      value: 1048576,
+      source: "route",
+      declaredAt: 524288,
+      measured: "2026-10-16",
+      samples: "prompts of 535,110, 935,110 and 979,550 tokens served whole, each with the needle at the end of it echoed back and each counted by `usage.prompt_tokens`, so the declared 524288 is already known to be small; a prompt placed over the window was refused 400, in words that name nothing",
+      how: "the catalogue's 524288 is its own `context − output` (1048576 − 524288) read as a cap, and this route does not enforce it: the samples above run from just past the declared cap to nearly twice it, served whole, and the wall is the 1048576-token window this same catalogue declares for this id. A host that shows the input axis shows the window — magpie's `context_window` and `max_input_tokens` are both this field when one is declared — so a derivation left here is a wrong window on screen.",
     },
   },
 };
@@ -443,7 +464,7 @@ export function limitOverrides(
   // an object handed in as `table` carries — evidence for a model nobody
   // declared, from a table that never named it.
   const record = table && Object.hasOwn(table, id) ? table[id] : undefined;
-  for (const axis of ["context", "output"]) {
+  for (const axis of ["context", "input", "output"]) {
     // Own property, like the table lookup two lines up: `declared` is handed in
     // by a caller, and a `context` inherited from a custom prototype — or from a
     // polluted `Object.prototype` — would otherwise be read as a declaration the
@@ -451,7 +472,12 @@ export function limitOverrides(
     // check with a number nobody declared.
     const declaredValue = declared && Object.hasOwn(declared, axis) ? declared[axis] : undefined;
     const entry = record?.[axis];
-    const live = (axis === "context" ? observed : observedOutput)?.get(id);
+    // Only the axes a refusal names have a live form — a window and a
+    // completion ceiling. An input axis is answered from the table alone: the
+    // refusals this route sends name the window that bounds it, never an input
+    // cap of its own, so there is nothing to observe into it.
+    const live =
+      (axis === "context" ? observed : axis === "output" ? observedOutput : undefined)?.get(id);
     // A route statement made while this process was running is the same tier as
     // the table and newer than it, so it is taken as it stands. Everything else
     // has to have been measured against the catalogue in front of us now: the

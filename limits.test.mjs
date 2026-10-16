@@ -141,6 +141,42 @@ test("the ids the tier added last do not keep the ceilings the catalogue gave th
   assert.deepEqual(limitOverrides("ll-alpha-free", { context: 262144, output: 131072 }), {});
 });
 
+// The third axis, and the one a catalogue derives rather than measures:
+// space-bunny-free's declared `input` is its own `context − output`, and prompts
+// of up to nearly twice it were served — while the input axis is what a host
+// that shows a window displays. The window and the ceiling are what this route
+// declares, and they are left alone.
+test("an input the catalogue derives, and the route does not enforce, is raised to the window", async () => {
+  const { limitOverrides } = await subject;
+  assert.deepEqual(
+    limitOverrides("space-bunny-free", { context: 1048576, input: 524288, output: 524288 }),
+    { input: 1048576 },
+  );
+  // the staleness guard is the axis's own: a catalogue that moves the input
+  // voids this entry rather than leaving the measured value behind
+  assert.deepEqual(
+    limitOverrides("space-bunny-free", { context: 1048576, input: 600000, output: 524288 }),
+    {},
+  );
+  // and the other two axes stay exactly as declared
+  assert.deepEqual(limitOverrides("space-bunny-free", { context: 1048576, output: 524288 }), {});
+  // a live window does not stand in for an input nobody named: the maps carry
+  // refusals, and no refusal names this axis
+  const live = new Map([["live-input-free", 900000]]);
+  const liveOutput = new Map([["live-input-free", 64000]]);
+  assert.deepEqual(
+    limitOverrides(
+      "live-input-free",
+      { context: 200000, input: 180000, output: 32000 },
+      undefined,
+      live,
+      liveOutput,
+    ),
+    { context: 900000, output: 64000 },
+    "the input axis has no live form",
+  );
+});
+
 // The window wording measured on ll-alpha-free's upstream: the same fact as the
 // "maximum context length is N tokens" sentence, phrased as a parenthetical. A
 // window this module cannot read is a window the plugin keeps under-declaring.
@@ -242,6 +278,9 @@ test("weaker evidence may raise a limit but never lower one", async () => {
     "witnessed-raise-free": { output: { value: 64000, source: "witnessed", declaredAt: 32000 } },
     "route-lower-free": { context: { value: 100000, source: "route", declaredAt: 200000 } },
     "malformed-free": { context: { value: 0, source: "route", declaredAt: 200000 } },
+    // the rule is per axis, and the input axis obeys it the same way
+    "vendor-input-lower-free": { input: { value: 100000, source: "vendor", declaredAt: 200000 } },
+    "route-input-lower-free": { input: { value: 100000, source: "route", declaredAt: 200000 } },
   };
   assert.deepEqual(limitOverrides("vendor-lower-free", DECLARED, table), {});
   assert.deepEqual(limitOverrides("witnessed-raise-free", DECLARED, table), { output: 64000 });
@@ -249,6 +288,16 @@ test("weaker evidence may raise a limit but never lower one", async () => {
   // page or a witness may not, because that invents a restriction
   assert.deepEqual(limitOverrides("route-lower-free", DECLARED, table), { context: 100000 });
   assert.deepEqual(limitOverrides("malformed-free", DECLARED, table), {});
+  assert.deepEqual(
+    limitOverrides("vendor-input-lower-free", { context: 200000, input: 200000, output: 32000 }, table),
+    {},
+    "a vendor page does not get to take room away from a prompt",
+  );
+  assert.deepEqual(
+    limitOverrides("route-input-lower-free", { context: 200000, input: 200000, output: 32000 }, table),
+    { input: 100000 },
+    "the route's own word does, on this axis as on the others",
+  );
 });
 
 test("a refusal naming a window while the process runs outranks the shipped table forever after", async () => {
@@ -572,10 +621,13 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
   // one axis has evidence for this one and the other does not, so only its
   // output moves and the catalogue's own `input` survives untouched
   assert.deepEqual(models["big-pickle"].limit, { context: 200000, input: 160000, output: 131072 });
-  // no evidence at all here: everything the catalogue declared survives
+  // the input axis is one of the axes now: this one's declared input is its own
+  // context − output, falsified by prompts of up to nearly twice it served, so
+  // the input moves to the window while the window and the ceiling stay as
+  // declared
   assert.deepEqual(models["space-bunny-free"].limit, {
     context: 1048576,
-    input: 524288,
+    input: 1048576,
     output: 524288,
   });
 });

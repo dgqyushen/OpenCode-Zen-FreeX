@@ -28,13 +28,19 @@ model whose own vendor publishes 1048576/131072. The ids the tier added on
 against a declared 65536, and `glm-5.3-flash-free` is declared 200000/32000
 while its paid twin `glm-5.3-flash` is declared 1000000/131072 in the same
 catalogue — and a 232685-token prompt was served through the free id, which the
-declared window does not allow.
+declared window does not allow. `space-bunny-free` under-reports on a third
+axis, its `input`: the catalogue derives that number from its own pair
+(`context − output`, 524288) while prompts of 535,110, 935,110 and 979,550
+tokens were served through the free id, and the axis is what a host that shows
+a window shows — magpie's `context_window` and `max_input_tokens` both follow
+it, so the derivation was on screen as half a window.
 
-Both numbers are acted on. The window decides when a conversation is compacted
-and how much of it is ever sent; the output cap is sent as `max_tokens` on every
-request, so a reply is cut at it with a finish reason that reads like the
-model's own decision. A window that is too small is never refused, it is just
-quietly never used, which is why this stayed invisible for so long.
+All of these numbers are acted on. The window decides when a conversation is
+compacted and how much of it is ever sent; the output cap is sent as
+`max_tokens` on every request, so a reply is cut at it with a finish reason that
+reads like the model's own decision; the `input` axis is the size a
+window-showing host displays. A window that is too small is never refused, it is
+just quietly never used, which is why this stayed invisible for so long.
 
 `limits.mjs` holds what was measured, per axis, with the catalogue value it was
 measured against. Each axis carries `samples` and `how`; the short of it:
@@ -51,6 +57,7 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | `ll-alpha-free` | output | 262144 | the ceiling the route's own refusal names, against a declared 65536 |
 | `glm-5.3-flash-free` | context | 1000000 | what this route declares for the same upstream model, with a 232685-token prompt served as witness |
 | `glm-5.3-flash-free` | output | 131072 | what this route declares for the same upstream model |
+| `space-bunny-free` | input | 1048576 | the window this route declares for the same id, with prompts of up to nearly twice the declared input served |
 
 A prompt sized just over the window is refused with
 
@@ -73,6 +80,14 @@ wall is — it is what the calibration is checked against, since
 figure is a rough one (characters, not tokens) and must not be read as a count.
 A second upstream words the same fact as "This endpoint's maximum context length
 is …" and breaks the request into text input, tool input and output.
+
+**The input**, the third axis: nothing cheap names it — the refusals on this
+route name the window, and this id's own refusal names nothing at all — so it is
+measured by serving. A prompt sized past the declared input is the measurement
+(535,110, 935,110 and 979,550-token prompts each came back with the needle at
+their end echoed, and `usage.prompt_tokens` is the count that says how much was
+served), and the window the catalogue declares for the same id bounds the value
+from above: a request placed over it is refused.
 
 The ceiling, which is cheaper than the window: ask for `max_tokens: 1000000` on a
 short prompt and stop reading as soon as the answer starts. An upstream that
@@ -104,7 +119,8 @@ own, which is the intended end state.
 that model's window for the rest of the process. The list is rebuilt at every
 start and hourly after, so a route that changes the window it enforces is
 followed without anyone editing this file. Nothing is persisted: a restart falls
-back to what is measured here.
+back to what is measured here. The `input` axis has no live form: the refusals
+this route sends name a window and a completion ceiling, and never an input cap.
 
 **The same shape on a second upstream.** `mimo-v2.6-flash-free` is declared
 200000/32000 here too, and its window is a route figure like the one above — an
