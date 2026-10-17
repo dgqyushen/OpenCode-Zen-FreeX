@@ -737,6 +737,587 @@ test("Responses places a frame naming the one item the stream opened without an 
   );
 });
 
+// What a client reading the frames without this collapse sees: the items the
+// output_item frames open, in the order the stream opened them. The invariant
+// these tests read is that the same bytes describe the same items on both
+// paths — the same count, the same order, each one the kind its own frames
+// say it is. What the frames leave to the deltas (a call's arguments, a text
+// block's text) is what this path accumulates, so it is not compared here.
+function streamedItems(frames) {
+  const held = new Map();
+  let next = 0;
+  for (const frame of frames) {
+    if (frame?.type !== "response.output_item.added") continue;
+    const item = frame.item ?? {};
+    let at = frame.output_index;
+    if (at === undefined && item.id)
+      at = [...held].find(([, value]) => value.id === item.id)?.[0];
+    if (at === undefined) at = next++;
+    held.set(at, item);
+  }
+  return [...held]
+    .sort(([a], [b]) => a - b)
+    .map(([, value]) => ({ type: value.type }));
+}
+
+test("Responses keeps two items the upstream placed nowhere apart", async () => {
+  // Two items with no output_index and no item id — the shape a stream that
+  // never indexed its items sends. The second one used to land on slot 0 as
+  // well, where `keep` read it as a partial view of the first and discarded
+  // it: the streamed reply carried both calls while this path answered 200
+  // with one of them.
+  const message = { type: "message", role: "assistant", content: [] };
+  const call = { type: "function_call", name: "lookup", arguments: "" };
+  const frames = [
+    { type: "response.output_item.added", item: message },
+    // A call's frames, and a message's, carry no item id at all here, so the
+    // item the stream opened is the one they are filling in.
+    { type: "response.output_text.delta", item_id: "msg_a", content_index: 0, delta: "hello" },
+    { type: "response.output_item.added", item: call },
+    { type: "response.function_call_arguments.delta", item_id: "call_a", delta: '{"a"' },
+    { type: "response.function_call_arguments.done", item_id: "call_a", arguments: '{"a":1}' },
+    { type: "response.output_item.done", item: { ...call, id: "call_a", arguments: '{"a":1}' } },
+    { type: "response.completed", response: { id: "r", status: "completed", output: [] } },
+  ];
+  const body = await json(frames.map((value) => event(value)).join(""), "responses");
+  assert.equal(body.output.length, 2, "two items placed nowhere are two items");
+  assert.deepEqual(
+    body.output.map((item) => item.type),
+    ["message", "function_call"],
+  );
+  assert.equal(body.output[0].content[0].text, "hello");
+  assert.equal(body.output[1].arguments, '{"a":1}');
+  // Each item is the one its own frames named: the id-less opening frames
+  // opened them, and the ids the frames after them carry are the ones they
+  // took, so the streamed client and this reply name one item one way.
+  assert.deepEqual(
+    body.output.map((item) => item.id),
+    ["msg_a", "call_a"],
+  );
+  // Neither item carries what the other's frames filled in.
+  assert.equal(body.output[0].arguments, undefined, "the message took the call's arguments");
+  assert.equal(body.output[1].content, undefined, "the call took the message's content");
+  // The same bytes describe the same items on both paths: the streamed reply
+  // opened these two, in this order, and the collapsed one holds these two.
+  assert.deepEqual(
+    body.output.map((item) => ({ type: item.type })),
+    streamedItems(frames),
+  );
+
+  // Two of the same kind as well: the second opening frame opens an item
+  // rather than continuing the one the first opened, and each id-less frame
+  // goes on filling in the item the stream opened last.
+  const second = await json(
+    event({ type: "response.output_item.added", item: message }) +
+      event({ type: "response.output_text.delta", item_id: "msg_a", content_index: 0, delta: "A" }) +
+      event({ type: "response.output_item.added", item: message }) +
+      event({ type: "response.output_text.delta", item_id: "msg_b", content_index: 0, delta: "B" }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed", output: [] } }),
+    "responses",
+  );
+  assert.equal(second.output.length, 2, "two messages placed nowhere are two items");
+  assert.deepEqual(
+    second.output.map((item) => item.content[0].text),
+    ["A", "B"],
+    "the messages are in the order the stream opened them",
+  );
+});
+
+// The other half of the same hazard, and the one a stream is more likely to
+// send: an item named by id alone (no output_index) and an item that states
+// its own output_index. Both used to be told apart by one number — the item
+// the id named was given the next free index, which the item stating
+// `output_index: 0` then claimed as its own. `keep` read the second item as a
+// newer view of the first, took it for the whole reply, and answered 200 with
+// one item of the two wearing the other's id: a tool call silently gone, and
+// the id of one call standing on another. An index the upstream states is a
+// fact about its reply; an index this file infers is a guess, and a guess
+// never displaces a fact.
+test("Responses keeps an item named by id and an item stating its own index apart", async () => {
+  const body = await json(
+    event({
+      type: "response.output_item.added",
+      item: { type: "function_call", id: "call_a", name: "bash", arguments: '{"a":1}' },
+    }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", name: "read", arguments: '{"b":2}' },
+      }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed" } }),
+    "responses",
+  );
+  assert.equal(body.output.length, 2, "a call named by id and a call stating index 0 are two calls");
+  // The call that stated index 0 is placed at 0 and the one that stated nothing
+  // takes the next place no index claims, so the reply reads in the order the
+  // upstream placed its items rather than the order the frames arrived in.
+  assert.deepEqual(
+    body.output.map((item) => [item.id, item.name, item.arguments]),
+    [
+      [undefined, "read", '{"b":2}'],
+      ["call_a", "bash", '{"a":1}'],
+    ],
+    "each call keeps its own identity and its own arguments",
+  );
+});
+
+test("Responses opens an item for an index no item has stated, instead of displacing one", async () => {
+  // Two calls the upstream placed nowhere, and a third that states index 0 —
+  // the place neither of those took, because an item the upstream places
+  // nowhere takes the first place no stated index claims rather than the number
+  // that happens to equal its arrival order. All three reach the reply, and the
+  // one the upstream placed is answered at its place.
+  const body = await json(
+    event({ type: "response.output_item.added", item: { type: "function_call", name: "bash", arguments: '{"one":1}' } }) +
+      event({ type: "response.output_item.added", item: { type: "function_call", name: "read", arguments: '{"two":2}' } }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", name: "edit", arguments: '{"three":3}' },
+      }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed" } }),
+    "responses",
+  );
+  assert.equal(body.output.length, 3, "three calls opened are three calls answered");
+  assert.deepEqual(
+    body.output.map((item) => item.arguments),
+    ['{"three":3}', '{"one":1}', '{"two":2}'],
+    "the stated index keeps its place, the unplaced items fill the next ones",
+  );
+});
+
+// The same collision with the identity and the frames a real reply carries:
+// the call named by id is opened, its arguments are streamed to it, and the
+// item claiming index 0 arrives between parts of that — the order measured on
+// this route. The id and the arguments must both stay on the call they came
+// from, and neither call may be dropped.
+test("Responses does not hand a stated index another call's id or arguments", async () => {
+  const body = await json(
+    event({
+      type: "response.output_item.added",
+      item: { type: "function_call", id: "call_a", name: "bash", arguments: "" },
+    }) +
+      event({ type: "response.function_call_arguments.delta", item_id: "call_a", delta: '{"a"' }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", name: "read", arguments: '{"b":2}' },
+      }) +
+      event({ type: "response.function_call_arguments.delta", item_id: "call_a", delta: ":1}" }) +
+      event({
+        type: "response.output_item.done",
+        item: { id: "call_a", type: "function_call", call_id: "call_a", name: "bash", arguments: '{"a":1}', status: "completed" },
+      }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed" } }),
+    "responses",
+  );
+  assert.equal(body.output.length, 2, "both calls are in the reply");
+  assert.deepEqual(
+    body.output.map((item) => [item.id, item.name, item.arguments]),
+    [
+      [undefined, "read", '{"b":2}'],
+      ["call_a", "bash", '{"a":1}'],
+    ],
+    "the id and the arguments stay on the call they were streamed for",
+  );
+});
+
+// An id that is `0`, `false` or `""` is not a name: a client cannot key an item
+// by it, so two calls carrying the same one are two calls — the rule
+// tool-response.mjs's identity() states, and the one this file reads a name by.
+// Reading them as names in one place and as non-names in another resolved the
+// second call to the first one's item, wrote the second call's arguments over
+// the first's, and refused the reply with a 502 where the same shape without
+// indexes answered 200 with two items.
+test("Responses reads an id that names nothing as no id, however many calls carry it", async () => {
+  for (const [label, id] of [
+    ["zero", 0],
+    ["false", false],
+    ["the empty string", ""],
+    ["null", null],
+  ]) {
+    for (const indexed of [true, false]) {
+      const frames = [];
+      for (const at of [0, 1])
+        frames.push(
+          {
+            type: "response.output_item.added",
+            ...(indexed ? { output_index: at } : {}),
+            item: { type: "function_call", id, name: `fn${at}`, arguments: "" },
+          },
+          {
+            type: "response.function_call_arguments.done",
+            ...(indexed ? { output_index: at } : {}),
+            arguments: `{"n":${at}}`,
+          },
+        );
+      frames.push({
+        type: "response.completed",
+        response: { id: "r", status: "completed", output: [] },
+      });
+      const body = await json(frames.map((value) => event(value)).join(""), "responses");
+      const where = `${label}${indexed ? ", each with its own index" : ", placed nowhere"}`;
+      assert.equal(body.output.length, 2, `${where}: two calls are two items`);
+      assert.deepEqual(
+        body.output.map((item) => item.arguments),
+        ['{"n":0}', '{"n":1}'],
+        `${where}: neither call took the other's arguments`,
+      );
+      // The id an item was sent with is not the guard's to rewrite: whatever
+      // the frame carried is what the reply answers, and it is the same on
+      // both items. What changed is only how the frames are placed, so nothing
+      // here is a name one item took from another.
+      assert.deepEqual(
+        body.output.map((item) => item.id),
+        [id, id],
+        `${where}: the reply answers the id the frame carried`,
+      );
+    }
+  }
+});
+
+test("Responses answers two calls that share one id when each states its own index", async () => {
+  // An upstream that spends one item id on two items is contradicting itself,
+  // and the index each of them states is the fact this file can still tell them
+  // apart by. Refusing the second one lost the whole reply — 502 where the same
+  // bytes had already delivered two items to a streaming client — so the
+  // second item opens, and the reply answers both, each with the id its own
+  // frames carried. The call that names the id alone in its arguments frames
+  // (the shape this route sends for an item it numbered) reaches the item that
+  // took the name last, so each call keeps its own arguments.
+  const twoCalls = (first, second) =>
+    event({
+      type: "response.output_item.added",
+      output_index: first.index,
+      item: { type: "function_call", id: "X", name: first.name, arguments: "" },
+    }) +
+    event({
+      type: "response.function_call_arguments.delta",
+      output_index: first.index,
+      item_id: "X",
+      delta: first.arguments,
+    }) +
+    event({
+      type: "response.function_call_arguments.done",
+      ...(first.namedOnly ? {} : { output_index: first.index }),
+      item_id: "X",
+      arguments: first.arguments,
+    }) +
+    event({
+      type: "response.output_item.done",
+      output_index: first.index,
+      item: { type: "function_call", id: "X", name: first.name, arguments: first.arguments, status: "completed" },
+    }) +
+    event({
+      type: "response.output_item.added",
+      output_index: second.index,
+      item: { type: "function_call", id: "X", name: second.name, arguments: "" },
+    }) +
+    event({
+      type: "response.function_call_arguments.delta",
+      ...(second.namedOnly ? {} : { output_index: second.index }),
+      item_id: "X",
+      delta: second.arguments,
+    }) +
+    event({
+      type: "response.function_call_arguments.done",
+      ...(second.namedOnly ? {} : { output_index: second.index }),
+      item_id: "X",
+      arguments: second.arguments,
+    }) +
+    event({
+      type: "response.output_item.done",
+      output_index: second.index,
+      item: { type: "function_call", id: "X", name: second.name, arguments: second.arguments, status: "completed" },
+    }) +
+    event({ type: "response.completed", response: { id: "r", status: "completed", output: [] } });
+  const bash = { name: "bash", index: 0, arguments: '{"k":1}', namedOnly: false };
+  const bedit = { name: "bedit", index: 1, arguments: '{"d":1}', namedOnly: true };
+
+  const first = await json(twoCalls(bash, bedit), "responses");
+  assert.equal(first.output.length, 2, "two calls are two items");
+  assert.deepEqual(
+    first.output.map((item) => [item.id, item.name, item.arguments]),
+    [
+      ["X", "bash", '{"k":1}'],
+      ["X", "bedit", '{"d":1}'],
+    ],
+    "each call answers its own name, arguments and the id its frames carried",
+  );
+
+  // The same two calls in the other order: the call naming the id alone opens
+  // the reply, so nothing has taken the name when its frames arrive. Both
+  // stated an index, so both are answered at the place they stated, whatever
+  // order the frames arrived in.
+  const second = await json(twoCalls(bedit, bash), "responses");
+  assert.equal(second.output.length, 2, "two calls are two items in either order");
+  assert.deepEqual(
+    second.output.map((item) => [item.id, item.name, item.arguments]),
+    [
+      ["X", "bash", '{"k":1}'],
+      ["X", "bedit", '{"d":1}'],
+    ],
+    "each call answers its own name, arguments and the id its frames carried",
+  );
+});
+
+test("Responses still refuses a frame that names an item this stream never opened", async () => {
+  // The allowance above is for a frame that states an index: that is a place in
+  // the reply, so the item opens there whatever id it carries. A frame that
+  // states nothing still has to name an item this stream opened — an id no
+  // frame opened, or one of two items of the frame's kind that both answer to
+  // no id, is still not something to guess at. Both halves are asserted here,
+  // because the rule they share is the one this file must not lose while
+  // answering the first.
+  const opened = { type: "function_call", id: "call_a", name: "bash", arguments: "" };
+  const body = await json(
+    event({ type: "response.output_item.added", item: opened }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", id: "call_a", name: "bedit", arguments: "" },
+      }) +
+      event({ type: "response.function_call_arguments.done", item_id: "call_a", arguments: '{"d":1}' }) +
+      event({ type: "response.completed", response: { id: "r", status: "completed", output: [] } }),
+    "responses",
+  );
+  assert.equal(body.output.length, 2, "the stated index opened the second call");
+  assert.equal(body.output[1].arguments, '{"d":1}', "the id alone reached the item that took it last");
+  assert.equal(body.output[0].arguments, "", "and left the first call's own arguments alone");
+
+  // An id that no item opened, with no index to place it by.
+  await failure(
+    event({ type: "response.output_item.added", item: opened }) +
+      event({ type: "response.function_call_arguments.done", item_id: "never_opened", arguments: "{}" }) +
+      event({ type: "response.completed" }),
+    "responses",
+    /unknown item/,
+  );
+  // Two items of the frame's kind that both answer to no id: naming one of them
+  // says which of two it could be.
+  await failure(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", name: "one", arguments: "" },
+    }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", name: "two", arguments: "" },
+      }) +
+      event({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: "{}" }) +
+      event({ type: "response.completed" }),
+    "responses",
+    /unknown item/,
+  );
+});
+
+test("Responses answers the reply's items in the order the upstream placed them", async () => {
+  // The output_index a frame states is where its item sits in the reply, and a
+  // client that reads no stream has nothing but the array's order to read the
+  // reply's order from. Answering the items in the order the frames arrived in
+  // told that client a reply that said 1 then 2 was 2 then 1.
+  const call = (index, name) =>
+    event({
+      type: "response.output_item.added",
+      output_index: index,
+      item: { type: "function_call", id: `call_${name}`, name, arguments: "" },
+    }) +
+    event({
+      type: "response.function_call_arguments.done",
+      output_index: index,
+      item_id: `call_${name}`,
+      arguments: `{"n":${index}}`,
+    });
+  const terminal = event({
+    type: "response.completed",
+    response: { id: "r", status: "completed", output: [] },
+  });
+
+  const swapped = await json(call(2, "one") + call(1, "two") + terminal, "responses");
+  assert.deepEqual(
+    swapped.output.map((item) => [item.name, item.arguments]),
+    [
+      ["two", '{"n":1}'],
+      ["one", '{"n":2}'],
+    ],
+    "the item that stated index 1 is answered first, whatever its arrival order",
+  );
+
+  const inOrder = await json(call(1, "one") + call(2, "two") + terminal, "responses");
+  assert.deepEqual(
+    inOrder.output.map((item) => [item.name, item.arguments]),
+    [
+      ["one", '{"n":1}'],
+      ["two", '{"n":2}'],
+    ],
+    "and the same two items in the same places when the stream agreed with itself",
+  );
+
+  // An item the upstream placed nowhere has no place of its own to read, so it
+  // takes the first place no stated index claims — the reading this file's slots
+  // gave by construction before they were split into a key space per fact: an
+  // unplaced item sat at the next free number, an indexed one at its index.
+  const mixed = await json(
+    event({
+      type: "response.output_item.added",
+      item: { type: "message", id: "msg", role: "assistant", content: [] },
+    }) +
+      event({
+        type: "response.output_text.delta",
+        item_id: "msg",
+        content_index: 0,
+        delta: "note",
+      }) +
+      call(2, "two") +
+      call(1, "one") +
+      terminal,
+    "responses",
+  );
+  assert.deepEqual(
+    mixed.output.map((item) => item.name ?? item.content[0].text),
+    ["note", "one", "two"],
+    "the unplaced item fills the first free place, the stated indices keep theirs",
+  );
+});
+
+test("Anthropic refuses a block snapshot that is not a block, instead of storing it", async () => {
+  // A start whose content_block is null, a string, or not there at all is a
+  // partial view of the block the deltas are filling in, and `carries` weighs
+  // it as nothing — the same view a repeated empty start is. Stored as it
+  // stood it answered 200 with a null among the content, and a string threw on
+  // the first delta that read a field of it. Nothing to take hold of opens
+  // nothing; a delta with no block above it is refused as it always was.
+  const start = event(
+    { type: "message_start", message: { id: "m", type: "message", role: "assistant", content: [] } },
+    "message_start",
+  );
+  const stop = event({ type: "message_stop" }, "message_stop");
+  for (const [shape, frame] of [
+    ["null", { type: "content_block_start", index: 0, content_block: null }],
+    ["a string", { type: "content_block_start", index: 0, content_block: "text" }],
+    ["nothing at all", { type: "content_block_start", index: 0 }],
+  ]) {
+    const body = await json(
+      start + event(frame, "content_block_start") + stop,
+      "anthropic",
+    );
+    assert.deepEqual(body.content, [], `${shape}: a block snapshot that is not a block was stored`);
+  }
+  // A null beside a sound block does not take the sound one's place, or add
+  // an entry of its own ahead of it.
+  const beside = await json(
+    start +
+      event(
+        { type: "content_block_start", index: 1, content_block: { type: "text", text: "kept" } },
+        "content_block_start",
+      ) +
+      event({ type: "content_block_start", index: 0, content_block: null }, "content_block_start") +
+      stop,
+    "anthropic",
+  );
+  assert.deepEqual(beside.content, [{ type: "text", text: "kept" }]);
+  // What the deltas of an unusable start carry cannot be placed either, and
+  // that is the answer a delta with no block has always had.
+  const text =
+    start +
+    event({ type: "content_block_start", index: 0, content_block: null }, "content_block_start") +
+    event(
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } },
+      "content_block_delta",
+    ) +
+    stop;
+  await failure(text, "anthropic", /without a content block/);
+});
+
+test("Anthropic takes a message_start's content only when it is a list of blocks", async () => {
+  // `content` is the one key of a message_start that apply fills in itself,
+  // and spreading the message onto the body let any value of it answer in the
+  // blocks' place: a string threw where the blocks are read back, and an
+  // object answered 200 with something that is not a list of blocks. A value
+  // that is not a list says nothing about the reply, so the blocks the stream
+  // accumulated stand.
+  for (const [shape, content] of [
+    ["a string", "nope"],
+    ["a number", 7],
+    ["an object", { type: "text", text: "x" }],
+  ]) {
+    const body = await json(
+      event(
+        { type: "message_start", message: { id: "m", type: "message", role: "assistant", content } },
+        "message_start",
+      ) +
+        event(
+          { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+          "content_block_start",
+        ) +
+        event({ type: "message_stop" }, "message_stop"),
+      "anthropic",
+    );
+    assert.deepEqual(
+      body.content,
+      [{ type: "text", text: "kept" }],
+      `${shape}: the message_start's content replaced the blocks the stream filled in`,
+    );
+  }
+});
+
+test("Anthropic does not read a delta type off the prototype chain", async () => {
+  // The table of delta types was an object literal read as `table[delta.type]`,
+  // so a type of "toString", "constructor" or "valueOf" reached the member the
+  // prototype chain holds there and the delta wrote the block a key of that
+  // name — a key the delta never named, holding a function that
+  // JSON.stringify then dropped. The block stands as it was, and the reply
+  // says nothing about a type it does not know.
+  const start = event(
+    { type: "message_start", message: { id: "m", type: "message", role: "assistant", content: [] } },
+    "message_start",
+  );
+  const stop = event({ type: "message_stop" }, "message_stop");
+  for (const type of ["toString", "constructor", "valueOf"]) {
+    const response = await collapseResponse(
+      sse(
+        start +
+          event(
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+            "content_block_start",
+          ) +
+          event(
+            { type: "content_block_delta", index: 0, delta: { type, text: "junk" } },
+            "content_block_delta",
+          ) +
+          stop,
+      ),
+      "anthropic",
+    );
+    assert.equal(response.status, 200);
+    const raw = await response.text();
+    assert.deepEqual(
+      JSON.parse(raw).content,
+      [{ type: "text", text: "kept" }],
+      `${type}: the block took a key its delta never named`,
+    );
+    // On the bytes as well: the key the prototype chain would have named is
+    // not something this reply carries at all.
+    assert.doesNotMatch(raw, /toString|constructor|valueOf/);
+  }
+  // A type the table does know still reaches its block.
+  const known = await json(
+    start +
+      event(
+        { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+        "content_block_start",
+      ) +
+      event({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "想" } }, "content_block_delta") +
+      event({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig" } }, "content_block_delta") +
+      stop,
+    "anthropic",
+  );
+  assert.equal(known.content[0].thinking, "想");
+  assert.equal(known.content[0].signature, "sig");
+});
+
 test("Anthropic takes only the fields a message_delta may carry", async () => {
   // Object.assign copies with [[Set]] semantics, and JSON.parse makes
   // "__proto__" an own property: an upstream's delta re-parented the message
@@ -1098,7 +1679,10 @@ test("upstream errors after terminal events are not successful responses", async
 // answered the same upstream differently — this one dropped an event after
 // the terminal marker, and that one forwarded it. An event after the marker
 // is not part of the reply, in either path; a failure after it still is.
-test("an event after the terminal marker is not folded into the reply", async () => {
+// Both halves of the same contract: what came before the marker is the reply
+// and is still there, and what came after it is not. The absence of the tail
+// alone was satisfied by a reply that carried nothing at all.
+test("an event after the terminal marker is not folded into the reply, and what came before it is", async () => {
   const tails = {
     chat: [
       { choices: [{ index: 0, delta: { content: "hi" } }] },
@@ -1106,29 +1690,28 @@ test("an event after the terminal marker is not folded into the reply", async ()
       { choices: [{ index: 0, delta: { content: "TAIL" } }] },
     ],
     responses: [
-      {
-        type: "response.completed",
-        response: {
-          status: "completed",
-          output: [
-            {
-              type: "message",
-              role: "assistant",
-              content: [{ type: "output_text", text: "hi", annotations: [] }],
-            },
-          ],
-        },
-      },
+      { type: "response.output_item.added", output_index: 0, item: { id: "m", type: "message", role: "assistant", content: [] } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "hi" },
+      // A terminal that carries no output of its own: what the stream
+      // accumulated before it is the reply, and the marker is the frame after
+      // which nothing more is folded in.
+      { type: "response.completed", response: { status: "completed" } },
       { type: "response.output_text.delta", item_id: "m", output_index: 0, content_index: 0, delta: "TAIL" },
     ],
     anthropic: [
-      { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content: [{ type: "text", text: "hi" }] } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
       { type: "message_stop" },
       { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "TAIL" } },
     ],
   };
   for (const [protocol, frames] of Object.entries(tails)) {
     const body = await json(frames.map((value) => event(value)).join(""), protocol);
+    assert.match(
+      JSON.stringify(body),
+      /hi/,
+      `${protocol}: the reply the terminal marker ended was discarded`,
+    );
     assert.doesNotMatch(
       JSON.stringify(body),
       /TAIL/,

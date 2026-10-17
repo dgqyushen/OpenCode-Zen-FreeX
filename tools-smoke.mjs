@@ -268,7 +268,26 @@ if (entry === undefined) {
 // refusals: a floor can come back `unreachable` or `failed`, and calling those
 // refused is what pointed the reader at the wording, and at `capture`, over an
 // outage. Exported so a test can pin the wording without asking Zen.
-export function refusedSummary({ served, total, unbuilt, unserved = [] }) {
+//
+// A `malformed` verdict belongs to `unbuilt` and nowhere else. A floor whose
+// request could not be built was never asked, so it is not one of the verdicts
+// to count, and `total` here is the number of floors something was actually
+// asked of: a `total` that counted the unasked ones made the one-line summary
+// name a single floor twice — `1 not served, 1 never asked of 2` for a run with
+// one malformed floor and one answered one — which is two names for one row and
+// a denominator that does not add up. The rows still print every floor and say
+// which is which; this is the sentence that counts them.
+export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
+  // The two call sites below used to disagree about which verdicts `unserved`
+  // held — one left `malformed` out, the other passed it straight through — so
+  // the split is made here, from the rows the caller has, rather than trusted to
+  // two places that can drift apart. A caller cannot mis-count a malformed floor
+  // into the refusals if the only list that carries verdicts has none in it.
+  const verdicts = unserved.filter((verdict) => verdict !== "malformed");
+  // Asked floors are the denominator: the ones that came back with a verdict and
+  // the ones that could not be built. Anything else was never asked, and asking
+  // nothing is not a way to be not served.
+  const total = served + verdicts.length + unbuilt.length;
   if (!served) {
     // Being unable to ask is not an answer. Saying the fingerprint has gone stale
     // when nothing was reached sends the reader to `capture` over a dead network.
@@ -287,32 +306,37 @@ export function refusedSummary({ served, total, unbuilt, unserved = [] }) {
       // in fingerprint.json, and so is the fix.
       return `${unbuilt.length}/${total} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`;
     }
-    if (unserved.every(fingerprint)) {
+    if (verdicts.every(fingerprint)) {
       return "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.";
     }
-    if (unserved.some(fingerprint)) {
+    if (verdicts.some(fingerprint)) {
       return "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.";
     }
-    if (!unserved.some((verdict) => verdict === "unreachable")) {
+    if (!verdicts.some((verdict) => verdict === "unreachable")) {
       return "Zen answered every floor request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.";
     }
     return "The free tier could not be reached at all, so this says nothing about the fingerprint. Check the network or ZEN_BASE_URL and ask again.";
   }
   // At least one generation works, so the rest are reported by what they
-  // actually were: only the ones Zen refused are called refused.
-  const refused = unserved.filter((verdict) => verdict === "refused" || verdict === "superseded").length;
-  const other = unserved.length - refused;
+  // actually were: only the ones Zen refused are called refused. `served` is
+  // named so the parts add up to the denominator on the page, and the unasked
+  // floors are kept outside it: "of N" is the floors something was asked of, and
+  // a request that could not be built is not one of them. Counting it in made a
+  // single floor appear on both sides of the sentence.
+  const refused = verdicts.filter((verdict) => verdict === "refused" || verdict === "superseded").length;
+  const other = verdicts.length - refused;
   const what = [
+    served ? `${served} served` : null,
     refused ? `${refused} refused` : null,
     other ? `${other} not served` : null,
-    unbuilt.length ? `${unbuilt.length} never asked` : null,
   ]
     .filter(Boolean)
     .join(", ");
+  const asked = unbuilt.length ? `${what} of ${total} asked, ` : `${what} of ${total}.`;
   const malformed = unbuilt.length
-    ? " The malformed lines above name what fingerprint.json has to gain before those can be asked."
+    ? `${unbuilt.length} never asked: the malformed lines above name what fingerprint.json has to gain before those can be asked.`
     : "";
-  return `At least one generation works, so the plugin still has a generation Zen will serve. ${what} of ${total}.${malformed}`;
+  return `At least one generation works, so the plugin still has a generation Zen will serve. ${asked}${malformed}`;
 }
 
 if (entry) {
@@ -367,17 +391,22 @@ if (entry) {
     console.log(
       refusedSummary({
         served: 0,
-        total: floor.length,
+        // No `total`: the summary counts the floors something was asked of from
+        // the rows it is handed, so there is no second place for this run to work
+        // out a denominator and get it different from the other call site's.
         unbuilt,
         unserved: floor.filter((result) => result.verdict !== "malformed").map((result) => result.verdict),
       }),
     );
     process.exitCode = 1;
   } else if (served.length < floor.length) {
+    // Reached when a floor was not answered, which a malformed one is: the exit
+    // code is still decided by the served floors alone, so a run whose one
+    // working generation answered and whose other floor has a name missing from
+    // its `tools` prints this line and no longer calls that floor refused.
     console.log(
       refusedSummary({
         served: served.length,
-        total: floor.length,
         unbuilt,
         unserved: floor.filter((result) => result.verdict !== "answered").map((result) => result.verdict),
       }),

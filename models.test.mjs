@@ -42,6 +42,10 @@ const provider = {
     "lifecycle-free": { status: "", lifecycle: "retired", cost: { input: 0, output: 0 } },
     // ...and a blank status on its own retires nothing.
     "blank-status-free": { status: "", cost: { input: 0, output: 0 } },
+    // Half-described: the catalogue describes it, and the package it gives the
+    // model is one this plugin has no SDK for. The id names itself free, so the
+    // rule for an id the catalogue cannot speak for is what answers it — before
+    // that rule reached this shape, the entry merely being there dropped it.
     "decision-free": { provider: { npm: "@vendor/systemone" } },
     "responses-free": { provider: { npm: "@ai-sdk/openai" } },
     "messages-free": { provider: { npm: "@ai-sdk/anthropic" } },
@@ -58,15 +62,23 @@ test("lists only live free models with supported protocols and excludes retired 
   const { buildModels } = await subject;
   assert.equal(typeof buildModels, "function", "model discovery must be implemented");
   const models = buildModels(ids, provider, {}, baseURL);
+  // `decision-free` is here, and the assertion it used to sit outside of is not
+  // a weaker one for it: the catalogue describes this id and gives it a package
+  // no SDK answers to, which is the same hole the `-free` rule exists for — an
+  // id with no catalogue entry at all was already offered the same way. What
+  // keeps a SystemOne id out is the docs naming its endpoint, which the test
+  // below pins; a package name alone is not the docs.
   assert.deepEqual(Object.keys(models).sort(), [
     "blank-status-free",
     "coder-free",
+    "decision-free",
     "late-free",
     "messages-free",
     "old-free",
     "responses-free",
     "zero-cost",
   ]);
+  assert.equal(models["decision-free"].api.npm, "@ai-sdk/openai-compatible");
   assert.equal(models["coder-free"].free, true);
   assert.equal(models["coder-free"].providerID, "opencode-zen-free");
   assert.deepEqual(models["coder-free"].limit, { context: 200000, input: 160000, output: 32000 });
@@ -157,6 +169,56 @@ test("a blank retirement date retires nothing, a set one does", async () => {
     Object.keys(buildModels(["blank-date-free", "dated-free"], catalogue, {}, baseURL)),
     ["blank-date-free"],
   );
+});
+
+// ...and the third way a field can fail to say anything, which is not about the
+// value but about its shape. `isSet` asks whether a field says something, and
+// `String` answered for a container as if it had: a list is one non-empty
+// string, so `retirement_date: ["2026-01-01"]` — a field that states no date —
+// retired the model, and the model left the offered list with nothing in the
+// table and nothing in a note to say why. Every other shape rule in this file
+// exists to prevent exactly that loss; a status and a date are single values,
+// and a container is not one of them.
+test("a retirement field written in another shape retires nothing", async () => {
+  const { buildModels, isFree } = await subject;
+  const free = { cost: { input: 0, output: 0 } };
+  // The contrast is the shape and not the value: the string the catalogue really
+  // writes retires the model, and a list holding that same string does not.
+  assert.equal(isFree("dated-free", { ...free, retirement_date: "2026-01-01" }), false);
+  for (const [axis, value] of [
+    ["retirement_date", ["2026-01-01"]],
+    ["retirement_date", {}],
+    ["retirement_date", []],
+    ["deprecated_at", [1]],
+    ["deprecated_at", () => {}],
+  ]) {
+    const model = { ...free, [axis]: value };
+    const label = `${axis} written as ${JSON.stringify(value) ?? typeof value}`;
+    assert.equal(isFree(`shape-${axis}-free`, model), true, `${label} is not a date`);
+    // "retires nothing" is about the offered list, so the id is asked for there
+    const id = `shape-${axis}-free`;
+    const offered = buildModels([id], { npm: "@ai-sdk/openai-compatible", models: { [id]: model } }, {}, baseURL);
+    assert.deepEqual(Object.keys(offered), [id], label);
+  }
+  // The status is the same rule with its own half: a container says nothing, so
+  // the `lifecycle` behind it is what is read — the ending the catalogue really
+  // wrote. A blank status has always been read that way (the case above); a
+  // container was not, and stood in front of the lifecycle as if it were a
+  // status the model never had.
+  assert.equal(isFree("container-status-free", { ...free, status: {}, lifecycle: "retired" }), false);
+  // ...and a container status with nothing behind it retires nothing, whatever
+  // it holds: `["retired"]` is a list, not the word
+  for (const status of [[], {}, ["retired"]])
+    assert.equal(
+      isFree("container-only-free", { ...free, status }),
+      true,
+      `a status written as ${JSON.stringify(status)} is not a status`,
+    );
+  // A status the catalogue really wrote is still read as itself, which is what
+  // keeps the rule above from being "a status never counts": it is set, and
+  // being set it stands in front of the lifecycle as it always has.
+  assert.equal(isFree("live-status-free", { ...free, status: "active", lifecycle: "retired" }), true);
+  assert.equal(isFree("ended-status-free", { ...free, status: "retired", lifecycle: "active" }), false);
 });
 
 // The catalogue writes an explicit null for an axis it does not state — this
@@ -307,12 +369,15 @@ test("endpoint documentation overrides inherited SDK and excludes SystemOne", as
   assert.equal(models["decision-free"], undefined);
 });
 
-// The test above leaves the SystemOne exclusion unpinned: `decision-free`'s
-// catalogue entry already names `@vendor/systemone`, which maps to no protocol,
-// so it is dropped whether the docs row is read or not. The id here is one the
-// catalogue does not describe, so the fallback would hand it `chat` — it can
-// only be missing if the endpoint the docs give it was resolved first, and
-// `systemone` is not a protocol this plugin asks.
+// The test above leaves the SystemOne exclusion with two possible reasons, and
+// this is the one it must be: an id the *docs* name as SystemOne. `decision-free`
+// is in that fixture's catalogue too, and its entry describes it with a package
+// mapping to no protocol — so before the `-free` rule reached a described id,
+// that entry alone dropped it and the docs row was never what did. The id here
+// has no catalogue entry at all, so the fallback would hand it `chat`: it can
+// only be missing when the docs named its endpoint, and `systemone` is not a
+// protocol this plugin asks. The same id, with a catalogue entry that resolves
+// to no protocol, is offered — the two halves are pinned together below.
 test("a documented SystemOne endpoint keeps an undescribed id out", async () => {
   const { buildModels, parseProtocolDocs } = await subject;
   const protocols = parseProtocolDocs(
@@ -321,6 +386,57 @@ test("a documented SystemOne endpoint keeps an undescribed id out", async () => 
   assert.equal(protocols["fresh-free"], "systemone");
   assert.deepEqual(Object.keys(buildModels(["fresh-free"], {}, {}, baseURL)), ["fresh-free"]);
   assert.deepEqual(Object.keys(buildModels(["fresh-free"], {}, protocols, baseURL)), []);
+});
+
+// The hole the `-free` rule was written for, on the one shape it could not
+// reach: an id the catalogue *does* describe, whose entry names a package no SDK
+// answers to. The fallback used to be skipped for it — the entry was there, so
+// the id was read as described and then dropped for a protocol nobody resolved —
+// while the very same id with no catalogue entry at all was offered. Nothing
+// about the two facts differs: neither the catalogue nor the package has said
+// what this id speaks.
+test("a catalogue entry that resolves to no protocol still leaves a free id to its own name", async () => {
+  const { buildModels } = await subject;
+  // the catalogue describes it and gives it a package `sdkProtocol` cannot read
+  const described = buildModels(
+    ["Foo-Free"],
+    { npm: "@ai-sdk/openai-compatible", models: { "Foo-Free": { provider: { npm: "@vendor/nothing" }, limit: { context: 4096 } } } },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(Object.keys(described), ["Foo-Free"]);
+  assert.equal(described["Foo-Free"].api.npm, "@ai-sdk/openai-compatible");
+  // the fallback is the provider's own protocol, not a guess at an endpoint: a
+  // provider that speaks responses gets that one
+  const elsewhere = buildModels(
+    ["Foo-Free"],
+    { npm: "@ai-sdk/openai", models: { "Foo-Free": { provider: { npm: "@vendor/nothing" } } } },
+    {},
+    baseURL,
+  );
+  assert.equal(elsewhere["Foo-Free"].api.npm, "@ai-sdk/openai");
+  // ...and the two shapes the rule must not reach are unchanged: systemone named
+  // by the docs keeps the id out however it names itself...
+  const systemone = { "Foo-Free": "systemone", "Foo-FREE": "systemone" };
+  assert.deepEqual(Object.keys(buildModels(["Foo-Free", "Foo-FREE"], {}, systemone, baseURL)), []);
+  // ...and so does an id the catalogue describes, when the docs name its
+  // endpoint: the docs' own name for it is what `protocols` carries here
+  assert.deepEqual(
+    Object.keys(
+      buildModels(
+        ["labeled-free"],
+        { npm: "@ai-sdk/openai-compatible", models: { "labeled-free": {} } },
+        { "labeled-free": "systemone" },
+        baseURL,
+      ),
+    ),
+    [],
+  );
+  // and the name the docs give is read as itself when it is one this plugin
+  // asks, so the rule above is about `systemone` and not about the docs map
+  const spoken = buildModels(["chatty-free"], {}, { "chatty-free": "chat" }, baseURL);
+  assert.deepEqual(Object.keys(spoken), ["chatty-free"]);
+  assert.equal(spoken["chatty-free"].api.npm, "@ai-sdk/openai-compatible");
 });
 
 test("an unknown id is offered on its own free name, never on a guessed endpoint", async () => {
@@ -335,6 +451,228 @@ test("an unknown id is offered on its own free name, never on a guessed endpoint
   const models = buildModels(["new-free"], {}, { "new-free": "chat" }, baseURL);
   assert.equal(models["new-free"].api.url, baseURL);
   assert.equal(models["new-free"].cost.input, 0);
+});
+
+// The catalogue writes `null` for a row it could not fill in, and one such row
+// used to take the whole list with it: this loop read the entry as a
+// description, `model.modalities?.input` on `null` threw, and the throw was
+// discovery's — so a host that could have been offering every other free model
+// offered none of them. An entry that is not an object describes nothing, which
+// is a fact this file already knows how to state: the id is then read exactly
+// like one the catalogue has no entry for, and is offered when it names itself
+// free.
+test("a malformed catalogue entry does not take the models that are described with it", async () => {
+  const { buildModels } = await subject;
+  const catalogue = {
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "coder-free": { cost: { input: 0, output: 0 }, limit: { context: 4096 } },
+      "empty-free": null,
+      "string-free": "not a model",
+    },
+  };
+  const models = buildModels(["coder-free", "empty-free", "string-free"], catalogue, {}, baseURL);
+  assert.deepEqual(Object.keys(models), ["coder-free", "empty-free", "string-free"]);
+  assert.equal(models["coder-free"].limit.context, 4096, "the described model keeps what the catalogue says");
+  // The row the catalogue could not fill in is read as an undescribed free id:
+  // the provider's own protocol, and the defaults where the catalogue said
+  // nothing. Said as "no title, not a model" rather than as a limit, because a
+  // `null` read as a description is a description with `name: null` in it — the
+  // model offered under a blank name is the same dirty row arriving one layer
+  // further along.
+  assert.equal(models["empty-free"].name, "empty-free", "a row that says nothing does not name the model");
+  assert.equal(models["empty-free"].api.npm, "@ai-sdk/openai-compatible");
+  assert.deepEqual(models["empty-free"].limit, { context: 32768, output: 4096 });
+  assert.equal(typeof models["string-free"], "object", "a row that is not an object is not a description");
+  assert.equal(models["string-free"].name, "string-free");
+  assert.equal(models["string-free"].api.npm, "@ai-sdk/openai-compatible");
+  assert.deepEqual(models["string-free"].limit, { context: 32768, output: 4096 });
+  // ...and one that does not call itself free is still not offered on the
+  // strength of a row that says nothing: the rule is the id's name or the
+  // catalogue's word, and a `null` row is not the catalogue's word
+  const notFree = buildModels(["empty-paid"], { npm: "@ai-sdk/openai-compatible", models: { "empty-paid": null } }, {}, baseURL);
+  assert.deepEqual(Object.keys(notFree), []);
+  // The rows the whole loop has to survive, each of which has a member read on it
+  // by the caller of `buildModels` (provider.mjs reads `.cost` off `metadata.models`):
+  // a `null` there is a TypeError out of a hook a host is waiting on. The empty
+  // list is the row that is hardest to catch — `typeof []` is `"object"`, so it
+  // passed the object test — and is read by the same rule: see the case below,
+  // which is where that row's own shapes are pinned.
+  for (const row of [null, [], "not a model", 17, true, undefined]) {
+    const dirty = { npm: "@ai-sdk/openai-compatible", models: { "dirty-free": row } };
+    const label = JSON.stringify(row) ?? String(row);
+    const offered = buildModels(["dirty-free"], dirty, {}, baseURL);
+    assert.deepEqual(Object.keys(offered), ["dirty-free"], `${label}: the id is still offered`);
+    assert.equal(offered["dirty-free"].name, "dirty-free", `${label}: and under its own name`);
+  }
+  // The rule stated where it cannot be missed: a row the catalogue cannot be
+  // read as a description is one this loop does not carry out of itself. What a
+  // member read on the malformed values above cannot show — `(17).name` is
+  // `undefined`, not a throw — is the difference between "read as nothing" and
+  // "read as a description with holes in it", and that difference is exactly
+  // what the guard is for; the rows above are the shapes the catalogue really
+  // writes, and each of them being offered on its own name is the observable
+  // half of the rule. What is left is stated as the rule it is.
+  for (const axis of Object.keys(catalogue.models))
+    assert.equal(
+      Object.hasOwn(models, axis),
+      true,
+      `${axis}: a malformed row is still the id's own reason to be offered`,
+    );
+  // the same row does not become a description the way an inherited one must
+  // not, and the result map's own prototype is untouched either way
+  assert.equal(Object.getPrototypeOf(models), Object.prototype);
+  assert.equal(Object.hasOwn(models, "__proto__"), false);
+});
+
+// The row that is a list, which is the same fact as `null` one step harder to
+// see: `typeof []` is `"object"`, so it passed the "is it an object" test that
+// `null` does not, and was then read as a description — from which nothing can
+// be read, because a list has no `name` and no `cost` and no `limit` of its own.
+// `provider.mjs` reads a row as a description by `isDescription`, which says a
+// list is not one, and the two sides deciding differently about one row is a
+// model whose fate depends on which file looked at it. This is that answer
+// stated where the models it decides about can be counted.
+test("an array is a row the catalogue could not fill in, not a description", async () => {
+  const { buildModels } = await subject;
+  const catalogue = {
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "described-free": { cost: { input: 0, output: 0 }, name: "Described", limit: { context: 4096 } },
+      "empty-array-free": [],
+      "empty-array-paid": [],
+    },
+  };
+  const models = buildModels(["described-free", "empty-array-free", "empty-array-paid"], catalogue, {}, baseURL);
+  // the row that is a description is untouched, and the ones beside it are what
+  // says the list did not take the call with it
+  assert.equal(models["described-free"].limit.context, 4096);
+  // An id the row belongs to is offered exactly the way an id the catalogue has
+  // no entry for is: on its `-free` name, at the provider's own protocol, with
+  // the defaults where the catalogue said nothing.
+  assert.deepEqual(Object.keys(models), ["described-free", "empty-array-free"]);
+  assert.equal(models["empty-array-free"].api.npm, "@ai-sdk/openai-compatible");
+  assert.equal(
+    models["empty-array-free"].name,
+    "empty-array-free",
+    "a row that is not a description does not name the model",
+  );
+  assert.deepEqual(models["empty-array-free"].limit, { context: 32768, output: 4096 });
+  // ...and one that does not call itself free gets nothing from the row at all,
+  // rather than a protocol invented for something nobody could read
+  assert.equal(Object.hasOwn(models, "empty-array-paid"), false);
+  // The rule, stated where it can fail. A bare list reads the same either way:
+  // every axis this loop consults is absent from an empty list and from an empty
+  // object alike, so the fixture that can tell the two rules apart is a list
+  // that *carries* something — a shape only a hand-built catalogue hands over,
+  // and the shape the rule is about. Nothing a list carries is the catalogue's
+  // word about the model.
+  const named = Object.assign([], { name: "Array Row" });
+  const namedModels = buildModels(
+    ["named-free"],
+    { npm: "@ai-sdk/openai-compatible", models: { "named-free": named } },
+    {},
+    baseURL,
+  );
+  assert.equal(
+    namedModels["named-free"].name,
+    "named-free",
+    "a name hung on a list is not the catalogue naming the model",
+  );
+  // The cost is the one that decides who is offered at all: a zero-cost row
+  // makes a model free, so a list carrying one would hand a host a model nobody
+  // described — the silent arrival the free rules exist to prevent.
+  const priced = Object.assign([], { cost: { input: 0, output: 0 }, name: "Array Row" });
+  assert.deepEqual(
+    Object.keys(
+      buildModels(["priced-paid"], { npm: "@ai-sdk/openai-compatible", models: { "priced-paid": priced } }, {}, baseURL),
+    ),
+    [],
+    "a cost hung on a list is not the catalogue calling the model free",
+  );
+  // ...and the same row through the free gate, where the id's own name is what
+  // offers it: the list's numbers are still not the model's numbers
+  const limited = Object.assign([], { limit: { context: 4096 }, name: "Array Row" });
+  const limitedModels = buildModels(
+    ["limited-free"],
+    { npm: "@ai-sdk/openai-compatible", models: { "limited-free": limited } },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(limitedModels["limited-free"].limit, { context: 32768, output: 4096 });
+});
+
+// The other half of the same rule, on the fields read as shapes rather than as
+// values. `?? []` and `?? {}` cover a field the catalogue left out and nothing
+// else, and these are the shapes it writes when it writes something else — each
+// of which used to throw out of `buildModels`, which is discovery's: `.filter`
+// is not a function on an object or a string, `option.type` on a `null` element
+// is a TypeError, and `Object.entries` reads a list as its indices. One dirty
+// field on one row took every free model with it, and the host was waiting on
+// the hook that threw.
+test("a field the catalogue wrote in another shape does not end the call", async () => {
+  const { buildModels } = await subject;
+  const catalogue = {
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "kept-free": {
+        cost: { input: 0, output: 0 },
+        name: "Kept",
+        reasoning_options: [{ type: "effort", values: ["low"] }],
+      },
+      "object-options-free": { cost: { input: 0, output: 0 }, reasoning_options: {} },
+      "string-options-free": { cost: { input: 0, output: 0 }, reasoning_options: "low" },
+      "null-element-free": {
+        cost: { input: 0, output: 0 },
+        reasoning_options: [null, { type: "effort", values: ["high"] }],
+      },
+      "string-values-free": { cost: { input: 0, output: 0 }, reasoning_options: [{ type: "effort", values: "low" }] },
+    },
+  };
+  const ids = Object.keys(catalogue.models);
+  const models = buildModels(ids, catalogue, {}, baseURL);
+  assert.deepEqual(Object.keys(models), ids, "a wrong shape is not a reason to lose a row, or the rows beside it");
+  // a list the catalogue did write is read exactly as it always was
+  assert.deepEqual(Object.keys(models["kept-free"].variants), ["low"]);
+  // and the ones it did not say nothing about are read as no efforts, which is
+  // what a host shows as "this model has no effort settings" rather than as a
+  // selection the catalogue never offered
+  for (const id of ["object-options-free", "string-options-free", "string-values-free"])
+    assert.deepEqual(Object.keys(models[id].variants), [], `${id}: no efforts can be read`);
+  // the element that is not a description is skipped and the one beside it is
+  // still read: a wrong element is not a wrong list
+  assert.deepEqual(Object.keys(models["null-element-free"].variants), ["high"]);
+  // The axis map: `Object.entries` reads a list as its indices, and a row whose
+  // `limit` was `[111, 222]` handed the host
+  // `{0: 111, 1: 222, context: 32768, output: 4096}` — two axes no catalogue
+  // named, on the one object a host plans a prompt from.
+  const listed = buildModels(
+    ["limit-list-free"],
+    { npm: "@ai-sdk/openai-compatible", models: { "limit-list-free": { cost: { input: 0, output: 0 }, limit: [111, 222] } } },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(listed["limit-list-free"].limit, { context: 32768, output: 4096 });
+  // a word is not an axis map either, and said here so the rule is one rule
+  const word = buildModels(
+    ["limit-word-free"],
+    { npm: "@ai-sdk/openai-compatible", models: { "limit-word-free": { cost: { input: 0, output: 0 }, limit: "big" } } },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(word["limit-word-free"].limit, { context: 32768, output: 4096 });
+  // ...and a map that really is one is still read, on both levels: the
+  // catalogue's own axes, and the evidence limits.mjs has for the id
+  const real = buildModels(
+    ["deepseek-v4.1-flash-free"],
+    {
+      npm: "@ai-sdk/openai-compatible",
+      models: { "deepseek-v4.1-flash-free": { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } } },
+    },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(real["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
 });
 
 // A model Zen lists that neither the catalogue nor the docs describe yet: the id

@@ -471,7 +471,13 @@ export function limitOverrides(
     // catalogue never made, feeding the staleness compare and the raise-only
     // check with a number nobody declared.
     const declaredValue = declared && Object.hasOwn(declared, axis) ? declared[axis] : undefined;
-    const entry = record?.[axis];
+    // Own property, the same rule as the two lines around it. Read through the
+    // prototype, an axis the record merely inherits — from a table built with
+    // `Object.create`, or from a polluted `Object.prototype` — read exactly like
+    // a measurement: it passed the guard below, because the guard is about the
+    // declaration and not about the record, and it then took an override past
+    // the staleness check and past the raise-only rule.
+    const entry = record && Object.hasOwn(record, axis) ? record[axis] : undefined;
     // Only the axes a refusal names have a live form — a window and a
     // completion ceiling. An input axis is answered from the table alone: the
     // refusals this route sends name the window that bounds it, never an input

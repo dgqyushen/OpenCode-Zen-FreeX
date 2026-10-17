@@ -71,10 +71,14 @@ function foldsTo(declared, key) {
 function declaredNames(policy) {
   const held = policy?.declared;
   const names = held instanceof Set ? [...held] : held;
+  // A field that is not one of the two shapes gets here as itself: `names` is
+  // the field's own value unless it was a Set, so an array never reaches this
+  // message (the old `Array.isArray(held) ? "an array of those"` arm could not
+  // be read at all).
   if (!Array.isArray(names))
     throw new TypeError(
       `policy.declared must be a Set or an array of tool names, not ${
-        held === null ? "null" : Array.isArray(held) ? "an array of those" : typeof held
+        held === null ? "null" : typeof held
       }`,
     );
   for (const name of names) {
@@ -182,6 +186,16 @@ function isCall(protocol, value) {
   );
 }
 
+// What a call is named by, when it is named at all: a non-empty string. ""
+// names nothing a client can key by — the empty id this route was measured
+// putting on a call — and neither does a number or a boolean. Every place
+// that asks whether a call has an identity asks it here, or two calls of one
+// reply share one item (measured: two `"call_id": ""` calls each became the
+// item `msg_`, and their arguments frames could not be matched to either).
+function identity(value) {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
 // Counts the ids invented for calls the reply gives nothing to place: a
 // counter cannot be stable, but it is the only thing that keeps two of them
 // apart (see inPlaceOf).
@@ -190,10 +204,10 @@ let synthesized = 0;
 // What a call left out of a Responses or Messages reply becomes: text
 // saying so, in the call's place, so no later index moves. `at` is where the
 // call sits in the reply as far as the caller can tell — a frame's
-// output_index, or the index the walk found it at. `placed` is the token a
-// caller that follows the whole stream already settled on for a call whose
-// frames place it nowhere at all (see snapshotStream): without it every
-// rewrite of that call invented a new id.
+// output_index, or the index the walk found it at. `placed` is the id a
+// caller that follows the whole stream has already answered for this call
+// (see snapshotStream): without it every rewrite of that call invented a new
+// id.
 function inPlaceOf(protocol, call, note, at, placed) {
   if (protocol === "anthropic") return { type: "text", text: note };
   // An item id is what a Responses client keys the item by, and what the
@@ -206,16 +220,20 @@ function inPlaceOf(protocol, call, note, at, placed) {
   // and a call the reply places nowhere takes the id its own stream settled
   // on for it.
   //
-  // Both arms still invent ids in one reply, and they still name them under
-  // different words: a counter that happened to reach another call's index
-  // would hand two unrelated calls the same item, which is the failure the
-  // counter was introduced to prevent.
+  // The id a stream already answered comes first, before the place the caller
+  // knows. The id the call *itself* carries comes last, and only behind the
+  // `msg_` the invented kind is named under: a word is not the guard's to hand
+  // out twice. A reply can name two items by one word (this route was measured
+  // settling on an id only after the frame that opened the call, and nothing
+  // stops the same id naming a call the reply keeps), and the note taking that
+  // id verbatim would key two items — the note and the item the reply kept —
+  // by one word, which is the failure this arm exists to prevent, read back at
+  // the other end. Behind the prefix the word cannot collide with an item of
+  // the reply, and a call_id the reply used is still named in the id it
+  // answers, as it was.
   const id =
-    typeof call.id === "string" && call.id
-      ? call.id
-      : `msg_${
-          call.call_id ?? placed ?? (at === undefined ? `anon_${++synthesized}` : `dropped_${at}`)
-        }`;
+    placed ??
+    `msg_${identity(call.call_id) ?? (at === undefined ? `anon_${++synthesized}` : `dropped_${at}`)}`;
   return {
     type: "message",
     id,
@@ -237,10 +255,27 @@ function inPlaceOf(protocol, call, note, at, placed) {
 // the wire leaves with an id: the last-resort kind, process-unique under the
 // same counter the invented item ids use, so two invented calls cannot share
 // one.
+//
+// An invented id is only process-unique, and the counter is shared with every
+// earlier reply, so it can reach a word the same reply already placed: an
+// upstream that names its calls call_1, call_2, … names the very ids the
+// counter mints, and a call left unnamed beside those used to be handed one of
+// them — two calls of one reply under one id, which is the same failure the
+// counter exists to prevent, one step further out. The ids the calls being
+// flushed already carry are read first, and an invented id misses all of them.
 function ensureCallIDs(calls) {
+  const held = new Set();
   for (const call of calls) {
-    if (typeof call.id === "string" && call.id !== "") continue;
-    call.id = `call_${++synthesized}`;
+    const id = identity(call.id);
+    if (id !== undefined) held.add(id);
+  }
+  for (const call of calls) {
+    if (identity(call.id) !== undefined) continue;
+    let id;
+    do id = `call_${++synthesized}`;
+    while (held.has(id));
+    held.add(id);
+    call.id = id;
   }
 }
 
@@ -334,6 +369,11 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
   return { changed, kept, left };
 }
 
+// The slot a fragmented call or a choice sits in. A frame that names no index
+// is read as the first one, which is what the collapse path reads it as too
+// (stream.mjs's `index`): a fragment carries no other place it could hold, and
+// the two paths over one stream must answer one reply (pinned by the chat test
+// "a fragment that names no index is read the same by both paths").
 function position(value) {
   const result = value ?? 0;
   if (!Number.isSafeInteger(result) || result < 0)
@@ -443,7 +483,16 @@ function chatBuffer(checkName) {
         const delta = choice.delta;
         if (!object(delta)) continue;
         if (typeof delta.content === "string" && delta.content) wrote.add(position(choice.index));
-        if (delta.tool_calls == null && delta.function_call == null) continue;
+        // A `tool_calls` that is there but empty is a call of nothing: a
+        // gateway re-emitting the shape with a role-only delta sends one, and
+        // no call is being waited for. Reading it as a call opened a round
+        // with nothing in it — the choice's `ended` mark was dropped with it,
+        // a choice the upstream never sent was flushed at [DONE], and a stream
+        // that then closed without the marker failed the whole turn "a tool
+        // call unfinished" while nothing was pending. It is left where it is,
+        // as a field the guard has nothing to say about.
+        const fragments = list(delta.tool_calls);
+        if (delta.function_call == null && !fragments.length) continue;
         changed = true;
         // A call buffered now opens a round of its own for this choice: a
         // choice that finished as a plain stop because every call of an
@@ -451,7 +500,7 @@ function chatBuffer(checkName) {
         const at = position(choice.index);
         ended.delete(at);
         const state = stateFor(at, data);
-        for (const fragment of list(delta.tool_calls)) {
+        for (const fragment of fragments) {
           if (!object(fragment) || (fragment.type != null && fragment.type !== "function")) {
             throw new GuardError("Unsupported upstream tool delta");
           }
@@ -534,8 +583,33 @@ function chatBuffer(checkName) {
 // as text carrying the note, and its arguments are never sent. A message
 // whose every call was left out stops as a turn's end, not as tool use.
 function snapshotStream(protocol, checkName) {
-  const left = new Map(); // output_index or content block index → true
-  const leftIDs = new Set(); // Responses item ids left out
+  // Where a call left out was replaced, by its output_index (or a Messages
+  // block's index, which stores true: the id it answers is the text's, not an
+  // item's). A copy of the call that lands on the same place answers the id
+  // recorded there rather than the one the upstream names it by later.
+  const left = new Map();
+  // The places the items the reply kept hold. A place is a fact about the
+  // reply, so an arguments frame that gives one belongs to whoever holds it —
+  // the item kept there, or the call left out there — whatever words either
+  // was named by. Reading the place first is what makes the answer the same
+  // whichever order the two calls arrived in: two sets subtracted from each
+  // other answered by arrival order instead (a kept call named X before a
+  // dropped one named X let the dropped call's frames through, and the same
+  // reply with the two swapped did not).
+  const keptPlaces = new Set();
+  // The words the items the reply kept were named by, for the one case a place
+  // cannot answer: two items stating one index, one of them replaced by a note
+  // (an upstream at odds with itself). There the frame's own word is all that
+  // says whose it is, and a word a kept item was named by is that item's —
+  // reading the place alone would swallow the declared call's frames with the
+  // dropped call's.
+  const keptWords = new Set();
+  // Every word the calls this stream left out are named by: the ids the guard
+  // invented for them, and the ids and call_ids the upstream named them by. A
+  // frame that gives no place and arrives outside any item is read by its
+  // word, and a word a call left out was named by is never forwarded —
+  // reaching the client it would describe an item that was replaced by a note.
+  const leftIDs = new Set();
   // The calls this stream placed nowhere — its frames carried no output_index
   // and no item id — in the order it opened them. Nothing in those frames says
   // which item is which, so the order is all the guard has: the k-th item a
@@ -546,11 +620,34 @@ function snapshotStream(protocol, checkName) {
   // (inPlaceOf), which is also what its arguments frames are matched by. An
   // entry is settled once the stream has left the call.
   const nowhere = []; // { token, name, settled }
-  // The item ids the reply has named on an item of its own: the arguments
-  // frames of a call the reply opened carry one of these, and are not the
-  // placeless call's to swallow.
+  // What each word the reply has used for a call it left out answers: the id
+  // the guard invented for that call, under every word the reply names it by.
+  // One call is replaced more than once, and the client keys an item by the id
+  // it was handed first — the frames of the measured route carry no id at all
+  // until their arguments frames name one, so the id the upstream settled on
+  // arrives after the replacement, and answering it then would make one call
+  // two items (inPlaceOf).
+  const minted = new Map(); // a word the call is named by → the id it answers
+  // The item ids the reply has named on an item of its own, and the words of
+  // the item the stream is inside. A frame that names one of the latter is that
+  // item's — the reply naming the same word elsewhere says nothing about it —
+  // while a frame naming one of the former belongs to that other item, which
+  // is what keeps an item the guard kept from being read as the one it is
+  // inside.
   const seen = new Set();
+  const insideWords = new Set();
   let open = -1; // the placeless call the stream is inside, or -1
+  // The item the stream is inside, as far as an arguments frame that gives no
+  // place of its own is concerned: the id the call left out there answers (and
+  // the name it was called), or undefined with `insideKept` for an item the
+  // reply kept. `closingID`/`closingName` are the same for the frame that
+  // closes an item: a copy of a call can arrive with nothing to name it by,
+  // and the call being closed is what it is.
+  let insideID;
+  let insideName;
+  let insideKept = false;
+  let closingID;
+  let closingName;
   let kept = 0;
   let dropped = 0;
   // What a frame says the reply's items are called. A frame that names none of
@@ -565,82 +662,190 @@ function snapshotStream(protocol, checkName) {
       if (object(value) && typeof value.id === "string" && value.id) seen.add(value.id);
     }
   }
-  // Opens a placeless call of its own and answers the token naming it.
+  // Opens a call the reply placed nowhere — a frame with no output_index — and
+  // answers the entry that names it. Its id is what the guard answered for the
+  // call, filled in by the caller once it knows: the entry is what a later copy
+  // of the same call is recognised by, and that copy can carry nothing at all —
+  // no word of its own and no index (measured: the frame that closes the call
+  // drops the call_id the frame that opened it carried), so the call's name
+  // among the entries is the only thing left to read it by.
   function entering(name, settled = false) {
-    const token = `anon_${++synthesized}`;
-    nowhere.push({ token, name, settled });
+    const entry = { name, id: undefined, settled };
+    nowhere.push(entry);
     open = nowhere.length - 1;
-    return token;
+    return entry;
   }
+  // The words a frame can name this call by: the item id and the call_id, a
+  // non-empty string each (identity), and both name the one call.
+  function names(call) {
+    return [identity(call.id), identity(call.call_id)].filter((value) => value !== undefined);
+  }
+  // Whether the call carries a word of its own to be placed by — the test
+  // inPlaceOf and ensureCallIDs make, so all three read "" the same way.
   function identified(call) {
-    return (typeof call.id === "string" && call.id) || call.call_id != null;
+    return identity(call.id) !== undefined || identity(call.call_id) !== undefined;
   }
-  // The stream's answer for a call whose frames carry no output_index and no
-  // item id, or undefined when the call is not one the stream has to place:
-  // the walk hands every call it leaves out through here.
+  // Records that this call answers `id`, under every word the reply has for it:
+  // the copies of the call that follow answer the same one.
+  function mintedFor(call, id) {
+    minted.set(id, id);
+    for (const word of names(call)) minted.set(word, id);
+    return id;
+  }
+  // The stream's answer for a call it leaves out: the id this call already
+  // answers, or undefined when the stream has none and the call keeps its own.
+  // The walk hands every call it leaves out through here.
   function placeOf(call, at, listed) {
-    if (protocol !== "responses" || identified(call)) return undefined;
+    if (protocol !== "responses") return undefined;
+    // A word the reply has already used for a call it left out names that
+    // call: answer the id it was handed.
+    const bound = names(call)
+      .map((word) => minted.get(word))
+      .find((id) => id !== undefined);
+    if (bound !== undefined) return bound;
     if (listed) {
-      // The copy inside a snapshot or the terminal response's output: the call
-      // sits where the walk found it, and an entry invented when the stream
-      // opened that call already names that place. A reply that places nothing
-      // is what this can be read from, so the entry is matched by the place it
-      // holds when the names agree, and by its name when they do not — the
+      // The copy inside a snapshot or the terminal response's output: it sits
+      // where the walk found it, and a call the stream already replaced at
+      // that place has answered an id there. A reply that places nothing is
+      // what the rest can be read from, so the entry is matched by the place
+      // it holds when the names agree, and by its name when they do not — the
       // same call is copied into several snapshots, and every one of them has
       // to answer the same id. Two calls of one name cannot be told apart
-      // here, and the last one the stream opened answers for both.
+      // here, and the last one the stream opened answers for both, and a call
+      // that carries a word of its own is not guessed at from a name.
+      const held = left.get(at);
+      if (typeof held === "string") return held;
+      if (identified(call)) return undefined;
       const entry =
         (nowhere[at]?.name === call.name ? nowhere[at] : undefined) ??
         nowhere.findLast((value) => value.name === call.name);
-      return entry?.token;
+      return entry?.id;
     }
-    // A frame's own item. One that gave an index is already placed by it (the
-    // dropped_<at> token inPlaceOf mints), so only the index-less frames need
-    // the stream's answer: the call of that name it is inside, or else the
-    // call it opened last — which is what a frame that repeats no name is.
-    if (at !== undefined) return undefined;
-    const entry =
-      nowhere.findLast((value) => value.name === call.name) ??
-      (nowhere[open] && !nowhere[open].settled ? nowhere[open] : undefined);
+    // A frame's own item. One that gave an index is placed by it: the call the
+    // stream already replaced at that place answered an id there, and the
+    // dropped_<at> token inPlaceOf mints is what a call the stream never
+    // replaced gets.
+    if (at !== undefined) {
+      const held = left.get(at);
+      return typeof held === "string" ? held : undefined;
+    }
+    const inside = nowhere[open] && !nowhere[open].settled ? nowhere[open] : undefined;
+    if (identified(call)) {
+      // The frame that closes a call the stream opened with nothing to place it
+      // by can be the first of its frames to carry an id (measured). It is the
+      // call the stream is inside, and the id already answered is what the
+      // client has.
+      if (!inside) return undefined;
+      inside.settled = true;
+      return mintedFor(call, inside.id);
+    }
+    // A frame with nothing at all to name it by: the call the stream opened
+    // last of that name, which is the one it is closing — the id it answered
+    // is the one the client was handed, and a later copy of the call has to
+    // answer it again rather than mint one of its own.
+    const entry = nowhere.findLast((value) => value.name === call.name) ?? inside;
     if (entry) {
       entry.settled = true;
-      return entry.token;
+      return mintedFor(call, entry.id);
     }
+    // The call the stream is closing, in a frame that carries nothing to name
+    // it by: the id the guard answered for it is what this copy answers, so
+    // the call's rewrites stay one item. A frame of another call that only
+    // looks like it — same name, no words — is read the same way, and that is
+    // the closest thing to a word either of them has.
+    if (closingID !== undefined && closingName === call.name) return mintedFor(call, closingID);
     // A done frame whose added frame was never seen. It is a call of its own,
     // and the terminal's copy of it still answers this id by name.
-    return entering(call.name, true);
+    const opened = entering(call.name, true);
+    opened.id = `msg_anon_${++synthesized}`;
+    return mintedFor(call, opened.id);
   }
   return {
     apply(data, type) {
       if (protocol === "responses") {
         see(data);
-        // A frame that opens an item ends the window the last one had: the
-        // stream is not inside that call any more, so an arguments frame
-        // naming an item the reply never opened is not that call's to swallow
-        // (below). The item this frame opens is entered just after this, in
-        // the frame's own branch.
-        if (type === "response.output_item.added" && nowhere[open]) nowhere[open].settled = true;
         const item = data.item;
-        if (
-          type === "response.output_item.added" &&
+        const opens = type === "response.output_item.added";
+        const closes = type === "response.output_item.done";
+        // A frame that opens or closes an item ends the window the last one
+        // had: the stream is not inside that item any more, so an arguments
+        // frame that gives no place of its own is not that item's to answer
+        // for (below). The item this frame opens is entered just after this,
+        // in the frame's own branch.
+        if (opens || closes) {
+          // The item the stream was inside, for the frame that closes it: a
+          // copy of a call can arrive with nothing at all to name it by — no
+          // word of its own and no index — and the call being closed is the
+          // one whose id it answers.
+          closingID = closes ? insideID : undefined;
+          closingName = closes ? insideName : undefined;
+          insideID = undefined;
+          insideName = undefined;
+          insideKept = false;
+          insideWords.clear();
+          if (opens && nowhere[open]) nowhere[open].settled = true;
+        }
+        // The item this frame carries, when it is a call of no tool the agent
+        // has: the walk below replaces it — opens or closes it, the copy is
+        // the same call — and its words are the ones a note takes the place
+        // of. Every other item the frame names is one the reply keeps, and the
+        // place it holds is a fact the suppression below reads before any word.
+        const leaving =
+          (opens || closes) &&
           object(item) &&
           item.type === "function_call" &&
-          checkName(item.name) == null
-        ) {
+          checkName(item.name) == null;
+        // A copy of a call left out — the frame that closes it, and every copy
+        // of it a snapshot or the terminal carries — holds no place of its own:
+        // the place the call holds is the one the frame that opened it was
+        // answered at, and a reply at odds with itself (one copy numbered and
+        // the next not, or two copies numbered differently) reads back as one
+        // item only when the copies leave the placing to the stream's own
+        // answer. The id they all answer is what the collapse path finds them
+        // by. The frame that opens the call keeps its index: that is where the
+        // place comes from.
+        if (closes && leaving && data.output_index !== undefined) delete data.output_index;
+        if ((opens || closes) && object(item) && !leaving) {
+          if (data.output_index !== undefined) keptPlaces.add(data.output_index);
+          for (const id of names(item)) keptWords.add(id);
+          // A function_call the reply kept: an arguments frame that gives no
+          // place of its own is this call's while the stream is inside it.
+          if (opens && item.type === "function_call") {
+            insideKept = true;
+            for (const id of names(item)) insideWords.add(id);
+          }
+        }
+        if (opens && leaving) {
           const note = droppedNote(item.name);
           // The frame's output_index is this call's place in the reply, which
           // is the id its later frames (done, the terminal's output) invent
           // for it again (inPlaceOf). A frame that gives no index leaves the
           // place to the stream: the entry opened here is what its later
-          // frames — and its arguments frames — are matched by.
-          const placed =
-            data.output_index === undefined && !identified(item)
-              ? entering(item.name)
-              : undefined;
-          const message = inPlaceOf(protocol, item, note, data.output_index, placed);
-          left.set(data.output_index, true);
-          leftIDs.add(message.id);
-          if (typeof item.id === "string") leftIDs.add(item.id);
+          // frames — and its arguments frames — are matched by, and it is
+          // opened whether or not the frame carried a word, because the frame
+          // that closes the call can carry none (measured: the call_id the
+          // added frame named is gone from the done frame).
+          const entry = data.output_index === undefined ? entering(item.name) : undefined;
+          const message = inPlaceOf(protocol, item, note, data.output_index, entry?.id);
+          if (entry) entry.id = message.id;
+          // Every word this call can be named by later is recorded, whichever
+          // shape its frames have: the id the guard answered for it (with the
+          // place in it), and the id and call_id the upstream gave it — the
+          // arguments frames of a call that gave an index name it by one of
+          // those alone, so a set of invented ids would let them through,
+          // describing an item the client is told was replaced by a note. The
+          // place it answered at is recorded too, so the copies of it that
+          // follow answer the same id rather than the one the upstream settles
+          // on after them.
+          if (data.output_index !== undefined) left.set(data.output_index, message.id);
+          for (const id of [message.id, ...names(item)]) leftIDs.add(id);
+          mintedFor(item, message.id);
+          // And the stream is inside it: its arguments frames carry no place
+          // of their own, and this window is what says they are its frames
+          // rather than an item the reply never opened.
+          insideID = message.id;
+          insideName = item.name;
+          for (const id of [message.id, ...names(item)]) insideWords.add(id);
           dropped++;
           const where = { item_id: message.id, output_index: data.output_index, content_index: 0 };
           const part = { type: "output_text", text: "", annotations: [] };
@@ -656,27 +861,40 @@ function snapshotStream(protocol, checkName) {
           };
         }
         if (typeof type === "string" && type.startsWith("response.function_call_arguments.")) {
-          if (data.output_index != null && left.has(data.output_index))
-            return { changed: true, data: null };
-          if (leftIDs.has(data.item_id)) return { changed: true, data: null };
-          // An item id the reply never named on an item of its own: the
-          // arguments frames of a call it placed nowhere name the item from
-          // the first of them on (measured: the added frame carries no id at
-          // all, and the frames after it carry only an item_id), so while the
-          // stream is inside that call they are its frames. They are left out
-          // with the call — reaching the client they would describe an item
-          // that was replaced by a note, and the collapse path refuses them —
-          // and the id is recorded, so the frames after the first are matched
-          // too. A frame naming an item the reply did name belongs to that
-          // item and is left alone.
-          const entry = nowhere[open];
-          if (
-            data.output_index == null &&
-            entry &&
-            !entry.settled &&
-            !seen.has(data.item_id)
-          ) {
-            if (typeof data.item_id === "string" && data.item_id) leftIDs.add(data.item_id);
+          // Whose frame this is, by what the frame itself says: the place it
+          // gives is a fact about the reply and is read first, whoever holds
+          // it; a frame that gives none belongs to the item the stream is
+          // inside; and one that arrives outside any item is read by its word.
+          // The answer is the same whichever order the calls arrived in,
+          // because no step of it subtracts one set of words from another.
+          const place = data.output_index;
+          const word = identity(data.item_id);
+          let holder = "kept";
+          if (place != null && left.has(place) && !keptPlaces.has(place)) holder = "dropped";
+          // Two items stated one index: the place cannot say whose the frame
+          // is, and the word it names is what is left.
+          else if (place != null && word !== undefined && keptWords.has(word)) holder = "kept";
+          else if (place != null && left.has(place)) holder = "dropped";
+          else if (place != null && keptPlaces.has(place)) holder = "kept";
+          else if (place == null && insideID !== undefined)
+            // A word the reply named on some other item is that item's frame,
+            // interleaved with this call's own: the call the stream is inside
+            // answers for the words it was named by, and for a word the reply
+            // names nowhere else (measured: the added frame carries no id, and
+            // the frames after it name one).
+            holder =
+              word !== undefined && seen.has(word) && !insideWords.has(word) ? "kept" : "dropped";
+          else if (place == null && insideKept) holder = "kept";
+          else if (word !== undefined && leftIDs.has(word)) holder = "dropped";
+          if (holder === "dropped") {
+            if (word !== undefined) {
+              leftIDs.add(word);
+              // The id names the call the stream is inside, so a copy of that
+              // call which later carries it answers the id the client was
+              // handed (placeOf).
+              const answers = (place != null ? left.get(place) : undefined) ?? insideID;
+              if (answers !== undefined) minted.set(word, answers);
+            }
             return { changed: true, data: null };
           }
         }
@@ -736,7 +954,10 @@ async function readBounded(response) {
   if (!reader) return "";
   const parts = [];
   let bytes = 0;
-  let failure;
+  // Named for the read it ends, not `failure`: that word is this module's
+  // error constructor, and a local of the same name reads as if the guard's
+  // own failures were being built here.
+  let readFailure;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -747,7 +968,7 @@ async function readBounded(response) {
       parts.push(value);
     }
   } catch (error) {
-    failure = error;
+    readFailure = error;
   }
   // Whatever ended the read — the limit, a malformed body, or the end of it —
   // this body is never read again, so the stream is cancelled and the reader
@@ -762,12 +983,12 @@ async function readBounded(response) {
   try {
     await reader.cancel();
   } catch (error) {
-    if (!failure) throw error;
-    if (failure instanceof Error && !("cause" in failure)) failure.cause = error;
+    if (!readFailure) throw error;
+    if (readFailure instanceof Error && !("cause" in readFailure)) readFailure.cause = error;
   } finally {
     reader.releaseLock();
   }
-  if (failure) throw failure;
+  if (readFailure) throw readFailure;
   const all = new Uint8Array(bytes);
   let offset = 0;
   for (const part of parts) {
@@ -1125,7 +1346,12 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             )
               completed = true;
             if (result || extra.length) {
-              const own = !result ? "" : changed ? rewrite(frame, result) : frame.raw;
+              // A frame the walk left as it came is forwarded as it came: only
+              // its own bytes carry what a rewrite would drop — the event name
+              // it was sent under, and any field of the frame the guard does
+              // not read.
+              let own = "";
+              if (result) own = changed ? rewrite(frame, result) : frame.raw;
               const added = extra.map((value) => encodeEvent(value, value.type)).join("");
               controller.enqueue(encoder.encode(own + added));
               return;

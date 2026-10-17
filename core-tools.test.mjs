@@ -47,22 +47,29 @@ function assertCaptureFailure(failure, what) {
   assert.match(failure.message, /bun run capture/, what);
 }
 
-// The generation whose agent is composed per protocol, and its captured
+// Every generation whose agent is composed per protocol, with its captured
 // provider-utils. Both tests around it need the same scan, and the guard is what
-// makes it mean something: `assert.ok(entry)` alone accepts a profile whose
-// provider-utils was captured as `{}`, and the loops below then iterate zero
-// times — the per-protocol composition would never be exercised, and this file
-// would go green without checking it. The predicate is guarded because a profile
-// without an `agent` is a shape the module deliberately accepts and loads (the
-// `{"9.x":{}}` case below pins that), so it must miss here rather than throw a
-// TypeError out of `find`.
-function perProtocolProfile() {
-  const entry = Object.entries(PROFILES).find(([, profile]) => profile.agent?.providerUtils);
-  assert.ok(entry, "the capture is expected to hold a per-protocol profile");
-  const [generation, profile] = entry;
-  const protocols = Object.keys(profile.agent.providerUtils);
-  assert.ok(protocols.length, "with at least one protocol in it");
-  return { generation, profile, protocols };
+// makes it mean something: `assert.ok(entries.length)` alone accepts a profile
+// whose provider-utils was captured as `{}`, and the loops below then iterate
+// zero times — the per-protocol composition would never be exercised, and this
+// file would go green without checking it. The predicate is guarded because a
+// profile without an `agent` is a shape the module deliberately accepts and loads
+// (the `{"9.x":{}}` case below pins that), so it must miss here rather than throw
+// a TypeError out of the scan.
+//
+// All of them, not the first: a capture may carry a second per-protocol
+// generation, and `find` answered with whichever one came first in the file —
+// the other was never asked about, and a case that says it pins "the
+// per-protocol branch" would go green having looked at one of two. Which
+// generations the capture holds is data, so the scan is over the data.
+function perProtocolProfiles() {
+  const entries = Object.entries(PROFILES).filter(([, profile]) => profile.agent?.providerUtils);
+  assert.ok(entries.length, "the capture is expected to hold a per-protocol profile");
+  return entries.map(([generation, profile]) => {
+    const protocols = Object.keys(profile.agent.providerUtils);
+    assert.ok(protocols.length, `${generation}: with at least one protocol in it`);
+    return { generation, profile, protocols };
+  });
 }
 
 // The generation whose agent is the release shape, which composes its
@@ -107,8 +114,11 @@ test("a corrupt capture is named the same way, with the parse error as the cause
 // A capture that cannot be read at all is neither absent nor corrupt, and the
 // remedy (`bun run capture`, which writes the file) cannot fix a permissions
 // problem. A directory standing where the capture belongs is the one such case
-// a test can build on every platform, and it is the same EISDIR an unreadable
-// file produces.
+// a test can build on every platform: `readFileSync` of a directory is EISDIR
+// wherever it runs — on Windows too, where the access-denied a directory open
+// raises is reported as EISDIR rather than EACCES — and the fixture is a
+// directory rather than a file with the read bit taken away precisely so that
+// the code it produces is not the platform's to choose.
 test("an unreadable capture is not reported as missing or invalid JSON", async (t) => {
   const failure = await scratch(t, true)().then(
     () => assert.fail("importing a copy whose capture cannot be read must fail"),
@@ -117,7 +127,12 @@ test("an unreadable capture is not reported as missing or invalid JSON", async (
   assertCaptureFailure(failure);
   assert.doesNotMatch(failure.message, /missing/, "the file is there, it just cannot be read");
   assert.doesNotMatch(failure.message, /invalid JSON/, "nothing was parsed, so nothing was invalid");
-  assert.match(failure.message, /EISDIR|EACCES|EPERM/, "the cause's own code is passed on");
+  // EISDIR and nothing else, because the code below pins the same thing: the
+  // regex used to accept EACCES and EPERM as well, which is a different claim —
+  // it passed on a message naming a permission problem while the assertion under
+  // it demanded the code this fixture always produces. One fixture, one code, so
+  // the message and the cause are one claim.
+  assert.match(failure.message, /EISDIR/, "the cause's own code is passed on");
   assert.equal(failure.cause?.code, "EISDIR");
 });
 
@@ -177,31 +192,33 @@ test("the profile lookup is exported, and a miss names the generation", async ()
 });
 
 test("a protocol with no captured provider-utils is named", () => {
-  const { generation, profile, protocols } = perProtocolProfile();
-  for (const protocol of ["systemone", "constructor", "toString"]) {
-    const failure = thrown(() => agentFor(generation, protocol));
-    assert.ok(
-      failure.message.includes(JSON.stringify(protocol)),
-      "the protocol that was asked for",
-    );
-    assert.ok(
-      failure.message.includes(JSON.stringify(generation)),
-      "the generation it was asked of",
-    );
-    for (const captured of protocols)
-      assert.ok(failure.message.includes(captured), `the message names the captured ${captured}`);
+  for (const { generation, protocols } of perProtocolProfiles()) {
+    for (const protocol of ["systemone", "constructor", "toString"]) {
+      const failure = thrown(() => agentFor(generation, protocol));
+      assert.ok(
+        failure.message.includes(JSON.stringify(protocol)),
+        "the protocol that was asked for",
+      );
+      assert.ok(
+        failure.message.includes(JSON.stringify(generation)),
+        "the generation it was asked of",
+      );
+      for (const captured of protocols)
+        assert.ok(failure.message.includes(captured), `the message names the captured ${captured}`);
+    }
   }
 });
 
 // The control for the two above: a protocol the capture did observe still
 // composes the User-Agent the capture describes, unchanged.
 test("a captured protocol still composes its own User-Agent", () => {
-  const { generation, profile, protocols } = perProtocolProfile();
-  for (const protocol of protocols) {
-    assert.equal(
-      agentFor(generation, protocol),
-      `opencode/${profile.agent.opencode} ai-sdk/provider-utils/${profile.agent.providerUtils[protocol]} ${profile.agent.runtime}`,
-    );
+  for (const { generation, profile, protocols } of perProtocolProfiles()) {
+    for (const protocol of protocols) {
+      assert.equal(
+        agentFor(generation, protocol),
+        `opencode/${profile.agent.opencode} ai-sdk/provider-utils/${profile.agent.providerUtils[protocol]} ${profile.agent.runtime}`,
+      );
+    }
   }
 });
 

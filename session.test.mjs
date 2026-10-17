@@ -112,6 +112,67 @@ test("a burst that fills the counter field still makes OpenCode's ids", () => {
   assert.notEqual(counters[0], counters[1]);
 });
 
+// A signal the host sends outranks an empty opening. `""` is falsy, so a
+// conversation whose first user message is empty used to be read as one with no
+// opening at all and was minted an id of its own — per call, not per
+// conversation — even though the host had named it. What the host said is the
+// one thing here that identifies a conversation, and an empty message is not a
+// reason to discard it.
+//
+// The two headed cases below are what says so: the same name answers one id,
+// two names answer two, and both are OpenCode-shaped rather than the name
+// passed through (a name that is not one of OpenCode's own is hashed, the way
+// any other signal is).
+test("a host signal still names a conversation whose first user message is empty", () => {
+  const empty = { messages: [{ role: "user", content: "" }] };
+  const first = sessionID(new Headers({ "x-opencode-session": "conversation-g" }), empty);
+  const second = sessionID(new Headers({ "x-opencode-session": "conversation-g" }), empty);
+  assert.equal(first, second, "one name, one conversation");
+  assert.ok(realSessionID(first), first);
+  const other = sessionID(new Headers({ "x-opencode-session": "conversation-h" }), empty);
+  assert.notEqual(first, other, "two names, two conversations");
+  assert.notEqual(first, "conversation-g", "a name that is not OpenCode's is hashed, not passed on");
+  // The body's metadata is the same kind of signal and outranks it the same way.
+  const byMetadata = sessionID(new Headers(), { ...empty, metadata: { session_id: "conversation-g" } });
+  assert.equal(byMetadata, first, "where the name came from does not change what it names");
+});
+
+// An empty opening with NO signal is the one shape that cannot be keyed: two
+// conversations that opened empty are indistinguishable from one, so any key
+// derived here would either be shared by unrelated conversations — one Zen
+// session, with its affinity and its quota — or differ again on the next turn.
+// Not sharing is the half worth keeping, and it is what this does: the id is
+// minted per call. This is a known limit and not an accident, so it is pinned:
+// a change that started sharing these would be a regression here.
+test("an empty opening with no signal is never shared between conversations", () => {
+  const empty = { messages: [{ role: "user", content: "" }] };
+  const first = sessionID(new Headers(), empty);
+  const second = sessionID(new Headers(), empty);
+  assert.ok(realSessionID(first), first);
+  assert.ok(realSessionID(second), second);
+  assert.notEqual(first, second, "nothing named this conversation, so nothing may be shared");
+  // An opening with words is still a key, so this is the shape that gave
+  // something up rather than the contract itself — the key is the first *user*
+  // message wherever it sits in the history.
+  const spoken = { messages: [{ role: "user", content: "hi" }, { role: "user", content: "" }] };
+  assert.equal(sessionID(new Headers(), spoken), sessionID(new Headers(), spoken));
+});
+
+// The reachable limit of keying a conversation by its opening: two hosts that
+// send no session signal at all and open with the very same words are one key,
+// and one Zen session. There is nothing in the request that distinguishes them
+// — that is what the signal is for — so this is pinned rather than papered
+// over, and it is the reason the signal above is read first: a host that does
+// name its conversations gets separate sessions for them.
+test("conversations with the same opening and no signal are one key", () => {
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  assert.equal(
+    sessionID(new Headers(), opening),
+    sessionID(new Headers(), opening),
+    "nothing distinguishes these two, so they key the same — the contract this plugin has",
+  );
+});
+
 test("a session id is never minted from a signal that is not a string", () => {
   // A body is the host's to fill in, so `metadata.session_id` is not guaranteed
   // to be text; a number there is not a session the tier could have seen. The

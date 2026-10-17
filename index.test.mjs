@@ -6,6 +6,71 @@ import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
 import { requestFor } from "./tools-smoke.mjs";
 
+// The names the discovery reads are counted by. Zen's own list is also the
+// endpoint the fixture's `models` handler answers, so the three are named here
+// rather than written out at each assertion: what a test holds is the shape of
+// a discovery round, not the spelling of one URL.
+const DISCOVERY_READS = ["/v1/models", "/catalog", "/docs"];
+
+// How many of the calls that reached the fixture were discovery reads, and how
+// many inference requests went with them. A round of discovery is one of each
+// of `DISCOVERY_READS`; the request path's own calls to `/v1/<protocol>` are
+// counted apart from it, since a test that drives two of them expects two.
+const reads = (state) => {
+  const urls = state.calls.map((call) => call.url);
+  const discovery = urls.filter((url) => DISCOVERY_READS.includes(url));
+  return {
+    rounds: Math.max(...DISCOVERY_READS.map((name) => discovery.filter((url) => url === name).length)),
+    discovery: discovery.length,
+    inference: urls.filter((url) => url.startsWith("/v1/") && url !== "/v1/models").length,
+  };
+};
+
+// Hold every read of a discovery at the fixture's gate, and give back the key
+// that releases them. A round held here has read nothing yet, so the requests
+// driving it are all inside it — which is what makes the counts below about
+// concurrency rather than about how fast a loopback answers.
+function holdDiscovery(state) {
+  state.discoveryHang = true;
+  state.discoveryReads = 0;
+  state.requests = 0;
+  state.discoveryGate ??= deferred();
+  return state.discoveryGate;
+}
+
+// Wait until a case's own two counters say the requests it is waiting for have
+// arrived. Raced against a watchdog so a request that is never sent reports
+// itself instead of hanging the suite.
+async function awaitReached(state, reached) {
+  let watchdog;
+  try {
+    await Promise.race([
+      (async () => {
+        while (!reached(state)) await new Promise((resolve) => setTimeout(resolve, 1));
+      })(),
+      new Promise((_, reject) => {
+        watchdog = setTimeout(() => {
+          const { requests, discoveryReads } = state;
+          reject(new Error(`${requests} requests and ${discoveryReads} discovery reads arrived, not what was waited for`));
+        }, WATCHDOG_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+// A promise a test can resolve from outside, and the key to it. Written once
+// because the fixture's gate and the cases that hold a discovery behind it all
+// need the same thing.
+function deferred() {
+  let settle;
+  const promise = new Promise((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+}
+
 const subject = import("./index.mjs").then((module) => ({
   default: { server: module.ZenFreePlugin },
   module,
@@ -75,7 +140,28 @@ function lastCall(state) {
 }
 
 async function fixture(t, input = {}) {
-  const state = { calls: [], status: 200, modelsStatus: 200, docsStatus: 200, catalogStatus: 200 };
+  const state = {
+    calls: [],
+    status: 200,
+    modelsStatus: 200,
+    docsStatus: 200,
+    catalogStatus: 200,
+    // A barrier a test can hold a discovery behind, and the two counters that
+    // say what arrived while it was held. `discoveryHang` holds every read of
+    // a discovery at the gate below — the listing, the catalogue and the docs
+    // alike — and releasing it lets those same reads go on to be answered, so
+    // a case can drive two rounds of discovery and not only look at one.
+    discoveryHang: false,
+    discoveryGate: null,
+    discoveryReads: 0,
+    requests: 0,
+    // Rows a case wants to add to (or override in) the catalogue's model map,
+    // named by id. What the real catalogue writes for a row it could not fill
+    // in is `null`, and `[]`, `"junk"` and `7` are the same kind of row; a case
+    // that drives one through a partial discovery needs to place it on an id of
+    // its own, since a `-free` id resolves without the catalogue either way.
+    catalogRows: undefined,
+  };
   // Headers an upstream error is served with: a real refusal arrives with a
   // length, an encoding and validators describing its own bytes, and what this
   // plugin hands back is not those bytes.
@@ -95,9 +181,15 @@ async function fixture(t, input = {}) {
     let text = "";
     for await (const chunk of req) text += chunk;
     state.calls.push({ url: req.url, headers: req.headers, body: parseBody(text) });
+    state.requests += 1;
     if (state.discoveryHang) {
-      state.onDiscovery?.();
-      return;
+      // Counted before the wait, so a test can tell that a read has arrived
+      // without the read having to be released for it to say so. One gate for
+      // all three reads of a round: releasing it releases that round, and the
+      // requests go on to be answered below rather than being left open.
+      state.discoveryReads += 1;
+      state.discoveryGate ??= deferred();
+      await state.discoveryGate.promise;
     }
     if (req.url === "/v1/models") {
       res.writeHead(state.modelsStatus, { "content-type": "application/json" });
@@ -124,6 +216,7 @@ async function fixture(t, input = {}) {
               "messages-free": { provider: { npm: "@ai-sdk/anthropic" } },
               paid: { cost: { input: 3, output: 10 } },
               "late-free": {},
+              ...(state.catalogRows ?? {}),
             },
           },
         }),
@@ -366,10 +459,7 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
   const { plugin, state, origin } = await fixture(t);
   const loader = await plugin.auth.loader(publicAuth);
   const controller = new AbortController();
-  state.discoveryHang = true;
-  const started = new Promise((resolve) => {
-    state.onDiscovery = resolve;
-  });
+  const gate = holdDiscovery(state);
   const request = loader.fetch(`${origin}/v1/chat/completions`, {
     method: "POST",
     signal: controller.signal,
@@ -377,19 +467,10 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
   });
   const rejected = assert.rejects(request, /abort/i);
   // A run in which the discovery request is never sent is a failure of what
-  // this test is about, and waiting on `started` alone would report it as a
-  // suite that never finishes: race it as well, so the regression fails here.
-  let pinged;
-  try {
-    await Promise.race([
-      started,
-      new Promise((_, reject) => {
-        pinged = setTimeout(() => reject(new Error("no discovery request was sent")), WATCHDOG_MS);
-      }),
-    ]);
-  } finally {
-    clearTimeout(pinged);
-  }
+  // this test is about, and waiting on the read alone would report it as a
+  // suite that never finishes: the wait below is raced, so the regression
+  // fails here instead.
+  await awaitReached(state, (now) => now.discoveryReads > 0);
   controller.abort();
   let timer;
   try {
@@ -402,6 +483,9 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
   } finally {
     clearTimeout(timer);
   }
+  // Released after the abort so the reads that were still arriving can finish
+  // being served; the assertion above is about the caller's own promise.
+  gate.settle();
 });
 
 test("partial discovery never restores a model explicitly changed to SystemOne", async (t) => {
@@ -411,8 +495,180 @@ test("partial discovery never restores a model explicitly changed to SystemOne",
   assert.ok(before["chat-free"]);
   state.catalogStatus = 503;
   state.chatProtocol = "systemone";
-  const after = await plugin.provider.models({ models: before }, { auth: await publicAuth() });
+  // A second read is asked for outright: the hook's own budget would answer
+  // from the list just read, and this case is about what a read that does
+  // happen makes of a model the catalogue no longer describes as chat.
+  const after = await plugin.refresh();
   assert.equal(after["chat-free"], undefined);
+});
+
+// A host that names its conversations gets one Zen session each, whatever the
+// two conversations happened to open with. The signal is read first and the
+// opening is only a fallback for a host that sends none, so the same "hi" in
+// two named conversations is two sessions rather than one — the fold the
+// version this replaces was described as making. What is asserted here is the
+// contract at the wire, where the id that actually reaches Zen is what matters.
+test("two conversations opening the same way keep separate Zen sessions", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const body = JSON.stringify({
+    model: "chat-free",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  const ask = async (conversation) => {
+    const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "x-session-id": conversation },
+      body,
+    });
+    await response.text();
+    return lastCall(state).headers["x-opencode-session"];
+  };
+  const first = await ask("conversation-one");
+  const second = await ask("conversation-two");
+  assert.ok(first && second, "both requests have to reach upstream");
+  assert.notEqual(first, second, "the same opening is not the same conversation");
+  // The signal is not passed on as it arrived: x-session-id is in OpenCode's
+  // own header set and is never sent (see outboundHeaders), so what separates
+  // these two upstream is an id of this plugin's own making.
+  assert.notEqual(first, "conversation-one");
+});
+
+// A cold instance, two requests for a model it has never heard of, arriving
+// together. Each of them found a list that did not have the model and asked for
+// a new one, so both read the listing, the catalogue and the docs — six reads
+// for one answer — and then raced to write `known`, `metadata` and `protocols`,
+// so which of the two survived was whichever settled last.
+//
+// The round is held at the fixture's gate, and the second request is sent while
+// it is held: `listedAt` cannot move until the reads finish, so neither request
+// can skip the gate, and the counts below are about two requests that really
+// are racing rather than about which one a loopback happened to serve first.
+test("two concurrent unknown-model requests share one round of discovery", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  const loader = await plugin.auth.loader(publicAuth);
+  const gate = holdDiscovery(state);
+  const ask = (question) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", stream: true, messages: [{ role: "user", content: question }] }),
+    });
+  const sent = [ask("a"), ask("b")];
+  // Both inference requests have arrived, so both have taken their turn at the
+  // gate: the round they joined read three times, and no fourth read was sent
+  // by the second one.
+  await awaitReached(state, (now) => now.discoveryReads === 3);
+  gate.settle();
+  const responses = await Promise.all(sent);
+  for (const response of responses) await response.text();
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 2 });
+});
+
+// The models hook has no signal to cancel with, and a host that opens its model
+// selector twice while the first answer is still coming is asking a question
+// that is already being answered. It waits for that answer instead of starting
+// a second round of reads beside it — the two calls are one round of discovery,
+// not two. The `undefined` the hook would have to pass to be treated as a
+// cancelling caller is not passed at all: `leased` reads it as "no way out".
+test("the models hook shares a discovery already in flight", async (t) => {
+  const { plugin, state } = await fixture(t);
+  const gate = holdDiscovery(state);
+  const asked = [
+    plugin.provider.models({ models: {} }, { auth: await publicAuth() }),
+    plugin.provider.models({ models: {} }, { auth: await publicAuth() }),
+  ];
+  // One round of three reads for two calls, and the second call is already
+  // inside it: no fourth read has been sent beside the round in flight.
+  await awaitReached(state, (now) => now.discoveryReads === 3);
+  gate.settle();
+  const models = await Promise.all(asked);
+  for (const answered of models) assert.ok(answered["chat-free"]);
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
+  // Nothing to cancel with, so the reads run to completion and are not aborted:
+  // the hook has no signal, and `undefined` is never passed on as one.
+  assert.equal(state.calls.length, 3);
+});
+
+// The hook spends RELIST_AFTER: a host that opens its model chooser twice in a
+// minute is served the list read the first time, for the three reads the first
+// open cost, instead of a second round beside it. What is offered is still the
+// live list — the first call read it — so this costs the host no freshness it
+// did not already have.
+test("the models hook reads within the RELIST_AFTER budget only once", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  const first = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(first).sort(), ["chat-free", "messages-free", "responses-free"]);
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
+  const second = await plugin.provider.models({ models: first }, { auth: await publicAuth() });
+  // Still three reads: the second open was answered from the list already read
+  // rather than from a second round upstream.
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
+  assert.deepEqual(Object.keys(second).sort(), Object.keys(first).sort());
+  assert.equal(second["chat-free"].api.url, `${origin}/v1`);
+});
+
+test("refresh asks for the listing again, and joins a refresh already in flight", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
+  // The budget would answer from `known`; asked for on purpose, the listing is
+  // read again — three more reads for three before.
+  await plugin.refresh();
+  assert.deepEqual(reads(state), { rounds: 2, discovery: 6, inference: 0 });
+  // Two refreshes at once are still one round: the forced read goes through the
+  // same single flight, so it is not a way around the coalescing either.
+  const gate = holdDiscovery(state);
+  const together = [plugin.refresh(), plugin.refresh()];
+  await awaitReached(state, (now) => now.discoveryReads === 3);
+  gate.settle();
+  const answers = await Promise.all(together);
+  // The same map, not two equal ones: one round has one result, and both
+  // callers are handed that one.
+  assert.equal(answers[0], answers[1]);
+  assert.deepEqual(reads(state), { rounds: 3, discovery: 9, inference: 0 });
+  // And a refresh does not make the request path read again either: the budget
+  // it just reset is the same one every path spends.
+  const loader = await plugin.auth.loader(publicAuth);
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+  await response.text();
+  assert.deepEqual(reads(state), { rounds: 3, discovery: 9, inference: 1 });
+});
+
+// A discovery that fails is one answer too, and two callers asking at once get
+// that one: the same fallback object, not two reads that failed separately. The
+// failed ask sets `listedAt` like a successful one (the contract stated on it),
+// so a request that follows within the interval is answered from the last list
+// rather than asking again — and the second half of this case is what says the
+// budget is really spent by a failure, since a discovery that had not written
+// it would read the three again.
+test("a failed discovery is shared by concurrent callers and still spends the budget", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  state.modelsStatus = 503;
+  const asked = [
+    plugin.provider.models({ models: {} }, { auth: await publicAuth() }),
+    plugin.provider.models({ models: {} }, { auth: await publicAuth() }),
+  ];
+  const [first, second] = await Promise.all(asked);
+  assert.equal(first[Symbol.for("magpie.fellBack")], true);
+  assert.equal(second, first, "one failed read, one answer for both callers");
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
+  // The listing was asked for and could not be read, so `listedAt` moved. A
+  // request for a model the (unchanged) list does not have asks again only
+  // after RELIST_AFTER, and this one is inside it — which is the whole of what
+  // this half proves, so it is the discovery reads that are counted: a request
+  // answered 404 never reaches upstream.
+  const loader = await plugin.auth.loader(publicAuth);
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "gone-free", stream: true }),
+  });
+  assert.equal(response.status, 404);
+  assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
 });
 
 test("registers without overwriting user config and enables public access without a secret", async (t) => {
@@ -441,9 +697,95 @@ test("discovers protocols and free models, caches success, marks failed refresh 
   assert.equal(models["messages-free"].api.npm, "@ai-sdk/anthropic");
   assert.equal(models["chat-free"].api.url, `${origin}/v1`);
   state.modelsStatus = 503;
-  const fallback = await plugin.provider.models({ models }, { auth: await publicAuth() });
+  // `refresh()`, not a second `models()`: the hook spends the RELIST_AFTER
+  // budget now, and a test that wants the listing read again has to ask for it
+  // rather than get it by accident. What is being tested here — a failed read
+  // coming back as the last list, said as fallen back — is unchanged.
+  const fallback = await plugin.refresh();
   assert.equal(fallback[Symbol.for("magpie.fellBack")], true);
-  assert.deepEqual(Object.keys(fallback), Object.keys(models));
+  assert.deepEqual(Object.keys(fallback).sort(), Object.keys(models).sort());
+});
+
+// A catalogue row the catalogue itself could not fill in — `null` is what it
+// writes — must not be read as a description of the model. Read by truthiness
+// it was not: `!null` is true, so the row answered "the catalogue says nothing
+// about this id", while a row that is truthy but is not an object at all (`[]`,
+// `"junk"`, `7`) answered the opposite — "the catalogue describes this" — for a
+// row that describes nothing. models.mjs reads a row as a description only when
+// it is an object; this is the same rule on the reading side of discovery.
+//
+// The shape below is the one that reaches the reading: a model the catalogue
+// described as free last time (`cost` of zero is what `isFree` reads, and it is
+// what puts the model in `known`), whose row is now one the catalogue could not
+// fill in, on a partial discovery. Read as "not described" the row means the
+// same as no row and the verified model is kept; read as "described" it is
+// dropped. `late-free` is the control: its row is still a description, so it is
+// kept by the listing itself rather than by the preservation above.
+for (const blankRow of [null, [], "junk", 7]) {
+  test(`a catalog row that is not a description does not drop a verified model (${JSON.stringify(blankRow)})`, async (t) => {
+    const { plugin, state } = await fixture(t);
+    state.ids = ["dirty", "late-free"];
+    state.catalogRows = { dirty: { cost: { input: 0, output: 0 }, provider: { npm: "@ai-sdk/openai-compatible" } } };
+    // First read: the catalogue describes `dirty` as a free model, which is what
+    // puts it in `known` and brings it back to life below.
+    const first = await plugin.refresh();
+    assert.ok(first["dirty"], "the catalogue's own free row is what makes this id known");
+    assert.ok(first["late-free"]);
+    // The row becomes one the catalogue could not fill in, and the docs go out
+    // of reach so this round is partial and the reader runs.
+    state.catalogRows = { dirty: blankRow };
+    state.docsStatus = 503;
+    const second = await plugin.refresh();
+    assert.ok(
+      second["dirty"],
+      `a row that describes nothing is not a description (${JSON.stringify(blankRow)})`,
+    );
+    assert.deepEqual(Object.keys(second).sort(), ["dirty", "late-free"]);
+    // Not said as fallen back: Zen's own list was read, and a partial catalogue
+    // must not make a host keep an older list instead of this one.
+    assert.equal(second[Symbol.for("magpie.fellBack")], undefined);
+  });
+}
+
+// An id is upstream's word, and upstream's word may be a name the prototype
+// already has. `known`, `protocols`, `discovered` and the catalogue's map are
+// plain objects, so `protocols["toString"]` is not "nothing" — it is
+// `Object.prototype.toString`, read through the chain — and `!protocols[id]`
+// was false for it, so the entry was skipped for a model no catalogue ever
+// described. `Object.hasOwn` is the rule models.mjs and limits.mjs read their
+// maps by, and it is what the entry is decided by here now.
+//
+// The id carries no `-free` suffix on purpose: `isFree` reads a `-free` name as
+// free however the catalogue describes it, so a `-free` id is resolved without
+// the catalogue and the loop never decides anything about it. The catalogue
+// describes this one as free in the round above (a `cost` of zero is what
+// `isFree` reads) and describes nothing in the read below, which is the shape
+// that leaves the entry to this loop.
+test("a prototype member name is an id like any other in the preservation path", async (t) => {
+  const { plugin, state } = await fixture(t);
+  state.ids = ["toString", "__proto__"];
+  state.catalogRows = { toString: { cost: { input: 0, output: 0 } } };
+  const first = await plugin.refresh();
+  assert.ok(Object.hasOwn(first, "toString"), "the catalogue's own free row makes it a known model");
+  // Read as an own property, not as a key: `first["__proto__"]` is the getter
+  // that answers the map's prototype, which is not a model and never was.
+  assert.equal(Object.hasOwn(first, "__proto__"), false, "no catalogue ever described it");
+  // The row becomes one that describes nothing, and the docs go out of reach so
+  // this round is partial and the loop runs.
+  state.catalogRows = { toString: [] };
+  state.docsStatus = 503;
+  const second = await plugin.refresh();
+  assert.ok(
+    Object.hasOwn(second, "toString"),
+    "a verified model must not be dropped because its id names something on Object.prototype",
+  );
+  // The map is the plugin's own: `__proto__` is not an entry, and an id from
+  // upstream must not have moved the map's prototype. That is the whole of what
+  // a `map["__proto__"] = model` write would do — the entry would not be stored,
+  // and the model would be the map's prototype instead.
+  assert.deepEqual(Object.keys(second), ["toString"]);
+  assert.equal(Object.getPrototypeOf(second), Object.prototype);
+  assert.equal(Object.prototype.polluted, undefined);
 });
 
 test("partial catalog failure retains previously verified models rather than dropping them", async (t) => {
@@ -1106,12 +1448,15 @@ test("a refresh drops a model Zen no longer lists and adds one it lists now", as
   const before = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   assert.deepEqual(Object.keys(before).sort(), ["chat-free", "messages-free", "responses-free"]);
   state.ids = ["chat-free", "messages-free", "late-free"];
-  const after = await plugin.provider.models({ models: before }, { auth: await publicAuth() });
+  // Each step that changes what upstream lists asks for a read outright: the
+  // hook would answer from the list it read a moment ago, and what this case is
+  // about is what a read that really happens does with a changed listing.
+  const after = await plugin.refresh();
   assert.deepEqual(Object.keys(after).sort(), ["chat-free", "late-free", "messages-free"]);
   assert.equal(after[Symbol.for("magpie.fellBack")], undefined);
   // a failed list keeps the last one, said as fallen back
   state.modelsStatus = 503;
-  const kept = await plugin.provider.models({ models: after }, { auth: await publicAuth() });
+  const kept = await plugin.refresh();
   assert.deepEqual(Object.keys(kept).sort(), ["chat-free", "late-free", "messages-free"]);
   assert.equal(kept[Symbol.for("magpie.fellBack")], true);
 });

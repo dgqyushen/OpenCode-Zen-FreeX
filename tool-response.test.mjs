@@ -322,9 +322,11 @@ async function withTimeout(promise, ms = 5000) {
   }
 }
 // One factory for every upstream mock below: a Response whose body is a
-// stream built from `pull`, the chunks it handed out counted, and the handles
-// a test needs to push into it or close it. The scaffolding is written once,
-// so a fix to it applies to all of the mocks at once.
+// stream built from `pull`, the chunks it handed out counted, and the way a
+// test pushes into it. The scaffolding is written once, so a fix to it applies
+// to all of the mocks at once. There is no `close` here: every caller ends its
+// stream from inside `pull`, and a member nothing calls is one the next reader
+// has to prove dead before touching this.
 function upstream(
   pull,
   { cancel = () => {}, headers = {}, status = 200, highWaterMark = 1 } = {},
@@ -351,7 +353,6 @@ function upstream(
     response,
     pulls: () => pulls,
     push: (value) => controller.enqueue(encoder.encode(value)),
-    close: () => controller.close(),
   };
 }
 function sse(text, { chunkSize = 31, headers = {}, status = 200 } = {}) {
@@ -500,11 +501,13 @@ for (const protocol of protocols) {
       );
       assert.equal(json.status, 200);
       assertOnlyDropped(protocol, [await json.json()], name, ["bash"]);
-      for (const upstream of [
+      // Not named `upstream`: that is this file's own `upstream(...)` factory, and
+      // this loop holds the bytes to read, not the thing that makes them.
+      for (const bytes of [
         event(streamSnapshot(protocol, [name])) + terminal(protocol),
         toolStream(protocol, name),
       ]) {
-        const streamed = await guardToolResponse(sse(upstream), protocol, tableRules);
+        const streamed = await guardToolResponse(sse(bytes), protocol, tableRules);
         assert.equal(streamed.status, 200);
         const values = frameData(await streamed.text());
         assertOnlyDropped(protocol, values, name, []);
@@ -1005,11 +1008,13 @@ test("Responses: one dropped call keeps one id across its added, done and termin
         value.type === "response.output_item.done",
     )
     .map((value) => value.item.id);
-  const terminal = data.find((value) => value.type === "response.completed");
+  // Not named `terminal`: this file's `terminal(protocol)` helper is the module's
+  // own, and a frame called by the same name would have hidden it from here on.
+  const terminalFrame = data.find((value) => value.type === "response.completed");
   assert.equal(replaced.length, 2, "both item frames are answered");
   assert.equal(new Set(replaced).size, 1, "one call became several items");
   assert.equal(
-    terminal.response.output[0].id,
+    terminalFrame.response.output[0].id,
     replaced[0],
     "and the terminal's copy is that same item",
   );
@@ -1136,6 +1141,696 @@ test("Responses: a placeless call's arguments are left out with it, and one the 
   assert.ok(!JSON.stringify(data).includes('"nonexistent"'), "the dropped call leaked");
 });
 
+// F2 (review, v0.2.16): the suppression above matched a call left out by the
+// output_index its own frame gave or by an invented id, and the arguments
+// frames of the measured route carry neither — the item is numbered, and the
+// frames after it name it by an id. Those frames went to the client, telling
+// it about an item it had been told was replaced by a note, and the guard's
+// own bytes could not be read back at all: the collapse path took the frame
+// for one naming an unknown item without an index and refused the whole reply
+// (502), where the upstream's own bytes are a 200. Every word the call is
+// named by is what its frames are matched by now, and a declared call beside
+// it keeps every one of its own.
+test("Responses: a dropped call that gave an index keeps its arguments frames out, in both paths", async () => {
+  const dropped = { type: "function_call", call_id: "call_x", name: "nonexistent", arguments: "" };
+  const kept = { id: "fc_2", type: "function_call", call_id: "call_2", name: "bash", arguments: "" };
+  const completed = (item, extra) => ({ ...item, arguments: extra, status: "completed" });
+  const text =
+    event(
+      { type: "response.output_item.added", output_index: 0, item: { ...dropped, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.function_call_arguments.delta", item_id: "call_x", delta: '{"a"' },
+      "response.function_call_arguments.delta",
+    ) +
+    event(
+      { type: "response.function_call_arguments.done", item_id: "call_x", arguments: '{"a":1}' },
+      "response.function_call_arguments.done",
+    ) +
+    event(
+      { type: "response.output_item.added", output_index: 1, item: { ...kept, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.function_call_arguments.delta", item_id: "fc_2", output_index: 1, delta: '{"command":' },
+      "response.function_call_arguments.delta",
+    ) +
+    event(
+      { type: "response.function_call_arguments.done", item_id: "fc_2", output_index: 1, arguments: '{"command":"ls"}' },
+      "response.function_call_arguments.done",
+    ) +
+    event({ type: "response.output_item.done", output_index: 0, item: completed(dropped, '{"a":1}') }) +
+    event({ type: "response.output_item.done", output_index: 1, item: completed(kept, '{"command":"ls"}') }) +
+    event(
+      {
+        type: "response.completed",
+        response: { id: "r1", status: "completed", output: [completed(dropped, '{"a":1}'), completed(kept, '{"command":"ls"}')] },
+      },
+      "response.completed",
+    );
+  // The same bytes upstream, collapsed for a client that reads no stream: a
+  // reply, not a refusal.
+  assert.equal((await collapseResponse(sse(text), "responses")).status, 200);
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  // (c) no frame describes the call that was replaced by a note, and (d) the
+  // declared call's arguments are all there.
+  assert.deepEqual(
+    data
+      .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+      .map((value) => value.item_id),
+    ["fc_2", "fc_2"],
+    "a call left out kept its arguments frames, or a kept call lost its own",
+  );
+  // The words the client is handed: the note item's invented id, and the kept
+  // call's own. The dropped call's call_id is nowhere on its own — the frames
+  // that named it are the ones that were left out.
+  assert.deepEqual(
+    [
+      ...new Set([
+        ...data.flatMap((value) => (value.item_id !== undefined ? [value.item_id] : [])),
+        ...data.filter((value) => value.item).map((value) => value.item.id),
+        ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+          (item) => item.id,
+        ),
+      ]),
+    ].sort(),
+    ["fc_2", "msg_call_x"],
+  );
+  assert.equal(textIn("responses", data), droppedNote("nonexistent"));
+  // (b) The guard's own bytes, read back: the same reply, not the 502 they
+  // were refused with, and the same items the stream handed the client.
+  const collapsed = await collapseResponse(sse(guarded), "responses");
+  assert.equal(collapsed.status, 200);
+  const items = (await collapsed.json()).output.map((item) => `${item.id}:${item.type}`).sort();
+  const handed = [
+    ...new Set([
+      ...data.filter((value) => value.item).map((value) => `${value.item.id}:${value.item.type}`),
+      ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+        (item) => `${item.id}:${item.type}`,
+      ),
+    ]),
+  ].sort();
+  assert.deepEqual(items, handed, "the streamed reply and its collapsed copy disagree");
+  assert.deepEqual(items, ["fc_2:function_call", "msg_call_x:message"]);
+});
+
+// The other half of that shape: the frame that opens the call can carry
+// nothing at all to name it by, and the id only turns up on the arguments
+// frames and the frame that closes it. Those frames name an item the reply
+// names nowhere else, and the stream inside the call is what says whose they
+// are. The call answers one id throughout — the id its opening frame was
+// replaced by, which is what the client already has.
+test("Responses: a dropped call its frames name nowhere else answers the one id it was given", async () => {
+  const bare = { type: "function_call", name: "nonexistent", arguments: "" };
+  const named = { ...bare, id: "fc_9", arguments: '{"a":1}', status: "completed" };
+  const text =
+    event(
+      { type: "response.output_item.added", output_index: 0, item: { ...bare, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.function_call_arguments.delta", item_id: "fc_9", delta: '{"a"' },
+      "response.function_call_arguments.delta",
+    ) +
+    event(
+      { type: "response.function_call_arguments.done", item_id: "fc_9", arguments: '{"a":1}' },
+      "response.function_call_arguments.done",
+    ) +
+    event({ type: "response.output_item.done", output_index: 0, item: named }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [named] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  assert.deepEqual(
+    data.filter((value) => value.type?.startsWith("response.function_call_arguments")).map((v) => v.item_id),
+    [],
+    "the arguments of a call that was left out reached the client",
+  );
+  const ids = [
+    ...data.filter((value) => value.item).map((value) => value.item.id),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+      (item) => item.id,
+    ),
+  ];
+  assert.deepEqual(ids, ["msg_dropped_0", "msg_dropped_0", "msg_dropped_0"]);
+  const collapsed = await collapseResponse(sse(guarded), "responses");
+  assert.equal(collapsed.status, 200);
+  assert.deepEqual(
+    (await collapsed.json()).output.map((item) => item.id),
+    ["msg_dropped_0"],
+  );
+});
+
+// The difference the suppression above makes: an id the reply later names on
+// an item of its own is that item's, whatever a call left out was named by
+// before it. A kept call whose arguments frames name the id it was opened
+// with keeps them, though a call left out of the same reply answered the same
+// word.
+test("Responses: a kept call's arguments survive an id a dropped call was named by", async () => {
+  const dropped = { type: "function_call", call_id: "shared", name: "nonexistent", arguments: "" };
+  const kept = { id: "shared", type: "function_call", call_id: "call_2", name: "bash", arguments: "" };
+  const text =
+    event(
+      { type: "response.output_item.added", output_index: 0, item: { ...dropped, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.function_call_arguments.delta", item_id: "shared", delta: '{"a"' },
+      "response.function_call_arguments.delta",
+    ) +
+    event(
+      { type: "response.output_item.added", output_index: 1, item: { ...kept, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.function_call_arguments.delta", item_id: "shared", delta: '{"command":' },
+      "response.function_call_arguments.delta",
+    ) +
+    event(
+      { type: "response.function_call_arguments.done", item_id: "shared", arguments: '{"command":"ls"}' },
+      "response.function_call_arguments.done",
+    ) +
+    event({ type: "response.output_item.done", output_index: 1, item: { ...kept, arguments: '{"command":"ls"}', status: "completed" } }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [{ ...kept, arguments: '{"command":"ls"}', status: "completed" }] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  assert.deepEqual(
+    data
+      .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+      .map((value) => [value.type.replace("response.function_call_arguments.", ""), value.item_id]),
+    [
+      ["delta", "shared"],
+      ["done", "shared"],
+    ],
+    "the kept call's arguments were left out with another call",
+  );
+});
+
+// F4 (review, v0.2.16): "" is not a name. `identified` read a call_id of ""
+// as an identity, so the call was not given a place, while inPlaceOf's
+// `call_id ?? …` read the same "" as present — and two such calls of one
+// reply became the one item `msg_`, with their arguments frames matching
+// neither. The three places that ask whether a call has an identity ask it
+// the same way now: a non-empty string, or nothing.
+test('Responses: two calls with a call_id of "" are two items, not one', async () => {
+  const output = ["one", "two"].map((name) => ({
+    type: "function_call",
+    call_id: "",
+    name,
+    arguments: "{}",
+  }));
+  const json = await guardToolResponse(Response.json({ output }), "responses", policy);
+  assert.equal(json.status, 200);
+  const items = (await json.json()).output;
+  assert.deepEqual(
+    items.map((item) => item.content[0].text),
+    [droppedNote("one"), droppedNote("two")],
+  );
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ["msg_dropped_0", "msg_dropped_1"],
+    "an empty call_id named nothing, yet the two calls became one item",
+  );
+  // The streamed shape: the calls are placeless (nothing names them), so each
+  // answers a token of its own, and the arguments frames naming "" are left
+  // out with them rather than describing the notes in their place.
+  const bare = (name) => ({ type: "function_call", call_id: "", name, arguments: "" });
+  const text =
+    event({ type: "response.output_item.added", item: bare("one") }, "response.output_item.added") +
+    event({ type: "response.function_call_arguments.delta", item_id: "", delta: "{}" }, "response.function_call_arguments.delta") +
+    event({ type: "response.output_item.added", item: bare("two") }, "response.output_item.added") +
+    event({ type: "response.function_call_arguments.done", item_id: "", arguments: "{}" }, "response.function_call_arguments.done") +
+    event({ type: "response.output_item.done", item: bare("two") }) +
+    event({ type: "response.output_item.done", item: bare("one") }) +
+    event(
+      { type: "response.completed", response: { status: "completed", output: [bare("one"), bare("two")] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const ids = [
+    ...data.filter((value) => value.item).map((value) => value.item.id),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+      (item) => item.id,
+    ),
+  ];
+  assert.equal(new Set(ids).size, 2, `two calls shared one item: ${ids.join(", ")}`);
+  assert.deepEqual(
+    data.filter((value) => value.type?.startsWith("response.function_call_arguments")).map((v) => v.item_id),
+    [],
+    "the arguments frames of the calls left out reached the client",
+  );
+});
+
+// The same call read the other way round: a call_id of null was never an
+// identity, and two of those calls were two items already. It is what the
+// empty string has to read like, so the two shapes are pinned side by side.
+test("Responses: two calls with a call_id of null are two items, as they always were", async () => {
+  const output = ["one", "two"].map((name) => ({
+    type: "function_call",
+    call_id: null,
+    name,
+    arguments: "{}",
+  }));
+  const response = await guardToolResponse(Response.json({ output }), "responses", policy);
+  assert.equal(response.status, 200);
+  const items = (await response.json()).output;
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ["msg_dropped_0", "msg_dropped_1"],
+  );
+  const collapsed = await collapseResponse(Response.json({ output }), "responses");
+  assert.equal(collapsed.status, 200);
+});
+
+// F5 (review, v0.2.16): one call is replaced more than once — the frame that
+// opens it, the frame that closes it, and the copy inside the terminal
+// response — and a client keys an item by the id it was handed. The measured
+// route names the call only partway through: the added frame carries no id,
+// and the done frame and the terminal's copy carry one. Answering that id
+// where the call's place had already answered a token made one call two items
+// to the client. The id a stream has answered for a call is what every later
+// copy of it answers.
+test("Responses: a dropped call answers one id, though a later copy carries its own", async () => {
+  const opened = { type: "function_call", name: "nonexistent", arguments: "" };
+  const named = { ...opened, id: "fc_1", call_id: "call_1", arguments: '{"a":1}', status: "completed" };
+  const text =
+    event(
+      { type: "response.output_item.added", item: { ...opened, status: "in_progress" } },
+      "response.output_item.added",
+    ) +
+    event({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"a"' }, "response.function_call_arguments.delta") +
+    event({ type: "response.function_call_arguments.done", item_id: "fc_1", arguments: '{"a":1}' }, "response.function_call_arguments.done") +
+    event({ type: "response.output_item.done", item: named }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [named] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  const ids = [
+    ...data.filter((value) => value.item).map((value) => value.item.id),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+      (item) => item.id,
+    ),
+  ];
+  assert.equal(ids.length, 3, "the added frame, the done frame and the terminal's copy");
+  assert.equal(new Set(ids).size, 1, `one call became ${new Set(ids).size} items: ${ids.join(", ")}`);
+  assert.match(ids[0], /^msg_anon_\d+$/, "the id the frames answered is the one kept");
+  // And the guard's own bytes read back as the same item, not as two.
+  const collapsed = await collapseResponse(sse(guarded), "responses");
+  assert.equal(collapsed.status, 200);
+  assert.deepEqual(
+    (await collapsed.json()).output.map((item) => item.id),
+    [ids[0]],
+  );
+});
+
+// task-11, residual 2: a dropped call with nothing to place it by, and then a
+// call the reply numbered. The note the guard puts in the first one's place is
+// an item of its own with no index, and the collapse path's "next free slot"
+// gave it the very slot the numbered call then claimed: the streaming client
+// was told the call had been left out, the client that reads no stream never
+// heard of it. The bytes the guard answers with are a reply to both, which is
+// the invariant this file's every rewrite is measured against.
+test("Responses: a dropped placeless call beside a numbered one is one reply to both clients", async () => {
+  const dropped = { type: "function_call", id: "d1", name: "bedit", arguments: "" };
+  const kept = { id: "k1", type: "function_call", name: "bash", arguments: "" };
+  const text =
+    event({ type: "response.output_item.added", item: { ...dropped, status: "in_progress" } }) +
+    event({ type: "response.function_call_arguments.delta", item_id: "d1", delta: '{"x":3}' }) +
+    event({ type: "response.function_call_arguments.done", item_id: "d1", arguments: '{"x":3}' }) +
+    event({ type: "response.output_item.done", item: { ...dropped, arguments: '{"x":3}', status: "completed" } }) +
+    event({ type: "response.output_item.added", output_index: 0, item: { ...kept, arguments: "", status: "in_progress" } }) +
+    event({ type: "response.function_call_arguments.delta", output_index: 0, item_id: "k1", delta: '{"k":1}' }) +
+    event({ type: "response.function_call_arguments.done", output_index: 0, item_id: "k1", arguments: '{"k":1}' }) +
+    event({ type: "response.output_item.done", output_index: 0, item: { ...kept, arguments: '{"k":1}', status: "completed" } }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  const collapsed = await collapseResponse(sse(guarded), "responses");
+  assert.equal(collapsed.status, 200, "the guard's own bytes are not a reply");
+  const items = (await collapsed.json()).output;
+  assert.equal(items.length, 2, "the note and the declared call are two items, not one");
+  assert.deepEqual(
+    items.map((item) => (item.type === "message" ? "message" : `${item.id}:${item.type}`)).sort(),
+    ["k1:function_call", "message"],
+  );
+  // The note answers a token of the guard's own (its count is the process's,
+  // so the shape is what is pinned here), and it is the text of the call that
+  // was left out.
+  assert.match(items.find((item) => item.type === "message").id, /^msg_anon_\d+$/);
+  assert.equal(textIn("responses", data), droppedNote("bedit"), "the note reached the stream");
+  assert.deepEqual(
+    data
+      .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+      .map((value) => [value.item_id, value.type.endsWith(".done") ? value.arguments : value.delta]),
+    [
+      ["k1", '{"k":1}'],
+      ["k1", '{"k":1}'],
+    ],
+    "the declared call's arguments, or a call left out kept its own",
+  );
+});
+
+// task-11, residual 3: one id, two items — the kept call is named X by the
+// reply, and so is the call the guard leaves out. The dropped call's frames
+// describe an item that was replaced by a note, so they are left out in either
+// order; the answer used to be read off two sets of words subtracted from each
+// other, which made it depend on which call came first — the kept call's word
+// let the dropped call's frames through when the kept call was the first one.
+// It is read off the places the reply's items hold now. The note is the guard's
+// own item and is named in the guard's own namespace, so the word the kept
+// item holds names one item again, and both clients read the same reply.
+test("Responses: one id on two items leaves the dropped call's frames out in both orders", async () => {
+  const frames = (name, index, payload, argsShape) => {
+    const where = argsShape === "both" ? { output_index: index, item_id: "X" } : { item_id: "X" };
+    return [
+      event({
+        type: "response.output_item.added",
+        output_index: index,
+        item: { type: "function_call", id: "X", name, arguments: "" },
+      }),
+      event({ type: "response.function_call_arguments.delta", ...where, delta: payload }),
+      event({ type: "response.function_call_arguments.done", ...where, arguments: payload }),
+      event({
+        type: "response.output_item.done",
+        output_index: index,
+        item: { type: "function_call", id: "X", name, arguments: payload, status: "completed" },
+      }),
+    ].join("");
+  };
+  const kept = frames("bash", 0, '{"k":1}', "both");
+  const dropped = frames("bedit", 1, '{"d":1}', "item_id");
+  const end = event(
+    { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+    "response.completed",
+  );
+  for (const [what, text] of [
+    ["the kept call first", kept + dropped + end],
+    ["the dropped call first", dropped + kept + end],
+  ]) {
+    const streamed = await guardToolResponse(sse(text), "responses", policy);
+    assert.equal(streamed.status, 200, what);
+    const guarded = await streamed.text();
+    const data = frameData(guarded);
+    // The dropped call's frames carry its own payload and no place of their
+    // own; the kept call's carry theirs and their place.
+    assert.deepEqual(
+      data
+        .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+        .map((value) => [value.item_id, value.output_index, value.delta ?? value.arguments]),
+      [
+        ["X", 0, '{"k":1}'],
+        ["X", 0, '{"k":1}'],
+      ],
+      `${what}: a call left out kept its arguments frames`,
+    );
+    assert.ok(
+      !JSON.stringify(data).includes('"d":1'),
+      `${what}: the dropped call's arguments reached the client`,
+    );
+    // The note does not take the word the kept item holds: one id, one item.
+    const ids = [
+      ...data.filter((value) => value.item).map((value) => value.item.id),
+      ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+        (item) => item.id,
+      ),
+    ];
+    assert.deepEqual([...new Set(ids)].sort(), ["X", "msg_dropped_1"], what);
+    const collapsed = await collapseResponse(sse(guarded), "responses");
+    assert.equal(collapsed.status, 200, `${what}: the guard's own bytes are not a reply`);
+    assert.deepEqual(
+      (await collapsed.json()).output.map((item) => `${item.id}:${item.type}`).sort(),
+      ["X:function_call", "msg_dropped_1:message"],
+      `${what}: the streamed reply and its collapsed copy disagree`,
+    );
+  }
+});
+
+// F5, second round: the frame that closes a call can carry nothing at all — no
+// word of its own and no index — while the frame that opened it named the call
+// by a call_id and gave it no index. Recognising the closing frame used to
+// need a word in the opening frame, so it minted an id of its own: one call
+// answered two ids, one of which no added frame had ever opened, and the
+// guard's own bytes could not be collapsed (502 — the invariant F2 exists for).
+// The entry a placeless call leaves in the stream is what says which call a
+// frame with nothing to name it by belongs to, and it carries the id the guard
+// answered for it, whichever word the opening frame had.
+test("Responses: a dropped call whose closing frame carries nothing answers the id it opened with", async () => {
+  const T = (output) =>
+    event(
+      {
+        type: "response.completed",
+        response: { id: "r1", status: "completed", ...(output === undefined ? {} : { output }) },
+      },
+      "response.completed",
+    );
+  const added = (item) => event({ type: "response.output_item.added", item });
+  const done = (item) => event({ type: "response.output_item.done", item });
+  const dropped = { type: "function_call", name: "bedit", arguments: '{"d":1}', status: "completed" };
+  const shapes = {
+    "named by a call_id": [
+      added({ type: "function_call", call_id: "c1", name: "bedit", arguments: "" }),
+      event({ type: "response.function_call_arguments.delta", item_id: "c1", delta: '{"d":1}' }),
+      event({ type: "response.function_call_arguments.done", item_id: "c1", arguments: '{"d":1}' }),
+      done(dropped),
+      T([]),
+    ],
+    "named by an id, with the terminal's copy carrying nothing": [
+      added({ type: "function_call", id: "i1", name: "bedit", arguments: "" }),
+      event({ type: "response.function_call_arguments.delta", item_id: "i1", delta: '{"d":1}' }),
+      event({ type: "response.function_call_arguments.done", item_id: "i1", arguments: '{"d":1}' }),
+      done(dropped),
+      T([{ ...dropped }]),
+    ],
+    "beside a declared call": [
+      added({ type: "function_call", call_id: "c1", name: "bedit", arguments: "" }),
+      event({ type: "response.function_call_arguments.delta", item_id: "c1", delta: '{"d":1}' }),
+      event({ type: "response.function_call_arguments.done", item_id: "c1", arguments: '{"d":1}' }),
+      done(dropped),
+      added({ type: "function_call", id: "k1", name: "bash", arguments: "" }),
+      event({ type: "response.function_call_arguments.delta", item_id: "k1", delta: '{"k":1}' }),
+      event({ type: "response.function_call_arguments.done", item_id: "k1", arguments: '{"k":1}' }),
+      done({ type: "function_call", id: "k1", name: "bash", arguments: '{"k":1}', status: "completed" }),
+      T([]),
+    ],
+  };
+  for (const [what, text] of Object.entries(shapes)) {
+    const streamed = await guardToolResponse(sse(text.join("")), "responses", policy);
+    assert.equal(streamed.status, 200, what);
+    const guarded = await streamed.text();
+    const data = frameData(guarded);
+    const replaced = data
+      .filter((value) => value.item?.type === "message")
+      .map((value) => value.item.id);
+    assert.equal(replaced.length, 2, `${what}: the added frame and the done frame`);
+    assert.equal(new Set(replaced).size, 1, `${what}: one call answered ${JSON.stringify(replaced)}`);
+    // Every frame the guard's own item answers with names that same id, and
+    // the terminal's copy of it does too.
+    const named = [
+      ...new Set(
+        data
+          .map((value) => value.item_id)
+          .filter((id) => typeof id === "string" && id.startsWith("msg_")),
+      ),
+    ];
+    const terminal = (data.find((value) => value.type === "response.completed")?.response.output ?? [])
+      .filter((item) => item.type === "message")
+      .map((item) => item.id);
+    assert.deepEqual(named, [replaced[0]], what);
+    for (const id of terminal) assert.equal(id, replaced[0], what);
+    // And the bytes are a reply the collapse path reads back as that one item
+    // (plus the declared call, where there is one).
+    const collapsed = await collapseResponse(sse(guarded), "responses");
+    assert.equal(collapsed.status, 200, `${what}: the guard's own bytes are not a reply`);
+    const items = (await collapsed.json()).output;
+    assert.equal(items.length, what === "beside a declared call" ? 2 : 1, what);
+    assert.deepEqual(
+      items.map((item) => [item.type, item.id]),
+      what === "beside a declared call"
+        ? [
+            ["message", replaced[0]],
+            ["function_call", "k1"],
+          ]
+        : [["message", replaced[0]]],
+      what,
+    );
+  }
+});
+
+// Two items stating one output_index, one of them a call left out: the place
+// cannot say whose arguments frame it is, and reading it alone swallowed the
+// declared call's frames along with the dropped call's. The word the frame
+// names is what is left to read, and a word the reply kept an item under is
+// that item's.
+test("Responses: two items stating one index leave the declared call its arguments", async () => {
+  const text =
+    event({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "d1", name: "bedit", arguments: "" } }) +
+    event({ type: "response.function_call_arguments.delta", output_index: 1, item_id: "d1", delta: '{"dropped":1}' }) +
+    event({ type: "response.function_call_arguments.done", output_index: 1, item_id: "d1", arguments: '{"dropped":1}' }) +
+    event({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "k1", name: "bash", arguments: "" } }) +
+    event({ type: "response.function_call_arguments.delta", output_index: 1, item_id: "k1", delta: '{"kept":1}' }) +
+    event({ type: "response.function_call_arguments.done", output_index: 1, item_id: "k1", arguments: '{"kept":1}' }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  assert.deepEqual(
+    data
+      .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+      .map((value) => [value.item_id, value.output_index, value.delta ?? value.arguments]),
+    [
+      ["k1", 1, '{"kept":1}'],
+      ["k1", 1, '{"kept":1}'],
+    ],
+    "the declared call's frames were left out with the call that shares its index",
+  );
+  assert.equal((await collapseResponse(sse(guarded), "responses")).status, 200);
+});
+
+// A reply at odds with itself about where one call sits: the frame that opens
+// it gives no index and the frame that closes it gives one, or the other way
+// round, or the two give two different ones. The guard answers the call one id
+// and one place, because the copies leave the placing to the stream's own
+// answer — the place the frame that opened the call was answered at — and the
+// id they all answer is what the collapse path finds them by. Reading each
+// copy's own index instead gave the streaming client one item and the client
+// that reads no stream two, which is the split F2 exists to close.
+test("Responses: a dropped call whose copies disagree about the place is one item to both clients", async () => {
+  const dropped = { type: "function_call", call_id: "c9", name: "bedit", arguments: '{"d":1}', status: "completed" };
+  const opened = (index) =>
+    event({
+      type: "response.output_item.added",
+      ...(index === undefined ? {} : { output_index: index }),
+      item: { type: "function_call", call_id: "c9", name: "bedit", arguments: "" },
+    });
+  const args = (handle, type) =>
+    event({ type, ...handle, ...(type.endsWith(".delta") ? { delta: '{"d":1}' } : { arguments: '{"d":1}' }) });
+  const shapes = {
+    "the opening frame gives no index, the closing frame gives one": [
+      opened(undefined),
+      args({ item_id: "c9" }, "response.function_call_arguments.delta"),
+      args({ item_id: "c9" }, "response.function_call_arguments.done"),
+      event({ type: "response.output_item.done", output_index: 7, item: { ...dropped } }),
+    ],
+    "the opening frame gives one, the closing frame gives none": [
+      opened(7),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.delta"),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.done"),
+      event({ type: "response.output_item.done", item: { ...dropped } }),
+    ],
+    "the two frames give two different indices": [
+      opened(7),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.delta"),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.done"),
+      event({ type: "response.output_item.done", output_index: 9, item: { ...dropped } }),
+    ],
+    // The closing copy names nothing at all — no word of its own and no index —
+    // so the call the stream is closing is the only thing left to read it by.
+    "the opening frame gives one, the closing frame names nothing": [
+      opened(7),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.delta"),
+      args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.done"),
+      event({
+        type: "response.output_item.done",
+        item: { type: "function_call", name: "bedit", arguments: '{"d":1}', status: "completed" },
+      }),
+    ],
+  };
+  for (const [what, frames] of Object.entries(shapes)) {
+    const text =
+      frames.join("") +
+      event(
+        { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+        "response.completed",
+      );
+    const streamed = await guardToolResponse(sse(text), "responses", policy);
+    assert.equal(streamed.status, 200, what);
+    const guarded = await streamed.text();
+    const data = frameData(guarded);
+    const replaced = data.filter((value) => value.item?.type === "message");
+    assert.equal(replaced.length, 2, `${what}: the added frame and the done frame`);
+    assert.deepEqual(
+      replaced.map((value) => value.item.id),
+      [replaced[0].item.id, replaced[0].item.id],
+      `${what}: one call answered more than one id`,
+    );
+    assert.equal(replaced[1].output_index, undefined, `${what}: the closing copy kept a place of its own`);
+    // One item to the streaming client, and one to the client that reads no
+    // stream: the same item, by the same id.
+    const streamedItems = new Set(replaced.map((value) => value.item.id));
+    const collapsed = await collapseResponse(sse(guarded), "responses");
+    assert.equal(collapsed.status, 200, `${what}: the guard's own bytes are not a reply`);
+    const items = (await collapsed.json()).output;
+    assert.equal(items.length, streamedItems.size, `${what}: a split between the two paths`);
+    assert.deepEqual(
+      items.map((item) => [item.type, item.id]),
+      [["message", replaced[0].item.id]],
+      what,
+    );
+  }
+});
+
+// The third word the suppression reads, pinned on its own: a frame that gives
+// an index nothing in the reply holds, and names a word a call left out was
+// named by. That index is the upstream's own numbering of a call the guard
+// replaced with a note — it says nothing about any item the reply kept — and
+// nothing else in the reply accounts for the frame, so it is left out with the
+// call. Removing that rule let these frames through to the client, describing
+// an item it had been told was replaced (the repo had no test that noticed).
+test("Responses: a dropped call's frames are left out though they give an index nobody declared", async () => {
+  const text =
+    event({ type: "response.output_item.added", item: { type: "function_call", call_id: "c9", name: "bedit", arguments: "" } }) +
+    event({ type: "response.function_call_arguments.delta", output_index: 7, item_id: "c9", delta: '{"d"' }) +
+    event({ type: "response.function_call_arguments.done", output_index: 7, item_id: "c9", arguments: '{"d":1}' }) +
+    event({ type: "response.output_item.done", item: { type: "function_call", call_id: "c9", name: "bedit", arguments: '{"d":1}', status: "completed" } }) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const data = frameData(guarded);
+  assert.deepEqual(
+    data.filter((value) => value.type?.startsWith("response.function_call_arguments")),
+    [],
+    "a call left out kept its arguments frames",
+  );
+  assert.equal(textIn("responses", data), droppedNote("bedit"));
+  const collapsed = await collapseResponse(sse(guarded), "responses");
+  assert.equal(collapsed.status, 200);
+  assert.deepEqual(
+    (await collapsed.json()).output.map((item) => [item.type, item.id]),
+    [["message", "msg_c9"]],
+  );
+});
+
 // [DONE] is the sentinel a Chat stream ends with, and a Responses or Messages
 // stream may be handed one after it has reported its own terminal event — a
 // gateway in front of the upstream appends it. That is an ending. Before the
@@ -1144,7 +1839,9 @@ test("Responses: a placeless call's arguments are left out with it, and one the 
 // half of this test is in stream.test.mjs).
 test("a [DONE] marker is an ending only where the reply already ended", async () => {
   for (const protocol of ["responses", "anthropic"]) {
-    const terminal =
+    // Named for the frame it is, not `terminal`: that name is this file's
+    // `terminal(protocol)` helper, and this loop is inside the module it lives in.
+    const terminalFrame =
       protocol === "responses"
         ? event(
             { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
@@ -1152,7 +1849,7 @@ test("a [DONE] marker is an ending only where the reply already ended", async ()
           )
         : event({ type: "message_stop" }, "message_stop");
     const marker = "data: [DONE]\n\n";
-    const good = await guardToolResponse(sse(terminal + marker), protocol, policy);
+    const good = await guardToolResponse(sse(terminalFrame + marker), protocol, policy);
     const out = await good.text();
     assert.equal(good.status, 200);
     assert.ok(out.endsWith(marker), "the marker is forwarded as it arrived");
@@ -1780,6 +2477,92 @@ test("chat: a call without an id gets one in a whole message too", async () => {
   assert.ok(typeof kept.id === "string" && kept.id !== "", "and the id is a name a result can carry");
 });
 
+// An invented id is only process-unique: the counter behind it is shared with
+// every earlier reply, and the route names its own calls by ids of the same
+// shape. A call left unnamed beside calls the reply did name could be handed
+// one of their ids — two calls of one reply under one id, which is the failure
+// the counter exists to prevent, and a host keys its tool results by the id.
+// The ids the calls being flushed already carry are read first, and the
+// invented one misses them all.
+test("chat: an invented call id misses the ids the reply already placed", async () => {
+  const flushChat = async (deltas) => {
+    const text = deltas.map((delta) => event(chat(delta))).join("") + terminal("chat");
+    const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+    return values
+      .flatMap((data) => data.choices ?? [])
+      .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  };
+  const named = (id, index, name) => ({
+    index,
+    id,
+    type: "function",
+    function: { name, arguments: "{}" },
+  });
+  // A call the counter names tells the test what the counter is at: the next
+  // invented id is the one after it, and the reply below is built to hold it.
+  const probe = await flushChat([{ tool_calls: [named(null, 0, "bash")] }]);
+  const last = Number(/(\d+)$/.exec(probe[0].id)?.[1]);
+  assert.ok(Number.isSafeInteger(last), `an invented id is readable: ${probe[0].id}`);
+  // Every id the counter can reach for a while, all of them the reply's own.
+  const held = Array.from({ length: 32 }, (_, index) => `call_${last + index + 1}`);
+  const flushed = await flushChat([
+    { tool_calls: [...held.map((id, index) => named(id, index, "bash")), named(null, held.length, "read")] },
+  ]);
+  assert.equal(flushed.length, held.length + 1, "every call is kept");
+  const ids = flushed.map((call) => call.id);
+  assert.equal(new Set(ids).size, ids.length, `two calls shared an id: ${ids.join(", ")}`);
+  const invented = ids.at(-1);
+  assert.ok(
+    !held.includes(invented),
+    `the invented id ${invented} is one the reply already placed`,
+  );
+});
+
+// A delta that carries `tool_calls: []` is not a call of anything: a gateway
+// re-emitting the shape with a role-only delta sends one, and no call is
+// being waited for. Reading it as a call opened a round with nothing in it —
+// the choice's `ended` mark was dropped with it, so a later "tool_calls"
+// finish stayed a tool use the client waits on forever, a choice the upstream
+// never sent was flushed at [DONE], and a stream that then closed without the
+// marker failed the whole turn "a tool call unfinished" while nothing was
+// pending.
+test("chat: an empty tool_calls delta is not a tool call", async () => {
+  // The frame is the upstream's own and flows through as it came.
+  const alone = frameData(
+    await (await guardToolResponse(sse(event(chat({ tool_calls: [] })) + terminal("chat")), "chat", policy)).text(),
+  );
+  assert.deepEqual(alone, [{ choices: [{ index: 0, delta: { tool_calls: [] }, finish_reason: null }] }]);
+  // A choice whose every call was left out still ends as a plain stop, though
+  // an empty delta arrives after it (#76).
+  const text =
+    event(chat({ content: "hi" })) +
+    event(chat({ tool_calls: [call("nope")] })) +
+    event(chat({}, "tool_calls")) +
+    event(chat({ tool_calls: [] })) +
+    event(chat({}, "tool_calls")) +
+    terminal("chat");
+  const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+  assert.deepEqual(
+    values.map((data) => {
+      const choice = data.choices[0];
+      return [choice.finish_reason, choice.delta?.tool_calls];
+    }),
+    [
+      [null, undefined],
+      ["stop", undefined],
+      [null, []],
+      ["stop", undefined],
+    ],
+    "the empty delta opened a round, or the choice's ending was lost with it",
+  );
+  // And a stream that closes without the marker after one blames the ending it
+  // did not get, not a call that was never there.
+  const cut = event(chat({ content: "hi" })) + event(chat({ tool_calls: [] }));
+  const blamed = await (await guardToolResponse(sse(cut), "chat", policy)).text();
+  assert.doesNotMatch(blamed, /a tool call unfinished/);
+  assert.match(blamed, /ended without a completion marker/);
+});
+
 test("chat: the note follows the text the model wrote before its call", async () => {
   const text =
     event(chat({ content: "Fixing the stray heredoc marker." })) +
@@ -1811,6 +2594,38 @@ test("chat: a call kept beside one left out is numbered from 0", async () => {
   ]);
   const finishes = values.flatMap((data) => data.choices ?? []).map((c) => c.finish_reason);
   assert.ok(finishes.includes("tool_calls"));
+});
+
+// The other half of that rule: a fragment that names no index at all. It is
+// read as the first call's — the collapse path reads it the same way, and a
+// fragment that names no place has no other one to hold — so the two paths
+// over one stream answer one reply. The guard's flush of the same bytes is
+// what a client that streams gets, and the collapse of those bytes is what a
+// client that does not gets.
+test("chat: a fragment that names no index is read the same by both paths", async () => {
+  const text =
+    event(chat({ tool_calls: [{ index: 0, id: "c0", type: "function", function: { name: "Bash", arguments: "" } }] })) +
+    event(chat({ tool_calls: [{ index: 1, id: "c1", type: "function", function: { name: "Read", arguments: "" } }] })) +
+    event(chat({ tool_calls: [{ function: { arguments: '{"file":"a"}' } }] })) +
+    event(chat({}, "tool_calls")) +
+    terminal("chat");
+  const streamed = await guardToolResponse(sse(text), "chat", policy);
+  const guarded = await streamed.text();
+  const calls = frameData(guarded)
+    .flatMap((data) => data.choices ?? [])
+    .flatMap((choice) => choice.delta?.tool_calls ?? [])
+    .map((kept) => `${kept.function.name}${kept.function.arguments}`);
+  assert.deepEqual(calls, ['Bash{"file":"a"}', "Read"]);
+  const collapsed = await collapseResponse(sse(guarded), "chat");
+  assert.equal(collapsed.status, 200);
+  const body = await collapsed.json();
+  assert.deepEqual(
+    (body.choices[0].message.tool_calls ?? []).map(
+      (kept) => `${kept.function.name}${kept.function.arguments}`,
+    ),
+    calls,
+    "the streamed reply and its collapsed copy disagree about a fragment with no index",
+  );
 });
 
 test("SSE: ambiguous injected names are left out in every protocol", async () => {
@@ -1848,14 +2663,23 @@ test("Responses and Messages: a streamed call left out comes as text in its plac
     ],
   );
   const note = droppedNote("bcp");
-  const message = { type: "message", id: "fc_1", role: "assistant", status: "completed" };
+  // The note is the guard's own item, named in the guard's own namespace:
+  // `msg_` and then the call_id the reply gave it (or the place it holds). It
+  // used to take the id of the item it replaced verbatim — `fc_1` here — and a
+  // reply that hands one word to two items then answered to that word for both
+  // the note and the item it kept, which a client keying by id reads as one
+  // item where the reply has two (task-11: the kept call and the dropped call
+  // named by one id). Behind `msg_` the word cannot collide with an id of the
+  // reply, and the note still answers one id in its item, its text frames and
+  // the terminal's copy.
+  const message = { type: "message", id: "msg_call_1", role: "assistant", status: "completed" };
   assert.deepEqual(responses[6].item, {
     ...message,
     content: [{ type: "output_text", text: note, annotations: [] }],
   });
   assert.deepEqual(responses[7].response.output, [responses[6].item]);
   for (const data of responses.slice(2, 6)) {
-    assert.equal(data.item_id, "fc_1");
+    assert.equal(data.item_id, "msg_call_1");
     assert.equal(data.output_index, 0);
   }
   const messages = frameData(

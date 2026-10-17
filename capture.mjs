@@ -316,7 +316,7 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     // what moved: `changed` counts tools and the required list and never the
     // agent, so a run where the required list *and* the agent both changed used
     // to print the change count alone and leave the agent out of the report.
-    const summary = [changed ? `${changed} change(s)` : null, agentChanged ? "the agent" : null].filter(Boolean);
+    const summary = drySummary({ changed, agentChanged });
     console.log(
       `\n${summary.length ? `${summary.join(" and ")} would change.` : "Nothing would change."} Nothing written (--dry).`,
     );
@@ -361,11 +361,46 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     (cause) => {
       // A write that failed leaves its temp file where nothing reads it, and the
       // next run would find it stale: the capture that could not be written is
-      // not one to be picked up later.
-      rmSync(scratch, { force: true });
+      // not one to be picked up later. The cleanup is therefore best-effort and
+      // reports its own failure rather than raising it: `rmSync` throws for
+      // anything but ENOENT, and what sits at the temp path when the write failed
+      // is exactly what the write failed on — a directory raises ERR_FS_EISDIR,
+      // which would replace the write error with a cleanup error and send the
+      // reader after the wrong one. The error that says why the capture was not
+      // written is the one that has to arrive.
+      try {
+        rmSync(scratch, { force: true });
+      } catch (cleanup) {
+        console.error(
+          `could not remove ${scratch} (${cleanup?.code ?? cleanup?.message ?? cleanup}); it is left behind`,
+        );
+      }
       throw cause;
     },
   );
+}
+
+// The parts of the --dry sentence, in the order they are said: the change count
+// when there is one, and "the agent" whenever the agent moved. The two are
+// independent because `changed` never counts the agent — it is the tools and the
+// required list — so a run where both moved has to say both, and a run where
+// only the agent moved has a count of zero to say nothing about.
+//
+// `requiredChanged` is deliberately not a parameter, and the reason is worth
+// stating because it looks like an omission. The summary used to be built inline
+// under a guard reading `agentChanged && !requiredChanged`, and that guard cannot
+// be reached from a run: `report` compares against the capture this process
+// imported (`PROFILES`, above) while the list it captures and writes back is the
+// `REQUIRED` literal in this file, so the two are the same list by construction
+// and `requiredChanged` is false for every run that is not a hand-edited
+// fingerprint changing under an already-loaded module. Re-injecting that guard is
+// therefore a behaviour-equivalent mutation of `report`, not a hole in this
+// file's coverage — no fixture can kill it, because the branch does not exist to
+// be taken. What the guard decided is decided here instead, from the two booleans
+// that do vary, and the pair that matters — a count *and* a moved agent — is
+// pinned directly in capture.test.mjs rather than argued about through a run.
+export function drySummary({ changed, agentChanged }) {
+  return [changed ? `${changed} change(s)` : null, agentChanged ? "the agent" : null].filter(Boolean);
 }
 
 // Key order is not what is being captured: these objects come out of a parsed

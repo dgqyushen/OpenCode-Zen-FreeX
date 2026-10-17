@@ -20,8 +20,19 @@ export const CATALOG = "https://models.opencode.ai/api.json";
 const DOCS =
   "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx";
 const PATHS = { chat: "/chat/completions", responses: "/responses", anthropic: "/messages" };
-// Which generation to present when the host says nothing that tells us: the
-// one opencode-ai publishes as latest.
+// Which generation to present when the host's tools name neither one: a floor,
+// and not a claim about what opencode-ai publishes as latest. What it publishes
+// as latest is 2.x, and `fingerprint.json` captures it — the profile whose
+// channel is `latest`, opencode 2.0.29 — so a comment saying this constant is
+// "the latest generation" would be the one thing here that is not true.
+//
+// It stays 1.x because a default is only reached when nothing identified the
+// host, and 1.x is the generation with more to say for it in that case: its
+// `required` set is the wider one, `normalizeTools` can stand in for every name
+// in it, and `bash`/`glob`/`grep`/`read` are the names a host that never sent
+// `shell` still carries. The floor is what a request falls back to, so it is
+// the generation a body is likeliest to already agree with — not the newest one
+// opencode-ai ships, which only a host that says so should be presented as.
 const DEFAULT_GENERATION = "1.x";
 // Said only of a tool this plugin added, which the agent has no such tool for.
 // It has to be phrased as being about that one tool: a blanket "these tools are
@@ -193,6 +204,47 @@ function httpURL(value) {
   return url.href.replace(/\/+$/, "");
 }
 
+// Whether a catalogue's row for an id is a description of a model at all. The
+// shape rule lives in one place because two readings depend on it — what the
+// catalogue says about an id, and what this plugin kept for it — and a row read
+// as a description by one of them and not the other is a model that disappears
+// without anything saying so.
+//
+// An array is not one, though `typeof []` is `"object"`: the catalogue writes a
+// row per model and never a list, so a list there is a row it could not fill in,
+// the same fact as `null`. `models.mjs` reads a row as a description by the same
+// test; the two must agree.
+function describesModel(row) {
+  return typeof row === "object" && row !== null && !Array.isArray(row);
+}
+
+// Give a model map an entry under an id that came from upstream, as an own
+// property whatever that id is. `map[id] = value` is not enough: for the id
+// `"__proto__"` a plain write is the prototype setter, so the entry is not
+// stored at all and the map's prototype is what changes — the one write here
+// whose id is not this package's to trust. An id may name a model, and it may
+// not reach past the map to do it.
+function own(map, id, value) {
+  if (id === "__proto__") {
+    return Object.defineProperty(map, id, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  map[id] = value;
+  return map;
+}
+
+// The catalogue's own row for an id, or `undefined` when the catalogue has none
+// under that name. Own properties only, for the reason the preservation loop
+// states: `models?.["toString"]` is the prototype's function, and reading it as
+// a description of a model invents one nothing described.
+function catalogueRow(metadata, id) {
+  return Object.hasOwn(metadata.models ?? {}, id) ? metadata.models[id] : undefined;
+}
+
 function requirePublic(auth) {
   if (auth?.type !== "api" || auth.key !== "public") {
     throw new Error(
@@ -237,6 +289,10 @@ function normalizeTools(body, protocol) {
   // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
   // often than descriptions do, so this survives a rewording that a pinned
   // User-Agent would not.
+  //
+  // Neither name being there is not the same as 1.x being there: the fallback
+  // is the floor described on DEFAULT_GENERATION, and it decides the names this
+  // loop then fills in as well as the User-Agent `agentForRequest` composes.
   const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
   // Through `profileFor`, not `PROFILES[generation]`: a capture that holds one
   // generation leaves the other key absent, and the direct read fails below on
@@ -421,20 +477,50 @@ export function sessionID(headers, body) {
   }
   if (typeof body.metadata?.session_id === "string") signal ??= body.metadata.session_id;
   if (realSessionID(signal)) return signal;
-  if (!signal) {
-    const messages = body.messages ?? body.input;
-    const first = Array.isArray(messages)
-      ? messages.find((message) => message.role === "user")?.content
-      : messages;
+  const messages = body.messages ?? body.input;
+  const first = Array.isArray(messages)
+    ? messages.find((message) => message.role === "user")?.content
+    : messages;
+  // A host signal is the conversation's own name for itself, so it is the key
+  // on its own and nothing else is folded in beside it: a host that carries a
+  // signal may open a later turn with a shortened history, and keyed by the
+  // opening too, the same conversation would answer a new id the moment its
+  // first message moved. It is also what keeps two conversations that happen to
+  // open with the same words — "hi", a template prompt — in separate Zen
+  // sessions rather than one, and the only thing that can: a host that sends no
+  // signal at all is keyed by its opening below, and two such hosts with one
+  // opening are one key. That limit is pinned in session.test.mjs.
+  //
+  // `first === ""` is separated from `first === undefined` because an empty
+  // opening is a conversation with nothing to key by, which a host signal still
+  // names, while no user message at all is a body with nothing to key by. Read
+  // by truthiness — as `!first` read both — the two are one branch, and the
+  // signal is spent before either can be told from the other.
+  if (signal !== undefined) {
+    const named = createHash("sha256").update(`ses\0${signal}`).digest("hex");
+    return kept(named);
+  }
+  // An empty opening has nothing to key a conversation by, and one cannot be
+  // invented: two of them are indistinguishable from a single one, so any key
+  // derived here would either be shared by unrelated conversations — one Zen
+  // session, with its affinity and its quota — or differ again on the next
+  // turn. Not sharing is the half worth keeping, so this answer is minted per
+  // call exactly as the unnamed case below is.
+  if (first === "" || first === undefined) {
     // Nothing names this conversation: no session header, no metadata, and no
     // user message to key one by. There is no identity to keep for the next
     // turn, so this one gets an id of its own rather than being folded into
     // whichever conversation happened to arrive first — but it is still an id
     // of OpenCode's shape, because that shape is what the tier checks.
-    if (!first) return opencodeID("ses", true);
-    signal = JSON.stringify(first);
+    return opencodeID("ses", true);
   }
-  const key = createHash("sha256").update(`ses\0${signal}`).digest("hex");
+  return kept(createHash("sha256").update(`ses\0${JSON.stringify(first)}`).digest("hex"));
+}
+
+// The id kept for a key, minted on first sight and reused while the key stays
+// in the map. Every caller that names a conversation goes through here, so the
+// eviction of the oldest entry is written once rather than at each key.
+function kept(key) {
   let session = SESSIONS.get(key);
   if (session) {
     SESSIONS.delete(key);
@@ -464,7 +550,92 @@ async function server(_input, options = {}) {
   // a 15 s timeout each on every request that names a model it doesn't know.
   let listedAt = 0;
 
-  async function discover(signal) {
+  // The discovery in flight, and who is waiting for it. Nineteen of the twenty
+  // requests a host makes name a model already known, so this exists for the
+  // ones that do not: without it two of them arriving together both read the
+  // listing, the catalogue and the docs — six upstream reads for one answer —
+  // and then race to write `known`, `metadata` and `protocols`, so which of the
+  // two survives is whichever settled last. One flight, one write.
+  let inflight = null;
+  // What every caller's lease travels on: the reads end when the last caller
+  // waiting for them has gone, and not before. A host that walks away from one
+  // request is still a host, so one caller's abandonment must not cancel an
+  // answer another is still waiting for.
+  const leases = new Set();
+  const interior = new AbortController();
+
+  // This caller's own way out, and its membership of the flight. Resolved when
+  // the caller's own signal aborts; an already-aborted one — for which no
+  // listener fires — ends the lease here rather than holding it for ever.
+  function leased(outward) {
+    const passing = new AbortController();
+    const end = () => passing.abort(outward?.reason ?? new DOMException("Aborted", "AbortError"));
+    if (outward?.aborted) end();
+    else outward?.addEventListener("abort", end, { once: true });
+    leases.add(passing);
+    passing.signal.addEventListener(
+      "abort",
+      () => {
+        leases.delete(passing);
+        if (!leases.size) interior.abort();
+      },
+      { once: true },
+    );
+    return passing.signal;
+  }
+
+  // A caller's wait for a discovery, told which signal says it has given up: a
+  // caller that walks away hears about it from its own abort rather than
+  // inheriting whoever started the flight's, and the flight itself carries on
+  // for the callers still waiting for it.
+  function waiting(signal, named) {
+    return Promise.race([
+      named,
+      new Promise((_, reject) => {
+        const end = () => reject(signal.reason);
+        if (signal.aborted) end();
+        else signal.addEventListener("abort", end, { once: true });
+      }),
+    ]);
+  }
+
+  // The discovery one caller waits for. Every caller takes a lease, the ones
+  // joining a flight included, so giving up is the caller's own.
+  function shared(observed) {
+    const mine = leased(observed);
+    // A flight that has already answered is not one to join: its result
+    // predates this caller's question, which is what the caller is asking
+    // again. `inflight` is kept rather than cleared, so this is the same test
+    // as "is it still running" and does not race the settle below.
+    if (inflight && !inflight.settled) return waiting(mine, inflight.named);
+    const named = reading(interior.signal);
+    const flight = { named, settled: false };
+    inflight = flight;
+    const settled = () => {
+      flight.settled = true;
+    };
+    named.then(settled, settled);
+    return waiting(mine, named);
+  }
+
+  // The one gate in front of the reads, and the reason it is here rather than
+  // at each caller: every path that can start a discovery goes through this
+  // function — a request for a model the last list did not have, the `models()`
+  // hook a host calls when it opens its model chooser, and `refresh()` — so a
+  // budget stated once cannot be spent by one path and bypassed by another. The
+  // hook used to call the reads directly, and every open of the chooser was a
+  // full round of discovery however recently the last one ran.
+  //
+  // A failed ask sets `listedAt` too (see `reading`), so a host whose listing
+  // cannot be read waits out the same interval as one whose listing can.
+  //
+  // `force` is for the one caller that is asking on purpose: `refresh()`.
+  async function discover(signal, { force = false } = {}) {
+    if (!force && Date.now() - listedAt < RELIST_AFTER) return known;
+    return shared(signal);
+  }
+
+  async function reading(signal) {
     const headers = { authorization: "Bearer public", "x-opencode-client": "cli" };
     const [listing, catalog, docs] = await Promise.allSettled([
       readRemote(`${baseURL}/models`, true, headers, signal),
@@ -495,9 +666,58 @@ async function server(_input, options = {}) {
     const discovered = buildModels(ids, metadata, protocols, baseURL);
     if (partial) {
       // Preserve previously verified models only while they remain in the live catalog.
+      //
+      // "The catalogue describes it" is read here as it is read in models.mjs:
+      // a row that is not a description describes nothing, whatever it is. The
+      // catalogue writes `null` for a row it could not fill in, and `null` is
+      // falsy, so the truthiness this used to test happened to answer the same
+      // way for that one shape — but `"junk"` and `7` are not descriptions
+      // either and are truthy, and they were read as if they were.
+      //
+      // An array is named as well as an object, because `typeof []` is
+      // `"object"` and the row shape the catalogue must never write is exactly
+      // the one a bare `typeof` check waves through: read as a description, the
+      // model it describes is not kept, which is a model silently disappearing
+      // for a catalogue row that could not be filled in.
+      //
+      // A row that is not a description is the same fact as no row at all:
+      // `buildModels` has already resolved the id without it (through the docs,
+      // or the `-free` rule), so what is preserved here is a model this plugin
+      // verified before, and holding it back because the catalogue wrote a row
+      // it could not fill in would be the same silent disappearance the `-free`
+      // rule exists to prevent.
+      //
+      // The entry kept is read as an object for the same reason: `known` only
+      // ever holds maps this plugin built, so anything else there is a shape
+      // this loop cannot reason about, and keeping it would carry it onward as
+      // a model. Judged rather than assumed, because the cost of being wrong is
+      // paid by a host on a hook it is waiting for.
+      //
+      // All three reads are own-property reads (`Object.hasOwn`), the same rule
+      // models.mjs and limits.mjs read their maps by. `known`, `protocols`,
+      // `discovered` and the catalogue's own map are all plain objects keyed by
+      // ids that arrived from upstream, so a name that is not a key at all —
+      // `toString` and the rest of `Object.prototype` — reads as a *value*
+      // through the prototype chain: `protocols["toString"]` is a function, so
+      // `!protocols[id]` was false and the entry was skipped for an id no
+      // catalogue ever described. What is under a name nobody wrote is what the
+      // prototype has, and it belongs to no model.
+      //
+      // `buildModels` skips `"__proto__"` before any of this, so the write below
+      // is unreachable for that id today. It is written safely anyway: this
+      // branch's job is to put a model in the map, and a `map[id] = value` for
+      // that id is the prototype setter rather than a write — a guard in another
+      // module is not the place this write's safety is decided.
       for (const id of ids) {
-        if (!discovered[id] && !metadata.models?.[id] && !protocols[id] && known[id]) {
-          discovered[id] = known[id];
+        const kept = known[id];
+        if (
+          !Object.hasOwn(discovered, id) &&
+          !describesModel(catalogueRow(metadata, id)) &&
+          !Object.hasOwn(protocols, id) &&
+          Object.hasOwn(known, id) &&
+          describesModel(kept)
+        ) {
+          own(discovered, id, kept);
         }
       }
       // Deliberately not said as fallen back. Zen's own list was read, and what
@@ -648,8 +868,23 @@ async function server(_input, options = {}) {
       async models(provider, { auth } = {}) {
         if (!auth) return provider.models;
         requirePublic(auth);
+        // Asked without a signal, and deliberately: the hook has none to give,
+        // and passing `undefined` on as one would read as a caller that cancels
+        // nothing — `leased` takes it as "no way out", which is what this call
+        // has. Whether it reads at all is `discover()`'s decision, so a host
+        // that opens its model chooser twice in a minute is given the list read
+        // the first time instead of a second round of upstream reads.
         return discover();
       },
+    },
+    // Read the list again now, whatever RELIST_AFTER says: the way for a host
+    // (and for a test) to ask for the listing on purpose, rather than having to
+    // spend a request on a model the last list did not have to get one. It
+    // skips the budget and nothing else — it goes through the same single
+    // flight, so a refresh asked for while a discovery is already running waits
+    // for that answer instead of reading beside it.
+    async refresh() {
+      return discover(undefined, { force: true });
     },
     async "chat.headers"(input, output) {
       if (![PROVIDER, `${PROVIDER}-plugin`].includes(input.model?.providerID) || !input.sessionID)

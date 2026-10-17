@@ -35,7 +35,17 @@ async function withScratch(body) {
 // opposed to an error this fixture made by mistake. Only these may become a
 // skip; anything else has to fail, because a case that silently does nothing is
 // a case that reports success without checking.
-const UNSUPPORTED = ["EPERM", "EACCES", "ENOSYS", "ENOTSUP", "EXDEV", "EINVAL"];
+//
+// `EINVAL` was in this list and is not any more, because it is the one code here
+// that a mistake in the fixture can produce. Neither `link` nor `symlink` lists
+// EINVAL among its errors — a file system that cannot make links answers ENOSYS,
+// ENOTSUP or EPERM — while an invalid argument is exactly what EINVAL means, so
+// the code that says "this host cannot do it" is also the code that says "these
+// arguments are wrong". Read as unsupported, a fixture that passed the wrong
+// arguments would skip instead of failing, and a skipped case is one that reports
+// success without checking anything. The codes that are left are the ones a host
+// with no links to give answers with; nothing else may become a skip.
+const UNSUPPORTED = ["EPERM", "EACCES", "ENOSYS", "ENOTSUP", "EXDEV"];
 
 function unsupportedError(error) {
   return UNSUPPORTED.includes(error?.code) ? error : undefined;
@@ -130,6 +140,69 @@ test("a different file that exists is a different file", async () => {
   });
 });
 
+test("a broken fixture throws instead of skipping, through the same catch the link cases use", async (t) => {
+  // A fixture's own mistake, driven through the same `try`/`catch`/`throw` the two
+  // link cases are built on: a source file that was never written, which this
+  // platform answers ENOENT for. `unsupportedError` does not call that
+  // unsupported, so it is thrown — which is the whole point, since a fixture whose
+  // mistake skipped would report a pass it never earned and would read exactly
+  // like a host that cannot make links. The classification above is what decides
+  // it; this is that decision arriving at the runner as a failure rather than
+  // being swallowed.
+  await withScratch(async (root) => {
+    const missing = join(root, "never-written.mjs");
+    const link = join(root, "hard.mjs");
+    assert.throws(
+      () => {
+        try {
+          linkSync(missing, link);
+        } catch (error) {
+          const unsupported = unsupportedError(error);
+          if (unsupported) {
+            t.skip(`this host cannot make the hard link: ${unsupported.message}`);
+            return;
+          }
+          throw error;
+        }
+        // Only reachable if the link was made from a source that was never
+        // written, which is the fixture being wrong in a way this cannot name.
+        assert.fail("linking a file that does not exist must raise, and it did not");
+      },
+      /ENOENT/,
+      "a fixture's own mistake has to reach the runner as a failure",
+    );
+  });
+});
+
+test("the skip list holds the codes a host without links answers with, and nothing else", () => {
+  // The rule itself, read off the list — not an observation of a host that could
+  // not make a link. Nothing in this file has ever seen a skip: this machine makes
+  // symlinks, junctions and hard links, so the branch that skips has never run
+  // here and a name claiming otherwise would be the same kind of overclaim as an
+  // assertion that holds for the wrong reason. What is checked is the
+  // classification `unsupportedError` applies, which is what decides whether a
+  // link failure becomes a skip or a failure: a host with no links to give answers
+  // with one of these codes, and everything else — EINVAL included, which is how
+  // the fixture's own argument mistakes arrive — has to fail the case. The
+  // `undefined` and code-less entries are the same answer for the same reason:
+  // nothing about them says the host cannot do it.
+  for (const code of ["EPERM", "EACCES", "ENOSYS", "ENOTSUP", "EXDEV"])
+    assert.equal(unsupportedError({ code })?.code, code, `${code} is a code that may become a skip`);
+  for (const error of [
+    { code: "EINVAL", message: "invalid argument" },
+    { code: "ENOENT", message: "no such file or directory" },
+    { code: "EEXIST", message: "file already exists" },
+    { code: "ERR_INVALID_ARG_VALUE", message: "Symlink type must be one of ..." },
+    { message: "an error with no code at all" },
+    undefined,
+  ])
+    assert.equal(
+      unsupportedError(error),
+      undefined,
+      `${JSON.stringify(error?.code ?? error)} must fail the case, not skip it`,
+    );
+});
+
 test("no entry point named at all is not a run of this file", () => {
   // `node -e`, a REPL, a worker: nothing was named as a script, so there is no
   // run for this module to be part of. This is the state the gate has always
@@ -206,9 +279,12 @@ test("a summary names what the rows actually said, never a refusal that did not 
   // Both kinds are counted as what they were.
   const both = refusedSummary({ served: 1, total: 3, unbuilt: [], unserved: ["refused", "unreachable"] });
   assert.match(both, /1 refused, 1 not served/);
-  // A request that could not be built was never asked, and is said that way.
+  // A request that could not be built was never asked, and is said that way —
+  // outside "of N", which is the floors something was asked of. `total` is
+  // ignored: the denominator is counted from the rows, because the number a
+  // caller passes can be one the sentence cannot use.
   const malformed = refusedSummary({ served: 1, total: 3, unbuilt: ["x"], unserved: ["refused", "unreachable"] });
-  assert.match(malformed, /1 refused, 1 not served, 1 never asked/);
+  assert.match(malformed, /1 served, 1 refused, 1 not served of 4 asked, 1 never asked/);
   assert.match(malformed, /fingerprint\.json has to gain/);
   // Nothing served: the all-refused reading is only for rows that really were.
   assert.match(
@@ -224,4 +300,58 @@ test("a summary names what the rows actually said, never a refusal that did not 
     refusedSummary({ served: 0, total: 1, unbuilt: [], unserved: ["failed"] }),
     /none of them with a verdict on the fingerprint/,
   );
+});
+
+test("a floor that was never asked is named once, not as a refusal as well", () => {
+  // The two call sites disagreed about which verdicts `unserved` held. The one
+  // taken when at least one floor was answered passed the malformed floor
+  // through, so a run of one malformed floor and one answered one printed "1 not
+  // served, 1 never asked of 2": one floor, two verdicts, and a denominator that
+  // counted a request nothing was ever asked of. Both arguments are passed here
+  // exactly as that call site built them — the malformed row in `unbuilt` *and*
+  // its verdict in `unserved` — because that is the input the sentence has to
+  // survive.
+  const row = { generation: "1.x", shape: "floor", verdict: "malformed", detail: "floor: no tool" };
+  const mixed = refusedSummary({ served: 1, unbuilt: [row], unserved: ["malformed"] });
+  assert.match(mixed, /1 served of 2 asked, 1 never asked/, mixed);
+  assert.equal(
+    /\bnot served\b|\brefused\b/.test(mixed),
+    false,
+    `nothing was refused in this run, so nothing may be said as refused: ${mixed}`,
+  );
+  assert.equal(
+    (mixed.match(/never asked/g) ?? []).length,
+    1,
+    `the malformed floor is one floor and gets one name: ${mixed}`,
+  );
+
+  // The other half of the same run: a floor that really was refused keeps its
+  // name, and the malformed one is still only "never asked" — never both.
+  const refusedToo = refusedSummary({ served: 0, unbuilt: [row], unserved: ["refused", "malformed"] });
+  assert.match(refusedToo, /1\/2 floor requests were never asked/, refusedToo);
+  assert.equal(
+    (refusedToo.match(/never asked/g) ?? []).length,
+    1,
+    `a malformed floor must not also be counted as another name: ${refusedToo}`,
+  );
+  assert.equal(
+    /\brefused\b/.test(refusedToo),
+    false,
+    `the refused floor was not asked about either, so the run still says nothing about the fingerprint: ${refusedToo}`,
+  );
+
+  // With a floor answered, the refused one is named as refused and the malformed
+  // one as never asked: two floors, two names, three numbers that add up.
+  const servedToo = refusedSummary({ served: 1, unbuilt: [row], unserved: ["refused", "malformed"] });
+  assert.match(servedToo, /1 served, 1 refused of 3 asked, 1 never asked/, servedToo);
+  assert.equal(
+    (servedToo.match(/never asked/g) ?? []).length,
+    1,
+    `the malformed floor gets one name: ${servedToo}`,
+  );
+
+  // Nothing was unbuilt, so nothing may be said to have been unasked: a summary
+  // that reaches for the phrase anyway names a floor no row reported.
+  const clean = refusedSummary({ served: 1, unserved: ["unreachable"] });
+  assert.equal(/never asked/.test(clean), false, clean);
 });

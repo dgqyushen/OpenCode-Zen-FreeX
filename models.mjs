@@ -32,17 +32,55 @@ function sdkProtocol(npm) {
   if (npm?.includes("openai-compatible")) return "chat";
 }
 
+// Whether a value the catalogue wrote is a description of a model, as opposed to
+// a row it could not fill in. `null` is the shape the catalogue uses for the
+// latter, and an array is the same fact: `typeof []` is `"object"`, but the
+// catalogue writes one row per model and a list is not a row — every axis a
+// description carries is absent from it, so reading one as a description reads
+// nothing as something.
+//
+// The same test, by rule, as `provider.mjs`'s own `describesModel` — each file
+// keeps its own name for it, and this comment is where the two names are tied
+// together. The reader there decides whether a row may stand in for a model, and
+// the two sides deciding differently about one row is a model whose fate depends
+// on which file looked at it. This one is this file's own — the two are kept in
+// step by their comments and their tests, not by a shared export, so neither
+// file's public surface grows for the other's sake.
+//
+// Exported nowhere, deliberately: a test asks about the rule through the models
+// it produces, which is the thing the rule is for.
+function isDescription(row) {
+  return typeof row === "object" && row !== null && !Array.isArray(row);
+}
+
 // Set, and not merely present: the catalogue writes both a missing date and an
 // explicit null, and neither retires a model. A blank string is not a date
 // either — see `isSet` below, which is the same rule stated for the two axes
 // the retirement checks read.
 const hasValue = (value) => value !== null && value !== undefined;
 
+// Whether what the catalogue wrote is a container — a list, an object, a
+// function — rather than the single value these fields are. A status is a word
+// and a date is a date; `["2026-01-01"]` is neither, and `String` writes a list
+// as one non-empty string, so a field nobody filled in passed the "does it say
+// something" test below and retired a model: it left the offered list with
+// nothing in the table and nothing in a note to say why, which is the silent
+// loss every shape rule in this file exists to prevent. `typeof null` is
+// `"object"`, so the null `hasValue` refuses on its own account is refused here
+// as well.
+const isContainer = (value) => typeof value === "object" || typeof value === "function";
+
 // A status has to say something to be one. The catalogue writes an empty string
 // as well as a null, and either one used to stand in front of the `lifecycle`
 // that does retire the model, so a model retired through `lifecycle` kept being
 // offered. A status that is set — "active" included — is still read as itself.
-const isSet = (value) => hasValue(value) && String(value).trim() !== "";
+//
+// The shape of what was written is part of "says something": a list or an object
+// is not a status and not a date, and reading one as either is how a field that
+// states nothing retired a model. `hasValue` is left as it is — "was anything
+// written here at all" and "does what was written say something" are two rules,
+// and only this one is about the shape of the answer.
+const isSet = (value) => hasValue(value) && !isContainer(value) && String(value).trim() !== "";
 
 // A status ends a model when it says the model is gone: "retired" and
 // "disabled" are endings. "deprecated" is not one — it says the catalogue
@@ -104,7 +142,27 @@ function protocolFor(id, model, raw, provider, protocols) {
   // name, and `protocols["__proto__"]` would be an inherited protocol nobody
   // wrote. What the docs actually say about an id is an own property or nothing.
   if (Object.hasOwn(protocols, id)) return protocols[id];
-  if (raw) return sdkProtocol(model.provider?.npm ?? provider.npm);
+  // The catalogue resolving to no protocol is not the same fact for both of the
+  // branches below, and they are read in that order for it.
+  //
+  // A catalogue entry whose package maps to no protocol is one this plugin
+  // cannot ask as the catalogue describes it — the "half-described" id, where
+  // the entry exists and its `npm` names a package `SDK` has never heard of.
+  // That is the same hole the `-free` fallback exists for, and it used to be the
+  // one shape the fallback could not reach: the entry was there, so `raw` was
+  // truthy, so the fallback was skipped and the id was dropped silently — while
+  // the very same id with no catalogue entry at all was offered.
+  //
+  // An id whose protocol *was* resolved — by the docs, to a name inside
+  // `PROTOCOLS` that this plugin has no SDK for, `systemone` above all — is a
+  // different fact and never falls through to the guess: the docs have said
+  // what this id speaks, and it is not something this plugin asks. That name
+  // comes back from the lookup above, so it never reaches this branch at all;
+  // what a package that maps to nothing answers is `undefined`, which is what
+  // keeps "no protocol could be read here" apart from "this id is not one this
+  // plugin asks".
+  const catalogProtocol = raw ? sdkProtocol(model.provider?.npm ?? provider.npm) : undefined;
+  if (catalogProtocol !== undefined) return catalogProtocol;
   if (listedFree(id)) return sdkProtocol(provider.npm) ?? "chat";
   return undefined;
 }
@@ -128,8 +186,15 @@ const usable = (value) => Number.isSafeInteger(value) && value > 0;
 // evidence for — each level only contributing axes it can actually state.
 function limitFor(id, declared) {
   const limit = { context: 32768, output: 4096 };
-  for (const [axis, value] of Object.entries(declared ?? {})) if (usable(value)) limit[axis] = value;
-  for (const [axis, value] of Object.entries(limitOverrides(id, declared))) limit[axis] = value;
+  // An axis map has to be one, by the same rule the row is read by. `limit` is
+  // an object of named axes, and `Object.entries` reads a list as its indices:
+  // a row whose `limit` was `[111, 222]` handed the host
+  // `{0: 111, 1: 222, context: 32768, output: 4096}` — axes no catalogue named,
+  // on the one object a host plans a prompt from. The evidence lookup is handed
+  // the same map, so neither level can read an axis off a shape that has none.
+  const axes = isDescription(declared) ? declared : {};
+  for (const [axis, value] of Object.entries(axes)) if (usable(value)) limit[axis] = value;
+  for (const [axis, value] of Object.entries(limitOverrides(id, axes))) limit[axis] = value;
   return limit;
 }
 
@@ -148,15 +213,47 @@ export function buildModels(ids, provider, protocols, baseURL) {
     // describes. An id with no entry here is one the catalogue has not caught up
     // with, which the `-free` rule below is for.
     const catalogue = provider.models ?? {};
-    const raw = Object.hasOwn(catalogue, id) ? catalogue[id] : undefined;
+    // ...and an entry that is not a description describes nothing either, so it
+    // is left unresolved exactly like a missing one instead of being carried out
+    // of this loop as a description. `null` is the shape the catalogue writes
+    // for a row it could not fill in, and a list is the same fact one step
+    // harder to see — see `isDescription` above, which is the rule both sides of
+    // the tree read a row by. Such a row is read as a description by everything
+    // downstream of here too: `provider.mjs` reads `.cost` off
+    // `metadata.models[id]` on the partial-catalogue path, where a `null` is a
+    // TypeError thrown out of a hook a host is waiting on. One dirty row
+    // upstream must not be the whole list: a model is not a thing worth failing
+    // discovery over, and the `-free` name is already this file's rule for an id
+    // the catalogue cannot speak for.
+    //
+    // Skipped rather than reported, and the difference matters: a report would
+    // need a sink on this path, and the only sinks in this tree are
+    // limits.mjs's, which are about limits. What a skipped row costs is a model
+    // the catalogue itself could not describe — no protocol, no limits, no
+    // capabilities — and the models that are described are still offered, which
+    // is the outcome this file exists for. A row this malformed is also visible
+    // where it is made: it is the catalogue's own data, upstream of discovery.
+    const listed = Object.hasOwn(catalogue, id) ? catalogue[id] : undefined;
+    const raw = isDescription(listed) ? listed : undefined;
     const model = raw ?? {};
     const protocol = protocolFor(id, model, raw, provider, protocols);
     if (!isFree(id, model) || !Object.hasOwn(SDK, protocol)) continue;
     const input = model.modalities?.input ?? ["text"];
     const output = model.modalities?.output ?? ["text"];
-    const efforts = (model.reasoning_options ?? [])
-      .filter((option) => option.type === "effort")
-      .flatMap((option) => option.values ?? []);
+    // The efforts a model offers, from the list the catalogue writes them in.
+    // `?? []` covers a list the catalogue left out and nothing else, and this is
+    // the one place in the loop where a wrong shape does not read as a wrong
+    // value but ends the whole call: `.filter` is not a function on an object or
+    // a string, and `option.type` on a `null` element is a TypeError — either one
+    // threw out of `buildModels`, so one dirty row upstream took discovery down
+    // with it, which is the failure the row rule above exists to prevent. A list
+    // that is not a list, and an element that is not a description, are read as
+    // no efforts: the model is still offered, without the variants nobody could
+    // state.
+    const options = Array.isArray(model.reasoning_options) ? model.reasoning_options : [];
+    const efforts = options
+      .filter((option) => isDescription(option) && option.type === "effort")
+      .flatMap((option) => (Array.isArray(option.values) ? option.values : []));
     result[id] = {
       id,
       providerID: PROVIDER,

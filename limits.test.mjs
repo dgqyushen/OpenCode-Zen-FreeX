@@ -271,6 +271,54 @@ test("a declaration carried only by the caller's prototype is not a declaration"
   );
 });
 
+// ...and the third read of the same rule, on the one line that was left out of
+// it. `table[id]` and `declared[axis]` are own-property reads, and the record's
+// own axis was not: read through the prototype, an axis nobody measured read
+// exactly like one that was. What it then does is worse than the other two —
+// the staleness compare asks whether `declaredAt` is still the catalogue's
+// number and not whose axis the entry is, so an inherited entry passes it, and
+// the raise-only rule reads `entry.source`, which the inherited value supplies
+// too. A record the table handed over with one axis is then one override more
+// than it declared.
+test("an axis carried only by the record's prototype is not evidence", async () => {
+  const { limitOverrides } = await subject;
+  // The pair the caller declares is the one the inherited axis was measured
+  // against, and the record's own axis is one the catalogue has not moved, so
+  // nothing but the own-property rule stands between the inherited number and
+  // the wire. `Object.create` is how a table built by hand gets there — and a
+  // polluted `Object.prototype` is the same read with a prototype nobody wrote.
+  const shared = { context: { value: 999999, source: "route", declaredAt: 200000 } };
+  const record = Object.assign(Object.create(shared), {
+    output: { value: 64000, source: "route", declaredAt: 32000 },
+  });
+  const table = { "phantom-axis-free": record };
+  assert.equal(Object.hasOwn(record, "context"), false, "the fixture's window is inherited, not declared");
+  assert.deepEqual(
+    limitOverrides("phantom-axis-free", { context: 200000, output: 32000 }, table),
+    { output: 64000 },
+    "only the axis the record itself carries is evidence",
+  );
+  // the same axis written as the record's own property is the measurement it
+  // looks like, so the silence above is the own-property rule and not the pair
+  record.context = shared.context;
+  assert.deepEqual(
+    limitOverrides("phantom-axis-free", { context: 200000, output: 32000 }, table),
+    { context: 999999, output: 64000 },
+  );
+  // and a marker on `Object.prototype` is the same read: no record declares it,
+  // so no model is measured against it — on any table, shipped one included
+  Object.prototype.context = { value: 999999, source: "route", declaredAt: 200000 };
+  try {
+    assert.deepEqual(limitOverrides("nothing-measured-free", { context: 200000, output: 32000 }), {});
+    assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }), {
+      context: 1048576,
+      output: 384000,
+    });
+  } finally {
+    delete Object.prototype.context;
+  }
+});
+
 test("weaker evidence may raise a limit but never lower one", async () => {
   const { limitOverrides } = await subject;
   const table = {
@@ -428,7 +476,7 @@ async function readCutAt(observe, id, limit, shape, size) {
 }
 
 test("a body cut inside the ceiling it names is not read as a smaller ceiling", async () => {
-  const { observeRouteStatement, limitOverrides, namedOutputCap } = await subject;
+  const { observeRouteStatement, limitOverrides, namedOutputCap, LIMITS } = await subject;
   const at = CEILING_WORDING.indexOf("262144");
   // whole, and cut after the number is complete: the ceiling is read
   assert.equal(namedOutputCap(CEILING_WORDING), 262144);
@@ -463,7 +511,24 @@ test("a body cut inside the ceiling it names is not read as a smaller ceiling", 
     "the refusal that failed halfway",
   );
   assert.equal(died.output, undefined, "a number at the end of a body that never finished is not a ceiling");
-  // and the declaration is still the one the table measured, not the half number
+  // and the declaration is still the one the table measured, not the half number.
+  //
+  // Read from the table rather than only through `limitOverrides`, because that
+  // call answers from two places: a live observation for this id outranks the
+  // table, so the pair below would have been satisfied by the run-time
+  // observation alone. The entry the plugin ships is a fact of its own — it has
+  // the measured ceiling, and it names the catalogue value it was measured
+  // against, which is what makes it live rather than stale.
+  assert.equal(
+    LIMITS["longcat-2.5-preview-free"]?.output?.value,
+    262144,
+    "the shipped ceiling has to be the measured one, not only what a live refusal would say",
+  );
+  assert.equal(
+    LIMITS["longcat-2.5-preview-free"]?.output?.declaredAt,
+    131072,
+    "and it has to carry the catalogue value it was measured against, which is what survives staleness",
+  );
   assert.deepEqual(limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }), {
     output: 262144,
   });
@@ -923,10 +988,12 @@ test("a multi-byte character split across two reads is decoded whole", async () 
   assert.equal(read.text, text, "the character is whole, not one replacement per piece");
   assert.equal(read.ended, true, "and the body was read to its end");
   assert.equal(read.over, false, "so nothing of it was cut");
-  // The same body through the character-count chunker this file already uses:
-  // `abc日` is four characters, so a chunk of five carries two of 日's three
-  // bytes and the next read opens with the third. This is the shape the suite
-  // had no fixture for, which is why the mutant survived it.
+  // The same body through the character-count chunker this file already uses.
+  // It slices by UTF-16 code units, so it can cut a chunk in the middle of a
+  // surrogate pair — and then the encoder replaces the half-pair it was handed,
+  // which is a fact about the fixture rather than about the reader. What it can
+  // be asked is the question it really asks: a body arriving in pieces, every
+  // piece a whole number of characters, still comes back as its own text.
   const chunkedRead = await within(
     1000,
     readBoundedText(refusal(text, { size: 5, status: 400 }), 4096),
@@ -935,6 +1002,27 @@ test("a multi-byte character split across two reads is decoded whole", async () 
   assert.equal(chunkedRead.text, text, "the same character, split by the same rule");
   assert.equal(chunkedRead.ended, true);
   assert.equal(chunkedRead.over, false);
+  // ...and the split that only a byte-wise reader can be asked: the same body,
+  // its bytes cut inside 日 rather than between two characters. The chunker
+  // above cannot state this — `text.slice` counts code units, and a code unit
+  // boundary that does not land on a character boundary corrupts the fixture
+  // before the reader ever sees it (`"ab日本def".slice(0, 4)` ends on half a
+  // surrogate pair, which `TextEncoder` replaces) — so the fixture is stated in
+  // bytes, and the reader is the thing that carries its decoder across the cut.
+  const cut = new TextEncoder().encode("ab日本def");
+  const insideChar = await within(
+    1000,
+    readBoundedText(new Response(splitAt("ab日本def", 3, 6), { status: 400 }), 4096),
+    "a read cut inside a character by its bytes",
+  );
+  assert.deepEqual(
+    [...cut.slice(3, 6)],
+    [0x97, 0xa5, 0xe6],
+    "the cuts have to land inside 日 and inside 本, not between two characters",
+  );
+  assert.equal(insideChar.text, "ab日本def", "a character whose bytes the read was cut inside is whole");
+  assert.equal(insideChar.ended, true);
+  assert.equal(insideChar.over, false);
 });
 
 // The budget is counted in characters of decoded text, and the read that reaches

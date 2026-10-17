@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { capture, fingerprintTarget, invokedDirectly, report } from "./capture.mjs";
+import { capture, drySummary, fingerprintTarget, invokedDirectly, report } from "./capture.mjs";
 
 // The capture itself may not be run here: a real run starts a server and writes
 // a fingerprint. So the two halves either side of that run are driven directly —
@@ -87,10 +87,18 @@ function fakeChild() {
 
 // `report` ends in process.exit for every path a case pins, so the exit is
 // stubbed and the lines it printed are collected. The stub is not where a
-// subprocess would end; it is how the branch is read. `timers`, when a case asks
-// for it, is where a spy on `setTimeout` records the watchdog `capture` arms,
-// with the flag that says whether the run cleared it again.
-function offline(body, { timers } = {}) {
+// subprocess would end; it is how the branch is read.
+//
+// `watchTimers`, when a case asks for it, spies on `setTimeout` so a watchdog
+// `capture` arms can be seen at all — a real 120 s wait cannot be waited out
+// inside a test. The handle a case is handed is what makes the answer belong to
+// this run rather than to the process: the spy records every handle armed while
+// it is installed, `armed()` reads the ones armed *since the call* and remembers
+// them, and `cleared()` is asked of those handles only. A case that asserts on
+// how many timers exist in the process is asserting on whatever else happened to
+// be running; one that asserts on the handles taken between two points of its own
+// path is asserting on the path.
+function offline(body, { watchTimers = false } = {}) {
   const exit = process.exit;
   const log = console.log;
   const error = console.error;
@@ -98,16 +106,21 @@ function offline(body, { timers } = {}) {
   const clearTimer = globalThis.clearTimeout;
   const lines = [];
   let code;
+  const armedWhileWatching = [];
+  let watched = [];
+  let armedSince = 0;
   process.exit = (value) => {
     code = value;
     throw new Error(`process.exit(${value})`);
   };
   console.log = (line) => lines.push(String(line));
   console.error = (line) => lines.push(String(line));
-  if (timers) {
+  if (watchTimers) {
     globalThis.setTimeout = (fn, ms, ...rest) => {
+      // `setTimer`, not `globalThis.setTimeout`: the spy has replaced the global,
+      // and calling it back would be the spy calling itself.
       const handle = setTimer(fn, ms, ...rest);
-      timers.push(Object.assign(handle, { cleared: false }));
+      armedWhileWatching.push(Object.assign(handle, { cleared: false }));
       return handle;
     };
     globalThis.clearTimeout = (handle) => {
@@ -120,6 +133,21 @@ function offline(body, { timers } = {}) {
     get code() {
       return code;
     },
+    // From here on, the handles this returns are this path's and nothing else's:
+    // whatever was armed before the call belongs to whoever else is running, and
+    // is neither counted nor required to have been cleared by this body. The
+    // index is kept rather than a copy so that a handle armed after the call and
+    // after the assertion — a stray one that outlives the case — is still the
+    // path's to answer for.
+    armed: () => {
+      armedSince = armedWhileWatching.length;
+      watched = [];
+      return watched;
+    },
+    armedCount: () => armedWhileWatching.length - armedSince,
+    cleared: () =>
+      armedWhileWatching.slice(armedSince).every((handle) => handle.cleared) &&
+      watched.every((handle) => handle.cleared),
     run: async () => {
       try {
         await body();
@@ -132,7 +160,7 @@ function offline(body, { timers } = {}) {
         process.exit = exit;
         console.log = log;
         console.error = error;
-        if (timers) {
+        if (watchTimers) {
           globalThis.setTimeout = setTimer;
           globalThis.clearTimeout = clearTimer;
         }
@@ -239,21 +267,25 @@ test("a spawn failure takes the watchdog and the signal handlers with it", async
   // a Ctrl-C. `setTimeout` is spied on rather than trusted to be noticed: what is
   // asked is whether the handler this module armed was cleared, which a real
   // 120 s wait cannot answer inside a test either way.
-  const timers = [];
   const run = fakeChild();
   const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
   const captureRun = offline(async () => {
+    // Taken before the capture starts, so every handle counted below was armed by
+    // this body. The count used to be of the process: `timers.length === 1` was a
+    // claim about whatever else had called setTimeout since the spy went in, and
+    // it happened to hold because nothing else did.
+    const watched = captureRun.armed();
     const pending = capture("probe", run.spawn);
     run.emit("error", new Error("ENOENT"));
     assert.deepEqual(await pending, { code: 1, ran: false });
-  }, { timers });
-  try {
-    await captureRun.run();
-  } finally {
-    for (const handle of timers) clearTimeout(handle);
-  }
-  assert.equal(timers.length, 1, "the watchdog is the one timer this path arms");
-  assert.equal(timers[0].cleared, true, "and the spawn failure must clear it");
+    assert.equal(captureRun.armedCount(), 1, "the watchdog is the one timer this path arms");
+    // The handle captured above is the watchdog this body armed, and it is asked
+    // about by identity rather than by position in the process's timer list.
+    assert.equal(watched.length, 0, "nothing was armed before the capture started");
+  }, { watchTimers: true });
+  await captureRun.run();
+  assert.equal(captureRun.armedCount(), 1, "the watchdog is the one timer this path arms");
+  assert.equal(captureRun.cleared(), true, "and the spawn failure must clear it");
   assert.deepEqual(
     [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
     before,
@@ -264,12 +296,19 @@ test("a spawn failure takes the watchdog and the signal handlers with it", async
 test("the signal handlers are dropped once the child is gone", async () => {
   // A `process.once` that has not fired stays armed, and settling an already
   // settled promise is a no-op: a Ctrl-C during the write phase would be
-  // swallowed rather than end the script.
+  // swallowed rather than end the script. The watchdog is asked about here too:
+  // an exit is the other way this promise is settled, and the timer that would
+  // outlive it is the same one.
   const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
   const run = fakeChild();
-  const pending = capture("probe", run.spawn);
-  run.emit("exit", 0, null);
-  assert.deepEqual(await pending, { code: 0, ran: true });
+  const captureRun = offline(async () => {
+    const pending = capture("probe", run.spawn);
+    run.emit("exit", 0, null);
+    assert.deepEqual(await pending, { code: 0, ran: true });
+  }, { watchTimers: true });
+  await captureRun.run();
+  assert.equal(captureRun.armedCount(), 1, "the exit path arms one watchdog");
+  assert.equal(captureRun.cleared(), true, "and the exit path must clear it");
   assert.deepEqual(
     [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
     before,
@@ -351,14 +390,31 @@ test("the anthropic shape is refused for what it is, before the per-tool schema 
 });
 
 test("a --dry report names the agent whenever it moved, required list or not", async () => {
-  // The ternary that built this summary was dead, and the guard on the line
-  // above it dropped "the agent" whenever the required list had also changed: a
-  // run where both moved reported the change count alone. The stored required
-  // list carries two names this request does not, so the list moved too.
-  const scratch = scratchFingerprint({ required: [...SHIPPED.required, "write", "edit"] });
+  // The ternary that built this summary was dead, and what replaced it dropped
+  // "the agent" whenever the required list had also changed. That guard is only
+  // reached when the required list did *not* move, so the run that pins it has to
+  // be one where the list stood still — and which list moved is not something a
+  // fixture gets to choose. `report` compares against the capture this process
+  // imported (`PROFILES`, capture.mjs:291), and the list it captures is the
+  // `REQUIRED` literal in capture.mjs, so the two agree for every run that is not
+  // a hand-edited fingerprint changing under a stale module: a stored list that
+  // differs from the request is a list that *already* disagreed with `REQUIRED`,
+  // and it is still written back over. The case that used to stand here put
+  // `write` and `edit` in the fixture and called that "the list moved too", which
+  // it never was — the fixture's tools were the short ones, every tool read
+  // CHANGED, and the summary was the agent alone. So this is the honest version
+  // of the same claim: nothing but the agent moved, and it is still named.
+  const names = Object.keys(SHIPPED.tools);
+  const scratch = scratchFingerprint({ names, required: [...SHIPPED.required] });
+  const stored = scratch.read();
+  stored.profiles["1.x"].tools = Object.fromEntries(names.map((name) => [name, SHIPPED.tools[name]]));
+  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
   const captureRun = offline(() =>
     report({
-      request: requestFor(bodyFor(toolsOf(NAMES)), "opencode/1.99.0 ai-sdk/provider-utils/9.9.9 runtime/bun/9.9.9"),
+      request: requestFor(
+        bodyFor(names.map((name) => ({ type: "function", function: SHIPPED.tools[name] }))),
+        "opencode/1.99.0 ai-sdk/provider-utils/9.9.9 runtime/bun/9.9.9",
+      ),
       code: 0,
       fingerprint: scratch.path,
       dry: true,
@@ -372,12 +428,50 @@ test("a --dry report names the agent whenever it moved, required list or not", a
   assert.equal(captureRun.code, 1, "a change under --dry exits non-zero");
   const summary = captureRun.lines.filter((line) => line.includes("would change"));
   assert.equal(summary.length, 1, `one summary line expected:\n  ${captureRun.lines.join("\n  ")}`);
-  assert.match(summary[0], /change\(s\) and the agent would change\. Nothing written \(--dry\)\./);
+  // No count: every tool was compared and matched, and the agent is named on its
+  // own rather than beside a number that would have to be zero. The summary
+  // carries a leading newline, which is why this is read trimmed.
+  assert.equal(
+    summary[0].trim(),
+    "the agent would change. Nothing written (--dry).",
+    `nothing but the agent moved, and the agent has to be named:\n  ${captureRun.lines.join("\n  ")}`,
+  );
+  assert.equal(
+    captureRun.lines.some((line) => line.startsWith("  bash") && line.includes("CHANGED")),
+    false,
+    `the shipped wording must compare equal, or this case is about a moved tool:\n  ${captureRun.lines.join("\n  ")}`,
+  );
   assert.equal(
     captureRun.lines.some((line) => line.includes("wrote")),
     false,
     "--dry must not say it wrote",
   );
+});
+
+test("the --dry summary names the agent beside a change count when both moved", () => {
+  // The run above reaches the summary with a count of zero, and a count of zero
+  // is the one case where "the agent" stands alone. The case the old guard was
+  // about — a count *and* a moved agent, so "the agent" has to be said beside the
+  // count — cannot be driven through `report` from a fixture, and the reason is
+  // structural rather than a gap in this file: `report` compares against the
+  // capture this process imported (`PROFILES`), while the list it captures and
+  // writes back is the `REQUIRED` literal in capture.mjs, so the two are the same
+  // list by construction and `requiredChanged` is false for every run. The guard
+  // `agentChanged && !requiredChanged` therefore decides exactly what
+  // `agentChanged` decides, which makes re-injecting it a behaviour-equivalent
+  // mutation of `report` that no fixture can catch — not a case this test is
+  // failing to build. `changed` is the half that does vary, and the pair that
+  // matters is pinned here instead, directly: a count with the agent dropped from
+  // beside it is what "1 change(s) would change." is, a report that never names
+  // the one thing whose move it cannot count.
+  assert.deepEqual(
+    drySummary({ changed: 3, agentChanged: true }),
+    ["3 change(s)", "the agent"],
+    "a count and a moved agent are two things and both are said",
+  );
+  assert.deepEqual(drySummary({ changed: 0, agentChanged: true }), ["the agent"]);
+  assert.deepEqual(drySummary({ changed: 3, agentChanged: false }), ["3 change(s)"]);
+  assert.deepEqual(drySummary({ changed: 0, agentChanged: false }), []);
 });
 
 test("a --dry run writes nothing", async () => {
@@ -488,10 +582,69 @@ test("a write that cannot land leaves the target alone and cleans up after itsel
     scratch.remove();
   }
   assert.notEqual(raised, undefined, "a write that cannot be made must be raised, not swallowed");
+  // The error has to be the one that says why the capture was not written. The
+  // cleanup of the temp path runs on this same path and cannot succeed here — a
+  // directory is what the write failed on — so `rmSync` raises ERR_FS_EISDIR,
+  // and letting that replace the write's error is how this path used to report a
+  // cleanup failure as the reason a capture was not written. Both codes come out
+  // of the same EISDIR an unwritable directory produces; they are not the same
+  // error, and only the first one names what has to be moved out of the way.
+  assert.equal(raised?.code, "EISDIR", `the write's own error must arrive: ${raised?.message}`);
+  assert.notEqual(raised?.code, "ERR_FS_EISDIR", "the cleanup's error must not be the one raised");
+  assert.ok(
+    raised?.message.includes(`${scratch.path}.tmp`),
+    `the write error names the path it could not write: ${raised?.message}`,
+  );
+  // The cleanup did fail, and that is said rather than raised: a temp file left
+  // behind is worth a line, and the next run reading it as its own capture is the
+  // thing the line is about.
+  assert.equal(
+    captureRun.lines.some((line) => line.includes("could not remove") && line.includes(`${scratch.path}.tmp`)),
+    true,
+    `a cleanup that could not run has to be reported, not raised:\n  ${captureRun.lines.join("\n  ")}`,
+  );
   assert.equal(after, before, "the target must be exactly what it was");
   assert.equal(
     captureRun.lines.some((line) => line.includes("wrote")),
     false,
     "a failed write must not be reported as a write",
   );
+});
+
+test("a failed write with nothing to clean up says nothing about cleanup", async () => {
+  // The control for the case above: a temp path that is a stale regular file
+  // instead of a directory. The removal succeeds, so the run must not report a
+  // cleanup it did not fail — a line here would be a false one.
+  const scratch = scratchFingerprint();
+  const wording = "A different wording for this tool, long enough to be read. ".repeat(4);
+  writeFileSync(`${scratch.path}.tmp`, "a half-written capture from a run that was interrupted");
+  const captureRun = offline(() =>
+    report({
+      request: requestFor(bodyFor(NAMES.map((name) => toolFor(name, { description: wording })))),
+      code: 0,
+      fingerprint: scratch.path,
+    }),
+  );
+  let raised;
+  let stored;
+  try {
+    try {
+      await captureRun.run();
+    } catch (cause) {
+      raised = cause;
+    }
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("could not remove")),
+      false,
+      `nothing failed to be removed here:\n  ${captureRun.lines.join("\n  ")}`,
+    );
+    // A stale temp file is not what stops a write: it is overwritten. The case
+    // above is the one where the write cannot land, and the two must not read
+    // alike.
+    assert.equal(raised, undefined, `a stale temp file does not stop the write: ${raised?.message}`);
+    stored = scratch.read().profiles["1.x"].tools.read.description;
+  } finally {
+    scratch.remove();
+  }
+  assert.equal(stored, wording.slice(0, 1200), "the capture landed over the stale temporary");
 });

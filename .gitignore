@@ -1,10 +1,14 @@
 node_modules/
 # npm rotates a debug log to `npm-debug.log.1`, `npm-debug.log.2026-10-17` or
-# `npm-debug.log.gz`: the name is kept and the ending is not `.log`, so `*.log`
-# below misses exactly the logs most likely to be the long ones.
-*.log
-*.log.*
-npm-debug.log*
+# `npm-debug.log.gz`: the name is kept and the ending is not `.log`, so the
+# `*.[Ll][Oo][Gg]` rule below misses exactly the logs most likely to be the long
+# ones. The three spellings are character classes for the reason given at `.env`
+# further down: ignore matching follows `core.ignorecase`, so on a case-sensitive
+# checkout a single-case pattern covers only the lowercase name — and npm's debug
+# log records the whole command line, the token in it included.
+*.[Ll][Oo][Gg]
+*.[Ll][Oo][Gg].*
+[Nn][Pp][Mm]-[Dd][Ee][Bb][Uu][Gg].[Ll][Oo][Gg]*
 .DS_Store
 # `npm pack` writes the tarball it reports into the working directory.
 *.tgz
@@ -16,34 +20,57 @@ npm-debug.log*
 # a commit: the npm token MAINTAINING.md describes lives in an npmrc outside it.
 # The log patterns above are deliberately unanchored, because npm's debug logs
 # record the whole command line and a log written from a subdirectory is the
-# same leak. `*.log.*` and `npm-debug.log*` are that rule extended to the names a
-# rotation leaves, because npm renames a log rather than rewriting it — a rotated
-# log still holds the command line, it has just stopped ending in `.log`.
-.env
-.env.*
-!.env.example
-.npmrc
+# same leak. `*.[Ll][Oo][Gg].*` and `[Nn][Pp][Mm]-[Dd][Ee][Bb][Uu][Gg].[Ll][Oo][Gg]*`
+# are that rule extended to the names a rotation leaves, because npm renames a
+# log rather than rewriting it — a rotated log still holds the command line, it
+# has just stopped ending in `.log`.
+#
+# Those, and the four names under them, are character classes — `.[Ee][Nn][Vv]`
+# rather than `.env` — for the reason the key patterns further down state: on a
+# case-sensitive checkout a single-case pattern ignores only the lowercase name,
+# so `A.ENV` or `X.NPMRC`, the token file this project's own publish recipe
+# writes, was left to be committed.
+.[Ee][Nn][Vv]
+.[Ee][Nn][Vv].*
+# The template is the one file here a reader is meant to copy, and it is not a
+# secret: it is put back in every spelling the two classes above can match. The
+# literal `!.env.example` this replaces no longer covers them, because the class
+# on the line above also matches `.ENV.EXAMPLE` and `.Env.Example`.
+!.[Ee][Nn][Vv].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
+.[Nn][Pp][Mm][Rr][Cc]
 # The publish recipe in MAINTAINING.md writes its token to a file named `npmrc`,
-# which `.npmrc` does not match.
-npmrc
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-*.keystore
-*.der
-id_rsa*
+# which `.[Nn][Pp][Mm][Rr][Cc]` does not match. This dotless spelling is kept
+# beside it, and carries the same case coverage, so neither form is narrowed.
+[Nn][Pp][Mm][Rr][Cc]
+# Every secret pattern below is spelled as a double-written character class,
+# `*.[Pp][Ee][Mm]` rather than `*.pem`. `.gitignore` matching is case-sensitive
+# and follows `core.ignorecase`, so on a case-sensitive checkout (Linux CI, a
+# macOS volume) the single-case spellings ignore only the lowercase names and
+# let `CERT.PEM`, `KEY.P12` and `ID_RSA` through. This repository is published to
+# npm, so a checkout that ignores half the keys is not good enough. The classes
+# stay one extension per line: nothing here matches a file without the exact
+# extension, and `LICENSE`, `NOTICE` and `.env.example` are untouched.
+*.[Pp][Ee][Mm]
+*.[Kk][Ee][Yy]
+*.[Pp]12
+*.[Pp][Ff][Xx]
+*.[Jj][Kk][Ss]
+*.[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]
+*.[Dd][Ee][Rr]
+[Ii][Dd]_[Rr][Ss][Aa]*
+[Ii][Dd]_[Ee][Dd]25519*
+[Ii][Dd]_[Ee][Cc][Dd][Ss][Aa]*
+[Ii][Dd]_[Dd][Ss][Aa]*
+*.[Pp][Pp][Kk]
+
 # The public halves are not secrets, and a fixture or a deploy note legitimately
-# carries one: `id_rsa*` above swallows them, so they are put back by name.
-!id_rsa.pub
-id_ed25519*
-!id_ed25519.pub
-# The rest of `ssh-keygen`'s types, and PuTTY's own key file — the one most
-# likely to be sitting in the working directory on the Windows setup this
-# project targets.
-id_ecdsa*
-!id_ecdsa.pub
-id_dsa*
-!id_dsa.pub
-*.ppk
+# carries one: the `id_*` lines above swallow them, so they are put back by name.
+# These are written as classes too, and not only for consistency: the excludes
+# above now cover every case, so a literal `!id_rsa.pub` would put back just the
+# lowercase name and leave `ID_RSA.PUB` ignored. The matching set is widened on
+# purpose — dropping an ignored public key only ever covers a publishing fixture,
+# and it cannot un-ignore a private one, which none of these names can spell.
+![Ii][Dd]_[Rr][Ss][Aa].[Pp][Uu][Bb]
+![Ii][Dd]_[Ee][Dd]25519.[Pp][Uu][Bb]
+![Ii][Dd]_[Ee][Cc][Dd][Ss][Aa].[Pp][Uu][Bb]
+![Ii][Dd]_[Dd][Ss][Aa].[Pp][Uu][Bb]

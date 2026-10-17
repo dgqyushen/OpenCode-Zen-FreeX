@@ -94,6 +94,13 @@ function carries(snapshot, accumulated, fields) {
   return weight(snapshot, fields) > 0 || weight(accumulated, fields) === 0;
 }
 
+// Whether a value can be read as a snapshot of something the stream
+// accumulated. A snapshot is the upstream's own view of an item, a block or a
+// part; a null, a string or a list is not one, and stands in for nothing.
+function isSnapshotObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function chatAccumulator() {
   const body = { object: "chat.completion", choices: [] };
   const choices = new Map();
@@ -184,67 +191,178 @@ function chatAccumulator() {
 function responsesAccumulator() {
   let body = { object: "response", output: [] };
   let final;
-  const output = new Map();
+  // The items a reply holds, in the order the stream opened them, keyed by the
+  // order itself. The key is not the item's output_index: an index the
+  // upstream states and an index this file has to infer are two different
+  // things, and while they shared one key space a frame that stated
+  // `output_index: 0` landed on the item an earlier frame had inferred into
+  // slot 0 — `keep` read the second item as a newer view of the first and the
+  // reply answered 200 with one item of the two, wearing the first one's id.
+  // One key space per fact: `output` follows the arrival order, `indexMap`
+  // holds only the indices the upstream itself stated, and a frame that states
+  // an index no item holds opens a new item rather than displacing one.
+  const output = new Map(); // arrival order -> { value, id, index }
+  let next = 0;
+  const indexMap = new Map(); // stated output_index -> arrival order
+  // The id a streamed item was named by, once a frame names it: an item opened
+  // by a frame that carries no id of its own is named by the frames after it.
+  const idMap = new Map(); // item id -> arrival order
   // The fields a streamed item fills in: a message its content, a call its
   // arguments, a reasoning item its summary.
   const fields = ["content", "arguments", "summary", "text"];
-  // The slot a frame belongs to: the output_index it carries, or the slot
-  // of the item it names when the upstream left output_index out. A frame
-  // naming an item the stream never opened has no slot at all — slot 0 is
-  // only for a frame that names nothing, which a stream that never indexed
-  // its items means as the first one. Merging an unknown item into slot 0
-  // was measured handing a function_call there the text of a message. An
-  // `added` frame opens an item, so the id it names is new there by
-  // definition and takes the next free slot; a frame that has to find an
-  // item that is already open still throws — unless the reply holds exactly
-  // one item of the frame's own kind with no id of its own, which is the item
-  // the frame is naming: measured on this route, a call's output_item.added
-  // can arrive carrying no id at all and every frame after it names the item
-  // by an id of its own, so the id is adopted onto the item the stream opened
-  // for that call, and one call stays one item. Two candidates, or none of
-  // the frame's kind, is still not something to guess at, and still throws.
-  function slot(data, id, fresh = false, kind) {
-    if (data.output_index !== undefined) return index(data.output_index);
-    if (id === undefined || id === null || id === "") return index(undefined);
-    const position = [...output].find(([, value]) => value.id === id)?.[0];
-    if (position !== undefined) return index(position);
-    if (!fresh) {
-      const candidates = [...output].filter(([, value]) => !value.id && value.type === kind);
-      if (candidates.length === 1) {
-        const [position, value] = candidates[0];
-        value.id = id;
-        return index(position);
+  // The newest item this stream opened without an id, by kind: a reply whose
+  // frames name nothing at all is one the upstream never indexed, and every
+  // frame after its item — the ones that say `added` and the ones that only
+  // fill a field in — belongs to that item. Remembering where it is keeps a
+  // frame with no id from opening a second item of its own kind (`item()`
+  // defaults to "message", so a text delta of such a reply would), while a
+  // frame of another kind is still not allowed to continue the wrong item —
+  // measured: a response's text landing on its function call. An item that
+  // adopts an id later still has the frames after the id that name nothing at
+  // all, so the slot stays here after it is named.
+  const openNone = new Map();
+  // What a streamed item is named by, when it is named at all: a non-empty
+  // string. `""` names nothing a client can key by, and neither does a number
+  // or a boolean — an item whose id is `0` or `false` has no identity here,
+  // however loudly the upstream says it. The same rule, in the same words, as
+  // `identity()` in tool-response.mjs: one upstream value must not be a name to
+  // one file and no name to the other, or two items of one reply share an item
+  // (measured: two calls with `"id": 0` and their own output_indexes — 0 and 1 —
+  // resolved to the first one's item, and the second call's arguments were
+  // written over the first's).
+  function identity(value) {
+    return typeof value === "string" && value !== "" ? value : undefined;
+  }
+  const at = (id) => idMap.get(id);
+  // Whether a record is still nameless: it was opened by a frame that said
+  // nothing about what it is, which is the one shape an id-less frame or a
+  // stated index may still claim as its own.
+  const nameless = (record) => record.id === undefined && record.index === undefined;
+  // A record's item and the item's identity are one fact told twice: the
+  // frames that follow a name an item took must answer by it, and the finished
+  // item must carry it. Written once, so the two cannot drift.
+  function named(slot, id) {
+    const record = output.get(slot);
+    record.id = id;
+    if (record.value !== undefined) record.value.id = id;
+    // Which item a frame that names the word alone reaches, when the reply has
+    // spent the word on two items: the one that took it last — the item the
+    // stream is working on, which is the reading this file already gives a
+    // frame that names nothing at all (openNone, above). The item it pointed
+    // at before keeps the id it answered with; only the routing moves. Measured
+    // on two calls sharing one id, each with its own output_index and one of
+    // them naming the id alone in its arguments frames: the older item held the
+    // word and every argument of the newer landed on it, so the reply came back
+    // with the newer call's arguments on both items.
+    idMap.set(id, slot);
+  }
+  // The record a frame belongs to. What it states comes first: the
+  // output_index it carries, then the item id it names — an item is the one
+  // its own frames say it is. What it leaves to this file comes second: a
+  // frame naming nothing continues the item the stream opened namelessly,
+  // which is what a reply that never indexed its items means. Anything else
+  // is a frame over an item this stream never opened, which is still not
+  // something to guess at.
+  function locate(data, id, opening = false, kind) {
+    const name = identity(id);
+    if (data.output_index !== undefined) {
+      const held = indexMap.get(index(data.output_index));
+      if (held !== undefined) return held;
+    } else if (name !== undefined) {
+      const held = at(name);
+      if (held !== undefined) return held;
+      const candidates = [...output].filter(
+        ([, record]) => record.id === undefined && record.value?.type === kind,
+      );
+      const open = openNone.get(kind);
+      if (open !== undefined && output.get(open).id === undefined) {
+        // The item the stream opened namelessly is the one an id-less reply
+        // names from the frames after it, so the id is adopted and one call
+        // stays one item (measured on this route: a call's output_item.added
+        // arrives with no id at all). An item that already has an id of its
+        // own is not it, and one named item is not a candidate at all.
+        named(open, name);
+        return open;
       }
+      if (!opening) {
+        // Exactly one nameless item of this kind is the item the frame names,
+        // so the id is adopted; two of them, or none, is a guess.
+        if (candidates.length === 1) {
+          const [held] = candidates[0];
+          named(held, name);
+          return held;
+        }
+        throw new Error("Upstream frame names an unknown item without an output index");
+      }
+    } else if (!opening) {
+      const open = openNone.get(kind);
+      if (open !== undefined) return open;
+      const candidates = [...output].filter(
+        ([, record]) => nameless(record) && record.value?.type === kind,
+      );
+      if (candidates.length === 1) return candidates[0][0];
       throw new Error("Upstream frame names an unknown item without an output index");
     }
-    let next = 0;
-    for (const held of output.keys()) next = Math.max(next, held + 1);
-    return index(next);
+    // A stated index this stream has not seen opens the item it names; the
+    // item a stream opens namelessly takes its place in the arrival order,
+    // which no stated index can collide with.
+    const slot = next++;
+    const record = { value: undefined, id: undefined, index: undefined };
+    output.set(slot, record);
+    if (data.output_index !== undefined) {
+      record.index = index(data.output_index);
+      indexMap.set(record.index, slot);
+    }
+    if (name !== undefined) {
+      // An `added` frame opens an item, and the id it carries is that item's
+      // own even when the reply has spent the word on an item already. A
+      // stated index says this frame belongs to another item, and a stated
+      // index is a fact about the reply; an id another item happens to hold is
+      // not a reason to refuse the frame. Refusing it lost the whole reply —
+      // two calls, one name, and a client that gets neither — where the
+      // upstream's own contradiction costs the reply only its second name.
+      named(slot, name);
+    }
+    if (nameless(record) && name === undefined) openNone.set(kind, slot);
+    return slot;
   }
   // A snapshot replaces the item in its slot only when it is a whole view of
   // it; a partial one leaves what the deltas delivered standing. A snapshot
   // that carries no id does not take away the one the stream named the item by
-  // (slot, above): the item's own snapshot arrives without it in the shape
+  // (locate, above): the item's own snapshot arrives without it in the shape
   // that names an item from the frames after it, and taking the snapshot as it
   // stands lost the id again. One that carries an id still wins, as it did.
-  function keep(position, value) {
-    if (carries(value, output.get(position), fields)) {
-      const held = output.get(position);
-      if (held?.id && !value.id) value.id = held.id;
-      output.set(position, value);
-    }
+  function keep(slot, value) {
+    const record = output.get(slot);
+    if (!carries(value, record.value, fields)) return;
+    // The id is inherited by the same item's partial view, never by another
+    // item. The slot is the item's own — locate resolves a stated index or id
+    // to the item that stated it, and opens a new item for one no item holds —
+    // so the snapshot in it names the same item, and a snapshot that brings an
+    // id of its own is that item named at last.
+    const stated = identity(value.id);
+    if (stated === undefined && record.id !== undefined) value.id = record.id;
+    record.value = value;
+    if (stated !== undefined) named(slot, stated);
+    if (record.index !== undefined) indexMap.set(record.index, slot);
   }
   function item(data, type = "message") {
-    const position = slot(data, data.item_id, false, type);
-    if (!output.has(position)) {
+    // The name is read the one way this file reads one (identity, above), so a
+    // frame carrying `0` or `false` opens the same item a frame carrying no id
+    // at all does, rather than one that is half-named.
+    const slot = locate(data, identity(data.item_id), false, type);
+    const record = output.get(slot);
+    if (record.value === undefined) {
       const value = { type };
-      if (data.item_id) value.id = data.item_id;
+      // locate has already recorded the name on the record when the frame
+      // carried one, so the item takes the name it was opened with.
+      if (record.id !== undefined) value.id = record.id;
       if (type === "message") Object.assign(value, { role: "assistant", content: [] });
       if (type === "function_call") value.arguments = "";
       if (type === "reasoning") value.summary = [];
-      output.set(position, value);
+      record.value = value;
     }
-    return output.get(position);
+    return record.value;
   }
   return {
     apply(data, type) {
@@ -254,13 +372,18 @@ function responsesAccumulator() {
           // A snapshot that carries an item where the reply already has one
           // adds only what it actually carries: the accumulated items stand
           // against an output list it does not carry, or carries empty.
-          for (const [position, value] of (data.response.output ?? []).entries())
-            keep(position, value);
+          for (const value of data.response.output ?? [])
+            keep(locate({}, identity(value?.id), true, value?.type), value);
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
         if (data.item)
           keep(
-            slot(data, data.item.id, type === "response.output_item.added", data.item?.type),
+            locate(
+              data,
+              identity(data.item.id),
+              type === "response.output_item.added",
+              data.item?.type,
+            ),
             data.item,
           );
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
@@ -332,11 +455,40 @@ function responsesAccumulator() {
       if (data.usage) body.usage = { ...body.usage, ...data.usage };
     },
     finish() {
+      // The reply holds the items that reached a value — a frame described one
+      // and a snapshot may not have arrived yet. Their order is the order the
+      // upstream placed them in: the output_index it stated for an item is
+      // where that item sits in the reply, and an item it stated none for takes
+      // the first place no stated index claims, in the order the stream opened
+      // it. That is the ordering this file's slots used to give by construction
+      // — an indexed item sat at its index, an unplaced one at the next free
+      // number — and the client that reads no stream has only the array's order
+      // to read the reply by: answering the items in arrival order instead
+      // answered them 2 then 1 for a reply that said 1 then 2. A stated index
+      // is a fact and an inferred place is a guess, so where the two meet the
+      // stated index keeps its place and the unplaced item takes the next one.
+      const items = () => {
+        const stated = new Set();
+        for (const record of output.values())
+          if (record.index !== undefined) stated.add(record.index);
+        const placed = [];
+        let free = 0;
+        for (const record of output.values()) {
+          if (record.value === undefined) continue;
+          if (record.index !== undefined) {
+            placed.push([record.index, record.value]);
+            continue;
+          }
+          while (stated.has(free)) free++;
+          placed.push([free++, record.value]);
+        }
+        return placed.sort(([a], [b]) => a - b).map(([, value]) => value);
+      };
       if (!final) {
-        body.output = sorted(output);
+        body.output = items();
         return body;
       }
-      const kept = sorted(output);
+      const kept = items();
       // A terminal object that carries no output of its own — absent, or
       // empty while the stream accumulated some — is not a whole view of the
       // reply: returning it verbatim discards every delta already delivered,
@@ -363,6 +515,19 @@ function responsesAccumulator() {
   };
 }
 
+// The block field each Anthropic text delta fills in. A Map rather than an
+// object literal, and one of them for the whole module rather than one per
+// delta: read off an object, a `delta.type` of "__proto__", "toString" or
+// "constructor" reached the member the prototype chain holds there and the
+// delta wrote that key onto its block — a key the delta never named, holding a
+// function that JSON.stringify then dropped. A Map holds no chain: those three
+// names are the misses they are.
+const ANTHROPIC_TEXT_FIELDS = new Map([
+  ["text_delta", "text"],
+  ["thinking_delta", "thinking"],
+  ["signature_delta", "signature"],
+]);
+
 function anthropicAccumulator() {
   let body = {
     type: "message",
@@ -380,12 +545,21 @@ function anthropicAccumulator() {
     apply(data, type) {
       if (type === "message_start") {
         body = { ...body, ...data.message };
+        // `content` is the one key of a message_start that `apply` fills in
+        // itself, and a value that is not a list of blocks — a string, a
+        // number, an object — is not a view of the reply to take it from: the
+        // spread above would set it on the body and answer with it, ahead of
+        // the blocks this stream accumulates. A null or a missing one is the
+        // shape every frame of this accumulator leaves alone already.
+        const stated = Array.isArray(data.message?.content) ? data.message.content : [];
+        body.content = stated;
         // A message_start that repeats beside the deltas it opened, or one
         // whose block has not been filled in yet, is a partial view of the
         // reply: a block that carries nothing where the accumulated one has
         // content leaves it standing.
-        for (const [position, block] of (data.message?.content ?? []).entries())
-          if (carries(block, blocks.get(position), fields)) blocks.set(position, block);
+        for (const [position, block] of stated.entries())
+          if (isSnapshotObject(block) && carries(block, blocks.get(position), fields))
+            blocks.set(position, block);
       } else if (type === "content_block_start") {
         // The same test message_start's blocks get, for the same reason: a
         // gateway re-emitting a block's opening frame carries a block that
@@ -393,19 +567,24 @@ function anthropicAccumulator() {
         // it would discard the text, thinking or signature the deltas
         // already delivered. A start with nothing accumulated applies, as
         // does one that carries content of its own.
+        //
+        // A frame that carries no block at all, or a null or a flat value
+        // where one belongs, is the same partial view: `carries` weighs it as
+        // nothing, so it was stored as it stood and the reply answered 200
+        // with a null among its content, or threw on the first delta that
+        // read a field of it. Nothing to take hold of is not a reason to fail
+        // a stream whose other frames are sound — it opens nothing, and the
+        // deltas that follow it are refused exactly like a delta with no
+        // block above them, which is the answer this file gives that shape.
         const position = index(data.index);
-        if (carries(data.content_block, blocks.get(position), fields))
+        if (isSnapshotObject(data.content_block) && carries(data.content_block, blocks.get(position), fields))
           blocks.set(position, data.content_block);
       } else if (type === "content_block_delta") {
         const position = index(data.index);
         const block = blocks.get(position);
         if (!block) throw new Error("Content delta without a content block");
         const delta = data.delta ?? {};
-        const field = {
-          text_delta: "text",
-          thinking_delta: "thinking",
-          signature_delta: "signature",
-        }[delta.type];
+        const field = ANTHROPIC_TEXT_FIELDS.get(delta.type);
         if (field) applyText(block, field, delta[field], true);
         if (delta.type === "input_json_delta") {
           argumentsJSON.set(

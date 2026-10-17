@@ -46,13 +46,30 @@ import { SDK, bootstrapProtocols, isFree } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
-const BASE = process.env.ZEN_BASE_URL ?? DEFAULT_BASE;
+// The route's own base, without the trailing slash a deployment's `ZEN_BASE_URL`
+// often carries. Every URL below is that base plus a path, and a base left with
+// its slash makes `//models` and `//chat/completions`: some routes treat the
+// doubled slash as a different path or answer it themselves, and the failure
+// reads as "the route or the catalogue could not be read … check the network"
+// about a variable the operator set by hand. This is provider.mjs's own rule for
+// its three URLs (`httpURL`, `url.href.replace(/\/+$/, "")`) stated here,
+// because the audit reads its base from the environment at module load and does
+// not go through the server to get at it. Exported so the rule can be asked
+// about directly: a constant would only show the answer for one spelling.
+export function baseFrom(value) {
+  return String(value ?? DEFAULT_BASE).replace(/\/+$/, "");
+}
+
+const BASE = baseFrom(process.env.ZEN_BASE_URL);
 const CATALOG_URL = process.env.ZEN_CATALOG_URL ?? CATALOG;
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
 // How many characters of a response body the audit reads. The reader is
 // limits.mjs's `readBoundedText`: the unit rule, the deadline and the release of
-// the rest of the body are all its, and only the budget is this file's.
-const READ_BUDGET = 4096;
+// the rest of the body are all its, and only the budget is this file's. Exported
+// because it is the number the tests' fixtures are built around — a fixture
+// pinned to a literal here goes on passing, and goes on meaning nothing, the
+// moment this constant moves.
+export const READ_BUDGET = 4096;
 const ASKED_CEILING = 1_000_000;
 // How many ids are asked at once. Each ask stops as soon as the answer starts,
 // so the connection and the upstream load stay modest while the 45 s abort of
@@ -66,13 +83,18 @@ const POOL = 4;
 // something this plugin has no SDK for is not offered by anyone: `jev-1.13-free`
 // is SystemOne, and stays out here for the same reason buildModels leaves it out.
 // "Free" is models.mjs's own answer, retirement included, so the audited set and
-// the offered set cannot drift apart. Exported for the tests.
+// the offered set cannot drift apart — and for an undescribed id that answer is
+// `isFree` with no description at all, which is the same `/i` rule buildModels
+// falls back on. Spelled `/-free$/` here it was case-sensitive, and an id like
+// `Foo-Free` — which the plugin does offer — was audited by nobody: a name the
+// audit does not read is a model this tool silently stops speaking for.
+// Exported for the tests.
 export function offeredIds(listing, catalog, snapshot = bootstrapProtocols) {
   return listing.filter((id) => {
     const protocol = snapshot?.[id];
     if (protocol !== undefined && !Object.hasOwn(SDK, protocol)) return false;
     const model = catalog?.[id];
-    if (!model) return /-free$/.test(id);
+    if (!model) return isFree(id);
     return isFree(id, model);
   });
 }
@@ -407,7 +429,12 @@ if (entry) {
   }
 }
 
-async function run() {
+// One audit: read the listing and the catalogue, ask every id the plugin would
+// offer, print what came back and judge it. Exported so a test can drive the
+// whole thing — the exit code, the summary and the candidate lines are the
+// answers it gives, and a test that reached only the helpers beside it could not
+// say whether they agree with each other.
+export async function run() {
   const names = [...PROFILES[GENERATION].required];
   const [listing, catalog] = await Promise.all([getJSON(`${BASE}/models`), getJSON(CATALOG_URL)]);
   const models = catalog?.opencode?.models ?? {};
@@ -460,7 +487,25 @@ async function run() {
     );
   }
 
-  const answered = rows.filter((row) => row.status === 200);
+  // "Answered" is this file's own word for a positive result, and a 200 is not
+  // the only shape it takes: an upstream that validates the ceiling it was asked
+  // for and names its own has answered the question this audit exists to ask —
+  // the file's header says so, and `findings` treats such a row as a candidate
+  // rather than as a failure. Counted as a 200 alone, a run where every id was
+  // refused in exactly that way printed its candidates and then said "nothing
+  // answered, so this says nothing about limits" and exited 1: the summary
+  // contradicting the table above it, and the exit code contradicting both.
+  //
+  // `says` alone is deliberately not enough. It is set on every refusal and on
+  // every transport failure alike — a 400 that names nothing, a 410 for a model
+  // that is gone, `status: 0` with a socket error in it — so counting it would
+  // call a run that reached nothing a run that answered. What is counted is a
+  // row that either served the request or named a limit: `ceiling` and `window`
+  // are the two axes only a refusal that stated something produces, and a row
+  // that named nothing has neither.
+  const answered = rows.filter(
+    (row) => row.status === 200 || row.ceiling !== undefined || row.window !== undefined,
+  );
   const candidates = findings(rows, new Set(Object.keys(LIMITS)));
   // Two different kinds of id, said as two lines. `elsewhere` was never asked —
   // the snapshot places it on a protocol this audit does not speak, and the
@@ -487,5 +532,12 @@ async function run() {
         : "\nNo offered id speaks the chat shape, so nothing was asked and this says nothing about limits.",
     );
     process.exitCode = 1;
+  } else {
+    // Said rather than left alone, so the rule at the top of this file has one
+    // answer instead of two: a run that answered sets 0, a run that did not sets
+    // 1. Left implicit, `undefined` was the success code after an earlier run in
+    // the same process had set 1 — the audit's answer was then whatever the last
+    // one was, which is no answer at all.
+    process.exitCode = 0;
   }
 }

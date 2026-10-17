@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { linkSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -57,6 +57,22 @@ test("the audit asks about the ids the listing offers, not every id the catalogu
   // the deepEqual above pins the listing's order, which is the order the table
   // prints in, so the guarantee is stated here rather than left implicit
   assert.deepEqual(offeredIds(["b-free", "a-free"], {}, {}), ["b-free", "a-free"]);
+  // "names itself free" is asked the way models.mjs asks it, case-insensitively.
+  // Spelled `/-free$/` here it was case-sensitive, so an id the plugin offers —
+  // `buildModels` reads its name with `/i` — was audited by nobody at all, and
+  // the run said so in no line: the id simply was not in the set.
+  for (const id of ["Foo-Free", "Foo-FREE", "foo-Free", "FOO-FREE"]) {
+    assert.deepEqual(offeredIds([id], {}), [id], `${id} names itself free whatever its case`);
+  }
+  // an id that does not end in `-free` is not offered on its name, whatever its
+  // case: the rule is the name's shape and not a broad match on "free"
+  assert.deepEqual(offeredIds(["Foo-Free-Tier", "free-Foo", "Foo"], {}), []);
+  // and the catalogue's own rule is the same one, so an id the catalogue retires
+  // stays out however it spells its name
+  assert.deepEqual(
+    offeredIds(["Gone-Free"], { "Gone-Free": { lifecycle: "retired", cost: { input: 0, output: 0 } } }),
+    [],
+  );
   // a snapshot can be handed in, so a test says what it knows without depending
   // on what the shipped one happens to carry
   assert.deepEqual(offeredIds(["x-free"], {}, { "x-free": "systemone" }), []);
@@ -299,19 +315,38 @@ test("the run/import question answers true, false, or an honest nothing", async 
   );
 });
 
-test("a junction naming this file is this file, not a different one", async () => {
+// The two cases below are about a file system that makes links, and the third is
+// about the one that does not: when the fixture cannot be built the case has to
+// be skipped, not reported as a pass. It was reported as a pass — the link call
+// failed, a `console.error` was written where nobody looks, and the `return`
+// jumped over every assertion — so a host that cannot make a junction certified
+// a behaviour nothing had exercised. The branch is written once here, both cases
+// take it, and what the runner was told is asserted by the case below: a report
+// that is not a skip fails whether it is a `console.error` or a bare `return`.
+function linked(t, make, what) {
+  try {
+    return make();
+  } catch (error) {
+    // A host that will not make a link — an unprivileged Windows account, a
+    // file system with no links — cannot be asked this question at all.
+    t.skip(`this host will not make ${what}: ${error?.message ?? error}`);
+    return undefined;
+  }
+}
+
+test("a junction naming this file is this file, not a different one", async (t) => {
   const { entryVerdict } = await subject();
   const real = fileURLToPath(new URL("./limits-audit.mjs", import.meta.url));
   const dir = mkdtempSync(join(tmpdir(), "limits-audit-"));
   const link = join(dir, "linked");
-  try {
-    symlinkSync(dirname(real), link, "junction");
-  } catch (error) {
-    // A host that will not make a link still has to run the rest of this file.
+  if (linked(t, () => symlinkSync(dirname(real), link, "junction"), "a junction") === undefined) {
     rmSync(dir, { recursive: true, force: true });
-    console.error(`skipped the junction case: ${error?.message ?? error}`);
     return;
   }
+  // The fixture has to exist before it can prove anything: a link call that
+  // answers without making one would fail below for a reason that is not the
+  // module's, so it is said here as the fixture it is.
+  assert.equal(statSync(link).isDirectory(), true, `the junction at ${link} has to exist`);
   try {
     const through = join(link, basename(real));
     // The module's own URL is the real path while argv[1] keeps the junction's
@@ -325,21 +360,17 @@ test("a junction naming this file is this file, not a different one", async () =
   }
 });
 
-test("two names for one file are one file, hard link or not", async () => {
+test("two names for one file are one file, hard link or not", async (t) => {
   const { entryVerdict } = await subject();
   const dir = mkdtempSync(join(tmpdir(), "limits-audit-link-"));
   try {
     const one = join(dir, "one.mjs");
     const two = join(dir, "two.mjs");
     writeFileSync(one, "// one file, two names\n");
-    try {
-      linkSync(one, two);
-    } catch (error) {
-      // A file system that will not make a hard link still has to run the rest
-      // of this file.
-      console.error(`skipped the hard-link case: ${error?.message ?? error}`);
-      return;
-    }
+    if (linked(t, () => linkSync(one, two), "a hard link") === undefined) return;
+    // ...and a link that was called for and is not there is a failed fixture
+    // rather than an answer about anything.
+    assert.equal(statSync(two).isFile(), true, `the hard link at ${two} has to exist`);
     // A hard link has no target to resolve, so realpath keeps the two names and
     // only file identity can say they are one file. A comparison that stopped at
     // the realpath would answer "different file" — "asked nothing, exit 0".
@@ -353,6 +384,36 @@ test("two names for one file are one file, hard link or not", async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The third case, and the one the two above cannot state: what the runner is
+// told when the fixture cannot be built. `linked` is called with a linking call
+// that cannot succeed — the only way to reach that branch on a host that makes
+// links — and the report it makes is what is asserted. A `console.error` here
+// fails this case, and so does a `return` that reports nothing.
+test("a fixture this host cannot build is skipped, never reported as a pass", async () => {
+  const { entryVerdict } = await subject();
+  const real = fileURLToPath(new URL("./limits-audit.mjs", import.meta.url));
+  const asked = {};
+  const reason = linked(
+    { skip: (why) => (asked.reason = why) },
+    () => {
+      const error = new Error("EPERM: a symlink could not be created on this host");
+      error.code = "EPERM";
+      throw error;
+    },
+    "a junction",
+  );
+  assert.equal(reason, undefined, "nothing comes back for a fixture that was not built");
+  assert.match(
+    asked.reason,
+    /^this host will not make a junction: EPERM: a symlink could not be created on this host$/,
+    "the runner has to be told, in the words the junction case uses",
+  );
+  // ...and the answer a skipped case must not be mistaken for: with no entry
+  // point named, the question stays open rather than answering "not this file",
+  // which is the `false` that means "asked nothing, exit 0".
+  assert.equal(entryVerdict({ main: undefined, url: pathToFileURL(real).href, argv: ["node"] }), undefined);
 });
 
 test("an identity the file system will not give leaves the question open", async () => {
@@ -437,19 +498,41 @@ function unterminated(chunks, { stop, status = 400 }) {
 // is the answer it gets back. `fetch` is swapped for one case and put back in
 // `finally`: every test file of this run shares the process, so the global goes
 // back as soon as the case is answered.
+//
+// A queue that runs out is the one fact this helper knows and its caller does
+// not, so it is said here rather than left to the shape of a row. `ask()`
+// catches everything a request can throw — that is what keeps one broken id from
+// ending the run — so a bare `assert.ok` inside the stub was absorbed into a
+// `status: 0` row, and a case that reached for an answer that was not queued
+// went on to assert against whatever the row happened to be. What is thrown
+// instead is named, and the caller checks for it after the run has finished:
+// a shortfall is then this case's own failure and not an upstream error it
+// mistook for one.
+const EXHAUSTED = "fetch was called with no answer left in this case's queue";
+
 async function answering(responses, run) {
   const real = globalThis.fetch;
   const sent = [];
+  let shortfall = null;
   globalThis.fetch = async (url, options) => {
     sent.push({ url: String(url), method: options?.method });
-    assert.ok(responses.length, "ask() asked more often than this case queued answers");
+    if (!responses.length) {
+      shortfall = new Error(`${EXHAUSTED} — after ${sent.length} call${sent.length === 1 ? "" : "s"}`);
+      throw shortfall;
+    }
     return responses.shift();
   };
+  let result;
   try {
-    return { result: await run(), sent };
+    result = await run();
   } finally {
     globalThis.fetch = real;
   }
+  // Read after the run, because `ask()` would have caught anything thrown
+  // inside it: a row built from this failure is not the run's answer about a
+  // model, and a case that went on to assert against one proves nothing.
+  assert.equal(shortfall, null, shortfall?.message ?? "");
+  return { result, sent };
 }
 
 // The names `run()` asks with, from the same capture the module reads: `ask()`
@@ -472,7 +555,7 @@ const REFUSAL_BODY = JSON.stringify({ error: { message: REFUSAL_SAYS } });
 // audit needs from it: a refusal arriving over several reads is decoded whole,
 // and the budget is counted in characters rather than in bytes.
 test("a refusal is read through ask()'s own reader, cut at the character budget and no further", async () => {
-  const { ask } = await subject();
+  const { ask, READ_BUDGET } = await subject();
   const names = await askingNames();
   const encoder = new TextEncoder();
 
@@ -491,15 +574,18 @@ test("a refusal is read through ask()'s own reader, cut at the character budget 
   assert.equal(split.result.ceiling, 131072, "a ceiling behind a character split across reads is still read");
   assert.equal(split.result.says, REFUSAL_SAYS, "and the refusal is handed back whole, not as replacement characters");
 
-  // The refusal sits past 4096 bytes and inside 4096 characters: 1500 three-byte
-  // characters put it there, in a single read. The retired reader compared
-  // `value.byteLength` against a budget it counted in characters (measured: a
-  // 64-character budget stopped after 192 bytes of a 3-byte-per-character body),
-  // so it cut this body at 4096 bytes — around character 1365 — and the ceiling
-  // below was never read at all.
+  // The refusal sits past the budget in bytes and inside it in characters: 1500
+  // three-byte characters put it there, in a single read. The retired reader
+  // compared `value.byteLength` against a budget it counted in characters
+  // (measured: a 64-character budget stopped after 192 bytes of a 3-byte-per-
+  // character body), so it cut this body at the byte budget — around character
+  // 1365 — and the ceiling below was never read at all. The budget is the
+  // module's own exported constant, not a literal: pinned to 4096 here, this
+  // fixture would go on passing and go on meaning nothing the moment the
+  // constant moved.
   const wide = "漢".repeat(1500) + REFUSAL_BODY;
-  assert.ok(wide.length < 4096, "the fixture has to be inside the character budget");
-  assert.ok(encoder.encode(wide).length > 4096, "and past the byte budget the retired reader cut at");
+  assert.ok(wide.length < READ_BUDGET, "the fixture has to be inside the character budget");
+  assert.ok(encoder.encode(wide).length > READ_BUDGET, "and past the byte budget the retired reader cut at");
   const wideAnswer = await answering([streamOf([encoder.encode(wide)]).response], () => ask("wide-free", names));
   assert.equal(wideAnswer.result.ceiling, 131072, "the budget is characters, so the refusal is reached");
   assert.equal(wideAnswer.result.says, REFUSAL_SAYS);
@@ -555,10 +641,13 @@ test("a 200 is read only far enough to stop the answer, and names no limit", asy
 // stopped before the body did, and limits.mjs's own cut-aware reader — the one
 // `observeRouteStatement` uses — is what the audit asks now.
 test("a number the budget cut short declares no limit, and the same number inside it does", async () => {
-  const { ask } = await subject();
+  const { ask, READ_BUDGET } = await subject();
   const names = await askingNames();
   const encoder = new TextEncoder();
-  const budget = 4096;
+  // The module's own budget, not a literal that agrees with it today: every case
+  // below is about where the read stops, so a fixture built around a number this
+  // file repeats would go on passing while testing nothing the audit does.
+  const budget = READ_BUDGET;
 
   // A body whose `marker` ends on character `at` of the read, with a tail behind
   // it so the read stops at the budget rather than at the end of the body.
@@ -626,10 +715,10 @@ test(
   "a read stopped short of the budget names no limit, even when its last characters are a number",
   { timeout: 15_000 },
   async () => {
-    const { ask } = await subject();
+    const { ask, READ_BUDGET } = await subject();
     const names = await askingNames();
     const encoder = new TextEncoder();
-    const budget = 4096;
+    const budget = READ_BUDGET;
 
     // LongCat's wording ends with its ceiling, so a read that stopped inside the
     // body can be holding a whole-looking number. Two things below say the read
@@ -730,6 +819,42 @@ test("a request that cannot be built is that id's own row, not the end of the ru
   assert.equal(answer.ceiling, undefined);
 });
 
+// What a fixture that ran out of answers is not: a row about a model. `ask()`
+// catches everything a request can throw — that is what keeps one broken id from
+// ending the run — so a helper that only *reported* the shortfall had it
+// absorbed into a `status: 0` row and read back as an upstream error, which is
+// the one thing a shortfall is not. `answering` names it and hands it on, and
+// this is that promise: a case whose queue runs dry hears `EXHAUSTED` and not a
+// row, so it cannot go on to assert against a status it never made.
+test("an answer queue that runs dry is not a row about a model", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const { result } = await answering([], () => ask("nothing-queued-free", names)).then(
+    (answered) => ({ result: answered }),
+    (error) => {
+      assert.match(error.message, /fetch was called with no answer left in this case's queue/);
+      return { result: undefined };
+    },
+  );
+  assert.equal(result, undefined, "the shortfall has to come back as itself, not as a row");
+});
+
+// The same shortfall through the whole helper, which is where the earlier shape
+// of this test lived: two answers queued for one ask. The row the second ask
+// built was `status: 0` with the shortfall's sentence in `says` — a transport
+// error the run never had — and a case that asserted on the first row went on
+// regardless. Read here as the failure it is.
+test("a case that queued fewer answers than it was asked for fails on the shortfall", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const queued = [streamOf([new TextEncoder().encode(REFUSAL_BODY)]).response];
+  await assert.rejects(
+    () => answering(queued, () => Promise.all([ask("one-free", names), ask("two-free", names)])),
+    { message: /fetch was called with no answer left/ },
+    "a fixture that ran dry is the case's failure, not the second id's status",
+  );
+});
+
 test("the pair a row is judged by is the plugin's, not the catalogue's under it", async () => {
   const { withEffective } = await subject();
   // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue and
@@ -768,4 +893,173 @@ test("a sibling is measured against the pair the plugin declares, not the catalo
     findings([rows[1], rows[0]]).some((line) => line.includes("(200000/32000)")),
     false,
   );
+});
+
+// A whole run, driven end to end: the listing, the catalogue, ask() and the exit
+// code. The cases below are the ones the helpers beside them cannot state — the
+// summary is written by `run` and the exit code is `run`'s own answer, so a test
+// that reached only `findings` or `ask` could not say whether the two agree, and
+// that agreement is the whole of finding F6.
+
+// `run` prints; a test asserts on what it prints, so the writes are collected
+// rather than left in the runner's output. Console is process-global, and every
+// file of this run shares the process, so it goes back as soon as the case is
+// answered.
+async function captured(runIt) {
+  const real = console.log;
+  const lines = [];
+  console.log = (...parts) => lines.push(parts.join(" "));
+  try {
+    await runIt();
+    return lines;
+  } finally {
+    console.log = real;
+  }
+}
+
+// Two prices the run asks about, and the free bodies it gets back. Ids no other
+// case uses, so nothing here can be read off another case's row.
+const RUN_IDS = ["audit-run-a-free", "audit-run-b-free"];
+const RUN_CATALOG = {
+  opencode: {
+    models: {
+      "audit-run-a-free": { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } },
+      "audit-run-b-free": { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } },
+    },
+  },
+};
+// One run, with `fetch` and `console.log` injected, and the exit code read as
+// the run left it. The code is process-global too: a case that leaves it at 1
+// would fail the run the tests themselves live in, so what it was is put back
+// before this returns and the answer is carried out separately.
+async function auditRun(answers, run) {
+  const real = globalThis.fetch;
+  const realCode = process.exitCode;
+  const sent = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url);
+    sent.push({ url: target, method: options.method });
+    if (options.method !== "POST") {
+      const body = target.endsWith("/models")
+        ? { data: RUN_IDS.map((id) => ({ id })) }
+        : RUN_CATALOG;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    // The id is a field of the request, not part of its path: the route names
+    // one endpoint and the model travels in the body. Read from the bytes `ask`
+    // really sent, so a case cannot answer for an id it was not asked about.
+    const body = JSON.parse(String(options.body ?? "{}"));
+    const id = RUN_IDS.find((candidate) => candidate === body.model);
+    assert.notEqual(id, undefined, `a request this run was not expected to make: ${target} ${body.model}`);
+    const answer = answers[id];
+    if (!answer) throw new Error("connection refused");
+    return new Response(answer.body ?? REFUSAL_BODY, {
+      status: answer.status ?? 400,
+      headers: answer.headers ?? {},
+    });
+  };
+  let lines;
+  let code;
+  try {
+    lines = await captured(() => run());
+    // read before the restore below, which is the last thing this helper does
+    code = process.exitCode;
+  } finally {
+    globalThis.fetch = real;
+    process.exitCode = realCode;
+  }
+  return { lines, sent, code };
+}
+
+// The one finding F6 is: a run where every id was refused, and every refusal
+// named the ceiling it was refused for. That is the audit doing its job — the
+// header says the exit code is about whether an id answered, and a refusal that
+// states a limit is this tool's positive result — yet the run counted only
+// `status === 200`, so it printed its candidate lines and then said "Nothing
+// answered, so this says nothing about limits" and exited 1. The summary
+// contradicted the table above it and both contradicted the rule at the top of
+// the file. The exit code is asserted exactly, not merely for "not 1": a run
+// that never said anything is a worse answer than either.
+test("a run whose every id was refused with a limit named is a run that answered", async () => {
+  const { run } = await subject();
+  const { lines, sent, code } = await auditRun({ "audit-run-a-free": {}, "audit-run-b-free": {} }, run);
+  const printed = lines.join("\n");
+  // the run did happen: two asks, each a POST to the endpoint the audit asks
+  assert.equal(sent.filter((request) => request.method === "POST").length, 2);
+  for (const request of sent.filter((entry) => entry.method === "POST"))
+    assert.match(request.url, /\/chat\/completions$/);
+  // and what it printed is the candidate each refusal is worth
+  assert.match(
+    printed,
+    /audit-run-a-free: the route names a ceiling of 131072 completion tokens, the catalogue declares 32000/,
+  );
+  // the two halves of the answer have to agree: a summary that says nothing was
+  // learned, printed under a table of candidates, is the contradiction
+  assert.equal(printed.includes("Nothing answered"), false, printed);
+  assert.equal(printed.includes("says nothing about limits"), false, printed);
+  assert.equal(code, 0, `the exit code has to say an id answered\n${printed}`);
+});
+
+// The other side of the same rule, which must not change: a run that reached
+// nothing has learned nothing about limits, says so, and exits non-zero. The
+// summary and the message are asserted word for word, because they are what the
+// rule change had to leave alone.
+test("a run that reached nothing still says so and exits non-zero", async () => {
+  const { run } = await subject();
+  const { lines, sent, code } = await auditRun({}, run);
+  const printed = lines.join("\n");
+  assert.equal(sent.filter((request) => request.method === "POST").length, 2, "the asks were made and failed");
+  for (const id of RUN_IDS) assert.match(printed, new RegExp(`${id}\\s`), printed);
+  assert.match(printed, /0 candidates:/);
+  assert.match(printed, /Nothing answered, so this says nothing about limits\. Check the network or ZEN_BASE_URL and ask again\./);
+  assert.equal(code, 1, `a run that answered nothing must not exit 0\n${printed}`);
+});
+
+// A refusal that names no limit is the third case, and it belongs with the
+// second: a 400 whose words are about the request's own content is a question
+// this audit asked and was refused, but it is no answer about a limit. Counted
+// as one — by counting `says`, which every refusal carries — this run would exit
+// 0, and the "nothing answered" sentence would be gone from a run that really
+// did learn nothing.
+test("a refusal that names no limit is not an answer about limits", async () => {
+  const { run } = await subject();
+  const body = '{"error":{"message":"invalid request"}}';
+  const { lines, code } = await auditRun({ "audit-run-a-free": { body }, "audit-run-b-free": { body } }, run);
+  const printed = lines.join("\n");
+  // the refusal's own words reached the table, so the id really was refused and
+  // the run really read what it said
+  assert.equal(printed.includes("invalid request"), true, printed);
+  // ...and none of that is a limit, so the run answered nothing
+  assert.match(printed, /Nothing answered, so this says nothing about limits/);
+  assert.equal(code, 1, `a refusal that states no limit answers nothing\n${printed}`);
+});
+
+// The base URL a deployment sets is a variable, and a trailing slash is what
+// people write. Every URL this file builds is the base plus a path, so a base
+// left with its slash asks for `//models` and `//chat/completions`: a route that
+// does not answer those leaves the audit printing "the route or the catalogue
+// could not be read … check the network and ZEN_BASE_URL" about a slash, and the
+// operator checks their network. The rule is read as itself here, because the
+// constant that uses it is fixed at load and would only ever answer for one
+// spelling. `undefined` is the environment variable nobody set, which has to
+// come back as the shipped base rather than as the string "undefined".
+test("a base URL with a trailing slash does not become a doubled path", async () => {
+  const { baseFrom } = await subject();
+  const { DEFAULT_BASE } = await import("./provider.mjs");
+  assert.equal(typeof baseFrom, "function", "the base's own rule has to be stated where it can be asked about");
+  assert.equal(baseFrom("https://opencode.ai/inference/v1/"), "https://opencode.ai/inference/v1");
+  assert.equal(baseFrom("https://opencode.ai/inference/v1///"), "https://opencode.ai/inference/v1");
+  assert.equal(baseFrom("https://opencode.ai/inference/v1"), "https://opencode.ai/inference/v1");
+  assert.equal(baseFrom(undefined), DEFAULT_BASE, "nothing set is the shipped base, not the word");
+  // and the reason the rule exists, in the URLs this file really builds
+  for (const value of ["https://opencode.ai/inference/v1/", "https://opencode.ai/inference/v1"]) {
+    const models = `${baseFrom(value)}/models`;
+    const asked = `${baseFrom(value)}/chat/completions`;
+    assert.equal(models, "https://opencode.ai/inference/v1/models", models);
+    assert.equal(asked, "https://opencode.ai/inference/v1/chat/completions", asked);
+    assert.equal(models.slice(models.indexOf("://") + 3).includes("//"), false, models);
+  }
 });
