@@ -530,7 +530,7 @@ async function server(_input, options = {}) {
       methods: [
         {
           type: "api",
-          label: "Zen 免费访问（密钥填写 public）",
+          label: "Zen 免费访问（密钥填 public；个人 key 请加到内置的 OpenCode Zen）",
           placeholder: "public",
           async authorize() {
             return { type: "success", key: "public" };

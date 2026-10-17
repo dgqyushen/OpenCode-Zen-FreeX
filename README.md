@@ -39,6 +39,8 @@ magpie plugin login opencode-zen-free
 
 在密钥一栏填 `public`。不需要个人的 API key。
 
+密钥一栏里填什么都会被丢掉：插件登录时返回的就是那一个共享的 `public` 凭据，宿主存下的也是它。自己在 OpenCode 账号下签发的 key 在这里不做任何事，多填几把也不会变成多个账号——个人 key 请加到 magpie 内置的 OpenCode Zen provider，那里收多把 key，并能轮换、故障转移。
+
 凭据保存在 OpenCode 的 `auth.json` 或 magpie 的 `plugin-auth.json` 里。
 
 ## 模型
