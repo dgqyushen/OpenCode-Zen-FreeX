@@ -1,5 +1,10 @@
 node_modules/
+# npm rotates a debug log to `npm-debug.log.1`, `npm-debug.log.2026-10-17` or
+# `npm-debug.log.gz`: the name is kept and the ending is not `.log`, so `*.log`
+# below misses exactly the logs most likely to be the long ones.
 *.log
+*.log.*
+npm-debug.log*
 .DS_Store
 # `npm pack` writes the tarball it reports into the working directory.
 *.tgz
@@ -9,8 +14,11 @@ node_modules/
 
 # Secrets. Nothing here is written by this repository, and none of it belongs in
 # a commit: the npm token MAINTAINING.md describes lives in an npmrc outside it.
-# `*.log` above is deliberately unanchored, because npm's debug logs record the
-# whole command line and a log written from a subdirectory is the same leak.
+# The log patterns above are deliberately unanchored, because npm's debug logs
+# record the whole command line and a log written from a subdirectory is the
+# same leak. `*.log.*` and `npm-debug.log*` are that rule extended to the names a
+# rotation leaves, because npm renames a log rather than rewriting it — a rotated
+# log still holds the command line, it has just stopped ending in `.log`.
 .env
 .env.*
 !.env.example

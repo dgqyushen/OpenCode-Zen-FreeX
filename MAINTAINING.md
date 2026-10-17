@@ -108,6 +108,14 @@ under a short prompt answers 200 and writes nothing like it, and `mimo`'s refusa
 came back with the 200000 it was asked for rather than with a ceiling — and
 neither is a generation nobody watched finish.
 
+`witnessed`, the fourth evidence tier, is used by nothing that ships here. The
+table draws on `route`, `route-twin` and `vendor` only; `witnessed` — a
+generation somebody watched finish — is accepted because `limitOverrides` is
+exported and a caller may hand it a table that says so, and no shipped entry
+says it. A live refusal is not an entry either: `observeRouteStatement` applies
+one to the running process, for the rest of that process, and needs no record in
+this file.
+
 **What voids it.** Each axis records the catalogue value it was measured
 against, and an axis whose declaration moved is dropped rather than kept: a
 measurement of one question is not an answer to another. A catalogue that raises

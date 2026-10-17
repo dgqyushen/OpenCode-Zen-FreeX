@@ -10,9 +10,10 @@ itself is unmodified MIT.
 The fork is maintained separately from upstream under the name
 `opencode-zen-freex` (https://github.com/tkhs101/OpenCode-Zen-FreeX) because the
 free tier's request fingerprint moves faster than that repository follows it:
-the tool wording and User-Agent Zen accepts can be recaptured here with
-`bun run capture`, without waiting for a release upstream. `MAINTAINING.md`
-describes that loop.
+the tool wording and User-Agent Zen accepts can be recaptured with
+`bun run capture` from a clone of this repository — `capture.mjs` is a
+maintenance tool and is not part of the published tarball — without waiting for a
+release upstream. `MAINTAINING.md` describes that loop.
 
 The provider id this package registers, `opencode-zen-free`, is deliberately the
 same one upstream's plugin registers — a model is written

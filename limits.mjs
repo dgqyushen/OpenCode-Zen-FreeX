@@ -434,7 +434,7 @@ function digitsEnd(found) {
 // digits touching the boundary are ambiguous. Each axis is read from the match
 // its number came from, so the match the guard judges and the number that is
 // returned cannot be two answers.
-function namedAxes(text, limit, cut) {
+export function namedAxes(text, limit, cut) {
   const head = text.slice(0, limit);
   const context = namedFrom(NAMED_CONTEXT, head);
   const output = namedFrom(NAMED_OUTPUT, head);

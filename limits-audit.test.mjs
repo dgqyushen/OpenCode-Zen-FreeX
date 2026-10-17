@@ -120,6 +120,37 @@ test("a ceiling the route names is a candidate, and one it agrees with is not", 
   assert.equal(lineFor(lines, "fledge-alpha-free"), "fledge-alpha-free: HTTP 410 — Model fledge-alpha-free has been deprecated.");
 });
 
+test("the line that names the catalogue prints the catalogue's own number, not the plugin's", async () => {
+  const { findings, withEffective } = await subject();
+  // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue and
+  // 1048576/384000 by limits.mjs, so a row carrying both pairs is where the two
+  // numbers can be confused. The candidate lines say "the catalogue declares X",
+  // which is the catalogue's own pair; they used to read `judgement(row)`, the
+  // effective one, and so printed limits.mjs's override as the catalogue's
+  // number for every id the table does not already cover.
+  const rowFor = (extra) =>
+    withEffective({
+      id: "deepseek-v4.1-flash-free",
+      declared: { context: 200000, output: 32000 },
+      status: 400,
+      upstream: "deepseek-v4.1-flash-free",
+      ...extra,
+    });
+  // the route named the plugin's own number: the catalogue's is still what the
+  // line has to print, and 384000 must not come back as the catalogue's
+  assert.deepEqual(findings([rowFor({ ceiling: 384000 })]), [
+    "deepseek-v4.1-flash-free: the route names a ceiling of 384000 completion tokens, the catalogue declares 32000",
+  ]);
+  assert.deepEqual(findings([rowFor({ window: 1048576 })]), [
+    "deepseek-v4.1-flash-free: a refusal named a window of 1048576, the catalogue declares 200000",
+  ]);
+  // A route statement the catalogue already declares is not a candidate. Judged
+  // against the overridden pair it was one, printed as "the route names a
+  // ceiling of 32000 …, the catalogue declares 384000" — both halves of the
+  // sentence wrong at once, which is what this pins.
+  assert.deepEqual(findings([rowFor({ ceiling: 32000, window: 200000 })]), []);
+});
+
 test("a 400 the audit provoked is not a candidate, and the ones it cannot explain are", async () => {
   const { findings, protocolScoped } = await subject();
   const rows = [
@@ -345,44 +376,344 @@ test("an identity the file system will not give leaves the question open", async
   assert.equal(sameFile(here, other), false);
 });
 
-test("a refusal is read to the budget and no further, and the reader is released", async () => {
-  const { readPrefix } = await subject();
-  const encoder = new TextEncoder();
-  const body = (chunk) => {
-    const seen = { read: 0, cancelled: false };
-    return {
-      seen,
-      response: {
-        body: {
-          getReader: () => ({
-            read: async () => {
-              seen.read += 1;
-              return { value: chunk, done: false };
-            },
-            cancel: async () => {
-              seen.cancelled = true;
-            },
-          }),
-        },
-      },
-    };
+// A body as the network delivers it: one the platform owns, handing over a chunk
+// per read. `pulled` is how much of the body the reader took and `released` says
+// whether the rest was cancelled rather than left open — the two facts the
+// retired test asserted about a reader it had built itself, now said by the
+// stream the module really reads.
+function streamOf(chunks, status = 400) {
+  const seen = { pulled: 0, released: false };
+  const body = new ReadableStream({
+    pull(controller) {
+      if (seen.pulled === chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[seen.pulled]);
+      seen.pulled += 1;
+    },
+    cancel() {
+      seen.released = true;
+    },
+  });
+  return { seen, response: new Response(body, { status }) };
+}
+
+// The same bytes in pieces of `size`, for a body whose statement has to sit a
+// known distance past the budget.
+function pieces(bytes, size) {
+  const out = [];
+  for (let at = 0; at < bytes.length; at += size) out.push(bytes.subarray(at, at + size));
+  return out;
+}
+
+// `streamOf` above hands out a body that ends. These are the two ways a body
+// stops a read WITHOUT ending: one that hands over its bytes and then never
+// answers again (`stall` — what limits.mjs's own 3 s deadline on the body is
+// for, and the shape a connection dying mid-body takes), and one that fails
+// outright (`fail`). Both leave the reader holding a prefix and its own flag
+// saying the read stopped before the body did — the pair a length rule cannot
+// tell apart from a body that ran past the budget.
+function unterminated(chunks, { stop, status = 400 }) {
+  const seen = { pulled: 0, released: false };
+  const body = new ReadableStream({
+    pull(controller) {
+      if (seen.pulled === chunks.length) {
+        if (stop === "stall") return new Promise(() => {});
+        controller.error(new Error("the body failed before the budget"));
+        return;
+      }
+      controller.enqueue(chunks[seen.pulled]);
+      seen.pulled += 1;
+    },
+    cancel() {
+      seen.released = true;
+    },
+  });
+  return { seen, response: new Response(body, { status }) };
+}
+
+// `ask()` builds and sends its own request, so the one thing a test can hand it
+// is the answer it gets back. `fetch` is swapped for one case and put back in
+// `finally`: every test file of this run shares the process, so the global goes
+// back as soon as the case is answered.
+async function answering(responses, run) {
+  const real = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, options) => {
+    sent.push({ url: String(url), method: options?.method });
+    assert.ok(responses.length, "ask() asked more often than this case queued answers");
+    return responses.shift();
   };
-  // a body that goes on for ever: the read has to stop at the budget, whatever
-  // is still waiting behind it
-  const many = body(encoder.encode("x".repeat(1024)));
-  assert.equal((await readPrefix(many.response, 4096)).length, 4096);
-  assert.equal(many.seen.read, 4);
-  assert.equal(many.seen.cancelled, true);
-  // one chunk can be the whole body, and decoding it whole would materialise the
-  // megabytes this path exists to avoid: only what the budget still wants is read
-  const huge = body(encoder.encode("y".repeat(1_000_000)));
-  const cut = await readPrefix(huge.response, 64);
-  assert.equal(cut.length, 64);
-  assert.equal(huge.seen.read, 1);
-  assert.equal(huge.seen.cancelled, true);
-  // a body with no reader to cancel is small by construction and still bounded
-  assert.equal(await readPrefix({ body: null, text: async () => "z".repeat(100) }, 10), "z".repeat(10));
+  try {
+    return { result: await run(), sent };
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+// The names `run()` asks with, from the same capture the module reads: `ask()`
+// refuses a name the profile does not carry, so a test that passed names of its
+// own would be asking as a caller this audit never is.
+async function askingNames() {
+  const { PROFILES } = await import("./core-tools.mjs");
+  const generation = process.env.ZEN_GENERATION ?? "1.x";
+  assert.ok(Object.hasOwn(PROFILES, generation), `the capture carries no ${generation} profile`);
+  return [...PROFILES[generation].required];
+}
+
+const REFUSAL_SAYS = "漢 max_tokens is too large: 1000000. This model supports at most 131072 completion tokens.";
+const REFUSAL_BODY = JSON.stringify({ error: { message: REFUSAL_SAYS } });
+
+// The reader this used to test was a hand-built object that never said
+// `done: true`, which is a body no response has. The reader is limits.mjs's now,
+// so what is tested is the path `ask()` really takes — a response, a stream the
+// platform owns, and the text that comes back out of it — and the two things the
+// audit needs from it: a refusal arriving over several reads is decoded whole,
+// and the budget is counted in characters rather than in bytes.
+test("a refusal is read through ask()'s own reader, cut at the character budget and no further", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const encoder = new TextEncoder();
+
+  // The refusal's own text carries a three-byte character, and its bytes are
+  // split across three reads. A reader that decoded each chunk on its own would
+  // answer with replacement characters, so the quoted message — the one thing
+  // this path exists to bring back — would not be the refusal's own words.
+  const whole = encoder.encode(REFUSAL_BODY);
+  const at = whole.indexOf(encoder.encode("漢")[0]);
+  assert.ok(at > 0, "the fixture has to carry the multi-byte character");
+  const split = await answering(
+    [streamOf([whole.subarray(0, at + 1), whole.subarray(at + 1, at + 2), whole.subarray(at + 2)]).response],
+    () => ask("split-free", names),
+  );
+  assert.equal(split.result.status, 400);
+  assert.equal(split.result.ceiling, 131072, "a ceiling behind a character split across reads is still read");
+  assert.equal(split.result.says, REFUSAL_SAYS, "and the refusal is handed back whole, not as replacement characters");
+
+  // The refusal sits past 4096 bytes and inside 4096 characters: 1500 three-byte
+  // characters put it there, in a single read. The retired reader compared
+  // `value.byteLength` against a budget it counted in characters (measured: a
+  // 64-character budget stopped after 192 bytes of a 3-byte-per-character body),
+  // so it cut this body at 4096 bytes — around character 1365 — and the ceiling
+  // below was never read at all.
+  const wide = "漢".repeat(1500) + REFUSAL_BODY;
+  assert.ok(wide.length < 4096, "the fixture has to be inside the character budget");
+  assert.ok(encoder.encode(wide).length > 4096, "and past the byte budget the retired reader cut at");
+  const wideAnswer = await answering([streamOf([encoder.encode(wide)]).response], () => ask("wide-free", names));
+  assert.equal(wideAnswer.result.ceiling, 131072, "the budget is characters, so the refusal is reached");
+  assert.equal(wideAnswer.result.says, REFUSAL_SAYS);
+
+  // A body that goes on past the budget: the refusal at its head is read, a
+  // statement in its tail is not, and the rest is released rather than drained.
+  const long = REFUSAL_BODY + "漢".repeat(5000) + " maximum context length is 999999 tokens. " + "漢".repeat(5000);
+  const chunks = pieces(encoder.encode(long), 900);
+  const past = streamOf(chunks);
+  const pastAnswer = await answering([past.response], () => ask("long-free", names));
+  assert.equal(pastAnswer.result.ceiling, 131072, "what is inside the budget is read");
+  assert.equal(pastAnswer.result.window, undefined, "a window named past the budget is not read");
+  assert.equal(past.seen.released, true, "the rest of the body is released rather than left open");
+  assert.ok(
+    past.seen.pulled < chunks.length,
+    `the body must not be drained into the buffer (read ${past.seen.pulled} of ${chunks.length} chunks)`,
+  );
+
+  // Each case is one ask through ask()'s own path: a POST to the endpoint the
+  // audit asks, not a helper called beside it.
+  const sent = [...split.sent, ...wideAnswer.sent, ...pastAnswer.sent];
+  assert.equal(sent.length, 3);
+  for (const request of sent) {
+    assert.equal(request.method, "POST");
+    assert.match(request.url, /\/chat\/completions$/);
+  }
 });
+
+// A 200 is the model's own prose, not a limit, so `ask()` reads it only far
+// enough to stop the answer and then drops the reader. A change that read a
+// served body to its end, or read one for a number, shows up here.
+test("a 200 is read only far enough to stop the answer, and names no limit", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const prose = "Sure. " + "x".repeat(50_000) + " This model supports at most 262144 completion tokens.";
+  const chunks = pieces(new TextEncoder().encode(prose), 1000);
+  const served = streamOf(chunks, 200);
+  const { result } = await answering([served.response], () => ask("answered-free", names));
+  assert.equal(result.status, 200);
+  assert.equal(result.ceiling, undefined, "a served body is not read for a ceiling");
+  assert.equal(result.window, undefined);
+  assert.equal(result.says, "");
+  assert.equal(served.seen.released, true, "the answer is dropped rather than drained");
+  assert.ok(
+    served.seen.pulled < chunks.length,
+    `the answer must not be read to its end (read ${served.seen.pulled} of ${chunks.length} chunks)`,
+  );
+});
+
+// These rows are what a maintainer hand-edits LIMITS from, so a number the
+// budget cut in half must not come back as a ceiling: it would be written into
+// the table as a measurement nobody made. `readBoundedText` says whether it
+// stopped before the body did, and limits.mjs's own cut-aware reader — the one
+// `observeRouteStatement` uses — is what the audit asks now.
+test("a number the budget cut short declares no limit, and the same number inside it does", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const encoder = new TextEncoder();
+  const budget = 4096;
+
+  // A body whose `marker` ends on character `at` of the read, with a tail behind
+  // it so the read stops at the budget rather than at the end of the body.
+  const endingAt = (marker, at) =>
+    "x".repeat(at - marker.length) + marker + " and the body goes on past the budget " + "y".repeat(3000);
+  const asked = async (id, body) => {
+    const chunks = pieces(encoder.encode(body), 1000);
+    const stream = streamOf(chunks);
+    const { result } = await answering([stream.response], () => ask(id, names));
+    // the fixture says something about a cut read only if the read really was
+    // cut: the body has to go on past where the reader stopped
+    assert.equal(stream.seen.released, true, `${id}: the read has to stop and release the rest`);
+    assert.ok(stream.seen.pulled < chunks.length, `${id}: the body has to go on past the budget`);
+    return result;
+  };
+
+  // LongCat's wording ends with its ceiling, which is the one shape whose digits
+  // can land exactly on the last character read: "…is not less or equal to
+  // 262144", read as far as "…262144", may have had digits the budget cut off.
+  const ceiling = "max_tokens: 1000000 is not less or equal to 262144";
+  assert.equal(
+    (await asked("cut-ceiling-free", endingAt(ceiling, budget))).ceiling,
+    undefined,
+    "a ceiling whose digits end on the cut is not a ceiling the route stated",
+  );
+  assert.equal(
+    (await asked("whole-ceiling-free", endingAt(ceiling, budget - 1))).ceiling,
+    262144,
+    "the same wording one character inside the budget is a whole number and is read",
+  );
+
+  // The window wordings carry words after their digits, so their sentence has to
+  // be complete inside the budget: the axes are read from the first `limit`
+  // characters, and the one character past it is kept only to say the body went
+  // on. A sentence that completes only on that extra character was not inside
+  // the budget this audit declared, and is not a window the route named.
+  const window = "maximum context length is 1048576 tokens";
+  assert.equal(
+    (await asked("cut-window-free", endingAt(window, budget + 1))).window,
+    undefined,
+    "a window sentence that only completes on the character past the budget is not read",
+  );
+  assert.equal(
+    (await asked("whole-window-free", endingAt(window, budget))).window,
+    1048576,
+    "the same sentence complete inside the budget names its window",
+  );
+});
+
+// The read's own cut flag, against the length rule it replaced. The test above
+// always hands the reader a body that goes ON past the budget, and in that shape
+// the two rules agree: the text is at least as long as the budget, so
+// `text.length >= READ_BUDGET` and the reader's `over` are both true, and neither
+// test can tell which one the audit asked. The shape that tells them apart is a
+// read stopped SHORT of the budget — by the deadline, or by a body that fails —
+// whose text happens to end on a number. `over` is true there because the read
+// stopped before the body did; the length rule is false because the body never
+// reached the budget. The real tree answers `undefined`, because the digits may
+// have been cut and a number read a digit short is a measurement nobody made;
+// the length rule answers the number as if the route had stated it. Measured:
+// with `namedAxes(text, READ_BUDGET, text.length >= READ_BUDGET)` at
+// limits-audit.mjs:267 the whole suite stayed green, so it is this case the file
+// was missing.
+test(
+  "a read stopped short of the budget names no limit, even when its last characters are a number",
+  { timeout: 15_000 },
+  async () => {
+    const { ask } = await subject();
+    const names = await askingNames();
+    const encoder = new TextEncoder();
+    const budget = 4096;
+
+    // LongCat's wording ends with its ceiling, so a read that stopped inside the
+    // body can be holding a whole-looking number. Two things below say the read
+    // is that kind of read rather than one the budget cut: the fixture is far
+    // inside the budget, so the budget is not what stopped it, and the stream
+    // says whether it was still open when the read gave up.
+    const wording = "Upstream request failed: max_tokens: 1000000 is not less or equal to 2621";
+    assert.ok(wording.length < budget, `the fixture has to be inside the budget (${wording.length})`);
+    assert.match(wording, /\d$/, "the fixture has to end on the digits of its number");
+
+    // Stopped by the module's own deadline: the body hands over the wording and
+    // then never answers again. This is the shape the verifier measured — the
+    // reader gave up mid-body with the digits already in hand, so nothing about
+    // the length of what it read says the number was cut, and only the read's own
+    // flag does.
+    const stalled = unterminated([encoder.encode(wording)], { stop: "stall" });
+    const stalledAnswer = await answering([stalled.response], () => ask("stalled-short-free", names));
+    assert.equal(stalledAnswer.result.status, 400);
+    assert.equal(
+      stalled.seen.released,
+      true,
+      "the read has to give up on the wait rather than read the body to its end",
+    );
+    assert.equal(
+      stalledAnswer.result.says,
+      wording,
+      "the whole wording was in hand, so the length rule sees it as whole and the read's flag does not",
+    );
+    assert.equal(
+      stalledAnswer.result.ceiling,
+      undefined,
+      "a number at the end of a read that stopped short is not a ceiling the route stated",
+    );
+
+    // The same disagreement from the other stop, and at no cost in time: a body
+    // that fails instead of stalling. Same text in hand, same answer.
+    const failed = unterminated([encoder.encode(wording)], { stop: "fail" });
+    const failedAnswer = await answering([failed.response], () => ask("failed-short-free", names));
+    assert.equal(failedAnswer.result.says, wording, "the whole wording was in hand here too");
+    assert.equal(
+      failedAnswer.result.ceiling,
+      undefined,
+      "a failed read names no ceiling either",
+    );
+
+    // One character further is the same case stated plainly: the digits really
+    // were cut, and the number in hand is a whole number to the pattern and a
+    // prefix of the route's own to a reader that knows the read stopped.
+    const cutDigits = wording.slice(0, -1);
+    assert.match(cutDigits, /\d$/, "this fixture ends inside the number");
+    const cutAnswer = await answering(
+      [unterminated([encoder.encode(cutDigits)], { stop: "fail" }).response],
+      () => ask("cut-digits-free", names),
+    );
+    assert.equal(cutAnswer.result.says, cutDigits, "the digits that arrived are what the read holds");
+    assert.equal(
+      cutAnswer.result.ceiling,
+      undefined,
+      "and a number whose digits were cut is not a ceiling",
+    );
+
+    // The window axis for the same stopped shape. Said plainly: this half does
+    // NOT distinguish the length rule from `over`. Both context wordings carry a
+    // word after their digits (" tokens"), so the sentence has to be complete
+    // inside the read for the pattern to match at all, and a read that stopped
+    // inside the sentence names no window under either rule. It is here because
+    // the shape is worth stating for both axes, not because it catches that
+    // mutant — the ceiling assertions above are what do.
+    const sentence = "maximum context length is 1048576 toke";
+    assert.ok(sentence.length < budget, "the fixture has to be inside the budget");
+    const cutSentence = unterminated([encoder.encode(sentence)], { stop: "fail" });
+    const windowAnswer = await answering([cutSentence.response], () => ask("cut-sentence-free", names));
+    assert.equal(
+      windowAnswer.result.says,
+      sentence,
+      "the sentence the read stopped inside is what it holds",
+    );
+    assert.equal(
+      windowAnswer.result.window,
+      undefined,
+      "a context sentence the read stopped inside names no window",
+    );
+  },
+);
 
 test("a request that cannot be built is that id's own row, not the end of the run", async () => {
   const { ask } = await subject();

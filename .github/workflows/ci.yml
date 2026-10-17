@@ -36,12 +36,22 @@ jobs:
       # The two places the runtime is pinned are linked here: this env value and
       # `packageManager` in package.json. Nothing else compares them, so an upgrade
       # on one side alone would leave the suite and the gate running on a Bun the
-      # project no longer declares and nothing would fail.
+      # project no longer declares and nothing would fail. The field is read with
+      # Bun rather than the runner image's `node`, so the step that holds the run
+      # to one runtime is not itself run by an undeclared third one. The version
+      # actually on PATH is asserted too: the pin and the version `setup-bun`
+      # resolved were otherwise never compared, and a mismatch would leave the
+      # gate's report describing a runtime the project does not declare.
       - name: The pinned Bun is the one package.json declares
         run: |
-          declared="$(node -p "require('./package.json').packageManager")"
+          declared="$(bun -e "console.log(require('./package.json').packageManager)")"
           if [ "$declared" != "bun@$BUN_VERSION" ]; then
             echo "package.json declares $declared while this workflow pins $BUN_VERSION; bump both together." >&2
+            exit 1
+          fi
+          actual="$(bun --version)"
+          if [ "$actual" != "$BUN_VERSION" ]; then
+            echo "this workflow pins Bun $BUN_VERSION and package.json declares $declared, but the Bun that just ran is $actual; bump both together." >&2
             exit 1
           fi
       # These never touch the network: they are the plugin's own behaviour.

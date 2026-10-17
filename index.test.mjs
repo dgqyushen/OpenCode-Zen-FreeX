@@ -984,6 +984,60 @@ for (const [path, model, key] of [
   });
 }
 
+// The two Anthropic headers a host gets to choose. `anthropic-version` is the
+// wire version the host's own SDK was built against, and `anthropic-beta` names
+// the features it was written for: an answer in a version this plugin picked
+// instead is a shape the host did not ask for, and a beta it named and did not
+// get is a field it was waiting on. Neither is the plugin's to overrule, and
+// nothing here said so until now — the only assertion about either header was
+// the default at index.test.mjs:981, so forcing that default unconditionally
+// broke no test in the file.
+test("a host's own anthropic headers reach Zen unchanged", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const response = await loader.fetch(`${origin}/v1/messages`, {
+    method: "POST",
+    headers: {
+      // Deliberately not the default this plugin would otherwise pick: a host
+      // pinned to an older wire version gets that version or the test is not
+      // about passing anything through.
+      "anthropic-version": "2023-01-01",
+      "anthropic-beta": "prompt-caching-2024-07-31",
+    },
+    body: JSON.stringify({ model: "messages-free", stream: true }),
+  });
+  await response.text();
+  const sent = lastCall(state).headers;
+  assert.equal(
+    sent["anthropic-version"],
+    "2023-01-01",
+    "the host's version, not a default chosen here",
+  );
+  assert.equal(
+    sent["anthropic-beta"],
+    "prompt-caching-2024-07-31",
+    "the beta the host asked for is forwarded",
+  );
+});
+
+// The other half: a host that names no version is answered in the default, and
+// one that names no beta is not sent a beta it did not ask for. Both are the
+// same request path as the test above, so the pair is what pins the branch.
+test("a host that names no anthropic version is served the default", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const response = await loader.fetch(`${origin}/v1/messages`, {
+    method: "POST",
+    body: JSON.stringify({ model: "messages-free", stream: true }),
+  });
+  await response.text();
+  const sent = lastCall(state).headers;
+  assert.equal(sent["anthropic-version"], "2023-06-01", "the version every Anthropic host speaks");
+  assert.equal(sent["anthropic-beta"], undefined, "and no beta nobody named");
+});
+
 test("rejects paid models, wrong protocol and foreign URLs before sending inference", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });

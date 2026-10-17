@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_BYTES } from "./stream.mjs";
+import { MAX_BYTES, collapseResponse } from "./stream.mjs";
 import { cutShortNote, droppedNote, guardToolResponse } from "./tool-response.mjs";
 
 const encoder = new TextEncoder();
@@ -903,6 +903,53 @@ test("an unsupported protocol is refused before the upstream's status is read (#
   }
 });
 
+// The names the guard reads the policy for. `new Set(undefined)` does not
+// throw — it answers an empty set — so a field that was renamed, or a policy
+// built by mistake, used to turn every call of every reply into "a tool this
+// agent doesn't have": chat lost every tool call, and Responses and Messages
+// calls were rewritten into explanation text, with nothing thrown and nothing
+// logged to say why. A policy the guard cannot read is a caller's mistake and
+// is refused by name — the same rule, and the same place, as the protocol
+// above: before the upstream's status decides whether it is reported.
+test("a policy whose declared field cannot be read is refused by name", async () => {
+  const rejected = [
+    ["a policy with no declared field", {}],
+    ["no policy at all", undefined],
+    ["a null declared field", { declared: null }],
+    ["a declared field that is a string", { declared: "Bash" }],
+    ["a declared field that is an object", { declared: { Bash: true } }],
+    ["an array holding something that is not a name", { declared: ["Bash", 7] }],
+    ["a Set holding something that is not a name", { declared: new Set(["Bash", null]) }],
+  ];
+  for (const [what, bad] of rejected) {
+    for (const status of [200, 500]) {
+      await assert.rejects(
+        guardToolResponse(Response.json({}, { status }), "chat", bad),
+        (error) =>
+          error instanceof TypeError &&
+          !error.code &&
+          /policy\.declared/.test(error.message),
+        `${what} was read as a policy of no tools`,
+      );
+    }
+  }
+  // The two shapes it does read: what this package's own producer builds, and
+  // an array of names — and the guard works the same with either.
+  for (const declared of [new Set(["Bash"]), ["Bash"]]) {
+    const result = await guardToolResponse(
+      Response.json({
+        choices: [
+          { message: { tool_calls: [{ type: "function", id: "c1", function: { name: "bash", arguments: "{}" } }] } },
+        ],
+      }),
+      "chat",
+      { declared },
+    );
+    assert.equal(result.status, 200);
+    assert.equal((await result.json()).choices[0].message.tool_calls[0].function.name, "Bash");
+  }
+});
+
 // An item id stands in for the item, so two calls left out of one reply that
 // arrived without ids cannot be handed the same one: a Responses client keys
 // by it, and the streamed path suppresses arguments by it (#49).
@@ -1002,6 +1049,93 @@ test("Responses: a call the reply places nowhere never shares an id with a place
   );
 });
 
+// The id an item is keyed by has to be the same one every time the same call
+// is replaced, and the frames of the reply are all the guard has to tell one
+// call from another: a stream that carries no output_index and no item id
+// leaves the place of each call to the order it opens them in. A counter per
+// rewrite made one dropped call three items to the client — its added frame,
+// its done frame and the terminal's copy of it each answered a different id —
+// and left the call's arguments frames, which name an item the reply never
+// opened an item for, forwarded to describe an item that was replaced.
+// Collapsing the same bytes for a client that reads no stream then refused
+// them ("an unknown item without an output index") where the streaming client
+// was given a reply, so the two paths disagreed about the same upstream.
+test("Responses: a dropped call the frames place nowhere answers one id, in both paths", async () => {
+  const call = { type: "function_call", name: "nonexistent", arguments: "" };
+  const text =
+    event({ type: "response.output_item.added", item: call }) +
+    event({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"a"' }) +
+    event({
+      type: "response.function_call_arguments.done",
+      item_id: "fc_1",
+      arguments: '{"a":1}',
+    }) +
+    event({ type: "response.output_item.done", item: { ...call, arguments: '{"a":1}' } }) +
+    event(
+      { type: "response.completed", response: { status: "completed", output: [{ ...call, arguments: '{"a":1}' }] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const items = [
+    ...data.filter((value) => value.item).map((value) => value.item),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []),
+  ];
+  assert.equal(new Set(items.map((item) => item.id)).size, 1, "one call became several items");
+  assert.equal(items[0].id, items[1].id, "the done frame answers the added frame's id");
+  assert.ok(
+    !data.some((value) => value.type?.startsWith("response.function_call_arguments")),
+    "the arguments of a call that was left out reached the client",
+  );
+  assert.deepEqual(callsIn("responses", data), []);
+  assert.equal(textIn("responses", data), droppedNote("nonexistent"));
+  // The bytes the same upstream sent, collapsed for a client that reads no
+  // stream: a reply saying the call was left out, not a 502 about an item.
+  const collapsed = await collapseResponse(
+    await guardToolResponse(sse(text), "responses", policy),
+    "responses",
+  );
+  assert.equal(collapsed.status, 200);
+  const body = await collapsed.json();
+  assert.equal(body.output.length, 1);
+  assert.equal(body.output[0].content[0].text, droppedNote("nonexistent"));
+});
+
+// The other side of that rule: a call the reply named nowhere is not the only
+// item a stream can hold, and the frames of one the agent does have must not
+// be swallowed with it — a frame naming an item the reply did name on an item
+// of its own belongs to that item. The frames of the call that was left out
+// are left out with it (they used to be forwarded, describing an item the
+// client was told was replaced by a note).
+test("Responses: a placeless call's arguments are left out with it, and one the agent has keeps its own", async () => {
+  const kept = { type: "function_call", name: "bash", arguments: "" };
+  const text =
+    event({ type: "response.output_item.added", item: { type: "function_call", name: "nonexistent", arguments: "" } }) +
+    event({ type: "response.function_call_arguments.delta", item_id: "fc_dropped", delta: "{}" }) +
+    event({ type: "response.output_item.added", item: kept }) +
+    event({ type: "response.function_call_arguments.delta", item_id: "fc_kept", delta: '{"command":"ls"}' }) +
+    event({ type: "response.function_call_arguments.done", item_id: "fc_kept", arguments: '{"command":"ls"}' }) +
+    event({ type: "response.output_item.done", item: kept }) +
+    event({ type: "response.completed", response: { status: "completed", output: [kept] } }, "response.completed");
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const forwarded = data.filter((value) =>
+    value.type?.startsWith("response.function_call_arguments"),
+  );
+  assert.deepEqual(
+    forwarded.map((value) => value.item_id),
+    ["fc_kept", "fc_kept"],
+    "the kept call's arguments frames were left out with another call",
+  );
+  // The kept call is copied into its added frame, its done frame and the
+  // terminal response, so its name is read once per copy; the call left out
+  // is named nowhere but in the note.
+  assert.deepEqual([...new Set(callsIn("responses", data))], ["Bash"]);
+  assert.ok(!JSON.stringify(data).includes('"nonexistent"'), "the dropped call leaked");
+});
+
 // [DONE] is the sentinel a Chat stream ends with, and a Responses or Messages
 // stream may be handed one after it has reported its own terminal event — a
 // gateway in front of the upstream appends it. That is an ending. Before the
@@ -1034,6 +1168,68 @@ test("a [DONE] marker is an ending only where the reply already ended", async ()
       frames[0].data.message ?? frames[0].data.error.message,
       "Unexpected upstream completion marker",
     );
+  }
+});
+
+// The contract both paths implement, pinned here for the path that streams to
+// a client. The terminal marker still ends the reply where it stands and is
+// still forwarded as it arrived; an event after it is not part of the reply —
+// this path used to forward one the collapse path dropped, so the same
+// upstream answered two different replies; and a failure after it still failed
+// the turn, which is why the ignore sits below the error branch. The collapse
+// path's half of this test is in stream.test.mjs.
+test("an event after the terminal marker is ignored, and a failure after it is not", async () => {
+  const cases = {
+    chat: [
+      event({ choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }] }),
+      event("[DONE]"),
+      event({ choices: [{ index: 0, delta: { content: "TAIL" } }] }),
+    ],
+    responses: [
+      event({ type: "response.completed", response: { status: "completed", output: [] } }, "response.completed"),
+      event({
+        type: "response.output_text.delta",
+        item_id: "m",
+        output_index: 0,
+        content_index: 0,
+        delta: "TAIL",
+      }),
+    ],
+    anthropic: [
+      event({ type: "message_stop" }, "message_stop"),
+      event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "TAIL" } }),
+    ],
+  };
+  for (const [protocol, frames] of Object.entries(cases)) {
+    const result = await guardToolResponse(sse(frames.join("")), protocol, policy);
+    assert.equal(result.status, 200);
+    const out = await result.text();
+    assert.doesNotMatch(out, /TAIL/, `${protocol}: an event after the terminal marker was forwarded`);
+    assert.ok(
+      out.includes(protocol === "chat" ? "data: [DONE]" : frames[0].trim()),
+      `${protocol}: the terminal marker is forwarded as it arrived`,
+    );
+  }
+  for (const [protocol, terminal] of [
+    ["chat", event("[DONE]")],
+    ["responses", event({ type: "response.completed", response: { output: [] } })],
+    ["anthropic", event({ type: "message_stop" })],
+  ]) {
+    const result = await guardToolResponse(
+      sse(terminal + event({ error: { message: "late error" } })),
+      protocol,
+      policy,
+    );
+    assert.match(
+      JSON.stringify(frameData(await result.text())),
+      /late error/,
+      `${protocol}: a failure after the terminal marker was ignored too`,
+    );
+    // And a frame the guard cannot read at all is a failure either way, as it
+    // was before the marker: ignoring the event after an ending must not
+    // become reading a body nothing checked.
+    const broken = await guardToolResponse(sse(terminal + "data: {broken\n\n"), protocol, policy);
+    assert.match(JSON.stringify(frameData(await broken.text())), /Invalid JSON/);
   }
 });
 

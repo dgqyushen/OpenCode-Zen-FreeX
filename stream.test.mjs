@@ -693,6 +693,50 @@ test("Responses refuses a frame that names an item the stream never opened", asy
   assert.equal(body.output[0].content[0].text, "named");
 });
 
+// The same refusal must not refuse the reply this route actually sends: an
+// item whose own frames carry no id at all, named from the frames after it
+// on. The item the stream opened for the call is the one those frames name,
+// so the id is adopted onto it and the call is one item of the reply — the
+// id-less shape the streaming path (tool-response.mjs) rewrote the item ids
+// for, and what the collapsed reply of the same bytes has to agree with.
+test("Responses places a frame naming the one item the stream opened without an id", async () => {
+  const call = { type: "function_call", name: "lookup", arguments: "" };
+  const body = await json(
+    event({ type: "response.output_item.added", item: call }) +
+      event({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"a"' }) +
+      event({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_1",
+        arguments: '{"a":1}',
+      }) +
+      event({ type: "response.output_item.done", item: { ...call, arguments: '{"a":1}' } }) +
+      event({ type: "response.completed" }),
+    "responses",
+  );
+  assert.equal(body.output.length, 1, "one call is one item");
+  assert.equal(body.output[0].id, "fc_1", "the id the frames name is the item's");
+  assert.equal(body.output[0].arguments, '{"a":1}');
+
+  // Two items of that kind, neither with an id, is still not something to
+  // guess at: naming one of them says which of two it could be.
+  await failure(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", name: "one", arguments: "" },
+    }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", name: "two", arguments: "" },
+      }) +
+      event({ type: "response.output_text.delta", item_id: "fc_1", content_index: 0, delta: "x" }) +
+      event({ type: "response.completed" }),
+    "responses",
+    /unknown item/,
+  );
+});
+
 test("Anthropic takes only the fields a message_delta may carry", async () => {
   // Object.assign copies with [[Set]] semantics, and JSON.parse makes
   // "__proto__" an own property: an upstream's delta re-parented the message
@@ -1049,6 +1093,58 @@ test("upstream errors after terminal events are not successful responses", async
   }
 });
 
+// The other half of this contract is in tool-response.test.mjs, where the
+// same bytes are streamed to a client that reads a stream: the two paths
+// answered the same upstream differently — this one dropped an event after
+// the terminal marker, and that one forwarded it. An event after the marker
+// is not part of the reply, in either path; a failure after it still is.
+test("an event after the terminal marker is not folded into the reply", async () => {
+  const tails = {
+    chat: [
+      { choices: [{ index: 0, delta: { content: "hi" } }] },
+      "[DONE]",
+      { choices: [{ index: 0, delta: { content: "TAIL" } }] },
+    ],
+    responses: [
+      {
+        type: "response.completed",
+        response: {
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "hi", annotations: [] }],
+            },
+          ],
+        },
+      },
+      { type: "response.output_text.delta", item_id: "m", output_index: 0, content_index: 0, delta: "TAIL" },
+    ],
+    anthropic: [
+      { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content: [{ type: "text", text: "hi" }] } },
+      { type: "message_stop" },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "TAIL" } },
+    ],
+  };
+  for (const [protocol, frames] of Object.entries(tails)) {
+    const body = await json(frames.map((value) => event(value)).join(""), protocol);
+    assert.doesNotMatch(
+      JSON.stringify(body),
+      /TAIL/,
+      `${protocol}: an event after the terminal marker reached the reply`,
+    );
+  }
+  // A frame after the marker that is not JSON at all is a failure, not an
+  // event to ignore — the same answer the streaming path gives it.
+  for (const [protocol, terminal] of [
+    ["chat", event("[DONE]")],
+    ["responses", event({ type: "response.completed", response: { output: [] } })],
+    ["anthropic", event({ type: "message_stop" })],
+  ])
+    await failure(terminal + "data: {broken\n\n", protocol, /JSON/);
+});
+
 test("buffer-limit cancellation failures propagate instead of becoming JSON", async () => {
   const cause = new DOMException("cancel failed", "AbortError");
   const chunk = new Uint8Array(1024 * 1024);
@@ -1132,6 +1228,59 @@ test("success and error JSON remove stale entity headers and preserve retry meta
     assert.equal(response.headers.get("retry-after"), "12");
     assert.equal(response.headers.get("x-request-id"), "req-1");
   }
+});
+
+// The limit is exact, and it was not pinned: the fixture that stood for
+// "past the limit" used MAX_BYTES + 1, which a limit off by N refuses as
+// well, so an off-by-N in the number or in the comparison was invisible to
+// the whole suite. Exactly the limit is a reply, and one byte past it is
+// refused with the number it names. The bytes are one 64 KiB comment line
+// handed out again and again — comments reach no part of the reply — so
+// nothing here allocates 32 MiB to be counted.
+test("the buffer limit is exact: exactly 32 MiB is read, and one byte more is not", { timeout: 60_000 }, async () => {
+  const prefix = event({ choices: [{ index: 0, delta: { content: "hi" } }] });
+  const suffix = event("[DONE]");
+  const block = encoder.encode(`:${"x".repeat(65536 - 2)}\n`);
+  function exactStream(total) {
+    const head = encoder.encode(prefix);
+    const tail = encoder.encode(suffix);
+    const parts = [head];
+    let left = total - head.byteLength - tail.byteLength;
+    while (left >= block.byteLength) {
+      parts.push(block);
+      left -= block.byteLength;
+    }
+    // Whatever is left is one more comment line of exactly that size: the
+    // padding is part of the SSE's own framing, and its length is what puts
+    // the stream on the byte the limit names.
+    if (left === 1) parts.push(encoder.encode("\n"));
+    else if (left === 2) parts.push(encoder.encode(":\n"));
+    else if (left > 2) parts.push(encoder.encode(`:${"x".repeat(left - 2)}\n`));
+    parts.push(tail);
+    let at = 0;
+    return new Response(
+      new ReadableStream({
+        pull(controller) {
+          if (at === parts.length) return controller.close();
+          controller.enqueue(parts[at++]);
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  }
+
+  const accepted = await collapseResponse(exactStream(MAX_BYTES), "chat");
+  assert.equal(accepted.status, 200, "a reply of exactly the limit is a reply");
+  const body = await accepted.json();
+  assert.equal(body.choices[0].message.content, "hi");
+
+  const refused = await collapseResponse(exactStream(MAX_BYTES + 1), "chat");
+  assert.equal(refused.status, 502, "one byte past the limit is refused");
+  await assertProtocolError(
+    await refused.json(),
+    "chat",
+    new RegExp(`${MAX_BYTES / (1024 * 1024)} MiB`),
+  );
 });
 
 test("bounded buffering rejects oversized unterminated events and cancels the source", async () => {

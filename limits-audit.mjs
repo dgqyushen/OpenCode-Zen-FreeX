@@ -41,7 +41,7 @@ import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES } from "./core-tools.mjs";
-import { LIMITS, limitOverrides, namedContextWindow, namedOutputCap } from "./limits.mjs";
+import { LIMITS, limitOverrides, namedAxes, readBoundedText } from "./limits.mjs";
 import { SDK, bootstrapProtocols, isFree } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
@@ -49,6 +49,9 @@ import { chatRequest } from "./tools-smoke.mjs";
 const BASE = process.env.ZEN_BASE_URL ?? DEFAULT_BASE;
 const CATALOG_URL = process.env.ZEN_CATALOG_URL ?? CATALOG;
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
+// How many characters of a response body the audit reads. The reader is
+// limits.mjs's `readBoundedText`: the unit rule, the deadline and the release of
+// the rest of the body are all its, and only the budget is this file's.
 const READ_BUDGET = 4096;
 const ASKED_CEILING = 1_000_000;
 // How many ids are asked at once. Each ask stops as soon as the answer starts,
@@ -94,10 +97,14 @@ export function withEffective(row, table = LIMITS) {
   return { ...row, effective: { ...declared, ...limitOverrides(row.id, declared, table) } };
 }
 
-// The pair a row is judged by: what the plugin declares, not what the catalogue
-// lists under it. Reading `declared` here while the table printed `effective` is
-// how a sibling the plugin declares far below the numbers the evidence already
-// carries was never raised, and how a line could contradict the table above it.
+// The pair the sibling comparison below is made against: what the plugin
+// declares, not what the catalogue lists under it. Reading `declared` there
+// while the table printed `effective` is how a sibling the plugin declares far
+// below the numbers the evidence already carries was never raised, and how a
+// line could contradict the table above it. The two lines that name the
+// catalogue read `row.declared` instead — they are about the catalogue's own
+// number, and reading this pair there attributed limits.mjs's override to the
+// catalogue.
 const judgement = (row) => row.effective ?? row.declared ?? {};
 
 // What is worth a measurement, in the order it should be read. `covered` are the
@@ -106,7 +113,13 @@ const judgement = (row) => row.effective ?? row.declared ?? {};
 export function findings(rows, covered = new Set()) {
   const out = [];
   for (const row of rows) {
-    const declared = judgement(row);
+    // The catalogue's own pair, because that is what these two lines say. Every
+    // row `run` builds also carries `effective` — the same pair with limits.mjs's
+    // overrides over it — and `judgement` is that one, which belongs to the
+    // sibling comparison below, where the numbers the plugin puts on the wire are
+    // the point. Here they are not: an id the table does not cover would have had
+    // the plugin's own number printed as the catalogue's.
+    const declared = row.declared ?? {};
     // An id limits.mjs already carries evidence for is not asked for again: its
     // numbers are in the table and repeating them here would bury what is new.
     // Its status is still printed in the table above, so a model that dies is
@@ -196,49 +209,6 @@ async function getJSON(url) {
   return response.json();
 }
 
-// At most `limit` characters of a body, and no more of the body read than that.
-// A refusal can be a proxy's HTML page, a 5xx dump, or an echo of the
-// million-token request this audit sent, and this path exists to read a few
-// hundred characters cheaply: the reader is released as soon as the part that is
-// read is in hand, so the rest of the body is dropped rather than buffered.
-// Exported so the tests can hand it a body that says how much of itself was
-// read, since only a direct run may ask the route.
-export async function readPrefix(response, limit = READ_BUDGET) {
-  const stream = response.body;
-  if (typeof stream?.getReader !== "function") {
-    // No reader to stop: a body that is not a stream (a 204, a synthetic
-    // response) is small by construction, so reading it is already the bound.
-    return ((await response.text()) ?? "").slice(0, limit);
-  }
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  try {
-    while (text.length < limit) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const missing = limit - text.length;
-      // One chunk can be the whole body. Decoding it whole would materialise
-      // exactly the megabytes this function exists to avoid, so a chunk larger
-      // than what is still missing is decoded only as far as the budget and ends
-      // the read: cutting the bytes can split a character, and reading on past a
-      // byte that was dropped would mis-decode everything after it, which is
-      // worse than a prefix a character short.
-      if (value.byteLength > missing) {
-        text += decoder.decode(value.subarray(0, missing), { stream: true });
-        break;
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-  } catch {
-    // A body that fails halfway is still worth what was read of it, and a
-    // refusal nobody can finish reading is not a reason to fail the audit.
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-  return text;
-}
-
 // One cheap question per id. The ceiling asked for is past anything this route
 // serves, so an upstream that validates it says what it allows, and the stream
 // is dropped as soon as it starts rather than paying for an answer nobody reads.
@@ -271,7 +241,13 @@ export async function ask(id, names) {
     // A refusal is read for the limits it names; a 200 is the model's own prose,
     // which is not a limit, so it is read only far enough to stop the answer and
     // then dropped by the reader rather than left to the abort in `finally`.
-    const text = await readPrefix(response);
+    //
+    // The read is limits.mjs's, which is the one place in this tree that knows
+    // the budget is a character budget, that a body can stall as well as be
+    // large, and that a caller has to be told when the read stopped short. It is
+    // handed the request's own cancellation, so a host that gave up is not
+    // waited on, and it also carries its own 3 s deadline for the body alone.
+    const { text, over } = await readBoundedText(response, READ_BUDGET, { signal: controller.signal });
     const upstream = response.headers.get("x-opencode-upstream-model-id") ?? undefined;
     const endpoint = response.headers.get("x-opencode-endpoint-id") ?? undefined;
     // limits.mjs reads refusals, and a refusal is the only place this route
@@ -279,12 +255,22 @@ export async function ask(id, names) {
     // answer about token limits — or one that merely mentions them — would turn
     // into a ceiling nobody stated, and a `named` row then skips its status line
     // in findings() as well.
+    //
+    // The two axes come from limits.mjs's cut-aware reader, with the read's own
+    // `over` as the cut flag: a refusal can be longer than the budget, and a
+    // number whose digits land on the last character read may have had digits
+    // past it. Those rows are the documented source for hand-editing LIMITS, so
+    // a ceiling read a digit short (262144 as 26214) would be written into the
+    // table as a measurement nobody made. `over` is the reader's own answer to
+    // whether it stopped before the body did — not the length of what it read,
+    // which a body landing exactly on the budget makes look the same.
+    const axes = response.ok ? {} : namedAxes(text, READ_BUDGET, over);
     return {
       status: response.status,
       upstream,
       endpoint,
-      window: response.ok ? undefined : namedContextWindow(text),
-      ceiling: response.ok ? undefined : namedOutputCap(text),
+      window: axes.context,
+      ceiling: axes.output,
       says: response.ok ? "" : says(text),
     };
   } catch (error) {

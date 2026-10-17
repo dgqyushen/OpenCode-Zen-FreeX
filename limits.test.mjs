@@ -874,6 +874,105 @@ test("a caller's own signal ends the wait and keeps what was read", async () => 
 // put back exactly what the cut guard removes — measured before the read kept
 // this of its own: a stalled body whose text ends `...is not less or equal to
 // 2621`, out of `262144`, was stored and applied as a completion ceiling.
+// A body handed out at chosen byte offsets, so a character can be told to fall
+// across two reads rather than hoped to. `chunked` above splits on a character
+// count, which puts the cut wherever the string's own bytes happen to land: for
+// `参数校验失败` in fives the last read is the single byte `e8`. What matters
+// here is where the read stops, so the fixtures below state it in bytes.
+function splitAt(text, ...cuts) {
+  const bytes = new TextEncoder().encode(text);
+  const parts = [];
+  let from = 0;
+  for (const at of [...cuts, bytes.length]) {
+    parts.push(bytes.slice(from, at));
+    from = at;
+  }
+  return new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(part);
+      controller.close();
+    },
+  });
+}
+
+// Everything this route has to say fits in ASCII, and that is exactly why the
+// read could lose a character for so long: a refusal is the one body whose words
+// this package repeats, and this route refuses in Chinese (`参数校验失败`, the
+// 400 LongCat answers a bad request with), where a character is three bytes and
+// a read ends wherever the socket put it. Decoded one read at a time with no
+// state carried over, a character split across two reads becomes one U+FFFD per
+// piece — measured with `decoder.decode(value)` for the fixture below, `日` came
+// back as `\uFFFD\uFFFD\uFFFD`: a row of diamonds where a character was, in the
+// one message a caller is meant to repeat.
+test("a multi-byte character split across two reads is decoded whole", async () => {
+  const { readBoundedText } = await subject;
+  // `日` is `e6 97 a5`, so cutting after its first byte and after its third
+  // leaves it in two pieces, the way a socket may.
+  const text = "abc日本def";
+  const bytes = new TextEncoder().encode(text);
+  assert.deepEqual(
+    [...bytes.slice(3, 7)],
+    [0xe6, 0x97, 0xa5, 0xe6],
+    "the cut has to land after 日's first byte and inside 本",
+  );
+  const read = await within(
+    1000,
+    readBoundedText(new Response(splitAt(text, 4, 6), { status: 400 }), 4096),
+    "a read cut inside a character",
+  );
+  assert.equal(read.text, text, "the character is whole, not one replacement per piece");
+  assert.equal(read.ended, true, "and the body was read to its end");
+  assert.equal(read.over, false, "so nothing of it was cut");
+  // The same body through the character-count chunker this file already uses:
+  // `abc日` is four characters, so a chunk of five carries two of 日's three
+  // bytes and the next read opens with the third. This is the shape the suite
+  // had no fixture for, which is why the mutant survived it.
+  const chunkedRead = await within(
+    1000,
+    readBoundedText(refusal(text, { size: 5, status: 400 }), 4096),
+    "a read cut inside a character by the chunker",
+  );
+  assert.equal(chunkedRead.text, text, "the same character, split by the same rule");
+  assert.equal(chunkedRead.ended, true);
+  assert.equal(chunkedRead.over, false);
+});
+
+// The budget is counted in characters of decoded text, and the read that reaches
+// it is allowed one character past: a cut decided in characters is decided from
+// a decode that has to finish the character the previous read left half of. A
+// decoder that forgot between reads answers the cut with replacement characters,
+// which are characters too — `参数校验失败` decoded three bytes at a time is six
+// of them — and each one would sit in the refusal this package repeats.
+test("a split character landing on the budget edge is decoded whole", async () => {
+  const { readBoundedText } = await subject;
+  const text = "参数校验失败：max_tokens 超出";
+  // Decoded, `参数校验失败` is six characters falling at byte 18, and byte 15 is
+  // inside the sixth: the read that reaches the budget opens with a character
+  // the read before it started, and has to count the whole of it.
+  const read = await within(
+    1000,
+    readBoundedText(new Response(splitAt(text, 5, 10, 15, 18), { status: 400 }), 5),
+    "a read reaching the budget on the far side of a split character",
+  );
+  assert.equal(
+    read.text,
+    "参数校验失败",
+    "the budget, and the one character that says the body went on",
+  );
+  assert.equal(read.over, true, "the body went on past the budget");
+  assert.equal(read.ended, false, "and did not end where the read did");
+  // Stated again from the other side: with the budget landing between two
+  // characters, the same fixture reads one character less and no more.
+  const boundary = await within(
+    1000,
+    readBoundedText(new Response(splitAt(text, 5, 10, 15, 18), { status: 400 }), 4),
+    "a read budgeted between two characters",
+  );
+  assert.equal(boundary.text, "参数校验失", "the budget and nothing else");
+  assert.equal(boundary.over, true);
+  assert.equal(boundary.ended, false);
+});
+
 test("a number the wait cut short is not a limit", async () => {
   const { observeRouteStatement, limitOverrides } = await subject;
   const controller = new AbortController();

@@ -353,7 +353,7 @@ function explain(text, source, toolPolicy) {
           filled.length
             ? `The host declares none of ${filled.join(", ")}, so those were added from it.`
             : `The host declared every one of them; only the wording was replaced, and its own parameters were kept so its tools still run.`,
-          "OpenCode rewords those tools between releases. Run `bun run check:gate` to see whether that copy is still current; if it is not, capture the wording again from a current OpenCode and update this package.",
+          "OpenCode rewords those tools between releases. Run `bun run check:gate` from a clone of this repository to see whether that copy is still current; if it is not, capture the wording again from a current OpenCode and update this package.",
         ].join(" ");
   return new Response(
     JSON.stringify({

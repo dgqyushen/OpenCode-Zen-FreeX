@@ -196,24 +196,46 @@ function responsesAccumulator() {
   // was measured handing a function_call there the text of a message. An
   // `added` frame opens an item, so the id it names is new there by
   // definition and takes the next free slot; a frame that has to find an
-  // item that is already open still throws.
-  function slot(data, id, fresh = false) {
+  // item that is already open still throws — unless the reply holds exactly
+  // one item of the frame's own kind with no id of its own, which is the item
+  // the frame is naming: measured on this route, a call's output_item.added
+  // can arrive carrying no id at all and every frame after it names the item
+  // by an id of its own, so the id is adopted onto the item the stream opened
+  // for that call, and one call stays one item. Two candidates, or none of
+  // the frame's kind, is still not something to guess at, and still throws.
+  function slot(data, id, fresh = false, kind) {
     if (data.output_index !== undefined) return index(data.output_index);
     if (id === undefined || id === null || id === "") return index(undefined);
     const position = [...output].find(([, value]) => value.id === id)?.[0];
     if (position !== undefined) return index(position);
-    if (!fresh) throw new Error("Upstream frame names an unknown item without an output index");
+    if (!fresh) {
+      const candidates = [...output].filter(([, value]) => !value.id && value.type === kind);
+      if (candidates.length === 1) {
+        const [position, value] = candidates[0];
+        value.id = id;
+        return index(position);
+      }
+      throw new Error("Upstream frame names an unknown item without an output index");
+    }
     let next = 0;
     for (const held of output.keys()) next = Math.max(next, held + 1);
     return index(next);
   }
   // A snapshot replaces the item in its slot only when it is a whole view of
-  // it; a partial one leaves what the deltas delivered standing.
+  // it; a partial one leaves what the deltas delivered standing. A snapshot
+  // that carries no id does not take away the one the stream named the item by
+  // (slot, above): the item's own snapshot arrives without it in the shape
+  // that names an item from the frames after it, and taking the snapshot as it
+  // stands lost the id again. One that carries an id still wins, as it did.
   function keep(position, value) {
-    if (carries(value, output.get(position), fields)) output.set(position, value);
+    if (carries(value, output.get(position), fields)) {
+      const held = output.get(position);
+      if (held?.id && !value.id) value.id = held.id;
+      output.set(position, value);
+    }
   }
   function item(data, type = "message") {
-    const position = slot(data, data.item_id);
+    const position = slot(data, data.item_id, false, type);
     if (!output.has(position)) {
       const value = { type };
       if (data.item_id) value.id = data.item_id;
@@ -237,7 +259,10 @@ function responsesAccumulator() {
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
         if (data.item)
-          keep(slot(data, data.item.id, type === "response.output_item.added"), data.item);
+          keep(
+            slot(data, data.item.id, type === "response.output_item.added", data.item?.type),
+            data.item,
+          );
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
         value.content ??= [];
