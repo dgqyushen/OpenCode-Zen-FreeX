@@ -4,19 +4,18 @@
 
 ## 为什么有这个分支
 
-上游 [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free) 是这个插件的前身。它一直在维护，修bug也不慢，但对「给免费模型适配」这件事的态度摇摆不定，时而维护而放弃维护故催生本分支：
+ [zen-free](https://github.com/magpie-community/plugins/tree/main/packages/zen-free) 是这个插件的前身。先说清楚：上游一直在维护，修 Bug 也很快。问题在于它对**免费模型支持**这件事，始终缺少一个**稳定、明确的态度**
 
-| UTC | 提交 | 那一下说了什么 |
+免费模型失效时，用户反馈issue，得到的答复却是**将不再支持**；过一段时间，相关问题又被悄悄修复，免费模型重新恢复可用。支持、放弃、再支持——用户只能跟着上游的态度**反复折腾**，却始终无法确定这份支持究竟能持续多久
+
+既然有人依赖它，就值得一个明确的答案，而不是**反复摇摆**，这就是本项目诞生的原因
+| UTC | 提交 | 上游说了什么 |
 | --- | --- | --- |
 | 2026-10-13 23:53 | [`643ef50`](https://github.com/magpie-community/plugins/commit/643ef5018e63be78c4aa7554696831d4220ac9c9) | README 加上说明：免费层「只在 OpenCode 本体里能用」，`this plugin doesn't work around that`，请改用 Zen 付费 key 或 OpenCode Go；提交说明里写着 `No version bump … The code on main is left as it is` |
 | 2026-10-14 10:57 | [`a810ee7`](https://github.com/magpie-community/plugins/commit/a810ee7e882012ab106e2deb742176cd43db781a) | 0.1.6 把那段说明**删掉**，改为发 OpenCode 1.19.0 原样的请求头——距加上去 11 小时 |
 | 2026-10-14 17:59 | [`5fc0a75`](https://github.com/magpie-community/plugins/commit/5fc0a75292f0e5c0c10cf65a188bff5545d6b8e9) | 0.1.7：`free models answer again` |
 
-本分支切于 2026-10-15 00:14 UTC，就在那段声明被删掉之后、从 0.1.6 派生出来。所以这里不去赌下一次会往哪边倒：**指纹在这个仓库里可以随时重新采集**（`bun run capture`），不必等上游发版，也不必先有人被 403 挡住。维护步骤（重新采集、读闸门结果、发版）见 [MAINTAINING.md](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/MAINTAINING.md)。
-
-上游的修复是跟着报告走的——0.1.1 到 0.1.8 的每一个版本提交都挂着一位具名的报告者。没人遇到、没人报告，就没有那一次修复。这里的 `bun run check:gate` 把「去问 Zen 现在还认哪一代」变成一条随时能跑的命令。
-
-上游修好的东西会照常跟进。**版本号与上游不可比**：0.2.x 长在上游 0.1.6 上，之后按需合并上游的修复，同时保留自己的取舍（比如工具措辞按代从真实 OpenCode 采集，而不是钉死某一个版本）。升级看这个仓库的提交，别拿版本号大小跟上游排。
+上游的后续更新会按需合并，同时保留自己的取舍（比如工具措辞按代从真实 OpenCode 采集，而不是钉死某一个版本）
 
 ## 目录
 
