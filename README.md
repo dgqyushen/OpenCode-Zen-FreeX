@@ -64,8 +64,8 @@ bun run capture             # 确认差异后才写入
 
 发往 `https://opencode.ai/inference/v1`，按每个模型原生协议走（Chat Completions / Responses / Anthropic Messages），流式与普通 JSON 都支持。
 
-- **宿主的工具不会被丢**：Zen 调 OpenCode 工具名时，按大小写与 `_`/`-` 对上唯一匹配的宿主工具（`bash`↔`Bash`、`todowrite`↔`todo_write`）；对不上就略去并在正文说明。工具仍在宿主执行，调用一律带非空 id。
-- **只借 OpenCode 的样子**：请求头、User-Agent、工具必须同属一代（`bash`/`glob`/`grep`/`read` 是 1.x，`shell`/`read` 是 2.x）；宿主缺的 `required` 工具由插件补发描述（背后没有实现，正文注明），宿主自带的 User-Agent 原样透传。
+- **对不上的名字照样交给宿主**：Zen 调 OpenCode 工具名时，按大小写与 `_`/`-` 对上唯一匹配的宿主工具（`bash`↔`Bash`、`todowrite`↔`todo_write`）；对不上或有歧义时**不猜也不丢**，按模型写的名字、原样的 id 与参数送达宿主，由宿主回它自己的"没有这个工具"，模型据此改名重来。只有**没有名字**的调用会被略去，并在正文说明。工具仍在宿主执行，调用一律带非空 id。
+- **只借 OpenCode 的样子**：请求头、User-Agent、工具必须同属一代（`bash`/`glob`/`grep`/`read` 是 1.x，`shell`/`read` 是 2.x）；宿主缺的 `required` 工具由插件补发描述（背后没有实现，描述里注明别调它），宿主自带的 User-Agent 原样透传。
 - **请求头是刻意挑出的最小集合**：`content-type`、`accept`、`user-agent`、`x-opencode-project`、`x-opencode-session(-id)`（同一 id）、`x-opencode-client: cli`、`authorization: Bearer public`（走 Messages 时 `x-api-key: public` + `anthropic-version`；`anthropic-beta` 这个头插件自己从不设置：只在宿主已经发了的时候原样透传）。**不要加别的头**：两个各自无害的组合起来也会被拒——单试一个得不出结论。
 - **会话 id** 按会话首条消息生成并记住，同一会话各轮共用；宿主的 id 形状合法就原样传。
 - **提前掐断的流**：有内容且无未完成调用 → 按普通回答收尾并注明截断，再问会续；否则请求失败，错误写明回复 id 与已收字节。Messages / Responses 被截断同样失败。

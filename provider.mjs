@@ -339,10 +339,12 @@ function normalizeTools(body, protocol) {
       continue;
     }
     filled.push(name);
-    // A tool added here has nothing behind it: the agent has no such tool and
-    // a call to it is dropped. Describing it as OpenCode describes it is what
-    // Zen asks for, and it also makes the model want to call it, so the note
-    // goes after the opening Zen reads and before the closing it does not.
+    // A tool added here has nothing behind it: the agent has no such tool, so a
+    // call to it goes to the agent as called and comes back as the agent's own
+    // unknown-tool error, which the model corrects. Describing it as OpenCode
+    // describes it is what Zen asks for, and that description also makes the
+    // model want to call it, so the note goes after the opening Zen reads and
+    // before the closing it does not.
     body.tools.push(shapeOf({ ...spoken, description: `${spoken.description}\n\n${PLACEHOLDER}` }, protocol));
   }
   return { declared, filled, generation };

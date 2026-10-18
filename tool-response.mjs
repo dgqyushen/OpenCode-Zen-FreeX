@@ -19,8 +19,8 @@ function headersFor(response) {
 }
 
 // failure answers the error a client reads. `code` says what went wrong
-// where the shape has room for it: only a call of no tool the agent has is
-// an undeclared one, and a limit, a truncation or a malformed upstream is
+// where the shape has room for it: only a call the guard cannot name at all
+// is an undeclared one, and a limit, a truncation or a malformed upstream is
 // not.
 function failure(protocol, message, stream = false, code = "upstream_error") {
   if (protocol === "anthropic") return { type: "error", error: { type: "api_error", message } };
@@ -88,8 +88,15 @@ function declaredNames(policy) {
   return new Set(names);
 }
 
-// nameGuard answers the agent's name for a call, or null for a call of no
-// tool the agent has (a missing name included).
+// nameGuard answers the agent's name for a call: the agent's spelling when one
+// folds to it, else the name as the model wrote it. A call of a tool the agent
+// has no spelling of (bedit, psh, mcp__netcatcatty__unused) reaches the agent
+// as called, as it does on every other provider: the agent answers it with its
+// own unknown-tool error, and the model corrects the name and goes on (#209).
+// Leaving it out ended an agent's turn as a plain answer, which an autonomous
+// host reads as "the task is done" (#76 fixed the failure that came before
+// this one; that reply is not handed a turn's end any more, it is handed a
+// call). Only a call with no name answers null, and is left out.
 function nameGuard(policy) {
   const declared = declaredNames(policy);
   const lower = (name) => name.toLowerCase();
@@ -101,16 +108,16 @@ function nameGuard(policy) {
     if (declared.has(name)) return name;
     const match =
       byCase.get(lower(name)) ?? (byCase.has(lower(name)) ? null : byShape.get(bare(name)));
-    return match || null;
+    return match || name;
   };
 }
 
-// The models also call tools no agent has: bedit, bcp, ash, a mangled
-// mcp__netcatcatty__unused (#76). Such a call can't be run or named onto
-// one the agent has, and failing the reply for it threw away the whole
-// turn. It is left out instead, and the reply says so in its text, where
-// the agent's user and the model's next turn both read it. A reply left
-// with no call ends as a plain stop.
+// A call with no name can't be run, named onto one the agent has, or answered
+// by any agent: nothing keys a result by it and its own id names nothing. It
+// is left out instead of failing the reply — failing threw away the whole turn
+// (#76) — and the reply says so in its text, where the agent's user and the
+// model's next turn both read it. A reply left with no call ends as a plain
+// stop. Every named call, whatever the name, is handed on as called.
 export function droppedNote(name) {
   return typeof name === "string" && name
     ? `(The model called a tool this agent doesn't have: ${JSON.stringify(name.slice(0, 128))}. The call was left out.)`
@@ -785,11 +792,11 @@ function snapshotStream(protocol, checkName) {
           insideWords.clear();
           if (opens && nowhere[open]) nowhere[open].settled = true;
         }
-        // The item this frame carries, when it is a call of no tool the agent
-        // has: the walk below replaces it — opens or closes it, the copy is
-        // the same call — and its words are the ones a note takes the place
-        // of. Every other item the frame names is one the reply keeps, and the
-        // place it holds is a fact the suppression below reads before any word.
+        // The item this frame carries, when it is a call with no name: the
+        // walk below replaces it — opens or closes it, the copy is the same
+        // call — and its words are the ones a note takes the place of. Every
+        // other item the frame names is one the reply keeps, and the place it
+        // holds is a fact the suppression below reads before any word.
         const leaving =
           (opens || closes) &&
           object(item) &&

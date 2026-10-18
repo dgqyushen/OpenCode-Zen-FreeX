@@ -320,16 +320,21 @@ for (const { protocol, path, model } of protocols) {
           );
           assert.ok(Object.keys((tool.parameters ?? tool.input_schema).properties).length > 0);
         }
-        // A call of a tool the agent doesn't have is left out, said in
-        // the reply's text, and the turn ends as a stop rather than
-        // failing (#76).
+        // A call of a tool the agent doesn't have reaches the agent as
+        // called, as a tool call, so the agent answers it with its own
+        // unknown-tool error and the model goes on; it neither fails the
+        // turn (#76) nor ends it as a plain answer (#209).
         state.reply = toolReply(protocol, "edit", upstreamSSE);
-        const left = await send();
-        assert.equal(left.status, 200);
-        const text = await left.text();
-        assert.doesNotMatch(text, /"name"\s*:\s*"edit"/);
-        assert.doesNotMatch(text, /"error"|"tool_calls"|"tool_use"|"function_call"/);
-        assert.match(text, /a tool this agent doesn't have: \\"edit\\"/);
+        const handed = await send();
+        assert.equal(handed.status, 200);
+        const text = await handed.text();
+        assert.match(text, /"name"\s*:\s*"edit"/);
+        assert.match(text, /"tool_calls"|"tool_use"|"function_call"/);
+        // The id the model's call came with is the client's handle on it, and
+        // the call is handed on with it: Chat and Messages as `id`, Responses
+        // as `call_id`.
+        assert.match(text, /"(?:call_)?id"\s*:\s*"call_1"/);
+        assert.doesNotMatch(text, /"error"|The call was left out/);
       });
     }
   }
@@ -346,12 +351,68 @@ test("keeps declared tools isolated between requests using the same loader", asy
       body: JSON.stringify({ model: "chat-free", stream: false, tools }),
     });
   assert.equal((await send(declaredTools("chat"))).status, 200);
-  const blocked = await send([]);
-  assert.equal(blocked.status, 200);
-  const text = await blocked.text();
+  const undeclared = await send([]);
+  assert.equal(undeclared.status, 200);
+  const text = await undeclared.text();
   assert.doesNotMatch(text, /"name"\s*:\s*"Bash"/);
-  assert.match(text, /a tool this agent doesn't have: \\"bash\\"/);
+  assert.match(text, /"name"\s*:\s*"bash"/);
 });
+
+// toolReply refuses to write a call with no name — the shape a case reaching
+// for a tool name most easily gets by accident — so the one case that wants
+// that shape takes the name off the reply that builder wrote. Every protocol
+// writes the name where its wire does, so this stays on the shapes the other
+// cases here use; the assert is what keeps a builder that stopped writing the
+// name from leaving a named call to be asserted about instead.
+function namelessReply(protocol, sse) {
+  const written = `"name":${JSON.stringify("NAMELESS")}`;
+  const reply = toolReply(protocol, "NAMELESS", sse);
+  assert.ok(reply.includes(written), `${protocol} writes the tool name as ${written}`);
+  return reply.split(written).join('"name":""');
+}
+
+// The half of the guard that survives #209: a call the model gave no name to
+// names nothing a host could key a result by, so it is still left out of the
+// reply and the reply's text says so, where the client reads it (#76). The call
+// itself never reaches the client, and a turn left with no call ends as a plain
+// stop rather than tool use — hold it apart from the case above, where a *named*
+// call the agent has no spelling of now goes on as called. Where the note lands
+// is the protocol's own: Chat keeps it in the message's text, Responses answers
+// a text item in the call's place, Messages a text block.
+const leftOutShape = {
+  chat: {
+    note: /"content"\s*:\s*"\(The model called a tool without a name\./,
+    finish: /"finish_reason"\s*:\s*"stop"/,
+  },
+  responses: { note: /"type"\s*:\s*"output_text"/, finish: /"type"\s*:\s*"message"/ },
+  anthropic: { note: /"type"\s*:\s*"text"/, finish: /"stop_reason"\s*:\s*"end_turn"/ },
+};
+
+for (const { protocol, path, model } of protocols) {
+  for (const stream of [true, false]) {
+    for (const upstreamSSE of [true, false]) {
+      test(`${protocol}: a call with no name is left out, said in the text, with client stream=${stream}, upstream SSE=${upstreamSSE}`, async (t) => {
+        const { plugin, state, origin } = await fixture(t);
+        await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+        const loader = await plugin.auth.loader(publicAuth);
+        state.contentType = upstreamSSE ? "text/event-stream" : "application/json";
+        state.reply = namelessReply(protocol, upstreamSSE);
+        const response = await loader.fetch(`${origin}/v1/${path}`, {
+          method: "POST",
+          body: JSON.stringify({ model, stream, tools: declaredTools(protocol) }),
+        });
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        assert.match(text, /The model called a tool without a name\. The call was left out\./);
+        assert.doesNotMatch(text, /"tool_calls"|"tool_use"|"function_call"/);
+        const shape = leftOutShape[protocol];
+        assert.ok(shape, `no left-out shape is written for ${protocol}`);
+        assert.match(text, shape.note);
+        assert.match(text, shape.finish);
+      });
+    }
+  }
+}
 
 for (const [input, supplied, expected] of [
   [{}, undefined, "global"],

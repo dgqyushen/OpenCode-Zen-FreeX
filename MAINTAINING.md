@@ -173,6 +173,12 @@ bun run capture            # writes it
 bun run check:gate         # did that fix it
 ```
 
+`bun test` reads the tree; a running gateway does not. Magpie's plugin host
+imports the plugin once, when it starts, and no `magpie plugin` subcommand
+reloads it — pointing a gateway at this tree does not make it watch the tree, so
+a change to be measured through a live gateway needs that gateway restarted
+first.
+
 `check:gate` is the one that matters. It asks each generation twice, because the
 plugin sends two shapes and Zen does not answer them alike:
 
@@ -304,6 +310,22 @@ it. Rewriting the parameters as well looks tidier and breaks the agent.
 **Replacing the wording with something of your own.** That is what 0.1.5 and
 earlier did, and it is a guaranteed refusal.
 
+**Leaving out a call the agent has no tool for.** A call whose name folded onto
+no declared tool was dropped from the reply with a note in its text, and a reply
+whose every call was dropped ended as a plain `stop`. An autonomous host reads
+that as an answer: DeepSeek Harness ended 16 of the 19 such turns one user
+measured and the model never saw an error it could correct
+(`magpie-community/plugins#209`; upstream made the same change in its 0.1.11).
+The name now goes on as the model wrote it — same name, same id, same arguments,
+a tool-call finish — and the host answers it with its own unknown-tool error,
+which is the correction signal. A name two declared tools fold to is still never
+guessed: it goes on as called. Only a call with **no name** is left out now, and
+`droppedNote` says so. Measured 2026-10-18 through a local magpie pointed at
+this tree, `deepseek-v4.1-flash-free`, declaring `pwsh` and calling `bash`:
+before, `200` + `finish_reason: "stop"` + the note; after, `200` + `tool_calls`
++ `bash` carrying its id. Do not put the drop back to "protect" a host —
+answering is the host's to do, and a silent `stop` is the failure this replaced.
+
 **Merging a tool call's frames over its id.** The route puts `"id": null` on
 the continuation frames of a call whose first frame named it (measured
 2026-10-17 on `deepseek-v4.1-flash-free`), and a host that keys a tool result
@@ -314,6 +336,17 @@ replaces itself, and a call the route never names has to leave with an
 invented one. Both live in `tool-response.mjs` — the merge's keep, and
 `ensureCallIDs` at the two places a call is published — and `stream.mjs`'s
 collapse reads the same rule.
+
+Both of those places publish the **chat** shape only. A Responses or Messages
+reply whose call carries no id of its own is handed on as it stands — no id, no
+`call_id` — and both protocols require the field. Measured 2026-10-18, no free
+model is served on either route: the tier's own `/models` listed none,
+`muse-spark-1.3-contributor-free` answered 410 `ModelDeprecated` and the four
+Messages models answered "Model is unavailable". So the gap is real but not
+reachable today, and the sentence above — every published call leaves with a
+non-empty id — is chat's. A free model on either route puts it back in scope,
+and then the id has to be minted once per call across its added, done and
+terminal copies, the way the dropped ones already are.
 
 **Trusting one observation.** The gate is not steady: it moved more than once in
 a day while this was being worked out, and identical requests were answered both

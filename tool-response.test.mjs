@@ -113,6 +113,31 @@ function callsIn(protocol, values) {
     return items.filter((item) => callShaped(item.type)).map((item) => item.name);
   });
 }
+// The words the agent keys a call's result by: a Chat client matches a
+// tool/result by the call's id, a Responses item carries the call_id the route
+// named it by (and an id of its own), and a Messages block is keyed by its id.
+// A call the guard hands on has one — it leaves with an id (ensureCallIDs) —
+// and the note left in a nameless call's place is not a call at all.
+function idsIn(protocol, values) {
+  return values.flatMap((data) => {
+    if (protocol === "chat")
+      return (data.choices ?? [])
+        .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
+        .map((value) => value.id)
+        .filter(Boolean);
+    const items =
+      protocol === "responses"
+        ? [...((data.response ?? data).output ?? []), ...(data.item ? [data.item] : [])]
+        : [
+            ...((data.message ?? data).content ?? []),
+            ...(data.content_block ? [data.content_block] : []),
+          ];
+    return items
+      .filter((item) => callShaped(item.type))
+      .map((item) => item.call_id ?? item.id)
+      .filter(Boolean);
+  });
+}
 function textIn(protocol, values) {
   if (protocol === "chat")
     return values
@@ -294,16 +319,21 @@ function assertError(protocol, data, stream = true, code = "upstream_error") {
 }
 // The shape of a reply that dropped a call, whichever protocol and whichever
 // path built it: no error in the reply, exactly the calls it kept, the note
-// standing in for the one it left out, and no trace of the dropped name in
-// the bytes. Written once, so a change to the note's text or to what counts
-// as a call cannot leave the suites disagreeing about the same behaviour.
-// The leak check is over the whole value on purpose: callsIn reads the call
-// shapes it knows, so a call of another kind would be a leak it cannot see.
-function assertOnlyDropped(protocol, values, name, kept) {
+// standing in for the one it left out, and no call-shaped item left without a
+// name. Written once, so a change to the note's text or to what counts as a
+// call cannot leave the suites disagreeing about the same behaviour. Since
+// #209 the one call still left out is a nameless one, so the note is the
+// nameless note and the leak check is a call that reached the client with no
+// name to key it by; it is over the whole value on purpose, because callsIn
+// reads only the call shapes it knows.
+function assertOnlyDropped(protocol, values, kept) {
   assert.ok(!values.some((data) => data.type === "error" || data.error));
   assert.deepEqual(callsIn(protocol, values), kept);
-  assert.equal(textIn(protocol, values), droppedNote(name));
-  assert.ok(!JSON.stringify(values).includes(`"${name}"`), `${name} leaked in the reply`);
+  assert.equal(textIn(protocol, values), droppedNote(""));
+  assert.ok(
+    callsIn(protocol, values).every((name) => typeof name === "string" && name !== ""),
+    "a call left with no name reached the reply",
+  );
 }
 // A stream that never ends on its own is waited on with a budget: a hang is
 // then reported as one instead of stalling the run. A loaded machine can push
@@ -448,7 +478,12 @@ for (const protocol of protocols) {
     }
   });
 
-  test(`${protocol}: JSON leaves out unknown, non-injected, ambiguous and semantic aliases, and says so (#76)`, async () => {
+  // #209: an unknown name is no longer a call to leave out. Every name the
+  // model wrote that the agent has no spelling of — unknown, injected but not
+  // declared, an ambiguous fold, a fold onto a semantic alias — reaches the
+  // agent as called, so the agent answers it with its own unknown-tool error
+  // and the model corrects the name instead of reading a finished turn.
+  test(`${protocol}: JSON hands on unknown, non-injected, ambiguous and semantic aliases as called (#209)`, async () => {
     for (const [name, rules] of [
       ["unknown", policy],
       ["shell", policy],
@@ -466,13 +501,23 @@ for (const protocol of protocols) {
       );
       assert.equal(response.status, 200);
       const body = await response.json();
-      assertOnlyDropped(protocol, [body], name, ["Read"]);
+      assert.ok(!body.error, `${name}: the reply is an error, not a reply`);
+      assert.deepEqual(
+        callsIn(protocol, [body]),
+        ["Read", name],
+        `${name} was left out or handed on under another name`,
+      );
+      assert.equal(textIn(protocol, [body]), "", `${name} drew a note`);
     }
   });
 
-  // #76, tkhs101's table of 2026-10-10: the names step-5-preview-free
-  // called that DSH has no tool for, and no spelling of one either. Each
-  // failed the whole turn; each is now left out with the turn going on.
+  // #76, tkhs101's table of 2026-10-10, and #209, xiotbox's DSH sessions of
+  // 2026-10-16/17: the names step-5-preview-free called that DSH has no tool
+  // for, and no spelling of one either. Each used to be left out with the turn
+  // going on — and a reply of only such a call ended an autonomous agent's turn
+  // as a plain answer, which its host read as "the task is done". Each is now
+  // handed on as called, with its id and a tool-call finish, so the agent
+  // answers it with its own unknown-tool error and the model corrects the name.
   //
   // The last is the table's own spelling, doubled "cat" and all, kept
   // verbatim rather than "fixed": it names a different server than the
@@ -492,17 +537,27 @@ for (const protocol of protocols) {
     ]),
     injected: new Set(),
   };
-  test(`${protocol}: the names from #76's table are left out, not failed on`, async () => {
+  test(`${protocol}: a call of a tool the agent doesn't have reaches it as called, with its id and a tool-call finish (#76, #209)`, async () => {
     for (const name of ["bedit", "bcp", "ash", "mcp__netcatcatty__unused"]) {
-      const json = await guardToolResponse(
+      // Beside a call the agent has (#209's case B), and alone (case A).
+      const mixed = await guardToolResponse(
         Response.json(snapshot(protocol, ["bash", name])),
         protocol,
         tableRules,
       );
-      assert.equal(json.status, 200);
-      assertOnlyDropped(protocol, [await json.json()], name, ["bash"]);
-      // Not named `upstream`: that is this file's own `upstream(...)` factory, and
-      // this loop holds the bytes to read, not the thing that makes them.
+      assert.equal(mixed.status, 200);
+      const body = await mixed.json();
+      assert.deepEqual(callsIn(protocol, [body]), ["bash", name], `${name} was not handed on as called`);
+      assert.equal(textIn(protocol, [body]), "", `${name} drew a note`);
+      const alone = await guardToolResponse(
+        Response.json(snapshot(protocol, [name])),
+        protocol,
+        tableRules,
+      );
+      assert.equal(alone.status, 200);
+      const only = await alone.json();
+      assert.deepEqual(callsIn(protocol, [only]), [name]);
+      assert.ok(idsIn(protocol, [only]).length > 0, `${name} reached the agent with no id to key it by`);
       for (const bytes of [
         event(streamSnapshot(protocol, [name])) + terminal(protocol),
         toolStream(protocol, name),
@@ -510,8 +565,29 @@ for (const protocol of protocols) {
         const streamed = await guardToolResponse(sse(bytes), protocol, tableRules);
         assert.equal(streamed.status, 200);
         const values = frameData(await streamed.text());
-        assertOnlyDropped(protocol, values, name, []);
-        assert.doesNotMatch(JSON.stringify(values), /"(?:tool_calls|tool_use|function_call)"/);
+        assert.ok(!values.some((data) => data.type === "error" || data.error));
+        assert.deepEqual([...new Set(callsIn(protocol, values))], [name]);
+        assert.equal(textIn(protocol, values), "");
+        assert.ok(idsIn(protocol, values).length > 0, `${name} reached the agent with no id to key it by`);
+        assert.doesNotMatch(JSON.stringify(values), /The call was left out/);
+      }
+      // Zen's own stream comes through as it was sent: every call in it is
+      // named, so nothing in it is rewritten. Chat is compared by value — its
+      // buffer republishes each call as one whole delta — and the other two
+      // frame for frame.
+      const raw = toolStream(protocol, name);
+      const passed = frameData(await (await guardToolResponse(sse(raw), protocol, tableRules)).text());
+      if (protocol !== "chat") assert.deepEqual(passed, frameData(raw));
+      else {
+        const choices = passed.flatMap((data) => data.choices ?? []);
+        assert.deepEqual(
+          choices.flatMap((choice) => choice.delta?.tool_calls ?? []).map((call) => call.function.name),
+          [name],
+        );
+        assert.ok(
+          choices.some((choice) => choice.finish_reason === "tool_calls"),
+          "the flush told the client the turn ended in tool use",
+        );
       }
     }
   });
@@ -519,8 +595,9 @@ for (const protocol of protocols) {
   // The near miss the table's mangled name cannot cover: the declared server,
   // with a tool it does not have. A call is folded whole — case and
   // separators only — so sharing a server prefix is never enough to answer it
-  // with another tool's name.
-  test(`${protocol}: a tool the declared server does not have is left out, not matched by prefix`, async () => {
+  // with another tool's name, and a name no declared tool folds to is handed
+  // on as called (#209).
+  test(`${protocol}: a tool the declared server does not have is handed on as called, not matched by prefix`, async () => {
     const name = "mcp__netcatty-external__unused";
     const json = await guardToolResponse(
       Response.json(snapshot(protocol, ["bash", name])),
@@ -528,14 +605,20 @@ for (const protocol of protocols) {
       tableRules,
     );
     assert.equal(json.status, 200);
-    assertOnlyDropped(protocol, [await json.json()], name, ["bash"]);
+    const body = await json.json();
+    assert.ok(!body.error);
+    assert.deepEqual(callsIn(protocol, [body]), ["bash", name]);
+    assert.equal(textIn(protocol, [body]), "");
     const streamed = await guardToolResponse(
       sse(event(streamSnapshot(protocol, [name])) + terminal(protocol)),
       protocol,
       tableRules,
     );
     assert.equal(streamed.status, 200);
-    assertOnlyDropped(protocol, frameData(await streamed.text()), name, []);
+    const values = frameData(await streamed.text());
+    assert.ok(!values.some((data) => data.type === "error" || data.error));
+    assert.deepEqual([...new Set(callsIn(protocol, values))], [name]);
+    assert.equal(textIn(protocol, values), "");
   });
 
   // #76: DSH declares all five core tools (so nothing is injected) and
@@ -580,19 +663,23 @@ for (const protocol of protocols) {
     }
   });
 
-  test(`${protocol}: a call left out is named in the reply's text (#76)`, async () => {
+  // The one call that is still left out: a call with no name at all. Nothing
+  // keys a result by it and no agent can run it, so it is replaced by the note
+  // saying so (#76), and the note's text is the whole of what the reply says.
+  test(`${protocol}: a call with no name is left out, and the reply's text says so (#76)`, async () => {
     const json = await guardToolResponse(
-      Response.json(snapshot(protocol, ["subagent"])),
+      Response.json(snapshot(protocol, [""])),
       protocol,
       policy,
     );
-    assert.equal(textIn(protocol, [await json.json()]), droppedNote("subagent"));
+    assert.equal(json.status, 200);
+    assert.equal(textIn(protocol, [await json.json()]), droppedNote(""));
     const streamed = await guardToolResponse(
-      sse(event(streamSnapshot(protocol, ["subagent"])) + terminal(protocol)),
+      sse(event(streamSnapshot(protocol, [""])) + terminal(protocol)),
       protocol,
       policy,
     );
-    assert.equal(textIn(protocol, frameData(await streamed.text())), droppedNote("subagent"));
+    assert.equal(textIn(protocol, frameData(await streamed.text())), droppedNote(""));
     assert.equal(
       droppedNote("x".repeat(300)),
       `(The model called a tool this agent doesn't have: "${"x".repeat(128)}". The call was left out.)`,
@@ -653,7 +740,7 @@ for (const protocol of protocols) {
     assert.equal(source.response.body.locked, false);
   });
 
-  test(`${protocol}: a mixed SSE snapshot hands on the declared call and leaves out the rest (#76)`, async () => {
+  test(`${protocol}: a mixed SSE snapshot hands on every named call and leaves out a nameless one (#76, #209)`, async () => {
     for (const name of ["unknown", "shell", "todowrite"]) {
       const result = await guardToolResponse(
         sse(event(streamSnapshot(protocol, ["Read", name])) + terminal(protocol)),
@@ -661,8 +748,18 @@ for (const protocol of protocols) {
         policy,
       );
       const values = frameData(await result.text());
-      assertOnlyDropped(protocol, values, name, ["Read"]);
+      assert.ok(!values.some((data) => data.type === "error" || data.error));
+      assert.deepEqual(callsIn(protocol, values), ["Read", name]);
+      assert.equal(textIn(protocol, values), "");
     }
+    // The same snapshot with the second call nameless: that one is still left
+    // out, and the first is untouched.
+    const result = await guardToolResponse(
+      sse(event(streamSnapshot(protocol, ["Read", ""])) + terminal(protocol)),
+      protocol,
+      policy,
+    );
+    assertOnlyDropped(protocol, frameData(await result.text()), ["Read"]);
   });
 
   test(`${protocol}: upstream SSE errors pass through byte-for-byte and cancel open streams`, async () => {
@@ -955,15 +1052,17 @@ test("a policy whose declared field cannot be read is refused by name", async ()
 
 // An item id stands in for the item, so two calls left out of one reply that
 // arrived without ids cannot be handed the same one: a Responses client keys
-// by it, and the streamed path suppresses arguments by it (#49).
+// by it, and the streamed path suppresses arguments by it (#49). Both calls
+// are nameless — the one shape still left out (#209) — and carry no id of
+// their own, so nothing but the place each holds tells the two apart.
 test("Responses: dropped calls without ids are replaced by items with distinct ids", async () => {
-  const output = ["one", "two"].map((name) => ({ type: "function_call", name, arguments: "{}" }));
+  const output = [0, 1].map(() => ({ type: "function_call", name: "", arguments: "{}" }));
   const json = await guardToolResponse(Response.json({ output }), "responses", policy);
   assert.equal(json.status, 200);
   const items = (await json.json()).output;
   assert.deepEqual(
     items.map((item) => item.content[0].text),
-    [droppedNote("one"), droppedNote("two")],
+    [droppedNote(""), droppedNote("")],
   );
   assert.equal(new Set(items.map((item) => item.id)).size, 2, "two items shared one id");
   const streamed = await guardToolResponse(
@@ -987,9 +1086,11 @@ test("Responses: dropped calls without ids are replaced by items with distinct i
 // keys an item by its id. A counter that gave every replacement a fresh id made
 // one call into several items and left the arguments frames of it unmatched: the
 // call's place in the reply is the same in all three, so that is what the
-// invented id names.
+// invented id names. The call is nameless, so the three copies are all that
+// say it is one call, and an id of `undefined` on all three would satisfy a
+// set-equality check while proving nothing: the id is asserted to exist.
 test("Responses: one dropped call keeps one id across its added, done and terminal copies", async () => {
-  const call = { type: "function_call", name: "nonexistent", arguments: "{}" };
+  const call = { type: "function_call", name: "", arguments: "{}" };
   const streamed = await guardToolResponse(
     sse(
       event({ type: "response.output_item.added", output_index: 0, item: call }) +
@@ -1012,6 +1113,8 @@ test("Responses: one dropped call keeps one id across its added, done and termin
   // own, and a frame called by the same name would have hidden it from here on.
   const terminalFrame = data.find((value) => value.type === "response.completed");
   assert.equal(replaced.length, 2, "both item frames are answered");
+  for (const id of replaced)
+    assert.equal(typeof id, "string", `a replacement was handed no id: ${id}`);
   assert.equal(new Set(replaced).size, 1, "one call became several items");
   assert.equal(
     terminalFrame.response.output[0].id,
@@ -1025,14 +1128,14 @@ test("Responses: one dropped call keeps one id across its added, done and termin
 // the failure the counter itself exists to prevent — and a client that keys by
 // id then reads one call's arguments as the other's.
 test("Responses: a call the reply places nowhere never shares an id with a placed one", async () => {
-  const placed = Array.from({ length: 64 }, (_, index) => ({
+  const placed = Array.from({ length: 64 }, () => ({
     type: "function_call",
-    name: `nonexistent-${index}`,
+    name: "",
     arguments: "{}",
   }));
   const response = await guardToolResponse(
     Response.json({
-      item: { type: "function_call", name: "nonexistent-placeless", arguments: "{}" },
+      item: { type: "function_call", name: "", arguments: "{}" },
       output: placed,
     }),
     "responses",
@@ -1066,7 +1169,7 @@ test("Responses: a call the reply places nowhere never shares an id with a place
 // them ("an unknown item without an output index") where the streaming client
 // was given a reply, so the two paths disagreed about the same upstream.
 test("Responses: a dropped call the frames place nowhere answers one id, in both paths", async () => {
-  const call = { type: "function_call", name: "nonexistent", arguments: "" };
+  const call = { type: "function_call", name: "", arguments: "" };
   const text =
     event({ type: "response.output_item.added", item: call }) +
     event({ type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"a"' }) +
@@ -1094,7 +1197,7 @@ test("Responses: a dropped call the frames place nowhere answers one id, in both
     "the arguments of a call that was left out reached the client",
   );
   assert.deepEqual(callsIn("responses", data), []);
-  assert.equal(textIn("responses", data), droppedNote("nonexistent"));
+  assert.equal(textIn("responses", data), droppedNote(""));
   // The bytes the same upstream sent, collapsed for a client that reads no
   // stream: a reply saying the call was left out, not a 502 about an item.
   const collapsed = await collapseResponse(
@@ -1104,7 +1207,7 @@ test("Responses: a dropped call the frames place nowhere answers one id, in both
   assert.equal(collapsed.status, 200);
   const body = await collapsed.json();
   assert.equal(body.output.length, 1);
-  assert.equal(body.output[0].content[0].text, droppedNote("nonexistent"));
+  assert.equal(body.output[0].content[0].text, droppedNote(""));
 });
 
 // The other side of that rule: a call the reply named nowhere is not the only
@@ -1112,11 +1215,13 @@ test("Responses: a dropped call the frames place nowhere answers one id, in both
 // be swallowed with it — a frame naming an item the reply did name on an item
 // of its own belongs to that item. The frames of the call that was left out
 // are left out with it (they used to be forwarded, describing an item the
-// client was told was replaced by a note).
+// client was told was replaced by a note). The call left out is nameless — the
+// one shape still left out (#209) — so what must not leak is not a name but
+// the call itself: its item and the arguments frames that describe it.
 test("Responses: a placeless call's arguments are left out with it, and one the agent has keeps its own", async () => {
   const kept = { type: "function_call", name: "bash", arguments: "" };
   const text =
-    event({ type: "response.output_item.added", item: { type: "function_call", name: "nonexistent", arguments: "" } }) +
+    event({ type: "response.output_item.added", item: { type: "function_call", name: "", arguments: "" } }) +
     event({ type: "response.function_call_arguments.delta", item_id: "fc_dropped", delta: "{}" }) +
     event({ type: "response.output_item.added", item: kept }) +
     event({ type: "response.function_call_arguments.delta", item_id: "fc_kept", delta: '{"command":"ls"}' }) +
@@ -1135,10 +1240,15 @@ test("Responses: a placeless call's arguments are left out with it, and one the 
     "the kept call's arguments frames were left out with another call",
   );
   // The kept call is copied into its added frame, its done frame and the
-  // terminal response, so its name is read once per copy; the call left out
-  // is named nowhere but in the note.
+  // terminal response, so its name is read once per copy; the call left out is
+  // replaced by the note, and no item shaped like a call is left without a
+  // name — that is the whole of what is left of it.
   assert.deepEqual([...new Set(callsIn("responses", data))], ["Bash"]);
-  assert.ok(!JSON.stringify(data).includes('"nonexistent"'), "the dropped call leaked");
+  assert.ok(
+    !data.some((value) => value.item && callShaped(value.item.type) && !value.item.name),
+    "the nameless call's item reached the client",
+  );
+  assert.equal(textIn("responses", data), droppedNote(""));
 });
 
 // F2 (review, v0.2.16): the suppression above matched a call left out by the
@@ -1152,7 +1262,7 @@ test("Responses: a placeless call's arguments are left out with it, and one the 
 // named by is what its frames are matched by now, and a declared call beside
 // it keeps every one of its own.
 test("Responses: a dropped call that gave an index keeps its arguments frames out, in both paths", async () => {
-  const dropped = { type: "function_call", call_id: "call_x", name: "nonexistent", arguments: "" };
+  const dropped = { type: "function_call", call_id: "call_x", name: "", arguments: "" };
   const kept = { id: "fc_2", type: "function_call", call_id: "call_2", name: "bash", arguments: "" };
   const completed = (item, extra) => ({ ...item, arguments: extra, status: "completed" });
   const text =
@@ -1220,7 +1330,7 @@ test("Responses: a dropped call that gave an index keeps its arguments frames ou
     ].sort(),
     ["fc_2", "msg_call_x"],
   );
-  assert.equal(textIn("responses", data), droppedNote("nonexistent"));
+  assert.equal(textIn("responses", data), droppedNote(""));
   // (b) The guard's own bytes, read back: the same reply, not the 502 they
   // were refused with, and the same items the stream handed the client.
   const collapsed = await collapseResponse(sse(guarded), "responses");
@@ -1245,7 +1355,7 @@ test("Responses: a dropped call that gave an index keeps its arguments frames ou
 // are. The call answers one id throughout — the id its opening frame was
 // replaced by, which is what the client already has.
 test("Responses: a dropped call its frames name nowhere else answers the one id it was given", async () => {
-  const bare = { type: "function_call", name: "nonexistent", arguments: "" };
+  const bare = { type: "function_call", name: "", arguments: "" };
   const named = { ...bare, id: "fc_9", arguments: '{"a":1}', status: "completed" };
   const text =
     event(
@@ -1295,7 +1405,7 @@ test("Responses: a dropped call its frames name nowhere else answers the one id 
 // with keeps them, though a call left out of the same reply answered the same
 // word.
 test("Responses: a kept call's arguments survive an id a dropped call was named by", async () => {
-  const dropped = { type: "function_call", call_id: "shared", name: "nonexistent", arguments: "" };
+  const dropped = { type: "function_call", call_id: "shared", name: "", arguments: "" };
   const kept = { id: "shared", type: "function_call", call_id: "call_2", name: "bash", arguments: "" };
   const text =
     event(
@@ -1343,12 +1453,14 @@ test("Responses: a kept call's arguments survive an id a dropped call was named 
 // `call_id ?? …` read the same "" as present — and two such calls of one
 // reply became the one item `msg_`, with their arguments frames matching
 // neither. The three places that ask whether a call has an identity ask it
-// the same way now: a non-empty string, or nothing.
+// the same way now: a non-empty string, or nothing. The two calls are
+// nameless — the one shape still left out (#209) — so the empty call_id is the
+// only word either of them carries, and it names neither.
 test('Responses: two calls with a call_id of "" are two items, not one', async () => {
-  const output = ["one", "two"].map((name) => ({
+  const output = [0, 1].map(() => ({
     type: "function_call",
     call_id: "",
-    name,
+    name: "",
     arguments: "{}",
   }));
   const json = await guardToolResponse(Response.json({ output }), "responses", policy);
@@ -1356,7 +1468,7 @@ test('Responses: two calls with a call_id of "" are two items, not one', async (
   const items = (await json.json()).output;
   assert.deepEqual(
     items.map((item) => item.content[0].text),
-    [droppedNote("one"), droppedNote("two")],
+    [droppedNote(""), droppedNote("")],
   );
   assert.deepEqual(
     items.map((item) => item.id),
@@ -1366,16 +1478,16 @@ test('Responses: two calls with a call_id of "" are two items, not one', async (
   // The streamed shape: the calls are placeless (nothing names them), so each
   // answers a token of its own, and the arguments frames naming "" are left
   // out with them rather than describing the notes in their place.
-  const bare = (name) => ({ type: "function_call", call_id: "", name, arguments: "" });
+  const bare = () => ({ type: "function_call", call_id: "", name: "", arguments: "" });
   const text =
-    event({ type: "response.output_item.added", item: bare("one") }, "response.output_item.added") +
+    event({ type: "response.output_item.added", item: bare() }, "response.output_item.added") +
     event({ type: "response.function_call_arguments.delta", item_id: "", delta: "{}" }, "response.function_call_arguments.delta") +
-    event({ type: "response.output_item.added", item: bare("two") }, "response.output_item.added") +
+    event({ type: "response.output_item.added", item: bare() }, "response.output_item.added") +
     event({ type: "response.function_call_arguments.done", item_id: "", arguments: "{}" }, "response.function_call_arguments.done") +
-    event({ type: "response.output_item.done", item: bare("two") }) +
-    event({ type: "response.output_item.done", item: bare("one") }) +
+    event({ type: "response.output_item.done", item: bare() }) +
+    event({ type: "response.output_item.done", item: bare() }) +
     event(
-      { type: "response.completed", response: { status: "completed", output: [bare("one"), bare("two")] } },
+      { type: "response.completed", response: { status: "completed", output: [bare(), bare()] } },
       "response.completed",
     );
   const streamed = await guardToolResponse(sse(text), "responses", policy);
@@ -1399,10 +1511,10 @@ test('Responses: two calls with a call_id of "" are two items, not one', async (
 // identity, and two of those calls were two items already. It is what the
 // empty string has to read like, so the two shapes are pinned side by side.
 test("Responses: two calls with a call_id of null are two items, as they always were", async () => {
-  const output = ["one", "two"].map((name) => ({
+  const output = [0, 1].map(() => ({
     type: "function_call",
     call_id: null,
-    name,
+    name: "",
     arguments: "{}",
   }));
   const response = await guardToolResponse(Response.json({ output }), "responses", policy);
@@ -1425,7 +1537,7 @@ test("Responses: two calls with a call_id of null are two items, as they always 
 // to the client. The id a stream has answered for a call is what every later
 // copy of it answers.
 test("Responses: a dropped call answers one id, though a later copy carries its own", async () => {
-  const opened = { type: "function_call", name: "nonexistent", arguments: "" };
+  const opened = { type: "function_call", name: "", arguments: "" };
   const named = { ...opened, id: "fc_1", call_id: "call_1", arguments: '{"a":1}', status: "completed" };
   const text =
     event(
@@ -1469,7 +1581,7 @@ test("Responses: a dropped call answers one id, though a later copy carries its 
 // heard of it. The bytes the guard answers with are a reply to both, which is
 // the invariant this file's every rewrite is measured against.
 test("Responses: a dropped placeless call beside a numbered one is one reply to both clients", async () => {
-  const dropped = { type: "function_call", id: "d1", name: "bedit", arguments: "" };
+  const dropped = { type: "function_call", id: "d1", name: "", arguments: "" };
   const kept = { id: "k1", type: "function_call", name: "bash", arguments: "" };
   const text =
     event({ type: "response.output_item.added", item: { ...dropped, status: "in_progress" } }) +
@@ -1500,7 +1612,7 @@ test("Responses: a dropped placeless call beside a numbered one is one reply to 
   // so the shape is what is pinned here), and it is the text of the call that
   // was left out.
   assert.match(items.find((item) => item.type === "message").id, /^msg_anon_\d+$/);
-  assert.equal(textIn("responses", data), droppedNote("bedit"), "the note reached the stream");
+  assert.equal(textIn("responses", data), droppedNote(""), "the note reached the stream");
   assert.deepEqual(
     data
       .filter((value) => value.type?.startsWith("response.function_call_arguments"))
@@ -1541,7 +1653,7 @@ test("Responses: one id on two items leaves the dropped call's frames out in bot
     ].join("");
   };
   const kept = frames("bash", 0, '{"k":1}', "both");
-  const dropped = frames("bedit", 1, '{"d":1}', "item_id");
+  const dropped = frames("", 1, '{"d":1}', "item_id");
   const end = event(
     { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
     "response.completed",
@@ -1608,24 +1720,24 @@ test("Responses: a dropped call whose closing frame carries nothing answers the 
     );
   const added = (item) => event({ type: "response.output_item.added", item });
   const done = (item) => event({ type: "response.output_item.done", item });
-  const dropped = { type: "function_call", name: "bedit", arguments: '{"d":1}', status: "completed" };
+  const dropped = { type: "function_call", name: "", arguments: '{"d":1}', status: "completed" };
   const shapes = {
     "named by a call_id": [
-      added({ type: "function_call", call_id: "c1", name: "bedit", arguments: "" }),
+      added({ type: "function_call", call_id: "c1", name: "", arguments: "" }),
       event({ type: "response.function_call_arguments.delta", item_id: "c1", delta: '{"d":1}' }),
       event({ type: "response.function_call_arguments.done", item_id: "c1", arguments: '{"d":1}' }),
       done(dropped),
       T([]),
     ],
     "named by an id, with the terminal's copy carrying nothing": [
-      added({ type: "function_call", id: "i1", name: "bedit", arguments: "" }),
+      added({ type: "function_call", id: "i1", name: "", arguments: "" }),
       event({ type: "response.function_call_arguments.delta", item_id: "i1", delta: '{"d":1}' }),
       event({ type: "response.function_call_arguments.done", item_id: "i1", arguments: '{"d":1}' }),
       done(dropped),
       T([{ ...dropped }]),
     ],
     "beside a declared call": [
-      added({ type: "function_call", call_id: "c1", name: "bedit", arguments: "" }),
+      added({ type: "function_call", call_id: "c1", name: "", arguments: "" }),
       event({ type: "response.function_call_arguments.delta", item_id: "c1", delta: '{"d":1}' }),
       event({ type: "response.function_call_arguments.done", item_id: "c1", arguments: '{"d":1}' }),
       done(dropped),
@@ -1686,7 +1798,7 @@ test("Responses: a dropped call whose closing frame carries nothing answers the 
 // that item's.
 test("Responses: two items stating one index leave the declared call its arguments", async () => {
   const text =
-    event({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "d1", name: "bedit", arguments: "" } }) +
+    event({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "d1", name: "", arguments: "" } }) +
     event({ type: "response.function_call_arguments.delta", output_index: 1, item_id: "d1", delta: '{"dropped":1}' }) +
     event({ type: "response.function_call_arguments.done", output_index: 1, item_id: "d1", arguments: '{"dropped":1}' }) +
     event({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "k1", name: "bash", arguments: "" } }) +
@@ -1722,12 +1834,12 @@ test("Responses: two items stating one index leave the declared call its argumen
 // copy's own index instead gave the streaming client one item and the client
 // that reads no stream two, which is the split F2 exists to close.
 test("Responses: a dropped call whose copies disagree about the place is one item to both clients", async () => {
-  const dropped = { type: "function_call", call_id: "c9", name: "bedit", arguments: '{"d":1}', status: "completed" };
+  const dropped = { type: "function_call", call_id: "c9", name: "", arguments: '{"d":1}', status: "completed" };
   const opened = (index) =>
     event({
       type: "response.output_item.added",
       ...(index === undefined ? {} : { output_index: index }),
-      item: { type: "function_call", call_id: "c9", name: "bedit", arguments: "" },
+      item: { type: "function_call", call_id: "c9", name: "", arguments: "" },
     });
   const args = (handle, type) =>
     event({ type, ...handle, ...(type.endsWith(".delta") ? { delta: '{"d":1}' } : { arguments: '{"d":1}' }) });
@@ -1758,7 +1870,7 @@ test("Responses: a dropped call whose copies disagree about the place is one ite
       args({ output_index: 7, item_id: "c9" }, "response.function_call_arguments.done"),
       event({
         type: "response.output_item.done",
-        item: { type: "function_call", name: "bedit", arguments: '{"d":1}', status: "completed" },
+        item: { type: "function_call", name: "", arguments: '{"d":1}', status: "completed" },
       }),
     ],
   };
@@ -1805,10 +1917,10 @@ test("Responses: a dropped call whose copies disagree about the place is one ite
 // an item it had been told was replaced (the repo had no test that noticed).
 test("Responses: a dropped call's frames are left out though they give an index nobody declared", async () => {
   const text =
-    event({ type: "response.output_item.added", item: { type: "function_call", call_id: "c9", name: "bedit", arguments: "" } }) +
+    event({ type: "response.output_item.added", item: { type: "function_call", call_id: "c9", name: "", arguments: "" } }) +
     event({ type: "response.function_call_arguments.delta", output_index: 7, item_id: "c9", delta: '{"d"' }) +
     event({ type: "response.function_call_arguments.done", output_index: 7, item_id: "c9", arguments: '{"d":1}' }) +
-    event({ type: "response.output_item.done", item: { type: "function_call", call_id: "c9", name: "bedit", arguments: '{"d":1}', status: "completed" } }) +
+    event({ type: "response.output_item.done", item: { type: "function_call", call_id: "c9", name: "", arguments: '{"d":1}', status: "completed" } }) +
     event(
       { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
       "response.completed",
@@ -1822,7 +1934,7 @@ test("Responses: a dropped call's frames are left out though they give an index 
     [],
     "a call left out kept its arguments frames",
   );
-  assert.equal(textIn("responses", data), droppedNote("bedit"));
+  assert.equal(textIn("responses", data), droppedNote(""));
   const collapsed = await collapseResponse(sse(guarded), "responses");
   assert.equal(collapsed.status, 200);
   assert.deepEqual(
@@ -1930,13 +2042,21 @@ test("an event after the terminal marker is ignored, and a failure after it is n
   }
 });
 
-test("Responses codes a call of no declared tool as an undeclared one, and nothing else", async () => {
+test("Responses codes a call with no name where a snapshot was expected as an undeclared one, and nothing else", async () => {
   // A call where a snapshot was expected, so it cannot be put in place of
-  // by a note: the reply fails and says which failure it was.
-  const bare = { type: "function_call", name: "unknown", call_id: "call1", arguments: "{}" };
+  // by a note: the reply fails and says which failure it was. A call of a tool
+  // the agent doesn't have is no longer a failure of any kind (#209) — it is
+  // handed on — so the one shape that still fails this way is a nameless call.
+  const bare = { type: "function_call", name: "", call_id: "call1", arguments: "{}" };
   const undeclared = await guardToolResponse(Response.json(bare), "responses", policy);
   assert.equal(undeclared.status, 502);
   assertError("responses", await undeclared.json(), false, "undeclared_tool");
+  // The same call with a name no declared tool folds to: a reply, handed on as
+  // called, not a failure.
+  const named = { type: "function_call", name: "unknown", call_id: "call1", arguments: "{}" };
+  const handed = await guardToolResponse(Response.json(named), "responses", policy);
+  assert.equal(handed.status, 200);
+  assert.deepEqual(await handed.json(), named);
   // An upstream that failed, or a call of a kind the agent can't be handed,
   // is a failure of another sort.
   const malformed = await guardToolResponse(
@@ -1960,8 +2080,29 @@ test("chat: JSON checks every choice, legacy function_call and missing tool name
     policy,
   );
   assert.equal((await result.json()).choices[0].message.function_call.name, "Read");
+  // A legacy function_call of a name the agent doesn't have is handed on as
+  // called, with its finish (#209), like every other named call.
+  const unknown = await guardToolResponse(
+    Response.json({
+      choices: [
+        {
+          message: { function_call: { name: "unknown", arguments: "{}" } },
+          finish_reason: "function_call",
+        },
+      ],
+    }),
+    "chat",
+    policy,
+  );
+  assert.deepEqual((await unknown.json()).choices[0], {
+    message: { function_call: { name: "unknown", arguments: "{}" } },
+    finish_reason: "function_call",
+  });
+  // The shapes still left out: a legacy function_call with no name at all, and
+  // a tool call whose function object carries no name either. Both are named
+  // in the reply's text and finish as a plain stop.
   for (const [message, name] of [
-    [{ function_call: { name: "unknown" } }, "unknown"],
+    [{ function_call: { name: "" } }, ""],
     [{ tool_calls: [{ type: "function", function: {} }] }, undefined],
   ]) {
     const source = Response.json({
@@ -2003,7 +2144,7 @@ test("Responses: nested JSON responses and all streaming snapshots are checked",
     "response.incomplete",
     "vendor.snapshot",
   ]) {
-    for (const name of ["read", "unknown"]) {
+    for (const name of ["read", "unknown", ""]) {
       const data = type.includes("output_item")
         ? { type, item: tool("responses", name) }
         : { type, response: snapshot("responses", [name]) };
@@ -2013,7 +2154,7 @@ test("Responses: nested JSON responses and all streaming snapshots are checked",
         policy,
       );
       const frames = parse(await result.text());
-      if (name === "unknown") {
+      if (name === "") {
         const raw = frames.map((frame) => frame.data);
         assert.ok(!raw.some((data) => data.type === "error" || data.error));
         assert.deepEqual(callsIn("responses", raw), []);
@@ -2024,16 +2165,21 @@ test("Responses: nested JSON responses and all streaming snapshots are checked",
           type === "response.output_item.added"
             ? textIn("responses", raw)
             : message.content[0].text;
-        assert.equal(said, droppedNote("unknown"));
+        assert.equal(said, droppedNote(""));
       } else
-        assert.equal(frames[0].data.item?.name ?? frames[0].data.response.output[0].name, "Read");
+        // A declared name in the agent's own spelling, and one it has no tool
+        // for handed on as called (#209): neither is rewritten to the other.
+        assert.equal(
+          frames[0].data.item?.name ?? frames[0].data.response.output[0].name,
+          name === "read" ? "Read" : name,
+        );
     }
   }
 });
 
 test("Anthropic: content_block_start, message_start and server_tool_use are guarded", async () => {
   for (const type of ["tool_use", "server_tool_use"]) {
-    for (const name of ["bash", "unknown"]) {
+    for (const name of ["bash", "unknown", ""]) {
       const block = { type, name, id: "t", input: {} };
       const json = await guardToolResponse(
         Response.json({ content: [block] }),
@@ -2041,8 +2187,11 @@ test("Anthropic: content_block_start, message_start and server_tool_use are guar
         policy,
       );
       assert.equal(json.status, 200);
-      if (name === "unknown")
-        assert.deepEqual((await json.json()).content, [{ type: "text", text: droppedNote(name) }]);
+      if (name === "")
+        assert.deepEqual((await json.json()).content, [{ type: "text", text: droppedNote("") }]);
+      else if (name === "unknown")
+        // No declared tool folds to it: handed on as called (#209).
+        assert.deepEqual((await json.json()).content, [block]);
       for (const data of [
         { type: "content_block_start", index: 0, content_block: block },
         { type: "message_start", message: { content: [block] } },
@@ -2053,15 +2202,15 @@ test("Anthropic: content_block_start, message_start and server_tool_use are guar
           policy,
         );
         const frames = parse(await response.text());
-        if (name === "unknown") {
+        if (name === "") {
           const values = frames.map((frame) => frame.data);
           assert.ok(!values.some((value) => value.type === "error"));
           assert.deepEqual(callsIn("anthropic", values), []);
-          assert.equal(textIn("anthropic", values), droppedNote(name));
+          assert.equal(textIn("anthropic", values), droppedNote(""));
         } else
           assert.equal(
             frames[0].data.content_block?.name ?? frames[0].data.message.content[0].name,
-            "Bash",
+            name === "bash" ? "Bash" : name,
           );
       }
     }
@@ -2301,7 +2450,7 @@ test("a cancel failure does not replace the 502 an oversized body becomes", asyn
   assert.equal(response.body.locked, false);
 });
 
-test("chat: each pending choice is settled on its own, an unknown or missing final name left out", async () => {
+test("chat: each pending choice is settled on its own, an unknown final name handed on and a missing one left out", async () => {
   for (const ending of [
     terminal("chat"),
     event({
@@ -2322,15 +2471,18 @@ test("chat: each pending choice is settled on its own, an unknown or missing fin
       const choices = values.flatMap((data) => data.choices ?? []);
       const of = (index) => choices.filter((choice) => choice.index === index);
       assert.deepEqual(callsIn("chat", [{ choices: of(0) }]), ["Bash"]);
-      assert.deepEqual(callsIn("chat", [{ choices: of(1) }]), []);
-      assert.equal(textIn("chat", [{ choices: of(1) }]), droppedNote(name));
+      // The call of choice 1 is a name the agent doesn't have: handed on as
+      // called, with its own finish (#209). A nameless one is still left out,
+      // in the note, under a plain stop.
+      assert.deepEqual(callsIn("chat", [{ choices: of(1) }]), name ? [name] : []);
+      assert.equal(textIn("chat", [{ choices: of(1) }]), name ? "" : droppedNote(name));
       const finishes = (index) =>
         of(index)
           .map((choice) => choice.finish_reason)
           .filter(Boolean);
       if (ending !== terminal("chat")) {
         assert.deepEqual(finishes(0), ["tool_calls"]);
-        assert.deepEqual(finishes(1), ["stop"]);
+        assert.deepEqual(finishes(1), [name ? "tool_calls" : "stop"]);
       }
     }
   }
@@ -2339,26 +2491,26 @@ test("chat: each pending choice is settled on its own, an unknown or missing fin
 test("chat: a choice whose every call was left out finishes as a stop, again and again (#76)", async () => {
   // step-5-preview-free sends its tool_calls finish twice, the second with
   // usage (seen 2026-10-11); neither may tell the agent to run a tool.
-  const response = await guardToolResponse(sse(toolStream("chat", "bedit")), "chat", policy);
+  const response = await guardToolResponse(sse(toolStream("chat", "")), "chat", policy);
   const values = frameData(await response.text());
   const finishes = values
     .flatMap((data) => data.choices ?? [])
     .map((choice) => choice.finish_reason)
     .filter(Boolean);
   assert.deepEqual(finishes, ["stop", "stop"]);
-  assert.equal(textIn("chat", values), droppedNote("bedit"));
+  assert.equal(textIn("chat", values), droppedNote(""));
   assert.ok(values.some((data) => data.usage?.completion_tokens === 5));
 });
 
 test("chat: a round whose only call was left out does not decide the round after it (#76)", async () => {
-  // Round 1 calls a tool this agent has no name for and ends in tool use;
-  // round 2, in the same stream, calls a declared one. The first round ends
+  // Round 1 calls a tool with no name at all and ends in tool use; round 2, in
+  // the same stream, calls a declared one. The first round ends
   // as a plain stop (#76) — and the second is judged on its own, not on the
   // round before it: a client that keys execution off finish_reason never
   // runs a call published under "stop".
   const round = (name) => event(chat({ tool_calls: [call(name)] }, "tool_calls"));
   const two = await guardToolResponse(
-    sse(round("bedit") + round("bash") + terminal("chat")),
+    sse(round("") + round("bash") + terminal("chat")),
     "chat",
     policy,
   );
@@ -2368,7 +2520,7 @@ test("chat: a round whose only call was left out does not decide the round after
     ["stop", "tool_calls"],
   );
   assert.deepEqual(callsIn("chat", [{ choices }]), ["Bash"]);
-  assert.equal(textIn("chat", [{ choices }]), droppedNote("bedit"));
+  assert.equal(textIn("chat", [{ choices }]), droppedNote(""));
   // The control: the same round on its own, where nothing preceded it.
   const one = await guardToolResponse(sse(round("bash") + terminal("chat")), "chat", policy);
   assert.deepEqual(
@@ -2397,11 +2549,11 @@ test("chat: buffered calls flushed at [DONE] say the turn ended in tool use", as
   const legacy = await flush({ function_call: { name: "bash", arguments: "{}" } });
   assert.equal(legacy.finish_reason, "function_call");
   assert.equal(legacy.delta.function_call.name, "Bash");
-  // A call of no declared tool is left out, and what is left is a plain stop.
-  const dropped = await flush({ tool_calls: [call("bedit")] });
+  // A call with no name is left out, and what is left is a plain stop.
+  const dropped = await flush({ tool_calls: [call("")] });
   assert.equal(dropped.finish_reason, "stop");
   assert.equal(dropped.delta.tool_calls, undefined);
-  assert.equal(dropped.delta.content, droppedNote("bedit"));
+  assert.equal(dropped.delta.content, droppedNote(""));
 });
 
 // 2026-10-17, measured through this plugin: deepseek-v4.1-flash-free's reply
@@ -2536,7 +2688,7 @@ test("chat: an empty tool_calls delta is not a tool call", async () => {
   // an empty delta arrives after it (#76).
   const text =
     event(chat({ content: "hi" })) +
-    event(chat({ tool_calls: [call("nope")] })) +
+    event(chat({ tool_calls: [call("")] })) +
     event(chat({}, "tool_calls")) +
     event(chat({ tool_calls: [] })) +
     event(chat({}, "tool_calls")) +
@@ -2566,18 +2718,18 @@ test("chat: an empty tool_calls delta is not a tool call", async () => {
 test("chat: the note follows the text the model wrote before its call", async () => {
   const text =
     event(chat({ content: "Fixing the stray heredoc marker." })) +
-    event(chat({ tool_calls: [call("bedit")] }, "tool_calls")) +
+    event(chat({ tool_calls: [call("")] }, "tool_calls")) +
     terminal("chat");
   const response = await guardToolResponse(sse(text), "chat", policy);
   assert.equal(
     textIn("chat", frameData(await response.text())),
-    `Fixing the stray heredoc marker.\n\n${droppedNote("bedit")}`,
+    `Fixing the stray heredoc marker.\n\n${droppedNote("")}`,
   );
 });
 
 test("chat: a call kept beside one left out is numbered from 0", async () => {
   const text =
-    event(chat({ tool_calls: [call("bedit", 0), call("read", 1, '{"path":"a"}')] }, "tool_calls")) +
+    event(chat({ tool_calls: [call("", 0), call("read", 1, '{"path":"a"}')] }, "tool_calls")) +
     terminal("chat");
   const response = await guardToolResponse(sse(text), "chat", policy);
   const values = frameData(await response.text());
@@ -2628,7 +2780,11 @@ test("chat: a fragment that names no index is read the same by both paths", asyn
   );
 });
 
-test("SSE: ambiguous injected names are left out in every protocol", async () => {
+// #209: an ambiguous fold is still never guessed. Both Bash and BASH are
+// declared, so "bash" folds to two of the agent's tools and the guard cannot
+// tell which one the model meant — it hands the call on as called, and the
+// agent (which knows its own tools) is the one to answer it.
+test("SSE: an ambiguous injected name is handed on as called, never guessed, in every protocol", async () => {
   const rules = { declared: new Set(["Bash", "BASH"]), injected: new Set(["bash"]) };
   for (const protocol of protocols) {
     const response = await guardToolResponse(
@@ -2638,15 +2794,252 @@ test("SSE: ambiguous injected names are left out in every protocol", async () =>
     );
     const values = frameData(await response.text());
     assert.ok(!values.some((data) => data.type === "error" || data.error));
-    assert.deepEqual(callsIn(protocol, values), []);
-    assert.equal(textIn(protocol, values), droppedNote("bash"));
+    assert.deepEqual(callsIn(protocol, values), ["bash"]);
+    assert.equal(textIn(protocol, values), "");
+  }
+});
+
+// The invariant every rewrite in this file is measured against: a frame the
+// guard has nothing to change goes out as the bytes the upstream sent
+// (`frame.raw`), and only a frame that carries a call whose name changes is
+// re-encoded. The bytes are what a client that does not parse everything
+// sees — the event name, the spacing, a number written `1e3` — and a
+// re-serialization is exactly where those are lost. So the frames below are
+// written with a spacing and an exponent `JSON.stringify` would not produce
+// (`event()` writes canonical JSON, which would make a forward and a rewrite
+// indistinguishable). A re-encoded frame is asserted by what it must keep —
+// its event name, the fields the guard never reads, and the values (`1e3` and
+// `1000` are one number) — and never by its bytes.
+test("Responses and Messages: a stream with nothing to change is forwarded frame for frame", async () => {
+  // One space JSON.stringify would never write (it only ever starts an object
+  // with "{"), and a number as an exponent: the two marks of a frame that was
+  // forwarded rather than re-encoded. The space is written after the opening
+  // brace only, so no string value of the payload is touched.
+  const frame = (data, name) =>
+    `event: ${name}\ndata: ${JSON.stringify(data)
+      .replace(/^\{/, "{ ")
+      .replace(/\b1000\b/g, "1e3")}\n\n`;
+  const framesOf = (text) => text.split("\n\n").filter(Boolean);
+  const callItem = (name, id, extra = {}) => ({
+    type: "function_call",
+    id,
+    call_id: id,
+    name,
+    arguments: "{}",
+    ...extra,
+  });
+  // Nothing to drop and nothing to fold: "Bash" is declared as written, and
+  // "unknown" is handed on as called (#209), so no call of this reply changes.
+  const untouched = {
+    responses: [
+      frame(
+        {
+          type: "response.created",
+          response: { id: "r1", status: "in_progress", x_note: "kept", usage: { total_tokens: 1000 } },
+        },
+        "response.created",
+      ),
+      frame(
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: callItem("Bash", "fc_1", { x_vendor: { hint: 1000 } }),
+        },
+        "response.output_item.added",
+      ),
+      frame(
+        {
+          type: "response.function_call_arguments.delta",
+          item_id: "fc_1",
+          output_index: 0,
+          delta: '{"command":"ls"}',
+        },
+        "response.function_call_arguments.delta",
+      ),
+      frame(
+        {
+          type: "response.output_item.added",
+          output_index: 1,
+          item: callItem("unknown", "fc_2", { x_vendor: [1, 2, 3] }),
+        },
+        "response.output_item.added",
+      ),
+      frame(
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { ...callItem("Bash", "fc_1"), arguments: '{"command":"ls"}', status: "completed" },
+        },
+        "response.output_item.done",
+      ),
+      frame(
+        { type: "response.output_item.done", output_index: 1, item: { ...callItem("unknown", "fc_2"), status: "completed" } },
+        "response.output_item.done",
+      ),
+      frame(
+        {
+          type: "response.completed",
+          response: {
+            id: "r1",
+            status: "completed",
+            output: [
+              { ...callItem("Bash", "fc_1"), arguments: '{"command":"ls"}', status: "completed" },
+              { ...callItem("unknown", "fc_2"), status: "completed" },
+            ],
+          },
+        },
+        "response.completed",
+      ),
+    ].join(""),
+    anthropic: [
+      frame(
+        {
+          type: "message_start",
+          message: {
+            id: "m1",
+            type: "message",
+            role: "assistant",
+            content: [],
+            x_note: "kept",
+            usage: { input_tokens: 1000 },
+          },
+        },
+        "message_start",
+      ),
+      frame(
+        {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "t1", name: "Bash", input: {}, x_vendor: { hint: 1000 } },
+        },
+        "content_block_start",
+      ),
+      frame(
+        { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } },
+        "content_block_delta",
+      ),
+      frame({ type: "content_block_stop", index: 0 }, "content_block_stop"),
+      frame(
+        { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "t2", name: "unknown", input: {} } },
+        "content_block_start",
+      ),
+      frame({ type: "content_block_stop", index: 1 }, "content_block_stop"),
+      frame(
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } },
+        "message_delta",
+      ),
+      frame({ type: "message_stop" }, "message_stop"),
+    ].join(""),
+  };
+  for (const protocol of ["responses", "anthropic"]) {
+    const raw = untouched[protocol];
+    const out = await (await guardToolResponse(sse(raw), protocol, policy)).text();
+    assert.equal(out, raw, `${protocol}: a reply with nothing to change was re-encoded`);
+    // And the reply really held calls: a stream with none would be no test of
+    // what a call does to a frame.
+    assert.deepEqual([...new Set(callsIn(protocol, frameData(out)))].sort(), ["Bash", "unknown"]);
+  }
+  // One name to fold: "bash" is the injected spelling of the declared "Bash",
+  // so the frames that carry it are the only ones re-encoded — and the ones
+  // beside them are still the upstream's own bytes.
+  const folded = {
+    responses: [
+      frame(
+        {
+          type: "response.created",
+          response: { id: "r1", status: "in_progress", x_note: "kept", usage: { total_tokens: 1000 } },
+        },
+        "response.created",
+      ),
+      frame(
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { ...callItem("bash", "call_1"), x_vendor: { hint: 1000 } },
+        },
+        "response.output_item.added",
+      ),
+      frame(
+        {
+          type: "response.completed",
+          response: {
+            id: "r1",
+            status: "completed",
+            output: [{ ...callItem("bash", "call_1"), status: "completed" }],
+          },
+        },
+        "response.completed",
+      ),
+    ].join(""),
+    anthropic: [
+      frame(
+        {
+          type: "message_start",
+          message: { id: "m1", type: "message", role: "assistant", content: [], x_note: "kept" },
+        },
+        "message_start",
+      ),
+      frame(
+        {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "t1", name: "bash", input: {}, x_vendor: { hint: 1000 } },
+        },
+        "content_block_start",
+      ),
+      frame(
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } },
+        "message_delta",
+      ),
+      frame({ type: "message_stop" }, "message_stop"),
+    ].join(""),
+  };
+  const renamed = {
+    responses: async (out) => {
+      const emitted = framesOf(out);
+      const added = parse(emitted[1])[0];
+      assert.equal(added.name, "response.output_item.added", "the event name was lost");
+      assert.equal(added.data.item.name, "Bash");
+      assert.equal(added.data.output_index, 0);
+      assert.equal(added.data.item.x_vendor.hint, 1000, "a field the guard never reads was lost");
+      const ended = parse(emitted[2])[0];
+      assert.equal(ended.name, "response.completed");
+      assert.equal(ended.data.response.output[0].name, "Bash");
+    },
+    anthropic: async (out) => {
+      const emitted = framesOf(out);
+      const started = parse(emitted[1])[0];
+      assert.equal(started.name, "content_block_start", "the event name was lost");
+      assert.equal(started.data.content_block.name, "Bash");
+      assert.equal(started.data.content_block.id, "t1");
+      assert.equal(started.data.index, 0);
+      assert.equal(started.data.content_block.x_vendor.hint, 1000, "a field the guard never reads was lost");
+    },
+  };
+  for (const protocol of ["responses", "anthropic"]) {
+    const raw = folded[protocol];
+    const out = await (await guardToolResponse(sse(raw), protocol, policy)).text();
+    const upstream = framesOf(raw);
+    const emitted = framesOf(out);
+    assert.equal(emitted.length, upstream.length, `${protocol}: a frame was added or lost`);
+    // response.created / message_start: no call in it, and the upstream's own
+    // bytes — which is what says the reply was not re-encoded wholesale.
+    assert.equal(emitted[0], upstream[0], `${protocol}: a frame with no call was re-encoded`);
+    await renamed[protocol](out);
+    // The Messages stream has frames with no call of their own on either side
+    // of the rewritten one, and each is still the upstream's own bytes; the
+    // Responses stream's terminal frame carries the call too, so it has no
+    // untouched neighbour left to pin here.
+    if (protocol === "anthropic")
+      for (const at of [2, upstream.length - 1])
+        assert.equal(emitted[at], upstream[at], `anthropic: frame ${at} was re-encoded`);
   }
 });
 
 test("Responses and Messages: a streamed call left out comes as text in its place", async () => {
   const responses = frameData(
     await (
-      await guardToolResponse(sse(toolStream("responses", "bcp")), "responses", policy)
+      await guardToolResponse(sse(toolStream("responses", "")), "responses", policy)
     ).text(),
   );
   assert.deepEqual(
@@ -2662,7 +3055,7 @@ test("Responses and Messages: a streamed call left out comes as text in its plac
       "response.completed",
     ],
   );
-  const note = droppedNote("bcp");
+  const note = droppedNote("");
   // The note is the guard's own item, named in the guard's own namespace:
   // `msg_` and then the call_id the reply gave it (or the place it holds). It
   // used to take the id of the item it replaced verbatim — `fc_1` here — and a
@@ -2684,7 +3077,7 @@ test("Responses and Messages: a streamed call left out comes as text in its plac
   }
   const messages = frameData(
     await (
-      await guardToolResponse(sse(toolStream("anthropic", "ash")), "anthropic", policy)
+      await guardToolResponse(sse(toolStream("anthropic", "")), "anthropic", policy)
     ).text(),
   );
   assert.deepEqual(
@@ -2699,7 +3092,7 @@ test("Responses and Messages: a streamed call left out comes as text in its plac
     ],
   );
   assert.deepEqual(messages[1].content_block, { type: "text", text: "" });
-  assert.deepEqual(messages[2].delta, { type: "text_delta", text: droppedNote("ash") });
+  assert.deepEqual(messages[2].delta, { type: "text_delta", text: droppedNote("") });
   assert.equal(messages[4].delta.stop_reason, "end_turn");
 });
 
@@ -2712,7 +3105,7 @@ test("Messages: a kept call keeps the tool_use stop beside one left out", async 
     {
       type: "content_block_start",
       index: 0,
-      content_block: { type: "tool_use", id: "a", name: "ash", input: {} },
+      content_block: { type: "tool_use", id: "a", name: "", input: {} },
     },
     { type: "content_block_stop", index: 0 },
     {
@@ -2940,6 +3333,10 @@ test("anthropic and responses: a stream cut short still fails, naming the reply 
   }
 });
 
+// A name made of separators only folds to "" — the bare form of every
+// declared name — so it used to be read as a spelling of "_" and handed that
+// tool, or, when the fold was ambiguous, left out. Neither: a fold is never a
+// guess, and the call reaches the agent under the name the model wrote (#209).
 test("a declared name of separators only is never handed another call (#76 follow-up)", async () => {
   const rules = { declared: new Set(["todo_write", "_"]) };
   for (const name of ["--", "-", "__"]) {
@@ -2949,8 +3346,8 @@ test("a declared name of separators only is never handed another call (#76 follo
       rules,
     );
     const data = await result.json();
-    assert.deepEqual(callsIn("chat", [data]), []);
-    assert.match(textIn("chat", [data]), /a tool this agent doesn't have/);
+    assert.deepEqual(callsIn("chat", [data]), [name], `${name} was handed another call`);
+    assert.equal(textIn("chat", [data]), "");
   }
   const exact = await guardToolResponse(Response.json(snapshot("chat", ["_"])), "chat", rules);
   assert.deepEqual(callsIn("chat", [await exact.json()]), ["_"]);
