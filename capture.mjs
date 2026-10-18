@@ -126,9 +126,63 @@ const CHILD_TIMEOUT_MS = Number(process.env.CAPTURE_TIMEOUT_MS ?? 120_000);
 // below are only testable behind this guard, and the guard is what keeps an
 // import from taking that path. Exported so the guard itself is pinned by a test
 // rather than trusted.
+//
+// What that test can pin is the half below, and it is the half worth pinning:
+// this process reports `import.meta.main`, so a case here can only ever watch the
+// guard answer `false` for an import — the `true` a run gets is not something an
+// importing process can produce, and producing it would start a server. The
+// decision itself is therefore a function of the three facts rather than of the
+// process, and the facts a real run supplies are the only part left to the
+// runtime: the flag where there is one, this module's URL, and argv.
 export function invokedDirectly() {
-  if (typeof import.meta.main === "boolean") return import.meta.main;
-  return resolve(process.argv[1] ?? "") === resolve(fileURLToPath(import.meta.url));
+  // `typeof` rather than `??`: a runtime without the property throws on the
+  // member access itself, where there is nothing to fall back from.
+  const main = typeof import.meta.main === "boolean" ? import.meta.main : undefined;
+  return entryDecision({ main, url: import.meta.url, url1: process.argv[1] });
+}
+
+/**
+ * Whether `url` is the file `url1` named, from the facts alone: `main` is the
+ * runtime's own answer when it has one (`import.meta.main`), `url` where the
+ * module was loaded from, and `url1` the script path the runtime was handed.
+ *
+ * The three are parameters for the same reason `tools-smoke.mjs`'s
+ * `isEntryPoint` and `limits-audit.mjs`'s `entryVerdict` take theirs: the answer
+ * that matters most here — `true`, this module is the file that was run — is the
+ * one an importing process cannot produce without running the entry point, and
+ * the branch that produces it is the one every Node older than 22.18 takes,
+ * where there is no flag to read. Passed in, both halves are pinned by a test
+ * that is merely importing; read off the process, one of them never runs here.
+ *
+ * `false` rather than `undefined` for a question that cannot be answered is what
+ * this guard has always done, and it is the right way round for this file: the
+ * entry block below reads the answer as a boolean, so `undefined` would fall
+ * through it and a run would quietly do nothing. Where the fallback cannot
+ * compare — nothing named as a script, a module URL that is not a file — the
+ * file was still not shown to be the one that was run.
+ */
+export function entryDecision({ main, url, url1 }) {
+  // A runtime that offers the flag has answered the question, and its answer is
+  // the one to use: nothing else is consulted, so a path comparison cannot
+  // override a `false` that means this module really was imported.
+  if (typeof main === "boolean") return main;
+  // Nothing was named as a script — `node -e`, a REPL, a worker — so there is no
+  // run for this module to be part of. The empty string is the same nothing.
+  if (!url1) return false;
+  let here;
+  try {
+    here = resolve(fileURLToPath(url));
+  } catch {
+    // Not a `file:` URL — a `data:`, an eval, a loader's virtual module — so
+    // there is no path for `url1` to be equal to, and throwing here would take
+    // the import of this module down with it.
+    return false;
+  }
+  // Both sides are resolved, because one file answers to several spellings: the
+  // loader resolves what it reports while `argv[1]` is whatever was typed, so a
+  // relative path or a trailing separator is the same file and a raw string
+  // comparison would call it a different one.
+  return here === resolve(url1);
 }
 
 // The signal handlers are stored so the exit path can take them off again: a

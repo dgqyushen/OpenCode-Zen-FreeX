@@ -36,10 +36,70 @@ function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// The entries of a container the upstream sent: a list, or nothing when the
+// shape is not one. A container that is not a list holds no entry to walk (a
+// text field written where a list of items belongs, an object where an array
+// does), and a malformed snapshot is skipped rather than refused — the reading
+// stream.mjs gives the same bytes (a snapshot that is not one stands in for
+// nothing), so one stream answers one reply to a client that streams and one
+// that does not.
 function list(value) {
-  if (value == null) return [];
-  if (!Array.isArray(value)) throw new GuardError("Invalid upstream tool snapshot");
-  return value;
+  return Array.isArray(value) ? value : [];
+}
+
+// The containers one snapshot value carries, made the shapes their names claim:
+// a list where a list belongs (`output`, `content`), one item where one belongs
+// (`item`, `part`, `response`, `message`, `content_block`). A list the client
+// reads is rebuilt without an entry that is not an item, a container that is
+// not a list is handed on as an empty list rather than as the object or string
+// it arrived as, and a field that is not an item is removed. Skipping such a
+// value in the walk is not enough on its own: the frame goes on as it arrived,
+// and the value the guard would not read is the value the client cannot read
+// either (`output[0].id` over a null is the TypeError the collapse path used to
+// throw). Answers whether anything changed, so the frame is written again with
+// the values the client reads. A field that is missing, or null, is left as it
+// is: nothing is not a shape — with one exception, a Messages message's
+// `content`, which is a list of blocks to both arms (below).
+function tidy(value, protocol) {
+  let changed = false;
+  for (const name of protocol === "responses" ? ["output", "content"] : ["content"]) {
+    const held = value[name];
+    if (held === undefined) continue;
+    if (held === null) {
+      // A Messages message's `content` is a list of blocks, and the collapse
+      // path fills the field in itself and appends the block deltas to it: a
+      // reply that names null there is an empty list to the client that reads
+      // no stream, and is handed on as one here. The chat arm's `content: null`
+      // is a spelling of its own (a tool-only reply) and is not touched: `tidy`
+      // runs on the Responses and Messages walks only, never on a chat frame.
+      if (protocol === "anthropic") {
+        value[name] = [];
+        changed = true;
+      }
+      continue;
+    }
+    if (!Array.isArray(held)) {
+      value[name] = [];
+      changed = true;
+      continue;
+    }
+    // `every` keeps the array itself when there is nothing to leave out, so a
+    // call the walk replaces in place is still replaced in the reply.
+    const entries = held.every(object) ? held : held.filter(object);
+    if (entries !== held) {
+      value[name] = entries;
+      changed = true;
+    }
+  }
+  const items =
+    protocol === "responses" ? ["response", "item", "part"] : ["message", "content_block"];
+  for (const name of items) {
+    const held = value[name];
+    if (held === undefined || object(held)) continue;
+    delete value[name];
+    changed = true;
+  }
+  return changed;
 }
 
 // OpenCode's own models call OpenCode's tool names (bash, todowrite,
@@ -136,16 +196,22 @@ function appendNotes(message, notes) {
 }
 
 // checkChatMessage renames message's calls to the agent's tools and leaves
-// out the rest, answering the notes for those left out.
+// out the rest, answering the notes for those left out. An entry or field that
+// cannot be read as a call — one that is not an object at all — is skipped or
+// read as the nameless call the guard already leaves out with a note, never a
+// reason to refuse the whole reply: the collapse path accumulates the same
+// bytes as a call with nothing in it, and one stream must answer one reply to
+// a client that streams and one that does not.
 function checkChatMessage(message, checkName) {
   const result = { changed: false, notes: [] };
   if (!object(message)) return result;
   if (message.function_call != null) {
     const value = message.function_call;
-    if (!object(value)) throw new GuardError("Invalid upstream function call");
-    const name = checkName(value.name);
+    // A legacy call that is not an object carries no name to read, which is
+    // the one shape still left out (a call with no name), below.
+    const name = object(value) ? checkName(value.name) : null;
     if (name == null) {
-      result.notes.push(droppedNote(value.name));
+      result.notes.push(droppedNote(object(value) ? value.name : undefined));
       delete message.function_call;
       result.changed = true;
     } else if (name !== value.name) {
@@ -154,16 +220,28 @@ function checkChatMessage(message, checkName) {
     }
   }
   if (message.tool_calls != null) {
-    const calls = list(message.tool_calls);
+    // A `tool_calls` that is not a list is not one a client can read as the
+    // shape its name claims: handed on as an empty list, never as the object
+    // or string it arrived as.
+    if (!Array.isArray(message.tool_calls)) {
+      message.tool_calls = [];
+      result.changed = true;
+    }
+    const calls = message.tool_calls;
     const kept = [];
     for (const call of calls) {
-      if (!object(call) || (call.type != null && call.type !== "function")) {
+      // An entry that is not an object is not a call to read: skipped, and the
+      // list is rebuilt without it, as the walk skips an entry that is not a
+      // snapshot.
+      if (!object(call)) continue;
+      if (call.type != null && call.type !== "function") {
         throw new GuardError("Unsupported upstream tool call");
       }
-      if (!object(call.function)) throw new GuardError("Invalid upstream function call");
-      const name = checkName(call.function.name);
+      // A call whose `function` is not an object carries no name either, and
+      // is read the same way: left out with a note rather than refused.
+      const name = checkName(object(call.function) ? call.function.name : undefined);
       if (name == null) {
-        result.notes.push(droppedNote(call.function.name));
+        result.notes.push(droppedNote(object(call.function) ? call.function.name : undefined));
         result.changed = true;
         continue;
       }
@@ -176,6 +254,10 @@ function checkChatMessage(message, checkName) {
     if (kept.length !== calls.length) {
       if (kept.length) message.tool_calls = kept;
       else delete message.tool_calls;
+      // The list the client reads changed, so the frame has to be written
+      // again: a frame the guard leaves as it came is forwarded as its own
+      // bytes, and those still carry the entry that was left out.
+      result.changed = true;
     }
   }
   return result;
@@ -296,9 +378,40 @@ function ensureCallIDs(calls) {
 function checkSnapshots(data, protocol, checkName, placeOf) {
   let changed = false;
   if (protocol === "chat") {
-    for (const choice of list(data.choices)) {
-      if (!object(choice)) throw new GuardError("Invalid upstream choice");
+    // A `choices` that is not a list is not one a client can read as the shape
+    // its name claims: handed on as an empty list, never as the object or
+    // string it arrived as. The list the guard reads is the list the client
+    // reads, rebuilt without an entry that is not a choice.
+    const held = list(data.choices);
+    const choices = held.filter(object);
+    if (data.choices !== undefined && data.choices !== null && !Array.isArray(data.choices)) {
+      data.choices = [];
+      changed = true;
+    } else if (choices.length !== held.length) {
+      data.choices = choices;
+      changed = true;
+    }
+    for (const choice of choices) {
+      // A message that is not an object is not one to check: removed from the
+      // frame, never handed on as the shape it claims.
+      if (choice.message !== undefined && !object(choice.message)) {
+        delete choice.message;
+        changed = true;
+      }
       const message = choice.message;
+      // A `content` that is neither text nor null is no text: the collapse path
+      // appends only the strings a delta carries and answers a message with no
+      // content, so the guard reads it the same way. A null is text's absence
+      // (a tool-only reply) and is left as it came.
+      if (
+        object(message) &&
+        message.content !== undefined &&
+        message.content !== null &&
+        typeof message.content !== "string"
+      ) {
+        message.content = null;
+        changed = true;
+      }
       const checked = checkChatMessage(message, checkName);
       changed = checked.changed || changed;
       if (checked.notes.length) {
@@ -321,7 +434,15 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
   const stack = [[data, null, null, object(data) ? data.output_index : undefined, false]];
   while (stack.length) {
     const [value, holder, key, at, listed] = stack.pop();
-    if (!object(value)) throw new GuardError("Invalid upstream tool snapshot");
+    // A value that is not an object is not a snapshot to walk — an entry of a
+    // list, or a frame's own `item`, `part` or `response` carrying something
+    // else. It is skipped, never a refusal of the whole reply: the collapse
+    // path weighs such a snapshot as nothing and answers a body, and the two
+    // paths over one stream must answer one reply.
+    if (!object(value)) continue;
+    // Its own containers are the ones the client reads: made the shapes their
+    // names claim before the walk takes hold of them (tidy).
+    if (tidy(value, protocol)) changed = true;
     if (
       protocol === "responses" &&
       typeof value.type === "string" &&
@@ -355,13 +476,11 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
     const objects =
       protocol === "responses" ? ["response", "item", "part"] : ["message", "content_block"];
     for (const name of arrays) {
-      // Text content is not a snapshot container.
-      if (typeof value[name] === "string") continue;
       const items = list(value[name]);
       for (let i = 0; i < items.length; i++) stack.push([items[i], items, i, i, true]);
     }
     for (const name of objects) {
-      if (value[name] != null) stack.push([value[name], value, name, at, false]);
+      if (object(value[name])) stack.push([value[name], value, name, at, false]);
     }
   }
   if (
@@ -390,11 +509,17 @@ function position(value) {
   return result;
 }
 
+// The fields of a streamed call's function, appended as the fragments carry
+// them. A field that is not text is not text to append — a number or an object
+// written where the name or the arguments belong — and a fragment that is not
+// an object carries no field at all. Both are skipped, as the collapse path
+// skips them (it appends a field only when it is a string): a malformed shape
+// is not a reason to refuse a reply whose other frames are sound.
 function appendFunction(target, fragment) {
-  if (!object(fragment)) throw new GuardError("Invalid upstream function delta");
+  if (!object(fragment)) return;
   for (const [key, value] of Object.entries(fragment)) {
     if (key === "name" || key === "arguments") {
-      if (typeof value !== "string") throw new GuardError("Invalid upstream function delta");
+      if (typeof value !== "string") continue;
       target[key] = (target[key] ?? "") + value;
     } else {
       Object.defineProperty(target, key, {
@@ -515,9 +640,33 @@ function chatBuffer(checkName) {
       let { changed } = checkSnapshots(data, "chat", checkName);
       const choices = list(data.choices);
       for (const choice of choices) {
+        // A choice that is not an object holds no delta to read: skipped, as
+        // the same entry is skipped by the walk (checkSnapshots).
+        if (!object(choice)) continue;
         const delta = choice.delta;
         if (!object(delta)) continue;
+        // A `content` that is neither text nor null is no text: the collapse
+        // path appends only the strings a delta carries and answers a message
+        // with no content, so the guard reads it the same way. A null is text's
+        // absence (a tool-only delta) and is left as it came.
+        if (
+          delta.content !== undefined &&
+          delta.content !== null &&
+          typeof delta.content !== "string"
+        ) {
+          delta.content = null;
+          changed = true;
+        }
         if (typeof delta.content === "string" && delta.content) wrote.add(position(choice.index));
+        // A `tool_calls` that is not a list is not one a client can read as the
+        // shape its name claims: handed on as an empty list, never as the
+        // object or string it arrived as — and `changed` is what makes the
+        // rewritten frame the frame that goes out.
+        const held = delta.tool_calls;
+        if (held !== undefined && held !== null && !Array.isArray(held)) {
+          delta.tool_calls = [];
+          changed = true;
+        }
         // A `tool_calls` that is there but empty is a call of nothing: a
         // gateway re-emitting the shape with a role-only delta sends one, and
         // no call is being waited for. Reading it as a call opened a round
@@ -536,7 +685,10 @@ function chatBuffer(checkName) {
         ended.delete(at);
         const state = stateFor(at, data);
         for (const fragment of fragments) {
-          if (!object(fragment) || (fragment.type != null && fragment.type !== "function")) {
+          // An entry that is not an object is not a call fragment to read:
+          // skipped, as an entry of a snapshot that is not one is.
+          if (!object(fragment)) continue;
+          if (fragment.type != null && fragment.type !== "function") {
             throw new GuardError("Unsupported upstream tool delta");
           }
           charge(state, fragment);
@@ -553,20 +705,26 @@ function chatBuffer(checkName) {
             previous.id !== ""
           )
             value.id = previous.id;
-          if (fragment.function != null) appendFunction(value.function, fragment.function);
+          if (object(fragment.function)) appendFunction(value.function, fragment.function);
           state.calls.set(index, value);
         }
         if (delta.function_call != null) {
-          charge(state, delta.function_call);
+          // A legacy call that is not an object carries no field to append: it
+          // is the call with no name the guard leaves out with a note, the
+          // same bytes the collapse path accumulates as a call with nothing in
+          // it.
           state.legacy ??= {};
-          appendFunction(state.legacy, delta.function_call);
+          if (object(delta.function_call)) {
+            charge(state, delta.function_call);
+            appendFunction(state.legacy, delta.function_call);
+          }
         }
         delete delta.tool_calls;
         delete delta.function_call;
       }
       // Validate every finishing choice before publishing any part of this event.
       for (const choice of choices) {
-        if (choice.finish_reason == null) continue;
+        if (!object(choice) || choice.finish_reason == null) continue;
         const index = position(choice.index);
         const state = pending.get(index);
         if (!state) continue;
@@ -579,6 +737,7 @@ function chatBuffer(checkName) {
         changed = true;
       }
       for (const choice of choices) {
+        if (!object(choice)) continue;
         if (callFinish.has(choice.finish_reason) && ended.has(position(choice.index))) {
           choice.finish_reason = "stop";
           changed = true;
@@ -587,9 +746,10 @@ function chatBuffer(checkName) {
       if (!changed) return { data, changed: false };
       data.choices = choices.filter(
         (choice) =>
-          choice.finish_reason != null ||
-          Object.keys(choice.delta ?? {}).length ||
-          Object.keys(choice).some((key) => !["index", "delta", "finish_reason"].includes(key)),
+          object(choice) &&
+          (choice.finish_reason != null ||
+            Object.keys(choice.delta ?? {}).length ||
+            Object.keys(choice).some((key) => !["index", "delta", "finish_reason"].includes(key))),
       );
       return { data: data.choices.length || data.usage != null ? data : null, changed: true };
     },
@@ -884,6 +1044,11 @@ function snapshotStream(protocol, checkName) {
           dropped++;
           const where = { item_id: message.id, output_index: data.output_index, content_index: 0 };
           const part = { type: "output_text", text: "", annotations: [] };
+          // The frame answers before the walk reaches it, so its own containers
+          // are made the shapes their names claim here: the values the client
+          // reads are the ones this frame hands on, whichever branch answered
+          // it.
+          tidy(data, protocol);
           return {
             changed: true,
             data: { ...data, item: { ...message, status: "in_progress", content: [] } },
@@ -963,6 +1128,11 @@ function snapshotStream(protocol, checkName) {
         ) {
           left.set(data.index, true);
           dropped++;
+          // The frame answers before the walk reaches it, so its own containers
+          // are made the shapes their names claim here: the values the client
+          // reads are the ones this frame hands on, whichever branch answered
+          // it.
+          tidy(data, protocol);
           return {
             changed: true,
             data: { ...data, content_block: { type: "text", text: "" } },

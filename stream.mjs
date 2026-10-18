@@ -110,6 +110,24 @@ function isSnapshotObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// The usage report a body holds after a snapshot has been spread whole onto it.
+// A frame's own top-level report is folded in only when it is an object (the
+// same rule, at each accumulator's fold); a snapshot spread whole — a
+// message_start's message, a response.created's response — brings its `usage`
+// in with every other field, and a string left standing there is spread into
+// its characters by the next frame that folds a real report in
+// (`{ ...body.usage, ...data.usage }` is `{"0":"a","1":"b","2":"c"}`), or
+// answered as itself when no frame follows. A report that is not one states
+// none, so the report the body already held stands and a body that held none
+// goes on without one — which is what a frame-level report that is not one
+// leaves behind. Written once, so the three places that copy a whole snapshot
+// cannot drift apart.
+function keepUsage(body, held) {
+  if (isSnapshotObject(body.usage)) return;
+  if (isSnapshotObject(held)) body.usage = held;
+  else delete body.usage;
+}
+
 function chatAccumulator() {
   const body = { object: "chat.completion", choices: [] };
   const choices = new Map();
@@ -151,8 +169,26 @@ function chatAccumulator() {
       for (const key of ["id", "created", "model", "system_fingerprint", "service_tier"]) {
         if (data[key] !== undefined) body[key] = data[key];
       }
-      if (data.usage) body.usage = { ...body.usage, ...data.usage };
-      for (const part of data.choices ?? []) {
+      // A usage report that is not an object states none, and folding one in as
+      // it stood invented keys for the client: a string spread answers its
+      // characters by index ({"0":"a","1":"b"}) in a field a host reads, and a
+      // list does the same by position. Read by shape, like every other value
+      // this file takes hold of, and the reply goes on without a usage it was
+      // never given.
+      if (isSnapshotObject(data.usage)) body.usage = { ...body.usage, ...data.usage };
+      // The choices a chunk carries, read the way the guard reads them
+      // (tool-response.mjs's `list`, which names this file's reading): a
+      // container that is not a list holds no entry to walk, and an entry that
+      // is not an object holds nothing to read. Walked as they stood, a
+      // `choices` written as an object threw "{} is not iterable" and a null
+      // entry threw "null is not an object" — a 502 carrying an internal
+      // TypeError on a reply whose other frames were sound — while a string was
+      // walked character by character and answered a choice the upstream never
+      // sent (a one-character string has no index, and `index` reads that as
+      // the first slot). One stream answers one reply to a client that streams
+      // and one that does not.
+      for (const part of Array.isArray(data.choices) ? data.choices : []) {
+        if (!isSnapshotObject(part)) continue;
         const position = index(part.index);
         if (!choices.has(position)) {
           choices.set(position, {
@@ -176,7 +212,12 @@ function chatAccumulator() {
         // The calls this choice has opened: what a fragment with no index of
         // its own is placed against, by the id it carries.
         const calls = tools.get(position);
-        for (const fragment of delta.tool_calls ?? []) {
+        // The same reading for the fragments of a delta: a `tool_calls` that is
+        // not a list holds no fragment, and one that is not an object is not a
+        // fragment to place — read as one it opened a call with nothing in it
+        // that no upstream frame ever described.
+        for (const fragment of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+          if (!isSnapshotObject(fragment)) continue;
           const toolIndex = place(fragment, calls);
           if (!calls.has(toolIndex))
             calls.set(toolIndex, { type: "function", function: { name: "", arguments: "" } });
@@ -197,7 +238,10 @@ function chatAccumulator() {
         // project's rules do not allow it.
         if (part.finish_reason !== null && part.finish_reason !== undefined)
           choice.finish_reason = part.finish_reason;
-        if (part.logprobs) {
+        // A logprobs that is not an object states none: `Object.entries` over a
+        // string answers its characters by index, and over a list its positions,
+        // which is a report nobody wrote. Read by shape, as `usage` is above.
+        if (isSnapshotObject(part.logprobs)) {
           choice.logprobs ??= {};
           // Written as a defined own property, and read back as one. A
           // "__proto__" key arrives as an own property of the parsed object,
@@ -437,7 +481,12 @@ function responsesAccumulator() {
           // entry to read.
           const stated = Array.isArray(data.response.output);
           const items = stated ? data.response.output.filter(isSnapshotObject) : [];
+          // The snapshot is spread whole, and its own `usage` comes with it:
+          // read by shape, so a report that is not one leaves the body holding
+          // the report it already had (keepUsage, above).
+          const reported = body.usage;
           body = { ...body, ...data.response };
+          keepUsage(body, reported);
           if (stated) body.output = items;
           // A snapshot that carries an item where the reply already has one
           // adds only what it actually carries: the accumulated items stand
@@ -566,7 +615,10 @@ function responsesAccumulator() {
           if (data[key] !== undefined) body[key] = data[key];
         }
       }
-      if (data.usage) body.usage = { ...body.usage, ...data.usage };
+      // Read by shape, as the chat accumulator's usage is (above): a report that
+      // is not one states none, and a spread of it would answer its characters
+      // or positions as keys of a field the client reads.
+      if (isSnapshotObject(data.usage)) body.usage = { ...body.usage, ...data.usage };
     },
     finish() {
       // The reply holds the items that reached a value — a frame described one
@@ -615,6 +667,11 @@ function responsesAccumulator() {
         : final.output !== null && final.output !== undefined;
       // An array is not a reply object at all, and is returned as it came.
       if (Array.isArray(final)) return final;
+      // The terminal is spread whole onto the answer, so the report it carries
+      // is read by shape like every other (keepUsage, above): one that is not a
+      // report states none, and the report the stream accumulated stands.
+      const terminal = { ...final };
+      keepUsage(terminal, body.usage);
       // The terminal is not the whole reply either. What apply merged onto
       // the body from the events' top level — usage, status,
       // incomplete_details, finish_reason, and the object this reply is — is
@@ -623,8 +680,8 @@ function responsesAccumulator() {
       // one that omits object, answered without them. The body is the base,
       // the terminal overrides what it carries, and the items it lost come
       // back from the accumulation.
-      if (whole || !kept.length) return { ...body, ...final };
-      return { ...body, ...final, output: kept };
+      if (whole || !kept.length) return { ...body, ...terminal };
+      return { ...body, ...terminal, output: kept };
     },
   };
 }
@@ -658,7 +715,12 @@ function anthropicAccumulator() {
   return {
     apply(data, type) {
       if (type === "message_start") {
+        // The message is spread whole, and its own `usage` comes with it: read
+        // by shape, so a report that is not one leaves the body holding the
+        // report it already had (keepUsage, above).
+        const reported = body.usage;
         body = { ...body, ...data.message };
+        keepUsage(body, reported);
         // `content` is the one key of a message_start that `apply` fills in
         // itself, and a value that is not a list of blocks — a string, a
         // number, an object — is not a view of the reply to take it from: the
@@ -714,7 +776,8 @@ function anthropicAccumulator() {
         for (const field of ["stop_reason", "stop_sequence"]) {
           if (data.delta?.[field] !== undefined) body[field] = data.delta[field];
         }
-        if (data.usage) body.usage = { ...body.usage, ...data.usage };
+        // Read by shape, as the chat accumulator's usage is (above).
+        if (isSnapshotObject(data.usage)) body.usage = { ...body.usage, ...data.usage };
       }
     },
     finish() {

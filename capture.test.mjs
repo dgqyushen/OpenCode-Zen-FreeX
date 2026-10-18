@@ -3,7 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { capture, drySummary, fingerprintTarget, invokedDirectly, report } from "./capture.mjs";
+import { fileURLToPath } from "node:url";
+import {
+  capture,
+  drySummary,
+  entryDecision,
+  fingerprintTarget,
+  invokedDirectly,
+  report,
+} from "./capture.mjs";
 
 // The capture itself may not be run here: a real run starts a server and writes
 // a fingerprint. So the two halves either side of that run are driven directly —
@@ -267,6 +275,57 @@ test("the guard that keeps an import from running the capture", () => {
   // write. The `false` half is still the one that matters for isolation: if it
   // ever became `true` in a test process, every case below would start a server.
   assert.equal(invokedDirectly(), false);
+});
+
+test("the entry-point decision, with the facts passed in not read off the process", () => {
+  // The other half of the guard above, and the reason it is a case of its own:
+  // `invokedDirectly()` asks a runtime flag that is a property of how the
+  // process was started, so this file can pin the answer it gives here — an
+  // import, above — and cannot pin the answer a run gives, because producing
+  // `true` means being the file that was run, which starts a server. What can be
+  // pinned is the decision itself: `entryDecision` takes the three facts as
+  // arguments, so every branch is exercised from a process that is merely
+  // importing, including the one the fallback exists for.
+  //
+  // That fallback is the branch every Node older than 22.18 takes: there is no
+  // `import.meta.main` to read, so the question is settled by comparing where the
+  // module was loaded from against the path the runtime was handed. The runtime
+  // this suite runs on reports the flag, so the fallback has never run here — it
+  // is checked by fact from now on rather than by the runtime happening to have
+  // the feature. What still comes from the process is only the trio of values
+  // `invokedDirectly()` passes: the flag if the runtime has one, this module's
+  // URL, and `process.argv`.
+  const here = fileURLToPath(import.meta.url);
+  const other = join(import.meta.dir, "capture-not-the-entry-point.mjs");
+  const entry = (facts) => entryDecision({ url: import.meta.url, ...facts });
+
+  // A runtime that offers the flag has answered the question, and its `false`
+  // really does mean this module was imported — nothing else is consulted, so
+  // argv[1] naming this file cannot turn it back into a run.
+  assert.equal(entry({ main: true, url1: here }), true);
+  assert.equal(entry({ main: true, url1: other }), true);
+  assert.equal(entry({ main: false, url1: here }), false);
+  assert.equal(entry({ main: false, url1: other }), false);
+
+  // No flag: the fallback, which is the Node < 22.18 path. The same file under
+  // the spelling the loader resolved is the same file — the `true` a run needs.
+  assert.equal(entry({ main: undefined, url1: here }), true);
+  // A different file that exists is a different file, and this is the one answer
+  // the fallback may give `false` to.
+  assert.equal(entry({ main: undefined, url1: other }), false);
+  // Nothing was named as a script, so nothing is this module's run: `node -e`,
+  // a REPL, a worker. Both spellings of "nothing" are the same answer, and they
+  // are `false` rather than `undefined` because that is what this guard has
+  // always done — `invokedDirectly()` returns a boolean, and the entry block
+  // reads it as one.
+  assert.equal(entry({ main: undefined, url1: undefined }), false);
+  assert.equal(entry({ main: undefined, url1: "" }), false);
+  // A module URL that names no file on disk (`data:`, an eval) has nothing for
+  // argv[1] to be equal to, so the fallback answers `false` — and it answers it
+  // rather than throwing, which is what `fileURLToPath` does at this point in
+  // the fallback. `false` is the honest reading: a module that is not a file
+  // cannot be the file a run named.
+  assert.equal(entry({ main: undefined, url1: here, url: "data:text/javascript," }), false);
 });
 
 test("a child a signal killed is a failed run, not exit 0", async () => {

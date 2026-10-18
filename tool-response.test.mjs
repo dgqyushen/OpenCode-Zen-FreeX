@@ -258,7 +258,11 @@ function toolStream(protocol, name) {
     .join("");
 }
 // An event no undeclared name can explain: a call of a kind the agent
-// can't be handed, beside a declared one.
+// can't be handed, beside a declared one. Messages has no unsupported call
+// kind of its own — a block that is not a call is not one — and an entry that
+// is not a block is skipped by both paths now (a malformed snapshot is skipped,
+// never fatal). The refusal left for it is the walk's own: a frame that is
+// itself a call with no name and no holder to put the note in (checkSnapshots).
 function badMixed(protocol) {
   if (protocol === "chat")
     return chat({ tool_calls: [call("Read"), { ...call("x", 1), type: "custom" }] }, "tool_calls");
@@ -267,7 +271,7 @@ function badMixed(protocol) {
       type: "response.completed",
       response: { output: [tool(protocol, "Read"), { type: "custom_tool_call", name: "x" }] },
     };
-  return { type: "message_start", message: { content: [tool(protocol, "Read"), 5] } };
+  return { type: "tool_use", name: "", id: "t1" };
 }
 function parse(text) {
   return text
@@ -714,7 +718,7 @@ for (const protocol of protocols) {
     }
   });
 
-  test(`${protocol}: bad mixed SSE snapshot never leaks a tool and cancels immediately`, async () => {
+  test(`${protocol}: a refused SSE snapshot never leaks a tool and cancels immediately`, async () => {
     let cancelled = false;
     const source = openSource(
       event(badMixed(protocol)) + event({ sentinel: "must not escape" }),
@@ -2949,6 +2953,408 @@ test("Responses: a dropped call's arguments frames are not the kept call's", asy
       `the arguments frame naming ${word} reached the client, or the kept call lost its own`,
     );
     assert.deepEqual([...new Set(callsIn("responses", data))], ["Bash"]);
+  }
+});
+
+// The shapes a reply's names claim: the fields a client reads as a list, and
+// the fields it reads as one item. A frame that hands on a value which is not
+// the shape its name claims is a frame a host crashes on — `output[0].id` over
+// a null, `choices[0]` over an object — and the collapse path never hands one
+// on, so neither may the guard. Walked like the verifier's probe: every array
+// entry, at any depth, and every named field the protocol claims.
+const CONTAINERS = {
+  chat: ["choices", "tool_calls"],
+  responses: ["output", "content"],
+  anthropic: ["content"],
+};
+const ITEM_FIELDS = {
+  chat: ["message"],
+  responses: ["item", "part", "response"],
+  anthropic: ["message", "content_block"],
+};
+function shapeDrift(protocol, values) {
+  const found = [];
+  const walk = (value, path) => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, at) => {
+        if (entry === null || typeof entry !== "object")
+          found.push(`${path}[${at}]=${JSON.stringify(entry)}`);
+        else walk(entry, `${path}[${at}]`);
+      });
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "error") continue;
+      if (
+        CONTAINERS[protocol].includes(key) &&
+        entry !== undefined &&
+        entry !== null &&
+        !Array.isArray(entry)
+      )
+        found.push(`${path}.${key} is not a list`);
+      if (
+        ITEM_FIELDS[protocol].includes(key) &&
+        entry !== undefined &&
+        !(entry && typeof entry === "object" && !Array.isArray(entry))
+      )
+        found.push(`${path}.${key} is not an item`);
+      walk(entry, `${path}.${key}`);
+    }
+  };
+  walk(values, "");
+  return found;
+}
+
+// The invariant D1 pinned for placement, for shapes: the guard and the
+// collapse path read one stream as one reply. A snapshot entry or container
+// that cannot be walked is skipped, never a refusal of the whole reply — the
+// reading stream.mjs was given for M-43 (a snapshot that is not one stands in
+// for nothing) — so a streaming client is never handed an error where the
+// client that reads no stream is handed a body. The throw the walk used to
+// make on the first value that was not an object took the sound frames of the
+// reply with it.
+//
+// Skipping it in the walk is not enough: the frame goes on as it arrived, and
+// the value the guard would not read is the value the client cannot read
+// either. No frame hands one on — a list is rebuilt without it, a container
+// that is not a list is handed on as an empty one, and a field that is not an
+// item is removed — which is what the `shapeDrift` assertion below reads off
+// the frames the guard hands on, on top of the two paths answering alike.
+//
+// Every row below is bytes both paths answer today. A container the collapse
+// path reads without a guard of its own — a `choices` or `tool_calls` that is
+// not a list, or a content delta whose block never opened — is refused there
+// with a TypeError of its own; the guard is deliberately the tolerant one for
+// those, and the split is reported to the lead rather than frozen here (the
+// `tolerant` list below pins the guard's own answer only).
+test("a malformed snapshot entry is skipped, not fatal, in both paths", async () => {
+  const message = (content) => ({ type: "message", id: "msg_1", role: "assistant", content });
+  const text = (value) => ({ type: "output_text", text: value });
+  const opened = (output) =>
+    event({ type: "response.created", response: { id: "r1", status: "in_progress", output } });
+  const added = (item) => event({ type: "response.output_item.added", output_index: 0, item });
+  const part = (value) =>
+    event({ type: "response.content_part.added", output_index: 0, content_index: 0, part: value });
+  const said = (delta) =>
+    event({ type: "response.output_text.delta", output_index: 0, content_index: 0, delta });
+  const completed = (output) =>
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output } },
+      "response.completed",
+    );
+  const chatDelta = (delta) => event({ choices: [{ index: 0, delta }] });
+  const chatFinish = (finish_reason) => event({ choices: [{ index: 0, delta: {}, finish_reason }] });
+  const chatMessage = (value) => event({ choices: [{ index: 0, message: value }] });
+  const began = (content = []) =>
+    event(
+      { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content } },
+      "message_start",
+    );
+  const block = (content_block) =>
+    event({ type: "content_block_start", index: 0, content_block }, "content_block_start");
+  const rows = [
+    ["responses", "a content part that is a string", [opened([]), part("hello"), said("x")]],
+    ["responses", "a terminal output entry that is null", [
+      added(message([])),
+      said("hi"),
+      completed([null, message([text("hi")])]),
+    ]],
+    ["responses", "an item that is a string", [opened([]), added("not-an-item")]],
+    ["responses", "an item that is a number", [opened([]), added(42)]],
+    ["responses", "a response that is a string", [
+      event({ type: "response.created", response: "not-a-response" }),
+    ]],
+    ["responses", "an output that is an object", [opened({})]],
+    ["responses", "item content that is an object", [added(message({}))]],
+    ["chat", "a delta tool_calls that is a string", [
+      chatDelta({ tool_calls: "nope" }),
+      chatFinish("tool_calls"),
+    ]],
+    ["chat", "a delta call whose function is a string", [
+      chatDelta({ tool_calls: [{ index: 0, id: "c0", type: "function", function: "nope" }] }),
+      chatFinish("tool_calls"),
+    ]],
+    ["chat", "a delta call whose arguments are a number", [
+      chatDelta({
+        tool_calls: [
+          { index: 0, id: "c0", type: "function", function: { name: "bash", arguments: 5 } },
+        ],
+      }),
+      chatFinish("tool_calls"),
+    ]],
+    ["chat", "a delta function_call that is a string", [
+      chatDelta({ function_call: "not-a-call" }),
+      chatFinish("function_call"),
+    ]],
+    ["chat", "a delta function_call whose name is a number", [
+      chatDelta({ function_call: { name: 5 } }),
+      chatFinish("function_call"),
+    ]],
+    ["chat", "a snapshot call entry that is a string", [
+      chatMessage({ role: "assistant", tool_calls: ["nope"] }),
+    ]],
+    ["chat", "a snapshot call whose function is a string", [
+      chatMessage({
+        role: "assistant",
+        tool_calls: [{ id: "c0", type: "function", function: "nope" }],
+      }),
+    ]],
+    ["anthropic", "a content block that is a string", [began(), block("nope")]],
+    ["anthropic", "a content block that is an array", [began(), block([])]],
+    ["anthropic", "a message_start message that is a string", [
+      event({ type: "message_start", message: "nope" }, "message_start"),
+    ]],
+    ["anthropic", "a message content entry that is null", [began([null])]],
+    ["anthropic", "a message content that is an object", [began({})]],
+  ];
+  for (const [protocol, label, frames] of rows) {
+    const text_ = frames.join("") + terminal(protocol);
+    const streamed = await guardToolResponse(sse(text_), protocol, policy);
+    const guarded = await streamed.text();
+    assert.equal(streamed.status, 200, `${label}: the guard refused the reply`);
+    assert.ok(
+      !parse(guarded).some(
+        (frame) => frame.name === "error" || frame.data?.type === "error" || frame.data?.error,
+      ),
+      `${label}: the guard answered an error where the collapse path answers a body`,
+    );
+    const collapsed = await collapseResponse(sse(text_), protocol);
+    assert.equal(collapsed.status, 200, `${label}: the collapse path refused these bytes`);
+    assert.ok(!(await collapsed.text()).includes('"error"'), `${label}: the collapse answered an error`);
+    assert.deepEqual(
+      shapeDrift(protocol, frameData(guarded)),
+      [],
+      `${label}: a value the client cannot read as the shape its name claims was handed on`,
+    );
+  }
+  // The shapes the collapse path refuses with an unguarded read of its own:
+  // the guard answers these, and that answer is what is pinned here. Matching
+  // stream.mjs's TypeError would mean failing a reply this decision says to
+  // skip.
+  const tolerant = [
+    ["chat", "a delta tool_calls that is an object", [
+      chatDelta({ tool_calls: {} }),
+      chatFinish("tool_calls"),
+    ]],
+    ["chat", "a delta tool_calls entry that is null", [
+      chatDelta({ tool_calls: [null] }),
+      chatFinish("tool_calls"),
+    ]],
+    ["chat", "a choices that is an object", [event({ choices: {} })]],
+    ["anthropic", "a content delta whose block never opened", [
+      began(),
+      block("nope"),
+      event(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+        "content_block_delta",
+      ),
+    ]],
+  ];
+  for (const [protocol, label, frames] of tolerant) {
+    const streamed = await guardToolResponse(sse(frames.join("") + terminal(protocol)), protocol, policy);
+    const guarded = await streamed.text();
+    assert.equal(streamed.status, 200, `${label}: the guard refused the reply`);
+    assert.ok(
+      !parse(guarded).some(
+        (frame) => frame.name === "error" || frame.data?.type === "error" || frame.data?.error,
+      ),
+      `${label}: the guard answered an error`,
+    );
+    assert.deepEqual(
+      shapeDrift(protocol, frameData(guarded)),
+      [],
+      `${label}: a value the client cannot read as the shape its name claims was handed on`,
+    );
+  }
+  // The same shapes as one whole reply, where no collapse path is involved:
+  // the walk reads them the same way, as a body rather than a 502.
+  for (const [label, body] of [
+    ["a malformed item", { item: "not-an-item" }],
+    ["a malformed output entry", { output: [null] }],
+    ["a malformed part", { part: "hello" }],
+  ]) {
+    const result = await guardToolResponse(Response.json(body), "responses", policy);
+    assert.equal(result.status, 200, `${label}: a whole reply was refused`);
+  }
+});
+
+// The entry that could not be walked does not take the sound ones with it: the
+// message beside a null entry is still delivered by both paths, whole.
+test("a malformed entry does not take the sound ones with it", async () => {
+  const message = { type: "message", id: "msg_1", role: "assistant" };
+  const text =
+    event({ type: "response.output_item.added", output_index: 0, item: message }) +
+    event({ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "hi" }) +
+    event(
+      {
+        type: "response.completed",
+        response: {
+          id: "r1",
+          status: "completed",
+          output: [null, { ...message, content: [{ type: "output_text", text: "hi" }] }],
+        },
+      },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  assert.equal(textIn("responses", frameData(await streamed.text())), "hi");
+  const collapsed = await collapseResponse(sse(text), "responses");
+  assert.equal(collapsed.status, 200);
+  const body = await collapsed.json();
+  assert.deepEqual(body.output.map((item) => item.id), ["msg_1"]);
+  assert.equal(body.output[0].content[0].text, "hi");
+});
+
+// The frame goes on rewritten, not as it arrived: a client that reads
+// `choices[0]`, `output[0].id` or `content[0].type` reads the shape its name
+// claims. A list is rebuilt without the entry that is not one, a container
+// that is not a list is handed on as an empty one, and a field that is not an
+// item is removed — and `changed` is what makes the rewritten frame the frame
+// that goes out.
+test("a frame hands on the shapes its names claim, rewritten", async () => {
+  const message = (content) => ({ type: "message", id: "msg_1", role: "assistant", content });
+  const opened = (output) =>
+    event({ type: "response.created", response: { id: "r1", status: "in_progress", output } });
+  const added = (item) => event({ type: "response.output_item.added", output_index: 0, item });
+  const part = (value) =>
+    event({ type: "response.content_part.added", output_index: 0, content_index: 0, part: value });
+  const completed = (output) =>
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output } },
+      "response.completed",
+    );
+  const chatDelta = (delta) => event({ choices: [{ index: 0, delta }] });
+  const began = (content = []) =>
+    event(
+      { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content } },
+      "message_start",
+    );
+  const block = (content_block) =>
+    event({ type: "content_block_start", index: 0, content_block }, "content_block_start");
+  const cases = [
+    ["responses", "an output that is an object", [opened({})], (values) => values[0].response.output, []],
+    ["responses", "an output entry that is null", [
+      completed([null, message([])]),
+    ], (values) => values[0].response.output, [message([])]],
+    ["responses", "an item that is a string", [added("not-an-item")], (values) => values[0].item, undefined],
+    ["responses", "a part that is a string", [
+      opened([]),
+      added(message([])),
+      part("hello"),
+    ], (values) => values[2].part, undefined],
+    ["responses", "a response that is a string", [
+      event({ type: "response.created", response: "not-a-response" }),
+    ], (values) => values[0].response, undefined],
+    ["responses", "a terminal whose response is null", [
+      event({ type: "response.completed", response: null }, "response.completed"),
+    ], (values) => values[0].response, undefined],
+    ["responses", "item content that is an object", [added(message({}))], (values) => values[0].item.content, []],
+    ["responses", "item content that carries null", [added(message([null]))], (values) => values[0].item.content, []],
+    ["chat", "a choices that is an object", [
+      event({ choices: {} }),
+      chatDelta({ content: "hi" }),
+    ], (values) => textIn("chat", values), "hi"],
+    ["chat", "a choice that is a string", [
+      event({ choices: ["nope"] }),
+      chatDelta({ content: "hi" }),
+    ], (values) => textIn("chat", values), "hi"],
+    ["chat", "a delta tool_calls that is an object", [
+      chatDelta({ tool_calls: {} }),
+    ], (values) => values[0].choices[0].delta.tool_calls, []],
+    ["chat", "a delta tool_calls entry that is null", [
+      chatDelta({ tool_calls: [null] }),
+      chatDelta({ content: "hi" }),
+    ], (values) => values.flatMap((value) => value.choices ?? []).flatMap((choice) => choice.delta?.tool_calls ?? []), []],
+    ["anthropic", "a content block that is a string", [began(), block("nope")], (values) => values[1].content_block, undefined],
+    ["anthropic", "a message content that is an object", [began({})], (values) => values[0].message.content, []],
+    ["anthropic", "a message content that carries null", [began([null])], (values) => values[0].message.content, []],
+  ];
+  for (const [protocol, label, frames, read, wanted] of cases) {
+    const streamed = await guardToolResponse(sse(frames.join("") + terminal(protocol)), protocol, policy);
+    assert.equal(streamed.status, 200, `${label}: the guard refused the reply`);
+    const values = frameData(await streamed.text());
+    assert.deepEqual(read(values), wanted, `${label}: the frame was not rewritten`);
+    assert.deepEqual(shapeDrift(protocol, values), [], `${label}: the client read a shape its name does not claim`);
+  }
+});
+
+// The malformed container does not take the sound call with it: a call beside
+// a `tool_calls` that is not a list still reaches both clients.
+test("a sound call beside a container that is not a list still reaches both clients", async () => {
+  const sound =
+    event({ choices: [{ index: 0, delta: { tool_calls: [
+      { index: 0, id: "call_sound", type: "function", function: { name: "bash", arguments: "{}" } },
+    ] } }] }) + event({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+  const text =
+    event({ choices: [{ index: 0, delta: { tool_calls: {} } }] }) + sound + terminal("chat");
+  const streamed = await guardToolResponse(sse(text), "chat", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const values = frameData(guarded);
+  assert.deepEqual([...new Set(callsIn("chat", values))], ["Bash"]);
+  assert.deepEqual(shapeDrift("chat", values), []);
+  // The client that reads no stream gets the same call from the bytes the
+  // streaming client was handed (provider.mjs collapses the guarded stream).
+  const collapsed = await collapseResponse(sse(guarded), "chat");
+  assert.equal(collapsed.status, 200);
+  const body = await collapsed.json();
+  assert.deepEqual(
+    (body.choices[0].message.tool_calls ?? []).map((call) => call.function.name),
+    ["Bash"],
+  );
+});
+
+// The two rows where the guard arm and the collapse arm still disagreed about
+// one upstream reply. A Messages `message_start` types its `content` as a list
+// of blocks, and the collapse path fills that field in itself and appends the
+// deltas to it: a reply that names null there is an empty list to the client
+// that reads no stream, and is handed on as one now.
+test("anthropic: a message_start whose content is null reads as an empty list, in both paths", async () => {
+  const text =
+    event(
+      { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content: null } },
+      "message_start",
+    ) + terminal("anthropic");
+  const streamed = await guardToolResponse(sse(text), "anthropic", policy);
+  assert.equal(streamed.status, 200);
+  assert.deepEqual(frameData(await streamed.text())[0].message.content, []);
+  const collapsed = await collapseResponse(sse(text), "anthropic");
+  assert.equal(collapsed.status, 200);
+  assert.deepEqual((await collapsed.json()).content, []);
+});
+
+// A Chat `content` that is neither text nor null is no text: the collapse path
+// appends only the strings a delta carries and answers an empty message, and
+// the guard reads it the same way. Chat's own `content: null` is a spelling of
+// its own (a tool-only reply) and is left alone — `tidy` never runs on a chat
+// stream, so no rule of its can reach it.
+test("chat: a content that is neither text nor null reads as null, in both paths", async () => {
+  const cases = [
+    ["a snapshot message's content is a list", event({ choices: [{ index: 0, message: { role: "assistant", content: ["a", null] } }] })],
+    ["a delta's content is a list", event({ choices: [{ index: 0, delta: { content: ["a", null] } }] })],
+    ["a snapshot message's content is a number", event({ choices: [{ index: 0, message: { role: "assistant", content: 7 } }] })],
+  ];
+  for (const [label, frame] of cases) {
+    const text = frame + terminal("chat");
+    const streamed = await guardToolResponse(sse(text), "chat", policy);
+    assert.equal(streamed.status, 200, label);
+    const choice = frameData(await streamed.text())[0]?.choices?.[0];
+    const content = choice?.message ? choice.message.content : choice?.delta?.content;
+    assert.equal(content, null, `${label}: the guard handed on a content that is not text`);
+    const collapsed = await collapseResponse(sse(text), "chat");
+    assert.equal(collapsed.status, 200, label);
+    assert.equal((await collapsed.json()).choices[0].message.content, null, `${label}: the collapse read it differently`);
+  }
+  // The shapes left as they are: a null content is text's absence, not a list,
+  // and both arms hand it on as null.
+  for (const [label, frame, read] of [
+    ["a snapshot message's content is null", event({ choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ index: 0, id: "c0", type: "function", function: { name: "bash", arguments: "{}" } }] } }] }), (values) => values[0].choices[0].message.content],
+    ["a delta's content is null", event({ choices: [{ index: 0, delta: { content: null } }] }), (values) => values[0].choices[0].delta.content],
+  ]) {
+    const streamed = await guardToolResponse(sse(frame + terminal("chat")), "chat", policy);
+    assert.equal(read(frameData(await streamed.text())), null, `${label}: a null content was rewritten`);
   }
 });
 

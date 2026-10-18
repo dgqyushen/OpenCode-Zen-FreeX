@@ -89,6 +89,14 @@ const isSet = (value) => hasValue(value) && !isContainer(value) && String(value)
 // `muse-spark-1.2-contributor-free` is marked deprecated in the catalogue while
 // Zen lists it and the free tier answers a request for it through this plugin,
 // so reading that status as an ending hid a model that was being served.
+// The two readings below take a catalogue row's *fields* — `deprecated`,
+// `status`, `lifecycle`, the two date axes, `cost` — and read them directly,
+// where the own-property rule stated further down is about a map read by a key
+// an upstream chose. The difference is what can collide: a key can be named
+// `toString` by a listing, while a field name here is written by this file and
+// the row is what `JSON.parse` built, so the only thing that puts another value
+// under one is a prototype polluted process-wide — which is not a shape this
+// file can tell from the real thing, and not one it pretends to guard against.
 const ENDED = ["retired", "disabled"];
 
 function isRetired(model) {

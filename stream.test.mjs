@@ -203,6 +203,243 @@ test("chat preserves text, reasoning, indexed choices, tool arguments, usage and
   });
 });
 
+// A container that is not a list holds no entry to walk, and an entry that is
+// not an object holds nothing to read — the rule the guard states (`list`,
+// `object`) and the one this file already gives a malformed snapshot entry. A
+// `choices` or `tool_calls` written as an object was walked anyway and threw "{}
+// is not iterable", and a null entry threw "null is not an object": a 502
+// carrying an internal TypeError on a reply whose other frames are sound, where
+// the guard answers the same bytes. One stream answers one reply to a client
+// that streams and one that does not.
+test("chat skips a malformed choice or tool-call fragment instead of failing the stream", async () => {
+  // A `choices` that is not a list holds no choice, and a choice that is not an
+  // object holds no delta; the frames beside them are the reply either way.
+  for (const [shape, choices] of [
+    ["an object", {}],
+    ["a string", "nope"],
+    ["a list holding a null", [null]],
+    ["a list holding a string", ["nope"]],
+  ]) {
+    const body = await json(
+      event({ choices }) +
+        event({ choices: [{ index: 0, delta: { content: "kept" } }] }) +
+        event("[DONE]"),
+      "chat",
+    );
+    assert.deepEqual(
+      body.choices.map((choice) => choice.message.content),
+      ["kept"],
+      `${shape} where a list of choices belongs was read as a choice or failed the stream`,
+    );
+  }
+  // Nor is a choice the reply holds the only thing a malformed entry can hide:
+  // a `tool_calls` that is not a list holds no fragment, and one that is not an
+  // object is not a fragment to place — read as one it opened a call with
+  // nothing in it, which no upstream frame ever described.
+  for (const [shape, toolCalls] of [
+    ["an object", {}],
+    ["a string", "nope"],
+    ["a null", null],
+    ["a number", 5],
+  ]) {
+    const body = await json(
+      event({ choices: [{ index: 0, delta: { tool_calls: toolCalls } }] }) +
+        event({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+        event("[DONE]"),
+      "chat",
+    );
+    assert.deepEqual(
+      body.choices[0].message.tool_calls,
+      undefined,
+      `${shape} where a list of tool calls belongs was read as a call or failed the stream`,
+    );
+  }
+  // An entry that is not a fragment is skipped where it stands, and the
+  // fragment beside it is placed as it always was.
+  for (const malformed of [null, "nope", 7, []]) {
+    const b = "bash";
+    const body = await json(
+      event({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                malformed,
+                { id: "call_A", type: "function", function: { name: b, arguments: '{"a":1}' } },
+              ],
+            },
+          },
+        ],
+      }) +
+        event({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+        event("[DONE]"),
+      "chat",
+    );
+    assert.deepEqual(
+      body.choices[0].message.tool_calls.map((call) => [
+        call.id,
+        call.function.name,
+        call.function.arguments,
+      ]),
+      [["call_A", "bash", '{"a":1}']],
+      `${JSON.stringify(malformed)} beside a fragment was read as a call of its own`,
+    );
+  }
+});
+
+// The report fields a frame carries are read by shape too. Folding in a `usage`
+// or a `logprobs` that is not an object invented keys for the client: a spread
+// of a string answers its characters by index ({"0":"a","1":"b"}) in a field a
+// host reads, and `Object.entries` over one answers them in `logprobs`. Neither
+// is a report anybody wrote, and the reply goes on without one.
+test("chat folds in a usage or logprobs report only when it is one", async () => {
+  for (const [shape, value] of [
+    ["a string", "abc"],
+    ["a number", 5],
+    ["a list", [1, 2]],
+  ]) {
+    const body = await json(
+      event({ choices: [{ index: 0, logprobs: value, delta: { content: "hi" } }], usage: value }) +
+        event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+        event("[DONE]"),
+      "chat",
+    );
+    assert.equal(body.usage, undefined, `${shape} where a usage report belongs was folded in`);
+    assert.equal(
+      body.choices[0].logprobs,
+      undefined,
+      `${shape} where a logprobs report belongs was folded in`,
+    );
+  }
+  // A report the frame does state is still folded in, key for key.
+  const body = await json(
+    event({
+      choices: [{ index: 0, logprobs: { a: 1 }, delta: { content: "hi" } }],
+      usage: { total_tokens: 3 },
+    }) +
+      event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+      event("[DONE]"),
+    "chat",
+  );
+  assert.deepEqual(body.usage, { total_tokens: 3 });
+  assert.deepEqual(body.choices[0].logprobs, { a: 1 });
+});
+
+// The other operand of the same merge. A frame's own report is read by shape
+// (above), but a snapshot spread whole onto the body brings its `usage` in with
+// every other field — a `message_start`'s message, a `response.created`'s
+// response — and a terminal response is spread whole onto the answer. A string
+// standing under `usage` there is spread into its characters by the next frame
+// that folds a real report in ({"0":"a","1":"b","2":"c"}), and answered as
+// itself when no frame follows: a report nobody wrote, in a field a host reads.
+// A report that is not one states none, so the report the body already held
+// stands, which is what a frame-level report that is not one leaves standing.
+test("a snapshot's usage is folded in only when it is a report, on every path that copies one", async () => {
+  const stop = event({ type: "message_stop" }, "message_stop");
+  const start = (usage) =>
+    event(
+      { type: "message_start", message: { id: "m1", role: "assistant", content: [], usage } },
+      "message_start",
+    );
+  const delta = (usage) =>
+    event(
+      { type: "message_delta", delta: { stop_reason: "end_turn" }, usage },
+      "message_delta",
+    );
+  const created = (usage) =>
+    event({
+      type: "response.created",
+      response: { id: "r1", status: "in_progress", output: [], usage },
+    });
+  const completed = (response, usage) =>
+    event({
+      type: "response.completed",
+      response: { id: "r1", status: "completed", output: [], ...response },
+      ...(usage === undefined ? {} : { usage }),
+    });
+
+  for (const [shape, usage] of [
+    ["a string", "abc"],
+    ["a number", 5],
+    ["a list", [1, 2]],
+  ]) {
+    // A Messages start whose message carries one, with nothing to merge onto it.
+    assert.equal(
+      (await json(start(usage) + stop, "anthropic")).usage,
+      undefined,
+      `${shape} where a usage report belongs was copied onto the Messages body`,
+    );
+    // The same start with a real report behind it: the string is spread by the
+    // merge that follows.
+    assert.deepEqual(
+      (await json(start(usage) + delta({ output_tokens: 3 }) + stop, "anthropic")).usage,
+      { output_tokens: 3 },
+      `${shape} from a message_start was spread by a later merge`,
+    );
+    // A Responses opening snapshot whose response carries one.
+    assert.equal(
+      (await json(created(usage) + completed(), "responses")).usage,
+      undefined,
+      `${shape} where a usage report belongs was copied onto the Responses body`,
+    );
+    assert.deepEqual(
+      (await json(created(usage) + completed(undefined, { input_tokens: 2 }), "responses"))
+        .usage,
+      { input_tokens: 2 },
+      `${shape} from a response.created was spread by a later merge`,
+    );
+    // Both in one frame: the snapshot's copy lands before the frame's own fold.
+    assert.deepEqual(
+      (await json(
+        event({
+          type: "response.created",
+          response: { id: "r1", status: "in_progress", output: [], usage },
+          usage: { input_tokens: 2 },
+        }) + completed(),
+        "responses",
+      )).usage,
+      { input_tokens: 2 },
+      `${shape} from a response.created was spread by the frame's own report`,
+    );
+    // A terminal is spread whole onto the answer as well.
+    assert.equal(
+      (await json(completed({ usage }, undefined), "responses")).usage,
+      undefined,
+      `${shape} where a usage report belongs was copied from the terminal`,
+    );
+  }
+
+  // A body that already holds a report keeps it: a repeated start or terminal
+  // that states none of its own takes nothing away.
+  assert.deepEqual(
+    (await json(start({ input_tokens: 5 }) + delta({ output_tokens: 3 }) + start("abc") + stop, "anthropic"))
+      .usage,
+    { input_tokens: 5, output_tokens: 3 },
+    "a malformed message_start took the accumulated report away",
+  );
+  assert.deepEqual(
+    (await json(created({ input_tokens: 5 }) + completed({ usage: "abc" }), "responses")).usage,
+    { input_tokens: 5 },
+    "a malformed terminal report took the accumulated report away",
+  );
+
+  // And a report that is one is still copied and merges as it always did.
+  assert.deepEqual(
+    (await json(start({ input_tokens: 5 }) + delta({ output_tokens: 3 }) + stop, "anthropic")).usage,
+    { input_tokens: 5, output_tokens: 3 },
+  );
+  assert.deepEqual(
+    (await json(created({ input_tokens: 5 }) + completed(undefined, { output_tokens: 3 }), "responses"))
+      .usage,
+    { input_tokens: 5, output_tokens: 3 },
+  );
+  assert.deepEqual(
+    (await json(completed({ usage: { output_tokens: 7 } }), "responses")).usage,
+    { output_tokens: 7 },
+  );
+});
+
 test("chat retains null content for tool-only replies and legacy function_call fragments", async () => {
   const body = await json(
     event({

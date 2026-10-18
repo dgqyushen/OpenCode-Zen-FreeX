@@ -403,7 +403,15 @@ runs, at the version pinned in `.github/workflows/ci.yml` so a run says somethin
 about the commit rather than about whatever Bun was newest that morning.
 
 Nothing here is installed with Bun — there are no dependencies — so Bun is the
-tools only. `import.meta.main` is what decides whether `tools-smoke.mjs` runs its
+tools only, and the floor a host's runtime has to clear is the newest API the
+modules a host imports reach for. That is `AbortSignal.any` (`provider.mjs`,
+`limits.mjs`), which Node added in 20.3.0 and backported to 18.17.0 — so
+`engines.node` says `>=18.17.0` and not `>=20.3.0`, which would have warned
+hosts that work. Everything else those modules use is older: `AbortSignal.timeout`
+and `throwIfAborted` (17.3), `findLast` (18.0), `Object.hasOwn` (16.9), and the
+fetch globals (18.0 unflagged).
+
+`import.meta.main` is what decides whether `tools-smoke.mjs` runs its
 gate or is being imported by a test, and a Node older than 22.18 does not define
 it: the gate falls back to comparing the entry path. That comparison resolves
 both paths and then their real paths, so a symlink or a junction naming this file
