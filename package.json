@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -12,7 +12,8 @@
     "./models.mjs": "./models.mjs",
     "./limits.mjs": "./limits.mjs",
     "./stream.mjs": "./stream.mjs",
-    "./tool-response.mjs": "./tool-response.mjs"
+    "./tool-response.mjs": "./tool-response.mjs",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
@@ -33,6 +34,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/tkhs101/OpenCode-Zen-FreeX.git" },
   "bugs": { "url": "https://github.com/tkhs101/OpenCode-Zen-FreeX/issues" },
   "homepage": "https://github.com/tkhs101/OpenCode-Zen-FreeX#readme",
+  "engines": { "node": ">=20.3.0" },
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",

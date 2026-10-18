@@ -121,10 +121,11 @@ const CHILD_TIMEOUT_MS = Number(process.env.CAPTURE_TIMEOUT_MS ?? 120_000);
 // Whether this module is the file that was run rather than one the tests
 // import. `import.meta.main` is the direct answer and the one Bun gives, but it
 // arrived in Node 22.18 and nothing before that has it — and a script that
-// cannot tell whether it was run is one a test cannot import: this file starts
-// a server and rewrites fingerprint.json the moment it is evaluated, so the
-// helpers below are only testable behind this guard. Exported so the guard
-// itself is pinned by a test rather than trusted.
+// cannot tell whether it was run is one a test cannot import: this file's
+// evaluation path starts a server and rewrites fingerprint.json, so the helpers
+// below are only testable behind this guard, and the guard is what keeps an
+// import from taking that path. Exported so the guard itself is pinned by a test
+// rather than trusted.
 export function invokedDirectly() {
   if (typeof import.meta.main === "boolean") return import.meta.main;
   return resolve(process.argv[1] ?? "") === resolve(fileURLToPath(import.meta.url));
@@ -207,10 +208,16 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     process.exit(1);
   }
 
+  // The shape is unpacked once, before anything asks a question of it: a tool
+  // arrives either as `{ type, function: { … } }` or as the function object
+  // itself, and `raw.function ?? raw` written out at each reading is one place
+  // per reading that has to agree about which of the two arrived.
+  const offered = (body.tools ?? []).map((raw) => raw?.function ?? raw);
+
   // Which generation this client is: the names it sends say so. It is read
   // before the tools are, since the two generations do not send the same names
   // and 2.x has to be recognised by `shell` rather than judged against 1.x's.
-  const sent = new Set((body.tools ?? []).map((raw) => (raw.function ?? raw)?.name));
+  const sent = new Set(offered.map((tool) => tool?.name));
   const generation = sent.has("shell") ? "2.x" : "1.x";
   const read = READ[generation];
 
@@ -222,15 +229,14 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   // anthropic client. Refused rather than written — and asked before the
   // per-tool loop below, which would otherwise refuse the same capture first
   // with "carries no parameter schema", a diagnosis about a schema that is there.
-  if ((body.tools ?? []).some((raw) => (raw.function ?? raw)?.input_schema !== undefined)) {
+  if (offered.some((tool) => tool?.input_schema !== undefined)) {
     console.error("the captured request is in the anthropic shape, which this script cannot read; nothing written");
     process.exit(1);
   }
   const protocol = body.input !== undefined && body.messages === undefined ? "responses" : "chat";
 
   const tools = {};
-  for (const raw of body.tools ?? []) {
-    const tool = raw.function ?? raw;
+  for (const tool of offered) {
     if (!tool?.name || !read.includes(tool.name) || !tool.description) continue;
     tools[tool.name] = {
       name: tool.name,
@@ -241,9 +247,10 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
 
   // A name this generation has to carry that the request does not carry at all:
   // this OpenCode no longer sends it, so the capture cannot be taken this way.
-  // `sent` rather than `tools`, because `tools` only holds names that arrived
-  // with a non-empty description — a required tool that is there and carries no
-  // description would otherwise be reported as one this OpenCode stopped sending.
+  // `sent` rather than `tools`, because `tools` only holds names that
+  // arrived with a non-empty description — a required tool that is there and
+  // carries no description would otherwise be reported as one this OpenCode
+  // stopped sending.
   const required = REQUIRED[generation];
   const missing = required.filter((name) => !sent.has(name));
   if (missing.length) {
@@ -254,8 +261,8 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   }
   // The other half of the same question, and the one reading `sent` alone left
   // open: a required name that was sent but has no description to capture is in
-  // `sent` and not in `tools`. Writing it into `required` would name a tool the
-  // profile does not carry, which is the shape `bun run check:gate` refuses —
+  // `sent` and not in `tools`. Writing it into `required` would name a tool
+  // the profile does not carry, which is the shape `bun run check:gate` refuses —
   // and the wording that would have said so is reported as GONE below, about a
   // tool that was sent. The two lists are held together here instead.
   const uncaptured = required.filter((name) => !tools[name]);

@@ -43,9 +43,9 @@ magpie plugin login opencode-zen-free
 
 模型名 = `opencode-zen-free/<模型名>`，例如 `opencode-zen-free/big-pickle`。
 
-- **自动发现**：宿主每次列举模型时重新获取（magpie：启动一次，其后每小时）。id 带 `-free`、Zen 的列表里就有就提供，**不等**目录；下线（`retired`/`disabled`/退役日期已生效）与 SystemOne 排除，标 `deprecated` 但 Zen 仍在服务的照常提供。
+- **自动发现**：宿主列举模型时重新获取，但一分钟内（`RELIST_AFTER`）重复列举复用上一次结果——magpie 启动一次、其后每小时，所以它每次列举都落到新的一次读取。id 带 `-free`、Zen 的列表里有就提供，**不等**目录。判为下线：`status`/`lifecycle` 为 `retired`/`disabled`、布尔 `deprecated: true`、`deprecated_at`/`retirement_date` 写了日期（不看到期与否），以及 SystemOne 路由的模型；目录只把 `deprecated` 写成 `status`/`lifecycle`、而 Zen 仍在服务的，照常提供。
 - **上限按实测对齐**：目录会少报上下文 / 输出 / `input`，插件按实测与路由自述对齐——例如 `deepseek-v4.1-flash-free` 目录 20 万上下文 / 3.2 万输出，付费同源是 100 万 / 38.4 万。依据与复测方法见 [`MAINTAINING.md` 的 “Limits Zen under-reports”](MAINTAINING.md#limits-zen-under-reports)。
-- **目录读不到 ≠ fallback**：Zen 的列表读到了它就是当前该提供的；只有**列表本身**读不到才沿用上一次结果。
+- **目录读不到 ≠ fallback**：Zen 的列表读到了它就是当前该提供的——目录或文档读不到，只影响它们各自描述的那部分。沿用上一次结果只有两种情形：**列表本身**读不到，或距上次读取不到一分钟（见上一条）。
 - 请求一个不再免费的模型 → 404，并列出当时免费的模型；刚转免费的模型会在重新获取列表后照常服务。可用性与限流归 Zen 管，插件看不到剩余额度。
 
 ## 免费层不再应答时
@@ -64,10 +64,10 @@ bun run capture             # 确认差异后才写入
 
 发往 `https://opencode.ai/inference/v1`，按每个模型原生协议走（Chat Completions / Responses / Anthropic Messages），流式与普通 JSON 都支持。
 
-- **对不上的名字照样交给宿主**：Zen 调 OpenCode 工具名时，按大小写与 `_`/`-` 对上唯一匹配的宿主工具（`bash`↔`Bash`、`todowrite`↔`todo_write`）；对不上或有歧义时**不猜也不丢**，按模型写的名字、原样的 id 与参数送达宿主，由宿主回它自己的"没有这个工具"，模型据此改名重来。只有**没有名字**的调用会被略去，并在正文说明。工具仍在宿主执行，调用一律带非空 id。
+- **对不上的名字照样交给宿主**：Zen 调 OpenCode 工具名时，按大小写，或按大小写加分隔符 `_`/`-`/`.`/空白对上唯一匹配的宿主工具（`bash`↔`Bash`、`todowrite`↔`todo_write`）；对不上或有歧义时**不猜也不丢**，按模型写的名字、原样的 id 与参数送达宿主，由宿主回它自己的"没有这个工具"，模型据此改名重来。只有**没有名字**的调用会被略去，并在正文说明。工具仍在宿主执行；Chat 形状的调用一律带非空 id，Responses / Messages 上模型自带什么 id 就原样转交（免费层目前不在这两条路由上提供模型）。
 - **只借 OpenCode 的样子**：请求头、User-Agent、工具必须同属一代（`bash`/`glob`/`grep`/`read` 是 1.x，`shell`/`read` 是 2.x）；宿主缺的 `required` 工具由插件补发描述（背后没有实现，描述里注明别调它），宿主自带的 User-Agent 原样透传。
 - **请求头是刻意挑出的最小集合**：`content-type`、`accept`、`user-agent`、`x-opencode-project`、`x-opencode-session(-id)`（同一 id）、`x-opencode-client: cli`、`authorization: Bearer public`（走 Messages 时 `x-api-key: public` + `anthropic-version`；`anthropic-beta` 这个头插件自己从不设置：只在宿主已经发了的时候原样透传）。**不要加别的头**：两个各自无害的组合起来也会被拒——单试一个得不出结论。
-- **会话 id** 按会话首条消息生成并记住，同一会话各轮共用；宿主的 id 形状合法就原样传。
+- **会话 id**：宿主给了 OpenCode 形状的会话 id 就原样传；给了别的会话信号（会话头或 `metadata.session_id`）就按它派生并记住；两者都没有时按会话首条用户消息派生，首条为空则每次新生成——同一会话各轮共用同一个 id。
 - **提前掐断的流**：有内容且无未完成调用 → 按普通回答收尾并注明截断，再问会续；否则请求失败，错误写明回复 id 与已收字节。Messages / Responses 被截断同样失败。
 - **错误正文不会冒充完整**：只读一小段找 Zen 自陈的上限；没读完的部分换成说明（保留上游状态码，已读开头放 `upstream` 字段）。
 

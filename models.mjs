@@ -218,13 +218,13 @@ export function buildModels(ids, provider, protocols, baseURL) {
     // of this loop as a description. `null` is the shape the catalogue writes
     // for a row it could not fill in, and a list is the same fact one step
     // harder to see — see `isDescription` above, which is the rule both sides of
-    // the tree read a row by. Such a row is read as a description by everything
-    // downstream of here too: `provider.mjs` reads `.cost` off
-    // `metadata.models[id]` on the partial-catalogue path, where a `null` is a
-    // TypeError thrown out of a hook a host is waiting on. One dirty row
-    // upstream must not be the whole list: a model is not a thing worth failing
-    // discovery over, and the `-free` name is already this file's rule for an id
-    // the catalogue cannot speak for.
+    // the tree read a row by. The other side is `provider.mjs`'s
+    // `describesModel`, asked of the same row on its partial-catalogue path
+    // while it decides which models to preserve, and the two answering
+    // differently is a model whose fate depends on which file looked at it. One
+    // dirty row upstream must not be the whole list: a model is not a thing
+    // worth failing discovery over, and the `-free` name is already this file's
+    // rule for an id the catalogue cannot speak for.
     //
     // Skipped rather than reported, and the difference matters: a report would
     // need a sink on this path, and the only sinks in this tree are
@@ -238,18 +238,27 @@ export function buildModels(ids, provider, protocols, baseURL) {
     const model = raw ?? {};
     const protocol = protocolFor(id, model, raw, provider, protocols);
     if (!isFree(id, model) || !Object.hasOwn(SDK, protocol)) continue;
-    const input = model.modalities?.input ?? ["text"];
-    const output = model.modalities?.output ?? ["text"];
+    // The two axes a host reads a model's abilities from, by the rule the
+    // efforts below are read by and for the same reason: `??` covers a field the
+    // catalogue left out and nothing else, so a word, a number or an object
+    // written there was taken for a list and `input.some(...)` threw out of
+    // `buildModels` — taking every free model with it, which is the failure the
+    // row rule above exists to prevent. A shape that is not a list is read as
+    // the field's own default, which is what a field nothing was written about
+    // is read as: text-only, the one thing a model here is known to read. The
+    // whole field written as a word or a list already read that way through
+    // `?.`, and still does.
+    const input = Array.isArray(model.modalities?.input) ? model.modalities.input : ["text"];
+    const output = Array.isArray(model.modalities?.output) ? model.modalities.output : ["text"];
     // The efforts a model offers, from the list the catalogue writes them in.
-    // `?? []` covers a list the catalogue left out and nothing else, and this is
-    // the one place in the loop where a wrong shape does not read as a wrong
-    // value but ends the whole call: `.filter` is not a function on an object or
-    // a string, and `option.type` on a `null` element is a TypeError — either one
-    // threw out of `buildModels`, so one dirty row upstream took discovery down
-    // with it, which is the failure the row rule above exists to prevent. A list
-    // that is not a list, and an element that is not a description, are read as
-    // no efforts: the model is still offered, without the variants nobody could
-    // state.
+    // `?? []` covers a list the catalogue left out and nothing else, and a wrong
+    // shape here does not read as a wrong value but ends the whole call:
+    // `.filter` is not a function on an object or a string, and `option.type` on
+    // a `null` element is a TypeError — either one threw out of `buildModels`, so
+    // one dirty row upstream took discovery down with it, which is the failure
+    // the row rule above exists to prevent. A list that is not a list, and an
+    // element that is not a description, are read as no efforts: the model is
+    // still offered, without the variants nobody could state.
     const options = Array.isArray(model.reasoning_options) ? model.reasoning_options : [];
     const efforts = options
       .filter((option) => isDescription(option) && option.type === "effort")

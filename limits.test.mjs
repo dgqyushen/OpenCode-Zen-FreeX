@@ -69,24 +69,42 @@ function diesMidway(text, after) {
   });
 }
 
-// A body that hands over its first chunk and then never answers again: the shape
-// of an upstream that dies mid-body, or of headers promising more bytes than the
-// response delivers (measured: a 403 with `content-length: 999` over a 120-byte
-// body). Nothing about this shape ends the read on its own — only the wait does.
-function stallsAfter(text) {
+// A body that hands over its first chunk and then never answers again until the
+// reader gives up on it: the shape of an upstream that dies mid-body, or of
+// headers promising more bytes than the response delivers (measured: a 403 with
+// `content-length: 999` over a 120-byte body). Nothing about this shape ends the
+// read on its own — only the wait does — and the promise the stalled read is
+// waiting on is `cancel`'s to settle, so the fixture ends when the code under
+// test releases it rather than leaving a pending promise and a live stream
+// behind for the life of the process. `seen` is where it says so, which is the
+// one fact a fixture that can never settle cannot state.
+function stallsAfter(text, seen = {}) {
   const bytes = new TextEncoder();
   let sent = false;
+  let release;
   return new ReadableStream({
     pull(controller) {
-      if (sent) return new Promise(() => {});
+      if (sent)
+        return new Promise((resolve) => {
+          release = () => {
+            seen.settled = true;
+            resolve();
+          };
+        });
       sent = true;
       controller.enqueue(bytes.encode(text));
+    },
+    cancel() {
+      release?.();
     },
   });
 }
 
-function stalled(text) {
-  return new Response(stallsAfter(text), { status: 403, headers: { "content-length": "999" } });
+function stalled(text, seen) {
+  return new Response(stallsAfter(text, seen), {
+    status: 403,
+    headers: { "content-length": "999" },
+  });
 }
 
 // Verbatim from a real refusal, 2026-10-15 (the request carried a 1,038,278
@@ -306,9 +324,13 @@ test("an axis carried only by the record's prototype is not evidence", async () 
     { context: 999999, output: 64000 },
   );
   // and a marker on `Object.prototype` is the same read: no record declares it,
-  // so no model is measured against it — on any table, shipped one included
-  Object.prototype.context = { value: 999999, source: "route", declaredAt: 200000 };
+  // so no model is measured against it — on any table, shipped one included. The
+  // patch goes on inside the `try` whose `finally` takes it off: a global
+  // assignment applied before the restore can be reached is one that outlives
+  // this case's own failure and leaves the prototype dirty for every later case
+  // in the process that reads it.
   try {
+    Object.prototype.context = { value: 999999, source: "route", declaredAt: 200000 };
     assert.deepEqual(limitOverrides("nothing-measured-free", { context: 200000, output: 32000 }), {});
     assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }), {
       context: 1048576,
@@ -349,13 +371,15 @@ test("weaker evidence may raise a limit but never lower one", async () => {
 });
 
 test("a refusal naming a window while the process runs outranks the shipped table forever after", async () => {
-  const { observeRouteStatement, namedContextWindow, limitOverrides } = await subject;
+  const { observeRouteStatement, namedContextWindow, limitOverrides, limitObservations } =
+    await subject;
   assert.equal(namedContextWindow(REFUSAL), 1048576);
-  // The observation is this case's own, under an id no other case asserts on:
-  // the map it lands in is module-global and outlives the case, so storing one
-  // for a shipped id would quietly change the answers later cases read instead
-  // of failing them. What the shipped ids resolve to is asserted separately,
-  // with nothing but the table in play.
+  // The observation is this case's own, under an id no other case asserts on,
+  // and the maps are put back when the case is done: they are module-global, so
+  // an entry left in one would quietly change the answers later cases read
+  // instead of failing them. What the shipped ids resolve to is asserted
+  // separately, with nothing but the table in play.
+  const held = limitObservations();
   const id = "observed-once-free";
   // The caller is still waiting on this response when the plugin reads it, so
   // observing has to be non-destructive in what it does with what it read: the
@@ -365,26 +389,30 @@ test("a refusal naming a window while the process runs outranks the shipped tabl
     status: 400,
     headers: { "content-type": "application/json" },
   });
-  const observed = await within(
-    1000,
-    observeRouteStatement(id, response),
-    "a one-chunk refusal",
-  );
-  assert.deepEqual(observed, { context: 1048576, output: undefined, text: REFUSAL, ended: true });
-  assert.equal(response.bodyUsed, true, "the one read of the body is the reader's");
-  // the live value is applied on the default path — no maps handed in — and it
-  // outranks the declaration it was measured against
-  assert.deepEqual(limitOverrides(id, DECLARED), { context: 1048576 });
-  // an injected observation still stands in for it...
-  const live = new Map([[id, 900000]]);
-  assert.deepEqual(limitOverrides(id, DECLARED, undefined, live), { context: 900000 });
-  // ...and an id the shipped table carries is answered from the table, which is
-  // the same answer the observation above would have given it, read from one
-  // place: the entry's own declared pair.
-  assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
-    context: 1048576,
-    output: 384000,
-  });
+  try {
+    const observed = await within(
+      1000,
+      observeRouteStatement(id, response),
+      "a one-chunk refusal",
+    );
+    assert.deepEqual(observed, { context: 1048576, output: undefined, text: REFUSAL, ended: true });
+    assert.equal(response.bodyUsed, true, "the one read of the body is the reader's");
+    // the live value is applied on the default path — no maps handed in — and it
+    // outranks the declaration it was measured against
+    assert.deepEqual(limitOverrides(id, DECLARED), { context: 1048576 });
+    // an injected observation still stands in for it...
+    const live = new Map([[id, 900000]]);
+    assert.deepEqual(limitOverrides(id, DECLARED, undefined, live), { context: 900000 });
+    // ...and an id the shipped table carries is answered from the table, which is
+    // the same answer the observation above would have given it, read from one
+    // place: the entry's own declared pair.
+    assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
+      context: 1048576,
+      output: 384000,
+    });
+  } finally {
+    limitObservations(held);
+  }
 });
 
 // An upstream that validates the ceiling it was asked for says what the ceiling
@@ -394,21 +422,53 @@ const CEILING =
   '{"param":"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.","type":"server_error"}';
 
 test("a refusal that names a completion ceiling is read on the output axis too", async () => {
-  const { namedOutputCap, namedContextWindow, observeRouteStatement, limitOverrides } = await subject;
+  const { namedOutputCap, namedContextWindow, observeRouteStatement, limitOverrides, limitObservations } =
+    await subject;
   assert.equal(namedOutputCap(CEILING), 131072);
   assert.equal(namedContextWindow(CEILING), undefined);
-  assert.deepEqual(await observeRouteStatement("x-free", new Response(CEILING, { status: 400 })), {
-    context: undefined,
-    output: 131072,
-    text: CEILING,
-    ended: true,
-  });
-  const liveOutput = new Map([["x-free", 131072]]);
-  assert.deepEqual(
-    limitOverrides("x-free", { context: 200000, output: 32000 }, undefined, undefined, liveOutput),
-    { output: 131072 },
-  );
+  // The id is this case's own, and the maps go back as they were when it is
+  // done. They are module state that outlives the case, so an observation left
+  // under a name other cases use answers a later read of that name from this
+  // case's measurement: `x-free` was that name, and the case below that reads it
+  // came back `{ output: 131072 }` where it expects `{}` until the maps were put
+  // back.
+  const id = "observed-ceiling-free";
+  const held = limitObservations();
+  try {
+    assert.deepEqual(await observeRouteStatement(id, new Response(CEILING, { status: 400 })), {
+      context: undefined,
+      output: 131072,
+      text: CEILING,
+      ended: true,
+    });
+    // the live value is applied on the default path, which is the path a host
+    // takes: no maps handed in
+    assert.deepEqual(limitOverrides(id, { context: 200000, output: 32000 }), { output: 131072 });
+    const liveOutput = new Map([[id, 131072]]);
+    assert.deepEqual(
+      limitOverrides(id, { context: 200000, output: 32000 }, undefined, undefined, liveOutput),
+      { output: 131072 },
+    );
+  } finally {
+    limitObservations(held);
+  }
   assert.equal(namedOutputCap('{"error":{"message":"supports at most 0 completion tokens"}}'), undefined);
+});
+
+// What the two cases above must not leave behind: the maps they observed into
+// are module-global, so an entry left in one answers a later case from evidence
+// that case never collected. None of these three ids is evidence for anything:
+// two of them are the ones those cases chose for themselves, and the third is
+// read here on the default path for exactly that reason.
+test("the observations two cases stored are put back before the next case reads", async () => {
+  const { limitOverrides } = await subject;
+  for (const id of ["x-free", "observed-once-free", "observed-ceiling-free"]) {
+    assert.deepEqual(
+      limitOverrides(id, DECLARED),
+      {},
+      `${id}: an observation another case made is not evidence for this one`,
+    );
+  }
 });
 
 test("an id with a route-stated ceiling and an unmeasured window is aligned on one axis only", async () => {
@@ -879,9 +939,13 @@ test("the same notes reach stderr when the environment asks for them", async () 
   const { limitOverrides, LIMITS_DEBUG_ENV } = await subject;
   const lines = [];
   const warn = console.warn;
-  console.warn = (line) => lines.push(line);
-  process.env[LIMITS_DEBUG_ENV] = "1";
   try {
+    // Both side effects go on inside the `try` whose `finally` takes them off.
+    // `console` and the environment are the process's, so an assignment made
+    // outside the restore's own guard is one that outlives this case's failure —
+    // and a `console.warn` left behind is a stub every later case writes into.
+    console.warn = (line) => lines.push(line);
+    process.env[LIMITS_DEBUG_ENV] = "1";
     limitOverrides("deepseek-v4.1-flash-free", { context: 250000, output: 32000 }, undefined, new Map(), new Map());
   } finally {
     delete process.env[LIMITS_DEBUG_ENV];
@@ -902,10 +966,16 @@ test("the same notes reach stderr when the environment asks for them", async () 
 // runner's own, so a regression fails with a sentence about the read.
 test("a body that stalls is given up on, and what it did read comes back cut", async () => {
   const { readBoundedText } = await subject;
-  const read = await within(4500, readBoundedText(stalled(REFUSAL), 4096), "the read of a stalled body");
+  const seen = {};
+  const read = await within(
+    4500,
+    readBoundedText(stalled(REFUSAL, seen), 4096),
+    "the read of a stalled body",
+  );
   assert.equal(read.text, REFUSAL, "the bytes that did arrive are the evidence");
   assert.equal(read.ended, false, "the body did not end; the wait did");
   assert.equal(read.over, true, "so a number at the end of it may be half of one");
+  assert.equal(seen.settled, true, "and the fixture's own wait is over, because the read released it");
 });
 
 // The other half of that bound belongs to the caller: a host that gave up on the
@@ -1059,6 +1129,77 @@ test("a split character landing on the budget edge is decoded whole", async () =
   assert.equal(boundary.text, "参数校验失", "the budget and nothing else");
   assert.equal(boundary.over, true);
   assert.equal(boundary.ended, false);
+});
+
+// The decode is counted in UTF-16 code units, and a character outside the basic
+// plane is two of them, so a cut taken on the unit count can land between the
+// halves of one character. What it then leaves is half a character: a lone
+// surrogate, which `String.length` counts as one, which renders as a replacement
+// diamond wherever it is shown, and which the caller repeating this refusal has
+// no way to put back together. The half is dropped and the read says it stopped
+// short, because a character the body held is not in the text.
+test("a cut landing inside a character outside the basic plane keeps no half of it", async () => {
+  const { readBoundedText } = await subject;
+  // `😀` is `f0 9f 98 80`, four bytes, two code units, and it is placed to start
+  // a chunk of its own: the cut for a four-unit budget lands on its high half.
+  const text = "aaaa😀zzzz";
+  const bytes = new TextEncoder().encode(text);
+  assert.deepEqual(
+    [...bytes.slice(4, 8)],
+    [0xf0, 0x9f, 0x98, 0x80],
+    "the fixture has to put the character exactly at the cut",
+  );
+  const read = await within(
+    1000,
+    readBoundedText(new Response(splitAt(text, 4, 8), { status: 400 }), 4),
+    "a read cut inside a character outside the basic plane",
+  );
+  assert.equal(
+    read.text,
+    "aaaaz",
+    "the half is dropped, and the next whole character says the body went on",
+  );
+  assert.equal(
+    read.text.isWellFormed(),
+    true,
+    `no half of a character may be kept: ${JSON.stringify(read.text)}`,
+  );
+  assert.equal(
+    read.over,
+    true,
+    "a character the body held is not in the text, so this is not the whole body",
+  );
+  assert.equal(read.ended, false, "however the stream ended");
+  // The same body read with room for the character: it is decoded whole, and the
+  // budget's own one character past the limit is a whole character too.
+  const roomy = await within(
+    1000,
+    readBoundedText(new Response(splitAt(text, 4, 8), { status: 400 }), 8),
+    "a read with room for the character",
+  );
+  assert.equal(roomy.text, "aaaa😀zzz", "a character inside the budget is read whole");
+  assert.equal(roomy.text.isWellFormed(), true);
+  assert.equal(roomy.over, true);
+  assert.equal(roomy.ended, false);
+  // The flag the drop has to leave behind, stated where nothing else says it:
+  // the same cut with nothing after it, so the read reaches the end of the body
+  // holding one character less than the body did. `ended` alone would be true —
+  // the stream really did end — and a caller told that and `over: false` would
+  // hand a prefix on as the whole reply, which is the one lie this read may not
+  // tell.
+  const trailing = await within(
+    1000,
+    readBoundedText(new Response(splitAt("aaaa😀", 4), { status: 400 }), 4),
+    "a read whose dropped half is the last thing in the body",
+  );
+  assert.equal(trailing.text, "aaaa", "the half is dropped, and nothing follows it");
+  assert.equal(trailing.text.isWellFormed(), true);
+  assert.equal(
+    trailing.ended,
+    false,
+    "the body ended at the reader, but a character the body held is not in the text",
+  );
+  assert.equal(trailing.over, true, "so this is not the whole body");
 });
 
 test("a number the wait cut short is not a limit", async () => {

@@ -6,22 +6,18 @@ export const protocols = [
 
 // The registry above is the one list of protocols, and this is the one lookup
 // of it: a typo, a renamed one, or one added there and not here is an error,
-// rather than a fixture of whichever shape happens to be written last.
+// rather than a fixture of whichever shape happens to be written last. The model
+// a protocol is asked as is read through here as well, from the same registry
+// every other fixture gets its protocol from, so a rename above cannot leave a
+// fixture naming a model the plugin no longer offers.
 function entryFor(protocol) {
   const entry = protocols.find((value) => value.protocol === protocol);
   if (!entry) throw new Error(`unknown protocol: ${protocol}`);
   return entry;
 }
 
-// The model a protocol is asked as, read from the same registry every other
-// fixture gets its protocol from: a rename there cannot leave a fixture
-// naming a model the plugin no longer offers.
-export function modelFor(protocol) {
-  return entryFor(protocol).model;
-}
-
 // Where a call's arguments are cut into the two deltas a stream delivers
-// them in. One number for both protocols, so the fixtures cannot disagree
+// them in. One number for every protocol, so the fixtures cannot disagree
 // about where the first piece ends.
 const argumentSplit = 12;
 
@@ -142,6 +138,12 @@ export function toolReply(protocol, name, sse = true) {
       event({ type: "response.completed", response }, "response.completed")
     );
   }
+  // Kept rather than removed as unreachable: entryFor() above refuses a protocol
+  // the registry does not hold, so this can only fire for one it does hold and
+  // this function has no shape for — the registry grew and the branch did not.
+  // Falling through would build the Messages fixture below for it, which is the
+  // "whichever fixture is written last" answer the comments above refuse. The
+  // same guard ends declaredTools(), for the same reason.
   if (protocol !== "anthropic") throw new Error(`unhandled protocol: ${protocol}`);
   const block = { type: "tool_use", id: "call_1", name, input: JSON.parse(args) };
   const message = {

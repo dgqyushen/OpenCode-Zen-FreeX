@@ -51,6 +51,15 @@ function index(value) {
   return result;
 }
 
+// What a streamed call is named by, when it is named at all: a non-empty
+// string. The same rule, in the same words, as `identity()` in
+// tool-response.mjs and in the Responses accumulator below — one upstream value
+// must not be a name to one file and no name to the other, or two calls of one
+// reply share a name.
+function identity(value) {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
 function sorted(map) {
   return [...map].sort(([a], [b]) => a - b).map(([, value]) => value);
 }
@@ -105,6 +114,38 @@ function chatAccumulator() {
   const body = { object: "chat.completion", choices: [] };
   const choices = new Map();
   const tools = new Map();
+  // The slot a fragmented call sits in. A fragment that states a place states
+  // where it belongs. One that states none is placed by the id it carries: an
+  // id an open call of this choice already answers is that call — a
+  // continuation frame echoing the name the call was opened with — and any
+  // other id is a call of its own, taking the lowest slot no call holds, which
+  // is the shape a reply that never indexed its calls sends. A fragment with no
+  // usable id has nothing to place it by, and is read as the first slot, which
+  // is what `index` has always read one as.
+  //
+  // Read as the first slot whatever it carried, a reply's second call was
+  // merged into its first: the second call's id, both names run together and
+  // both argument objects on it, where the same reply as one JSON body answers
+  // two calls (D1). A repeated `function.name` is deliberately not a placement:
+  // a name may legitimately be fragmented across the frames of one call, and
+  // only the id tells one call from the next.
+  //
+  // One rule, read the same way by the guard (tool-response.mjs's `slotFor`,
+  // which the chat test "a fragment that names no index is read the same by
+  // both paths" pins from both paths): a fragment with no index and no id is
+  // read as the first slot, so one stream still answers one reply to a client
+  // that streams and one that does not.
+  function place(fragment, calls) {
+    if (fragment.index !== null && fragment.index !== undefined) return index(fragment.index);
+    const id = identity(fragment.id);
+    if (id === undefined) return index(fragment.index);
+    for (const [slot, call] of calls) {
+      if (call.id === id) return slot;
+    }
+    let slot = 0;
+    while (calls.has(slot)) slot++;
+    return slot;
+  }
   return {
     apply(data) {
       for (const key of ["id", "created", "model", "system_fingerprint", "service_tier"]) {
@@ -132,9 +173,11 @@ function chatAccumulator() {
           message.function_call ??= { name: "", arguments: "" };
           appendFunction(message.function_call, delta.function_call);
         }
+        // The calls this choice has opened: what a fragment with no index of
+        // its own is placed against, by the id it carries.
+        const calls = tools.get(position);
         for (const fragment of delta.tool_calls ?? []) {
-          const toolIndex = index(fragment.index);
-          const calls = tools.get(position);
+          const toolIndex = place(fragment, calls);
           if (!calls.has(toolIndex))
             calls.set(toolIndex, { type: "function", function: { name: "", arguments: "" } });
           const call = calls.get(toolIndex);
@@ -221,18 +264,13 @@ function responsesAccumulator() {
   // adopts an id later still has the frames after the id that name nothing at
   // all, so the slot stays here after it is named.
   const openNone = new Map();
-  // What a streamed item is named by, when it is named at all: a non-empty
-  // string. `""` names nothing a client can key by, and neither does a number
-  // or a boolean — an item whose id is `0` or `false` has no identity here,
-  // however loudly the upstream says it. The same rule, in the same words, as
-  // `identity()` in tool-response.mjs: one upstream value must not be a name to
-  // one file and no name to the other, or two items of one reply share an item
-  // (measured: two calls with `"id": 0` and their own output_indexes — 0 and 1 —
-  // resolved to the first one's item, and the second call's arguments were
-  // written over the first's).
-  function identity(value) {
-    return typeof value === "string" && value !== "" ? value : undefined;
-  }
+  // What a streamed item is named by is read the one way this file reads a name
+  // (`identity`, above, which is this rule written once for both accumulators):
+  // the same words as `identity()` in tool-response.mjs, because one upstream
+  // value must not be a name to one file and no name to the other, or two items
+  // of one reply share an item (measured: two calls with `"id": 0` and their own
+  // output_indexes — 0 and 1 — resolved to the first one's item, and the second
+  // call's arguments were written over the first's).
   const at = (id) => idMap.get(id);
   // Whether a record is still nameless: it was opened by a frame that said
   // nothing about what it is, which is the one shape an id-less frame or a
@@ -332,7 +370,13 @@ function responsesAccumulator() {
   // (locate, above): the item's own snapshot arrives without it in the shape
   // that names an item from the frames after it, and taking the snapshot as it
   // stands lost the id again. One that carries an id still wins, as it did.
-  function keep(slot, value) {
+  // The index the frame states is a fact about where its item sits (locate,
+  // above), so it is recorded with the item it placed: a snapshot that carries
+  // an output_index states the same place an `added` frame does, and a stream
+  // whose opening snapshot arrived first is otherwise read as holding a second
+  // item stating the same index — the reply answered 200 with two entries
+  // carrying one id.
+  function keep(slot, value, at) {
     const record = output.get(slot);
     if (!carries(value, record.value, fields)) return;
     // The id is inherited by the same item's partial view, never by another
@@ -343,6 +387,14 @@ function responsesAccumulator() {
     const stated = identity(value.id);
     if (stated === undefined && record.id !== undefined) value.id = record.id;
     record.value = value;
+    if (at !== undefined) {
+      record.index = at;
+      indexMap.set(at, slot);
+      // A snapshot that states a place is a fact about it, so the record is no
+      // longer an item the upstream left unnamed — the one a later frame that
+      // states nothing may still claim as its own (nameless, above).
+      if (openNone.get(value.type) === slot) openNone.delete(value.type);
+    }
     if (stated !== undefined) named(slot, stated);
     if (record.index !== undefined) indexMap.set(record.index, slot);
   }
@@ -367,16 +419,53 @@ function responsesAccumulator() {
   return {
     apply(data, type) {
       if (type === "response.created" || type === "response.in_progress") {
-        if (data.response) {
+        // A snapshot that is not a reply object — a null, a string, a list —
+        // stands in for nothing: spread as it stood, a string's characters
+        // became the reply's own keys. The same reading every snapshot in this
+        // file gets (isSnapshotObject, above).
+        if (isSnapshotObject(data.response)) {
+          // A snapshot's output is a list of items, and an entry that is not an
+          // item is not one to take hold of: `keep` weighed it as nothing and
+          // the reply answered 200 with it among the items, and the id lookup
+          // threw on the first one that was null — a 502 carrying an internal
+          // TypeError on a reply whose other frames were sound. The same
+          // reading the Messages accumulator gives a block that is not a block
+          // (isSnapshotObject, above), and the one this file gives the items
+          // themselves: one that is not an item is skipped, and is not a reason
+          // to fail the stream. An output that is not a list at all is left as
+          // it arrived, which is how `finish` answers one (below): it holds no
+          // entry to read.
+          const stated = Array.isArray(data.response.output);
+          const items = stated ? data.response.output.filter(isSnapshotObject) : [];
           body = { ...body, ...data.response };
+          if (stated) body.output = items;
           // A snapshot that carries an item where the reply already has one
           // adds only what it actually carries: the accumulated items stand
           // against an output list it does not carry, or carries empty.
-          for (const value of data.response.output ?? [])
-            keep(locate({}, identity(value?.id), true, value?.type), value);
+          for (const [at, value] of items.entries()) {
+            // The entry's place in the list is where the stream placed it: the
+            // output_index a frame of the same reply states for its own item,
+            // or — for a snapshot that states none, which is what an opening
+            // snapshot does — the place the list itself gives it. Other frames
+            // of the reply name that place, and a stream whose opening snapshot
+            // arrived first was otherwise read as holding a second item stating
+            // the same index: the reply answered 200 with two entries carrying
+            // one id (fc1 twice), one call told twice. An index the entry states
+            // itself is a fact and wins over the position, as the stated index
+            // wins over an inferred one wherever they meet.
+            const where = value.output_index === undefined ? at : index(value.output_index);
+            keep(
+              locate({ output_index: where }, identity(value.id), true, value.type),
+              value,
+              where,
+            );
+          }
         }
       } else if (type === "response.output_item.added" || type === "response.output_item.done") {
-        if (data.item)
+        // An item frame whose `item` is not an item — a null, a string, a list
+        // — names nothing to keep, and storing it answered the reply with it
+        // among the items. The same rule the part frames below get.
+        if (isSnapshotObject(data.item))
           keep(
             locate(
               data,
@@ -385,6 +474,11 @@ function responsesAccumulator() {
               data.item?.type,
             ),
             data.item,
+            // The frame's own index is already recorded on the item it placed
+            // (locate, above), so only the frame that states one has anything
+            // to add here — an `added` frame that arrives with no index at all
+            // names no place of its own.
+            data.output_index === undefined ? undefined : index(data.output_index),
           );
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
@@ -394,8 +488,16 @@ function responsesAccumulator() {
         // guard above and content_block_start exist for, so the same test.
         // `refusal` is weighed too: a part whose only content is a refusal
         // weighs nothing on text alone and would be taken for an empty one.
+        // A part that is not a part at all — a null, a string, a list — is the
+        // same hazard in its plainest form: stored as it stood it answered 200
+        // with a null among the content, and the next delta that read a field
+        // of it threw ("Attempted to assign to readonly property"). Nothing to
+        // place places nothing, and the item's own frames stand.
         const at = index(data.content_index);
-        if (carries(data.part, value.content[at], ["text", "refusal"]))
+        if (
+          isSnapshotObject(data.part) &&
+          carries(data.part, value.content[at], ["text", "refusal"])
+        )
           value.content[at] = data.part;
       } else if (
         type === "response.output_text.delta" ||
@@ -425,9 +527,11 @@ function responsesAccumulator() {
       ) {
         const value = item(data, "reasoning");
         value.summary ??= [];
-        // The same re-emitted-opening-frame hazard as content_part above.
+        // The same re-emitted-opening-frame hazard as content_part above, and
+        // the same refusal of a part that is not a part.
         const at = index(data.summary_index);
-        if (carries(data.part, value.summary[at], ["text"])) value.summary[at] = data.part;
+        if (isSnapshotObject(data.part) && carries(data.part, value.summary[at], ["text"]))
+          value.summary[at] = data.part;
       } else if (/^response\.reasoning_(summary_)?text\.(delta|done)$/.test(type)) {
         const value = item(data, "reasoning");
         const summary = type.includes("summary");
@@ -446,7 +550,17 @@ function responsesAccumulator() {
       } else if (type === "response.reasoning_content.delta") {
         body.reasoning_content = (body.reasoning_content ?? "") + (data.delta ?? "");
       } else if (type === "response.completed" || type === "response.incomplete") {
-        if (data.response && typeof data.response === "object") final = data.response;
+        if (data.response && typeof data.response === "object") {
+          // The output a terminal carries is a list of items like any other
+          // snapshot's, and an entry that is not an item is not one to answer
+          // with: it was returned verbatim, so the reply ended with a null or a
+          // string where an item belongs. A terminal that carries nothing but
+          // such entries carries no output of its own — the items the stream
+          // accumulated stand in for the collection it lost (finish, below).
+          if (Array.isArray(data.response.output))
+            data.response.output = data.response.output.filter(isSnapshotObject);
+          final = data.response;
+        }
         body.status = type === "response.completed" ? "completed" : "incomplete";
         for (const key of ["incomplete_details", "finish_reason"]) {
           if (data[key] !== undefined) body[key] = data[key];

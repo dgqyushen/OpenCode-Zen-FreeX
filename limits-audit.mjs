@@ -40,7 +40,7 @@
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROFILES } from "./core-tools.mjs";
+import { PROFILES, profileFor } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedAxes, readBoundedText } from "./limits.mjs";
 import { SDK, bootstrapProtocols, isFree } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
@@ -57,7 +57,14 @@ import { chatRequest } from "./tools-smoke.mjs";
 // not go through the server to get at it. Exported so the rule can be asked
 // about directly: a constant would only show the answer for one spelling.
 export function baseFrom(value) {
-  return String(value ?? DEFAULT_BASE).replace(/\/+$/, "");
+  // An empty string is a variable that names no base: `ZEN_BASE_URL=` in a
+  // profile exports one, and `??` reads it as set, so the base became the empty
+  // string and every URL below it a relative path (`/models`) — a request to no
+  // host at all, reported as "the route or the catalogue could not be read …
+  // check the network" about a variable that was wrong before it was used.
+  // Whitespace names no base either, for the same reason.
+  const text = value === undefined || value === null ? DEFAULT_BASE : String(value);
+  return (text.trim() === "" ? DEFAULT_BASE : text).replace(/\/+$/, "");
 }
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
@@ -76,6 +83,21 @@ const ASKED_CEILING = 1_000_000;
 // one id no longer holds up every id behind it.
 const POOL = 4;
 
+// An own-property read of a table this module did not build: the protocol
+// snapshot, and the catalogue's own rows. `table[id]` otherwise answers out of
+// Object.prototype for an id named `toString`, `valueOf`, `constructor` or
+// `__proto__` — and an id the plugin offers, whose name is the only thing making
+// it free, can be named exactly that. Every such read is wrong in the same way:
+// as a protocol this plugin has no SDK for (so the id was dropped from the audit
+// with no line saying so), as a snapshot entry saying the id is not asked at the
+// chat shape, and as a catalogue description nobody wrote. models.mjs's
+// `protocolFor`, limits.mjs's `limitOverrides` and provider.mjs's `catalogueRow`
+// each state this rule for the tables they read; these are this file's reads of
+// other modules' tables.
+function ownIn(table, id) {
+  return table && Object.hasOwn(table, id) ? table[id] : undefined;
+}
+
 // The ids the plugin would offer: the listing's, kept where the catalogue calls
 // them free — or, for an id neither the catalogue nor the docs describe, where
 // the id names itself free and nothing else names its protocol, which is what
@@ -91,9 +113,9 @@ const POOL = 4;
 // Exported for the tests.
 export function offeredIds(listing, catalog, snapshot = bootstrapProtocols) {
   return listing.filter((id) => {
-    const protocol = snapshot?.[id];
+    const protocol = ownIn(snapshot, id);
     if (protocol !== undefined && !Object.hasOwn(SDK, protocol)) return false;
-    const model = catalog?.[id];
+    const model = ownIn(catalog, id);
     if (!model) return isFree(id);
     return isFree(id, model);
   });
@@ -247,10 +269,15 @@ export async function ask(id, names) {
     // entry point reported "unable to ask … check the network" — a broken
     // fingerprint read as an apparent transport failure, with every id's own
     // status-0 row skipped. tools-smoke.mjs guards this same case the same way.
+    //
+    // The profile is read through core-tools' own accessor, not `PROFILES[…]`:
+    // the accessor is the one place that says which generations the capture
+    // holds, and a generation it does not carry is named in the message instead
+    // of failing as `.required` of a function or of nothing.
     const { headers, body } = chatRequest({
       model: id,
       generation: GENERATION,
-      profile: PROFILES[GENERATION],
+      profile: profileFor(GENERATION),
       names,
       maxTokens: ASKED_CEILING,
     });
@@ -435,24 +462,38 @@ if (entry) {
 // answers it gives, and a test that reached only the helpers beside it could not
 // say whether they agree with each other.
 export async function run() {
-  const names = [...PROFILES[GENERATION].required];
+  // Through core-tools' accessor, as in `ask` above: it answers the failure with
+  // a sentence naming the generation and what the capture holds, which is what
+  // the entry point's own `Object.hasOwn` check reports for a generation nobody
+  // captured.
+  const names = [...profileFor(GENERATION).required];
   const [listing, catalog] = await Promise.all([getJSON(`${BASE}/models`), getJSON(CATALOG_URL)]);
   const models = catalog?.opencode?.models ?? {};
   const ids = offeredIds(
     (Array.isArray(listing?.data) ? listing.data : []).map((entry) => entry?.id).filter(Boolean),
     models,
   );
-  const free = Object.keys(models).filter(
-    (id) => /free/i.test(id) || (models[id].cost?.input === 0 && models[id].cost?.output === 0),
-  );
+  // The catalogue count is models.mjs's own free rule, the same one `offeredIds`
+  // reads a listing id by, so the two numbers in this line are one question.
+  // Written out as `/free/i` here — a match anywhere, not the `-free$` name Zen
+  // gives its free models — it counted a paid `free-tier-model`, and it counted
+  // a free id the catalogue has retired: the line then said the catalogue still
+  // describes models the plugin has stopped offering, which is the drift the
+  // count exists to make visible. Retirement is part of `isFree`, so a retired
+  // id belongs to neither number. `Object.keys` is what makes the row read an
+  // own one here: it names the catalogue's own ids and nothing else.
+  const free = Object.keys(models).filter((id) => isFree(id, models[id]));
   console.log(`limits audit — ${BASE}`);
   console.log(`${ids.length} free ids are offered; the catalogue still describes ${free.length}\n`);
 
   const rows = [];
   // This asks the chat shape only. An id the snapshot places on another protocol
   // is left to the host that speaks it, and said once rather than reported as a
-  // finding it cannot be.
-  const asked = ids.filter((id) => (bootstrapProtocols[id] ?? "chat") === "chat");
+  // finding it cannot be. The snapshot is read as its own property, the same rule
+  // `offeredIds` reads it by: through the prototype, an id named `constructor`
+  // read as a protocol this audit does not speak, was printed under "not asked"
+  // with a function for a protocol, and was never asked at all.
+  const asked = ids.filter((id) => (ownIn(bootstrapProtocols, id) ?? "chat") === "chat");
   const elsewhere = ids.filter((id) => !asked.includes(id));
   // The asks are independent, and each one can sit until its 45 s abort, so a
   // few run together: 4 at a time overlaps the waiting without opening a
@@ -464,8 +505,10 @@ export async function run() {
         const answer = await ask(id, names);
         // The pair the plugin puts on the wire travels with the row, so the
         // table, the sibling list and the candidates all read one number
-        // instead of three that can be computed from different things.
-        return withEffective({ id, declared: models[id]?.limit ?? {}, ...answer });
+        // instead of three that can be computed from different things. The
+        // catalogue's row for the id is an own read, like the two above it: a
+        // declaration read through the prototype is one nobody made.
+        return withEffective({ id, declared: ownIn(models, id)?.limit ?? {}, ...answer });
       }),
     );
     rows.push(...batch);
@@ -513,10 +556,16 @@ export async function run() {
   // and said no, and its snapshot entry is necessarily `chat`: printing that
   // under "not asked, this audit asks the chat shape only" would contradict the
   // line it sits on.
-  if (elsewhere.length)
-    console.log(
-      `\nnot asked, this audit asks the chat shape only: ${elsewhere.map((id) => `${id}${bootstrapProtocols[id] ? ` (${bootstrapProtocols[id]})` : ""}`).join(", ")}`,
-    );
+  if (elsewhere.length) {
+    // Own property here too, so the line names the same protocol the filter
+    // above read: through the prototype it printed a function where a protocol
+    // goes, which is not a protocol anybody captured.
+    const named = elsewhere.map((id) => {
+      const protocol = ownIn(bootstrapProtocols, id);
+      return `${id}${protocol ? ` (${protocol})` : ""}`;
+    });
+    console.log(`\nnot asked, this audit asks the chat shape only: ${named.join(", ")}`);
+  }
   const refusedShape = rows.filter(protocolScoped).map((row) => row.id);
   if (refusedShape.length)
     console.log(`\nasked, and refused for its shape: ${refusedShape.join(", ")}`);

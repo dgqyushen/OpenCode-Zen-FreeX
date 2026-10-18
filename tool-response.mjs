@@ -376,11 +376,13 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
   return { changed, kept, left };
 }
 
-// The slot a fragmented call or a choice sits in. A frame that names no index
-// is read as the first one, which is what the collapse path reads it as too
-// (stream.mjs's `index`): a fragment carries no other place it could hold, and
-// the two paths over one stream must answer one reply (pinned by the chat test
-// "a fragment that names no index is read the same by both paths").
+// The slot a choice, or a fragment that states one, sits in. A frame that
+// names no index is read as the first one, which is what the collapse path
+// reads it as too (stream.mjs's `index`): a choice carries no other place it
+// could hold, and the two paths over one stream must answer one reply (pinned
+// by the chat test "a fragment that names no index is read the same by both
+// paths"). A fragmented call that names no index is placed by the id it
+// carries where it has one (slotFor, in chatBuffer).
 function position(value) {
   const result = value ?? 0;
   if (!Number.isSafeInteger(result) || result < 0)
@@ -414,6 +416,32 @@ function chatBuffer(checkName) {
     state.bytes += size;
     if (bytes > MAX_BYTES)
       throw new GuardError(`Pending upstream tools exceed the ${LIMIT} buffer limit`);
+  }
+  // The slot a fragmented call sits in. A fragment that names a place holds
+  // it, and one that names none is placed by the id it carries: an id an open
+  // call of this choice already answers is that call's own slot — a
+  // continuation frame of it — while an id no open call answers is a call of
+  // its own, which opens the next unused slot. Reading every index-less
+  // fragment as the first slot merged two calls of one reply into one: the
+  // second call's id, both names run together and both argument objects on it,
+  // while the same reply as one JSON body answered two calls (D1). A fragment
+  // that carries no usable id is read as the first slot, which is what the
+  // collapse path reads it as too (stream.mjs's `index`), so one stream still
+  // answers one reply to both clients.
+  //
+  // A repeated `function.name` is deliberately not a placement: a name may
+  // legitimately be fragmented across the frames of one call, and only the id
+  // tells one call from the next.
+  function slotFor(state, fragment) {
+    if (fragment.index != null) return position(fragment.index);
+    const id = identity(fragment.id);
+    if (id === undefined) return position(fragment.index);
+    for (const [slot, call] of state.calls) {
+      if (call.id === id) return slot;
+    }
+    let slot = 0;
+    while (state.calls.has(slot)) slot++;
+    return slot;
   }
   function stateFor(index, data) {
     if (!pending.has(index)) {
@@ -512,7 +540,7 @@ function chatBuffer(checkName) {
             throw new GuardError("Unsupported upstream tool delta");
           }
           charge(state, fragment);
-          const index = position(fragment.index);
+          const index = slotFor(state, fragment);
           const previous = state.calls.get(index) ?? { index, function: {} };
           const value = { ...previous, ...fragment, index, function: previous.function };
           // A continuation frame may carry `"id": null` — measured on this
@@ -876,8 +904,23 @@ function snapshotStream(protocol, checkName) {
           // because no step of it subtracts one set of words from another.
           const place = data.output_index;
           const word = identity(data.item_id);
+          // A word the reply used for a call it left out names that call, and
+          // a frame of a dropped call describes an item the client was told was
+          // replaced by a note: forwarding it hands the client arguments for an
+          // item it was never given. It is read before the place and before the
+          // item the stream is inside, because both of those answer "kept" for
+          // a frame that is not — a declared call opened after the dropped one
+          // is what the stream is inside, and the dropped call's arguments
+          // frame, which gave no place of its own, was read as that kept call's
+          // and forwarded (D2). One word can name two items at once (the reply
+          // is at odds with itself): a word the reply kept an item under is
+          // that item's wherever it appears, so the word names a dropped call
+          // only where no kept item holds it — which is where the two pinned
+          // cases below live, and the inside-window answers them.
+          const droppedWord = word !== undefined && leftIDs.has(word) && !keptWords.has(word);
           let holder = "kept";
           if (place != null && left.has(place) && !keptPlaces.has(place)) holder = "dropped";
+          else if (droppedWord) holder = "dropped";
           // Two items stated one index: the place cannot say whose the frame
           // is, and the word it names is what is left.
           else if (place != null && word !== undefined && keptWords.has(word)) holder = "kept";
@@ -1161,7 +1204,6 @@ export const cutShortNote =
 
 function chatTrack() {
   const open = new Set();
-  const finished = new Set();
   const wrote = new Set();
   let said = false;
   let meta = null;
@@ -1181,17 +1223,14 @@ function chatTrack() {
           if (typeof delta[key] === "string" && delta[key]) said = true;
         }
         if (typeof delta.content === "string" && delta.content) wrote.add(index);
-        if (choice.finish_reason != null) {
-          finished.add(index);
-          open.delete(index);
-        } else {
-          // A frame for this choice after it finished opens a new round of it
-          // (chatBuffer.apply judges a later round the same way), so the
-          // choice is open again: latching it shut for good left a round cut
-          // short with no note and no finish_reason, only a bare [DONE].
-          finished.delete(index);
-          open.add(index);
-        }
+        // A choice that finishes is closed here, and a frame of it after that
+        // opens a new round of it (chatBuffer.apply judges a later round the
+        // same way): latching it shut for good left a round cut short with no
+        // note and no finish_reason, only a bare [DONE]. `open` is the whole
+        // of what the ending reads, so what a choice finished as is not kept
+        // beside it.
+        if (choice.finish_reason != null) open.delete(index);
+        else open.add(index);
       }
     },
     // ending answers the frames that end the reply as cut short, or null

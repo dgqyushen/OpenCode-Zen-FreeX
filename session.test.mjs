@@ -4,14 +4,18 @@ import { opencodeID, realSessionID, sessionID } from "./provider.mjs";
 
 // The layout provider.mjs encodes, from OpenCode's identifier.ts: a
 // 3-character prefix and "_", 12 hex of Date.now() * 0x1000 + counter, then
-// 14 random base62 characters. ID_SHAPE is that layout as one regex; SHAPE is
-// the same thing pinned to the session prefix, so the two cannot drift.
+// 14 random base62 characters. The tail of that layout is written once, in
+// LAYOUT; ID_SHAPE is the layout with the prefix left as a class as wide as the
+// prefix this module mints, and SHAPE is the same layout with that prefix
+// spelled out, so the field widths and the class after them cannot drift
+// between the two readings.
 const PREFIX = "ses";
 const PREFIX_CHARS = PREFIX.length + 1;
 const FIELD_HEX = 12;
 const TAIL_CHARS = 14;
-const ID_SHAPE = new RegExp(`^[a-z]{3}_[0-9a-f]{${FIELD_HEX}}[0-9A-Za-z]{${TAIL_CHARS}}$`);
-const SHAPE = new RegExp(`^${PREFIX}_[0-9a-f]{${FIELD_HEX}}[0-9A-Za-z]{${TAIL_CHARS}}$`);
+const LAYOUT = `_[0-9a-f]{${FIELD_HEX}}[0-9A-Za-z]{${TAIL_CHARS}}$`;
+const ID_SHAPE = new RegExp(`^[a-z]{${PREFIX.length}}${LAYOUT}`);
+const SHAPE = new RegExp(`^${PREFIX}${LAYOUT}`);
 const FIELD_MASK = 0xffffffffffffn; // the 48 bits that hex field carries
 const COUNTER_MOD = 0x1000n; // its low 12 bits are the counter
 // realSessionID calls a counter below this one of OpenCode's.
@@ -101,11 +105,16 @@ test("a burst that fills the counter field still makes OpenCode's ids", () => {
   const now = 1_790_000_000_001;
   const ids = Array.from({ length: 40 }, () => opencodeID("ses", true, now));
   const counters = ids.map((id) => decode(id, true).counter);
-  // Past the field's worth of ids in one millisecond the counter has to stay
-  // inside it: a counter that carried into bit 12 would move the time the id
-  // claims, and an id whose low bits read as time is one realSessionID rejects.
+  // Forty ids is past the sixteen the counter's own range holds, so the burst
+  // wraps it, and what this holds is that every id of the wrap stays inside that
+  // range. COUNTER_LIMIT is the range: realSessionID reads a counter at or above
+  // it as one OpenCode could not have made, and opencodeID's own wrap keeps the
+  // counter below it. COUNTER_MOD is the width of the whole hex field instead,
+  // and a counter read back below it is true by construction — a burst that
+  // broke the wrap would carry into the time the id claims and still pass that
+  // boundary, which is why this one is asserted here.
   for (const [at, counter] of counters.entries()) {
-    assert.ok(counter > 0 && counter < COUNTER_MOD, `id ${at} has counter ${counter}`);
+    assert.ok(counter > 0 && counter < COUNTER_LIMIT, `id ${at} has counter ${counter}`);
     assert.ok(realSessionID(ids[at]), `id ${at} is not one OpenCode could have made`);
   }
   // Counting still happens: consecutive ids inside one millisecond differ.

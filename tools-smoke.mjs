@@ -57,6 +57,15 @@ import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
 // and report `unreachable` while the plugin asked the new one. The trailing
 // slashes are stripped because the plugin puts the value through `httpURL`, which
 // does the same: `ZEN_BASE_URL=https://…/v1/` must not become `//chat/completions`.
+//
+// The stripping is a second copy of the rule `limits-audit.mjs` exports as
+// `baseFrom`, and it is kept as a copy deliberately rather than imported: that
+// file already imports `chatRequest` from here, so importing the rule back would
+// close a cycle between the two. What the two share is the one place the endpoint
+// itself comes from — `DEFAULT_BASE`, imported above — and that is the half that
+// drifted when it was copied; the rule is a single expression whose second copy
+// is reached only where `limits-audit.mjs` is not loaded. Moving `baseFrom` to a
+// module both can import without a cycle is the fix if a third caller appears.
 const BASE = (process.env.ZEN_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
 const MODEL = process.env.ZEN_CHECK_MODEL ?? "space-bunny-free";
 
@@ -72,7 +81,11 @@ function sessionID() {
 // OpenCode, so it is worth printing: a refusal that arrives with no message at
 // all reads as something other than a stale fingerprint.
 function says(text) {
-  const match = text.match(/"message"\s*:\s*"([^"]{0,120})"/);
+  // `{1,120}` rather than `{0,120}`: a quantifier that accepts nothing builds
+  // `": "` out of an empty message, and a detail ending in a colon and a space
+  // reads as a message that was cut off rather than as the absent one it is. A
+  // body with no message at all is the same answer as one with an empty message.
+  const match = text.match(/"message"\s*:\s*"([^"]{1,120})"/);
   return match ? `: ${match[1]}` : "";
 }
 
@@ -124,7 +137,12 @@ function malformed(generation, shape, error) {
 // request, and building it is what the guarded region is for: a profile that
 // names a tool it does not carry is this generation+shape's verdict rather than
 // a rejection into the fan-out that would leave every other generation unasked.
-async function check(generation, profile, shape, namesOf) {
+//
+// Exported so tools-smoke.test.mjs can hand it a stubbed `fetch` and pin what it
+// does with each answer — in particular that every response body is released —
+// without asking Zen. It takes no arguments the caller does not already have, and
+// a test that called it would otherwise have to reach the network to see it run.
+export async function check(generation, profile, shape, namesOf) {
   let request;
   try {
     request = requestFor(generation, profile, namesOf());
@@ -143,17 +161,35 @@ async function check(generation, profile, shape, namesOf) {
     // first made a 200 whose body was cut — a reset mid-stream, or the 30s
     // timeout firing while it was still arriving — look like `unreachable`,
     // "the free tier could not be reached at all", for a request Zen had
-    // answered. Nothing is read on the success path either: a body nobody reads
-    // is a body nobody has to receive.
-    if (response.ok)
+    // answered. Nothing more is read on the success path either: a body nobody
+    // reads is a body nobody has to receive. It is let go of rather than left
+    // dangling, the way provider.mjs's readRemote releases the body of a
+    // response it does not read: an unread body holds its connection open until
+    // the GC gets to it, and a gate that probes one host twice does not need two
+    // sockets held for a verdict it already has. A cancel that fails is not a
+    // verdict either, so it is swallowed here — and the status is still the
+    // answer whatever the release did.
+    if (response.ok) {
+      await response.body?.cancel().catch(() => {});
       return { generation, shape, verdict: "answered", detail: `as ${headers.get("user-agent")}` };
-    if (response.status === 426)
+    }
+    // The 426 body is released for the same reason as the answered one, and
+    // released here rather than above the `ok` check because the two branches
+    // below are the opposite case: they *do* read the body, to quote what Zen
+    // said about the fingerprint, and a release hoisted above them would take
+    // that away. This branch reads nothing — its detail is the fixed sentence
+    // below, since a 426 means Zen wants a newer OpenCode and there is nothing in
+    // the body this gate could add — so the body is let go of rather than left
+    // for the GC to close.
+    if (response.status === 426) {
+      await response.body?.cancel().catch(() => {});
       return {
         generation,
         shape,
         verdict: "superseded",
         detail: "Zen wants a newer OpenCode than this profile claims",
       };
+    }
     // A body that cannot be read leaves the status standing: a 403 whose body
     // was lost is still a 403, and `says` has nothing to add to it.
     const text = await response.text().catch(() => "");
@@ -236,10 +272,7 @@ export function isEntryPoint({ argv1, moduleUrl }) {
   // one file — a `true` that makes an import ask Zen. Where the identity cannot
   // be read at all, the question stays open rather than answered "different
   // file", because after this branch a differing realpath is not proof either.
-  const identity = (at) => {
-    const stats = statSync(at, { bigint: true });
-    return stats.ino === 0n ? undefined : `${stats.dev}:${stats.ino}`;
-  };
+  const identity = (at) => fileIdentity(statSync(at, { bigint: true }));
   let ids;
   try {
     ids = [identity(self), identity(run)];
@@ -248,6 +281,22 @@ export function isEntryPoint({ argv1, moduleUrl }) {
   }
   if (ids[0] === undefined || ids[1] === undefined) return undefined;
   return ids[0] === ids[1];
+}
+
+/**
+ * The identity of one file from the `stat` that was just read of it: `dev` and
+ * `ino` joined, or `undefined` where the file system reports no inode to compare
+ * (`ino` of 0 is how FUSE and some network mounts answer). Exported so
+ * tools-smoke.test.mjs can pin both readings by calling it with the numbers —
+ * `isEntryPoint` takes paths, and a host that reports an inode of 0 for a real
+ * file is one this suite cannot conjure on demand, so the rule that decides the
+ * hard-link question would otherwise be pinned only where inodes are reported
+ * and unchecked everywhere else. That is the wrong way round: `undefined` is the
+ * answer that must not be read as "a different file", since reading it that way
+ * is a gate that asks nothing and exits 0.
+ */
+export function fileIdentity(stats) {
+  return stats.ino === 0n ? undefined : `${stats.dev}:${stats.ino}`;
 }
 
 // Only a run asks Zen. index.test.mjs imports this module to hold its request
@@ -307,7 +356,7 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
       return `${unbuilt.length}/${total} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`;
     }
     if (verdicts.every(fingerprint)) {
-      return "None of them. Zen has moved past every generation this plugin knows; the tool wording in core-tools.mjs needs capturing again from a current OpenCode.";
+      return "None of them. Zen has moved past every generation this plugin knows; the tool wording in fingerprint.json needs capturing again from a current OpenCode.";
     }
     if (verdicts.some(fingerprint)) {
       return "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.";
@@ -323,6 +372,11 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
   // floors are kept outside it: "of N" is the floors something was asked of, and
   // a request that could not be built is not one of them. Counting it in made a
   // single floor appear on both sides of the sentence.
+  //
+  // `unbuilt` holds the `malformed` rows, which is how the gate's fan-out builds
+  // it: rows off the same `check` that produced every other verdict, so the
+  // suite's raw-word rows and the gate's rows are one shape rather than one shape
+  // plus an abbreviation only this summary accepts.
   const refused = verdicts.filter((verdict) => verdict === "refused" || verdict === "superseded").length;
   const other = verdicts.length - refused;
   const what = [
@@ -336,7 +390,19 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
   const malformed = unbuilt.length
     ? `${unbuilt.length} never asked: the malformed lines above name what fingerprint.json has to gain before those can be asked.`
     : "";
-  return `At least one generation works, so the plugin still has a generation Zen will serve. ${asked}${malformed}`;
+  // The opening sentence claims every generation this plugin knows is served —
+  // "so the plugin still has a generation Zen will serve" — and that is only what
+  // the rows said when every floor was asked. A floor that was never asked
+  // (`malformed`) or never answered (`unreachable`, `failed`) is a generation
+  // nothing is known about: the run still proves the plugin works, because one
+  // floor was answered, but it does not prove this plugin will be served in
+  // general, and the sentence said it did.
+  const proven = served === total;
+  return `${
+    proven
+      ? "At least one generation works, so the plugin still has a generation Zen will serve."
+      : "At least one generation was served, so the plugin works for the floor that was answered."
+  } ${asked}${malformed}`;
 }
 
 if (entry) {

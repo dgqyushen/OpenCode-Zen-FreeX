@@ -492,12 +492,14 @@ test("a malformed catalogue entry does not take the models that are described wi
   // catalogue's word, and a `null` row is not the catalogue's word
   const notFree = buildModels(["empty-paid"], { npm: "@ai-sdk/openai-compatible", models: { "empty-paid": null } }, {}, baseURL);
   assert.deepEqual(Object.keys(notFree), []);
-  // The rows the whole loop has to survive, each of which has a member read on it
-  // by the caller of `buildModels` (provider.mjs reads `.cost` off `metadata.models`):
-  // a `null` there is a TypeError out of a hook a host is waiting on. The empty
-  // list is the row that is hardest to catch — `typeof []` is `"object"`, so it
-  // passed the object test — and is read by the same rule: see the case below,
-  // which is where that row's own shapes are pinned.
+  // The rows the whole loop has to survive, each of which the caller of
+  // `buildModels` decides about by the same rule this file does. `provider.mjs`
+  // keeps that rule as `describesModel` and asks it of the catalogue's own row
+  // while it decides what to preserve, so a row read as a description on one
+  // side and not the other is a model whose fate depends on which file looked at
+  // it. The empty list is the row that is hardest to catch — `typeof []` is
+  // `"object"`, so it passed the object test — and is read by the same rule: see
+  // the case below, which is where that row's own shapes are pinned.
   for (const row of [null, [], "not a model", 17, true, undefined]) {
     const dirty = { npm: "@ai-sdk/openai-compatible", models: { "dirty-free": row } };
     const label = JSON.stringify(row) ?? String(row);
@@ -529,9 +531,9 @@ test("a malformed catalogue entry does not take the models that are described wi
 // see: `typeof []` is `"object"`, so it passed the "is it an object" test that
 // `null` does not, and was then read as a description — from which nothing can
 // be read, because a list has no `name` and no `cost` and no `limit` of its own.
-// `provider.mjs` reads a row as a description by `isDescription`, which says a
-// list is not one, and the two sides deciding differently about one row is a
-// model whose fate depends on which file looked at it. This is that answer
+// `provider.mjs` reads a row as a description by its own `describesModel`, which
+// says a list is not one, and the two sides deciding differently about one row is
+// a model whose fate depends on which file looked at it. This is that answer
 // stated where the models it decides about can be counted.
 test("an array is a row the catalogue could not fill in, not a description", async () => {
   const { buildModels } = await subject;
@@ -631,7 +633,14 @@ test("a field the catalogue wrote in another shape does not end the call", async
   };
   const ids = Object.keys(catalogue.models);
   const models = buildModels(ids, catalogue, {}, baseURL);
-  assert.deepEqual(Object.keys(models), ids, "a wrong shape is not a reason to lose a row, or the rows beside it");
+  // The ids as a set, both sides sorted: what this asserts is that no row was
+  // lost and none was invented, and `buildModels` writes its keys in the order
+  // it was handed them, which is not part of that.
+  assert.deepEqual(
+    Object.keys(models).sort(),
+    [...ids].sort(),
+    "a wrong shape is not a reason to lose a row, or the rows beside it",
+  );
   // a list the catalogue did write is read exactly as it always was
   assert.deepEqual(Object.keys(models["kept-free"].variants), ["low"]);
   // and the ones it did not say nothing about are read as no efforts, which is
@@ -673,6 +682,73 @@ test("a field the catalogue wrote in another shape does not end the call", async
     baseURL,
   );
   assert.deepEqual(real["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
+});
+
+// The same rule for the two modality axes, which the case above does not reach:
+// `modalities.input` is read by `input.some(...)`, and a word, a number or an
+// object there is not a list — `.some` is not a function on any of them, so the
+// row threw out of `buildModels` and took every free model with it, which is the
+// failure the whole shape rule exists to prevent. The neighbouring
+// `reasoning_options` is guarded with `Array.isArray` and read as its own
+// default, and these two are read the same way: `??` covers a field the
+// catalogue left out and nothing else, so every other shape has to be answered
+// for as well. What a field written as a word or a number means is "no list was
+// stated", and the default for a field nothing was stated about is text-only —
+// the one thing a model here is known to read.
+test("a modality axis written in another shape is read as its default", async () => {
+  const { buildModels } = await subject;
+  const catalogue = {
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "word-input-free": { cost: { input: 0, output: 0 }, modalities: { input: "text" } },
+      "number-input-free": { cost: { input: 0, output: 0 }, modalities: { input: 7 } },
+      "object-output-free": { cost: { input: 0, output: 0 }, modalities: { output: {} } },
+      // ...and the whole field in another shape: a word and a list read as
+      // nothing stated, which is what the `??` above always did with them, so
+      // the guard neither loses nor invents a modality for either.
+      "word-modalities-free": { cost: { input: 0, output: 0 }, modalities: "text" },
+      "list-modalities-free": { cost: { input: 0, output: 0 }, modalities: ["text", "image"] },
+      "described-free": {
+        cost: { input: 0, output: 0 },
+        modalities: { input: ["text", "image"], output: ["text"] },
+      },
+    },
+  };
+  const ids = Object.keys(catalogue.models);
+  const models = buildModels(ids, catalogue, {}, baseURL);
+  // the rows written plainly are still read as they were, and the malformed
+  // axes beside them cost no row: the axes are read one at a time
+  assert.deepEqual(models["described-free"].capabilities.input, {
+    text: true,
+    image: true,
+    audio: false,
+    video: false,
+    pdf: false,
+  });
+  assert.equal(models["described-free"].capabilities.attachment, true);
+  for (const id of [
+    "word-input-free",
+    "number-input-free",
+    "object-output-free",
+    "word-modalities-free",
+    "list-modalities-free",
+  ]) {
+    assert.deepEqual(
+      models[id].capabilities.input,
+      { text: true, image: false, audio: false, video: false, pdf: false },
+      `${id}: the input axis is the default`,
+    );
+    assert.deepEqual(
+      models[id].capabilities.output,
+      { text: true, image: false, audio: false, video: false, pdf: false },
+      `${id}: and so is the output axis, which is read by the same rule`,
+    );
+    assert.equal(
+      models[id].capabilities.attachment,
+      false,
+      `${id}: and text-only is not an attachment`,
+    );
+  }
 });
 
 // A model Zen lists that neither the catalogue nor the docs describe yet: the id
@@ -812,4 +888,338 @@ test("reads the console docs' endpoint table, and Jev stays out as SystemOne", a
   }
   const models = buildModels(["jev-1.13-free", "step-5-preview-free"], {}, protocols, baseURL);
   assert.deepEqual(Object.keys(models), ["step-5-preview-free"]);
+});
+
+// ---------------------------------------------------------------------------
+// Not a change of subject: everything above this line is about `models.mjs`, and
+// the cases below are `provider.mjs`'s discovery-lease invariants, driven from
+// here because the lease lifecycle has no entry point of its own. A lease is
+// taken by that module's server whenever a caller waits for a discovery, the only
+// caller that arrives with a signal of its own is the loader's request path, and
+// neither is exported. `index.test.mjs` drives the same server over a socket;
+// these drive it over a stubbed `fetch` instead, so the three reads one discovery
+// makes can be held open, watched for the signal that ends them, and answered on
+// demand.
+//
+// The three invariants, in the order they are pinned below:
+//   - a discovery that answered releases the lease it was waited on with, so a
+//     lease taken by a caller that never aborts — the `models()` hook, and
+//     `refresh()` — does not outlive it;
+//   - a caller that had already given up when its lease was taken releases that
+//     lease too, though no listener of its own ever fires;
+//   - a flight cancelled to no callers does not end the next discovery: that
+//     flight's reads end, and the one after it reads on a signal that is not
+//     already aborted.
+// The case after those holds the other half of the rule the leases exist for:
+// one caller's abandonment must not cancel an answer another is still waiting
+// for, which is why a lease released for a caller that left ends nothing. The
+// last one closes the other end of it: a flight that was abandoned is not
+// joinable either, so a caller arriving while it is still winding down is not
+// handed the abort some other caller asked for.
+//
+// What they were written for is the pair of failures that hid each other: a
+// lease that was never released (the set only ever grew, so the "last caller
+// waiting has gone" branch was not reachable at all), and a read signal built
+// once for the server, which stayed aborted for its life once that branch had
+// run, so every later discovery answered with the abort instead of the list.
+const providerModule = import("./provider.mjs");
+providerModule.catch(() => {});
+
+const zenBase = "https://zen.test/v1";
+const zenCatalog = "https://zen.test/catalog";
+const zenDocs = "https://zen.test/docs";
+const publicAuth = async () => ({ type: "api", key: "public" });
+const zenURLs = { baseURL: zenBase, catalogURL: zenCatalog, docsURL: zenDocs };
+
+// A macrotask boundary. The loader reaches its discovery through microtasks —
+// the auth lookup, the request body — so by the time a timer callback runs, a
+// discovery that was going to start has started and its reads have been issued.
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+// The three reads discovery makes, answered without a socket. A read is handed
+// the signal that ends it, and the only way that end is observable from here is
+// that signal: aborted is what `fetch` does with one, inside and outside this
+// stub, so a read that ended and one that is still waiting are told apart by it.
+function discoveryUpstream() {
+  const reads = [];
+  const held = [];
+  let holding = false;
+  let refusal = null;
+  const original = globalThis.fetch;
+  const answer = (url) => {
+    if (url.endsWith("/models")) return Response.json({ data: [{ id: "chat-free" }] });
+    if (url.endsWith("/catalog"))
+      return Response.json({ opencode: { models: { "chat-free": {} } } });
+    if (url.endsWith("/docs")) return new Response("| Model | id | endpoint |");
+    if (refusal)
+      return new Response(refusal.body, {
+        status: refusal.status,
+        headers: { "content-type": "application/json" },
+      });
+    throw new Error(`nothing answers ${url} in this case`);
+  };
+  globalThis.fetch = async (url, init) => {
+    const read = { url: String(url), signal: init?.signal ?? null };
+    reads.push(read);
+    // What a real fetch does with a signal: one that arrives already aborted
+    // refuses before anything is sent, and one aborted while the read waits
+    // rejects the read. Both are how a read ends here, and the second is why a
+    // read held at the gate needs no watchdog to end it.
+    const stop = () => {
+      throw read.signal?.reason ?? new Error("the read was aborted");
+    };
+    if (read.signal?.aborted) stop();
+    if (holding)
+      await new Promise((resolve, reject) => {
+        held.push(resolve);
+        const signal = read.signal;
+        // A turn later, and deliberately: a real fetch rejects a read it is
+        // waiting on, and not in the same turn as the abort. That turn is the
+        // window the case below is about — how long a flight that has ended its
+        // reads stays visible as one still running — so it is modelled here
+        // rather than raced against.
+        signal?.addEventListener("abort", () => setTimeout(() => reject(signal.reason), 0), {
+          once: true,
+        });
+      });
+    if (read.signal?.aborted) stop();
+    return answer(read.url);
+  };
+  return {
+    reads,
+    // Hold every read issued from now on at the gate, and release them all.
+    hold() {
+      holding = true;
+    },
+    free() {
+      holding = false;
+      for (const resolve of held.splice(0)) resolve();
+    },
+    // What the inference path answers with, once a request gets that far.
+    refuse(status, body) {
+      refusal = { status, body };
+    },
+    restore() {
+      globalThis.fetch = original;
+    },
+  };
+}
+
+async function zenPlugin(t) {
+  const upstream = discoveryUpstream();
+  t.after(() => upstream.restore());
+  const { server } = (await providerModule).default;
+  const plugin = await server({}, zenURLs);
+  return { upstream, plugin };
+}
+
+// A request for a model the last list did not have: the one path that takes a
+// lease with a caller's own signal, and so the one that can walk away from it.
+const askForUnknown = (loader, signal) =>
+  loader.fetch(`${zenBase}/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "nothing-free",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+    signal,
+  });
+
+// A discovery that answered is over for every caller that waited for it, and the
+// lease set has to say so. `models()` waits with no signal at all, so a lease it
+// leaves behind has nothing that could ever release it, and every later flight
+// counts it as a caller still waiting: the reads of a flight whose last real
+// caller walked away are then never ended — the one thing the leases exist to do.
+test("a caller a discovery has answered holds no lease on the next flight", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  const answered = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.ok(answered["chat-free"], "the fixture's listing is what that call answers with");
+  assert.equal(upstream.reads.length, 3, "a discovery is three reads");
+  // The relist budget would answer an unknown model out of `known`; moved past
+  // it, so the request below really is a second round, with a caller of its own.
+  const realNow = Date.now;
+  t.mock.method(Date, "now", () => realNow() + 61_000);
+  upstream.hold();
+  const loader = await plugin.auth.loader(publicAuth);
+  const controller = new AbortController();
+  const pending = askForUnknown(loader, controller.signal).catch((error) => error);
+  await tick();
+  assert.equal(upstream.reads.length, 6, "the request started its own discovery");
+  controller.abort();
+  const heard = await pending;
+  assert.equal(heard.name, "AbortError", "the caller that walked away hears its own signal");
+  await tick();
+  assert.deepEqual(
+    upstream.reads.slice(3).map((read) => read.signal.aborted),
+    [true, true, true],
+    "the reads end when the last caller waiting for them has gone",
+  );
+});
+
+// The other end of the same rule: a caller that had already given up when the
+// lease was taken. No `abort` listener of its own ever fires — its signal is
+// aborted before one is attached — so a lease released only by that listener is
+// held for the life of the server, and the flight it was taken on reads on with
+// nobody left to read for.
+test("a caller that had already given up holds no lease either", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  upstream.hold();
+  const loader = await plugin.auth.loader(publicAuth);
+  const controller = new AbortController();
+  const pending = askForUnknown(loader, controller.signal).catch((error) => error);
+  // Aborted once the loader is past its own gate: the request body is the await
+  // between that gate and the discovery, so the lease is taken by a caller that
+  // is already gone. Were the abort earlier, the loader would refuse the request
+  // before it read anything, which the read count below would say.
+  queueMicrotask(() => controller.abort());
+  await tick();
+  assert.equal(upstream.reads.length, 3, "the abort landed after the loader's own gate");
+  assert.deepEqual(
+    upstream.reads.map((read) => read.signal.aborted),
+    [true, true, true],
+    "nobody is waiting, so the flight has nothing left to read for",
+  );
+  assert.equal((await pending).name, "AbortError");
+});
+
+// ...and the failure those two leaks hide: the signal every read was given was
+// built once for the server, so once a flight had ended its reads by aborting
+// it, every later discovery started on a signal that was already aborted — the
+// listing, the catalogue and the docs all failed before they were sent, and
+// `refresh()`, the models hook and a request for a model the list did not have
+// all answered with that abort from then on.
+test("a flight cancelled to no callers does not end the next discovery", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  upstream.hold();
+  const loader = await plugin.auth.loader(publicAuth);
+  const controller = new AbortController();
+  const pending = askForUnknown(loader, controller.signal).catch((error) => error);
+  await tick();
+  assert.equal(upstream.reads.length, 3);
+  controller.abort();
+  assert.equal((await pending).name, "AbortError");
+  await tick();
+  assert.deepEqual(
+    upstream.reads.map((read) => read.signal.aborted),
+    [true, true, true],
+    "the reads end when the last caller waiting for them has gone",
+  );
+  // The discovery after it reads again, on a signal that is not already aborted.
+  upstream.free();
+  const refreshed = await plugin.refresh();
+  assert.ok(refreshed["chat-free"], "the discovery after a cancelled one still answers");
+  assert.equal(upstream.reads.length, 6, "and it read rather than answering from the abort");
+  // The request path answers too: an unknown model is refused by name, with the
+  // models Zen does serve, which is the answer only a discovery that finished
+  // can give.
+  const realNow = Date.now;
+  t.mock.method(Date, "now", () => realNow() + 61_000);
+  const refused = await askForUnknown(loader, undefined);
+  assert.equal(refused.status, 404);
+  const { error } = await refused.json();
+  assert.match(error.message, /nothing-free is not available.*chat-free/);
+  assert.equal(upstream.reads.length, 9, "and that request read the listing again");
+});
+
+// The other half of the rule the leases exist for, and the reason a release does
+// not abort anything of its own accord: a caller that walks away is not the
+// flight. Two callers wait on one discovery; the first gives up, and the reads
+// it was waiting for go on, because the second is still waiting for them.
+test("one caller walking away does not cancel the answer another waits for", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  upstream.hold();
+  const loader = await plugin.auth.loader(publicAuth);
+  const first = new AbortController();
+  const second = new AbortController();
+  const walkedAway = askForUnknown(loader, first.signal).catch((error) => error);
+  const waitingStill = askForUnknown(loader, second.signal).catch((error) => error);
+  await tick();
+  assert.equal(upstream.reads.length, 3, "two callers, one flight, one round of reads");
+  first.abort();
+  assert.equal((await walkedAway).name, "AbortError");
+  await tick();
+  assert.deepEqual(
+    upstream.reads.map((read) => read.signal.aborted),
+    [false, false, false],
+    "the caller that left was not the last one waiting, so the reads go on",
+  );
+  // The answer reaches the caller that stayed: it is the refusal for the model
+  // it named, which only a discovery that finished can write.
+  upstream.free();
+  const refused = await waitingStill;
+  assert.equal(refused.status, 404);
+  const { error } = await refused.json();
+  assert.match(error.message, /nothing-free is not available.*chat-free/);
+  assert.equal(upstream.reads.length, 3, "and no second round was read for it");
+});
+
+// ...and the other side of the same rule: a caller that arrives while a
+// cancelled flight is still winding down must not inherit its cancellation. The
+// window is not a microtask — a flight's reads reject a turn after they are
+// aborted, and the three of them settle it after that — so a request arriving
+// right after the cancellation finds a flight that is still "running" and
+// already dead. Its answer would be the abort some other caller asked for.
+test("a caller arriving after a cancellation is not handed its abort", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  upstream.hold();
+  const loader = await plugin.auth.loader(publicAuth);
+  const first = new AbortController();
+  const walkedAway = askForUnknown(loader, first.signal).catch((error) => error);
+  await tick();
+  assert.equal(upstream.reads.length, 3, "the caller that left started a discovery");
+  first.abort();
+  assert.equal((await walkedAway).name, "AbortError");
+  // Arrives with the cancelled flight unsettled: its reads have been aborted,
+  // but their rejection is a turn away and the settle comes after that.
+  const second = new AbortController();
+  const answered = askForUnknown(loader, second.signal).catch((error) => error);
+  await tick();
+  upstream.free();
+  const refused = await answered;
+  assert.notEqual(
+    refused.name,
+    "AbortError",
+    "the cancellation was not this caller's to inherit",
+  );
+  assert.equal(refused.status, 404, "and its own discovery is what answered it");
+  const { error } = await refused.json();
+  assert.match(error.message, /nothing-free is not available.*chat-free/);
+  assert.equal(upstream.reads.length, 6, "a round of its own, not the cancelled one");
+});
+
+// Why a refusal's body stopped short is not among the facts this path holds.
+// The reader answers "the read stopped short" for a budget it reached, a
+// deadline that passed, a read that failed and a caller that aborted, and it
+// names none of them; the length read is not a reason either, since a body past
+// the budget and one a stalled upstream left half-sent come back as the same
+// prefix. So the message states the fact it has — the body was not read to its
+// end — and how much of it was read. The request below is the budget case, whose
+// number the message can still state, and the wording is not the one that read a
+// reason off that number.
+test("a refusal read short says so without naming a reason it cannot know", async (t) => {
+  const { upstream, plugin } = await zenPlugin(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const long = `{"error":{"message":"${"x".repeat(5000)}"}}`;
+  upstream.refuse(400, long);
+  const response = await loader.fetch(`${zenBase}/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 400, "the upstream's status is the answer's status");
+  const { error } = await response.json();
+  assert.match(error.message, /HTTP 400/);
+  assert.match(error.message, /was not read to the end/);
+  assert.match(error.message, /\d+ characters read before the read stopped/);
+  assert.doesNotMatch(
+    error.message,
+    /ran past|this plugin reads of a refusal/,
+    "the budget is not stated as the reason, which this path cannot know",
+  );
+  assert.equal(
+    error.upstream,
+    long.slice(0, 512) + "…",
+    "the opening that was read is carried along",
+  );
 });

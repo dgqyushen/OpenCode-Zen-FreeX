@@ -16,6 +16,17 @@ import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 const MODULE = readFileSync(new URL("./core-tools.mjs", import.meta.url), "utf8");
 const CAPTURE = readFileSync(new URL("./fingerprint.json", import.meta.url), "utf8");
 
+// The module's one remedy, read out of the source read above rather than
+// respelled here. Every failure below has to carry it, and reading it from the
+// place that writes it is what makes a reworded remedy a change to core-tools.mjs
+// alone — the claim the module's own comment makes about the constant, which used
+// to be false here: the command was written out again at each of the three places
+// that assert it, so a rename of it failed six cases at once instead of one. The
+// shape read is pinned by the case below, because reading source text needs a
+// shape to read, and a remedy that stopped being one double-quoted constant would
+// otherwise leave the cases below matching a string nothing writes any more.
+const REMEDY = /^const REMEDY = "([^"]+)";$/m.exec(MODULE)?.[1];
+
 // A loader for a scratch copy in a fresh directory. Passing no fingerprint is
 // the missing-file case, `true` is a directory standing where the file should
 // be (the unreadable one), and the directory is removed when the test ends.
@@ -40,30 +51,44 @@ function thrown(act) {
 }
 
 // Every import-time failure names the file to fix and the command that writes it.
-// Spelled once because the module's remedy text is one string: if it is reworded
-// it has to be reworded here and nowhere else.
+// The remedy half comes from the module's own source, read once above, so the
+// three cases below assert one string rather than three copies of it.
 function assertCaptureFailure(failure, what) {
   assert.match(failure.message, /fingerprint\.json/, what);
-  assert.match(failure.message, /bun run capture/, what);
+  assertNamesRemedy(failure, what);
+}
+
+// The remedy a failure has to carry, and nothing else: the message reads
+// `core-tools: <what went wrong> — <remedy>`, and this is the half after the dash.
+function assertNamesRemedy(failure, what = "the failure") {
+  assert.ok(failure.message.includes(REMEDY), `${what}: the message carries the remedy`);
 }
 
 // Every generation whose agent is composed per protocol, with its captured
-// provider-utils. Both tests around it need the same scan, and the guard is what
-// makes it mean something: `assert.ok(entries.length)` alone accepts a profile
-// whose provider-utils was captured as `{}`, and the loops below then iterate
-// zero times — the per-protocol composition would never be exercised, and this
-// file would go green without checking it. The predicate is guarded because a
-// profile without an `agent` is a shape the module deliberately accepts and loads
-// (the `{"9.x":{}}` case below pins that), so it must miss here rather than throw
-// a TypeError out of the scan.
+// provider-utils. The cases around it all need the same scan, and the guard is
+// what makes it mean something: `assert.ok(entries.length)` alone accepts a
+// profile whose provider-utils was captured as `{}`, and the loops below then
+// iterate zero times — the per-protocol composition would never be exercised,
+// and this file would go green without checking it. The predicate is guarded
+// because a profile without an `agent`, or one that is not an object at all, is a
+// shape the module deliberately accepts and loads — the empty-profile case below
+// pins the first, the `9.x: null` scan case the second — so it must miss here
+// rather than throw a TypeError out of the scan. The scan runs inside cases about
+// something else, which would then report a failure of their own instead of the
+// shape they are about.
 //
 // All of them, not the first: a capture may carry a second per-protocol
 // generation, and `find` answered with whichever one came first in the file —
 // the other was never asked about, and a case that says it pins "the
 // per-protocol branch" would go green having looked at one of two. Which
-// generations the capture holds is data, so the scan is over the data.
-function perProtocolProfiles() {
-  const entries = Object.entries(PROFILES).filter(([, profile]) => profile.agent?.providerUtils);
+// generations the capture holds is data, so the scan is over the data. The map
+// itself is a parameter because a profile that is not an object is a shape the
+// shipped capture does not carry, so pinning the miss needs a scratch copy to
+// supply one.
+function perProtocolProfiles(profiles = PROFILES) {
+  const entries = Object.entries(profiles).filter(
+    ([, profile]) => profile?.agent?.providerUtils,
+  );
   assert.ok(entries.length, "the capture is expected to hold a per-protocol profile");
   return entries.map(([generation, profile]) => {
     const protocols = Object.keys(profile.agent.providerUtils);
@@ -74,13 +99,31 @@ function perProtocolProfiles() {
 
 // The generation whose agent is the release shape, which composes its
 // User-Agent out of channel/version/client instead of a provider-utils version.
-function releaseProfile() {
-  const entry = Object.entries(PROFILES).find(
-    ([, profile]) => profile.agent && !profile.agent.providerUtils,
+// Its predicate is guarded for the reason the scan above is, and takes the map it
+// reads for the same reason: a profile that is not an object has to be missed
+// here rather than throw out of a `find` the cases using it depend on.
+function releaseProfile(profiles = PROFILES) {
+  const entry = Object.entries(profiles).find(
+    ([, profile]) => profile?.agent && !profile.agent.providerUtils,
   );
   assert.ok(entry, "the capture is expected to hold a release-shaped profile");
   return entry;
 }
+
+// The two things the remedy read above depends on, asserted as a case of its own
+// so that either one failing names itself and leaves the rest of the file running:
+// the constant's shape, because that is what makes the read possible at all, and
+// the command it names, because that is the half of the remedy a reader acts on.
+// The command is pinned here rather than in each of the three assertions below, so
+// a rename is one case to read instead of six failures to interpret.
+test("the module's remedy is one constant, and still names the command it sends you to", () => {
+  assert.ok(REMEDY, "core-tools.mjs spells its remedy as one double-quoted constant");
+  assert.match(
+    REMEDY,
+    /bun run capture/,
+    "the remedy names the command that writes the capture",
+  );
+});
 
 test("a scratch copy with the project's own capture reads it back", async (t) => {
   const { PROFILES: copied } = await scratch(t, CAPTURE)();
@@ -159,7 +202,10 @@ test("a capture that carries no profile at all fails at import", async (t) => {
 // `undefined` is what `generationOf` returns for a body whose tools name
 // neither, which provider.mjs defaults itself. What has to be named is the
 // generation that was asked for and the ones the capture holds — not a
-// TypeError on the `.agent` of `undefined`, which says neither.
+// TypeError on the `.agent` of `undefined`, which says neither. The remedy is
+// asserted as well, because this throw used to be one of the two in the module
+// that composed its own message without it, and a case that only reads the
+// diagnosis would let it drift back.
 test("an uncaptured generation is named, with the profiles the capture holds", () => {
   for (const generation of [undefined, "3.x", "constructor", "toString"]) {
     const failure = thrown(() => agentFor(generation));
@@ -169,6 +215,7 @@ test("an uncaptured generation is named, with the profiles the capture holds", (
     );
     for (const key of Object.keys(PROFILES))
       assert.ok(failure.message.includes(key), `the message names the ${key} profile`);
+    assertNamesRemedy(failure, JSON.stringify(generation));
     assert.ok(
       !(failure instanceof TypeError),
       "a miss names itself rather than failing on undefined",
@@ -205,6 +252,9 @@ test("a protocol with no captured provider-utils is named", () => {
       );
       for (const captured of protocols)
         assert.ok(failure.message.includes(captured), `the message names the captured ${captured}`);
+      // The second of the module's two throws that used to compose its own
+      // message without the shared remedy, pinned for the same reason.
+      assertNamesRemedy(failure, `${generation}/${protocol}`);
     }
   }
 });
@@ -231,7 +281,7 @@ test("a differently named generation loads, and an empty profile is named", asyn
   const { agentFor: copied } = await scratch(t, '{"profiles":{"9.x":{}}}')();
   const failure = thrown(() => copied("9.x"));
   assert.match(failure.message, /9\.x/);
-  assert.match(failure.message, /bun run capture/);
+  assertNamesRemedy(failure);
 });
 
 // The other branch: a generation whose agent carries no provider-utils composes
@@ -251,7 +301,7 @@ test("a generation without provider-utils keeps its release User-Agent", () => {
 // answers a header like that with a refusal saying nothing about the capture.
 test("a release profile that does not fill in its User-Agent is named", async (t) => {
   for (const [what, agent] of [
-    ["a absent channel", { opencode: "2.0.29", client: "cli" }],
+    ["an absent channel", { opencode: "2.0.29", client: "cli" }],
     ["a blank channel", { channel: "", opencode: "2.0.29", client: "cli" }],
     ["a numeric channel", { channel: 5, opencode: "2.0.29", client: "cli" }],
     ["no client", { channel: "latest", opencode: "2.0.29" }],
@@ -295,6 +345,62 @@ test("a per-protocol profile with a field that is not a string is named", async 
   }
 });
 
+// The structural check on `provider-utils` has to be as strict as the two above
+// it — the profile map and the profile — which both refuse a list as well as
+// null. An empty list is truthy, so it is not read as the release shape, and it
+// used to pass the object check and die at the lookup below with a message
+// naming an empty set of protocols: `it holds ` and then nothing, because
+// `Object.keys([])` is empty. A list cannot be a table of protocol versions, so
+// it is refused where the field is read instead.
+test("a provider-utils that is a list is refused where it is read", async (t) => {
+  const { agentFor: copied } = await scratch(
+    t,
+    JSON.stringify({
+      profiles: {
+        "9.x": {
+          agent: { opencode: "1.19.0", providerUtils: [], runtime: "runtime/bun/1.3.14" },
+        },
+      },
+    }),
+  )();
+  const failure = thrown(() => copied("9.x", "chat"));
+  assert.match(failure.message, /9\.x/, "names the generation");
+  assert.match(failure.message, /has no per-protocol provider-utils/, "says what is wrong");
+  assert.doesNotMatch(failure.message, /it holds $/, "nothing is named after `it holds`");
+});
+
+// A profile that is not an object is a shape the import-time check accepts and
+// `profileFor` refuses where it is used, so both scans have to miss it the way
+// they miss a profile with no `agent`: reading `.agent` off null used to throw a
+// TypeError out of a scan that runs inside cases about something else. The
+// release shape is in the same capture because the second scan only means
+// something when it still finds one.
+test("a capture holding a profile that is not an object is missed by both scans", async (t) => {
+  const { PROFILES: copied } = await scratch(
+    t,
+    JSON.stringify({
+      profiles: {
+        "9.x": null,
+        "1.x": {
+          agent: {
+            opencode: "1.19.0",
+            providerUtils: { chat: "4.0.23" },
+            runtime: "runtime/bun/1.3.14",
+          },
+        },
+        "2.x": { agent: { channel: "latest", opencode: "2.0.29", client: "cli" } },
+      },
+    }),
+  )();
+  const entries = perProtocolProfiles(copied);
+  assert.deepEqual(
+    entries.map(({ generation }) => generation),
+    ["1.x"],
+    "the per-protocol profile is still found, and the null one is missed",
+  );
+  assert.equal(releaseProfile(copied)[0], "2.x", "the release profile is still found");
+});
+
 // Ownership of the key is only half of "the capture holds this generation": a
 // truncated or hand-edited capture can own it with a value that is not a profile
 // at all, and `Object.hasOwn` alone used to hand that back so the caller's
@@ -310,7 +416,7 @@ test("a profile that is not an object is named rather than read", async (t) => {
     assert.ok(!(failure instanceof TypeError), `${JSON.stringify(value)}: not the anonymous one`);
     assert.match(failure.message, /9\.x/, `${JSON.stringify(value)}: names the generation`);
     assert.match(failure.message, /not an object/, `${JSON.stringify(value)}: says what is wrong`);
-    assert.match(failure.message, /bun run capture/);
+    assertNamesRemedy(failure, JSON.stringify(value));
   }
 });
 

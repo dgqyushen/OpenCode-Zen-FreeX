@@ -81,7 +81,7 @@ function streamSnapshot(protocol, names) {
 }
 function namesIn(protocol, data) {
   if (protocol === "chat")
-    return data.choices
+    return (data.choices ?? [])
       .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
       .map((value) => value.function.name);
   return (
@@ -95,14 +95,16 @@ function namesIn(protocol, data) {
 const callShaped = (type) =>
   typeof type === "string" &&
   (type.endsWith("_call") || type === "tool_use" || type === "server_tool_use");
-// The calls a reply (JSON, or every SSE frame's data) hands the agent, and
-// the text it says.
-function callsIn(protocol, values) {
+// The calls a reply (JSON, or every SSE frame's data) hands the agent: a Chat
+// choice's tool_calls, a Responses output array or a frame's own item, or a
+// Messages content array or content block. One walk, so the two readers below
+// draw from the same items and a protocol added to one is added to both.
+function callItems(protocol, values) {
   return values.flatMap((data) => {
     if (protocol === "chat")
-      return (data.choices ?? [])
-        .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
-        .map((value) => value.function?.name);
+      return (data.choices ?? []).flatMap(
+        (choice) => (choice.message ?? choice.delta)?.tool_calls ?? [],
+      );
     const items =
       protocol === "responses"
         ? [...((data.response ?? data).output ?? []), ...(data.item ? [data.item] : [])]
@@ -110,33 +112,22 @@ function callsIn(protocol, values) {
             ...((data.message ?? data).content ?? []),
             ...(data.content_block ? [data.content_block] : []),
           ];
-    return items.filter((item) => callShaped(item.type)).map((item) => item.name);
+    return items.filter((item) => callShaped(item.type));
   });
 }
-// The words the agent keys a call's result by: a Chat client matches a
-// tool/result by the call's id, a Responses item carries the call_id the route
-// named it by (and an id of its own), and a Messages block is keyed by its id.
-// A call the guard hands on has one — it leaves with an id (ensureCallIDs) —
-// and the note left in a nameless call's place is not a call at all.
+// The names those calls were made under (callsIn), and the words the agent
+// keys a call's result by (idsIn): a Chat client matches a tool/result by the
+// call's id, a Responses item carries the call_id the route named it by (and
+// an id of its own), and a Messages block is keyed by its id. A call the guard
+// hands on has one — it leaves with an id (ensureCallIDs) — and the note left
+// in a nameless call's place is not a call at all.
+function callsIn(protocol, values) {
+  const name = protocol === "chat" ? (value) => value.function?.name : (value) => value.name;
+  return callItems(protocol, values).map(name);
+}
 function idsIn(protocol, values) {
-  return values.flatMap((data) => {
-    if (protocol === "chat")
-      return (data.choices ?? [])
-        .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
-        .map((value) => value.id)
-        .filter(Boolean);
-    const items =
-      protocol === "responses"
-        ? [...((data.response ?? data).output ?? []), ...(data.item ? [data.item] : [])]
-        : [
-            ...((data.message ?? data).content ?? []),
-            ...(data.content_block ? [data.content_block] : []),
-          ];
-    return items
-      .filter((item) => callShaped(item.type))
-      .map((item) => item.call_id ?? item.id)
-      .filter(Boolean);
-  });
+  const word = protocol === "chat" ? (value) => value.id : (value) => value.call_id ?? value.id;
+  return callItems(protocol, values).map(word).filter(Boolean);
 }
 function textIn(protocol, values) {
   if (protocol === "chat")
@@ -2780,6 +2771,187 @@ test("chat: a fragment that names no index is read the same by both paths", asyn
   );
 });
 
+// D1 (review round, DEC-3): the other shape of the same rule — two index-less
+// fragments, each naming a different id. Reading every one of them as the
+// first slot merged the two calls into one: the second call's id, both names
+// run together ("bashread"), and both argument objects on it, while the same
+// reply as one JSON body answers two calls. A fragment that names no place is
+// placed by the id it carries: an id an open call of this choice already
+// answers is that call's slot, and one no open call answers is a call of its
+// own, which takes the next unused slot. A fragment with no usable id at all
+// is read as the first slot, which the test above pins.
+test("chat: index-less fragments naming different ids are two calls, in both paths", async () => {
+  const fragments =
+    event({
+      id: "x",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                id: "call_A",
+                type: "function",
+                function: { name: "bash", arguments: '{"a":1}' },
+              },
+            ],
+          },
+        },
+      ],
+    }) +
+    event({
+      id: "x",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                id: "call_B",
+                type: "function",
+                function: { name: "read", arguments: '{"b":2}' },
+              },
+            ],
+          },
+        },
+      ],
+    }) +
+    event({ id: "x", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+    terminal("chat");
+  // The same two calls as one JSON body, told apart the way Chat's own shape
+  // tells two calls apart: one call per index.
+  const body = {
+    choices: [
+      {
+        index: 0,
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_A",
+              type: "function",
+              function: { name: "bash", arguments: '{"a":1}' },
+            },
+            {
+              index: 1,
+              id: "call_B",
+              type: "function",
+              function: { name: "read", arguments: '{"b":2}' },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const words = (calls) =>
+    calls.map((kept) => `${kept.id}:${kept.function.name}${kept.function.arguments}`);
+  const streamed = await guardToolResponse(sse(fragments), "chat", policy);
+  assert.equal(streamed.status, 200);
+  const guarded = await streamed.text();
+  const kept = frameData(guarded)
+    .flatMap((data) => data.choices ?? [])
+    .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  const calls = words(kept);
+  const whole = await guardToolResponse(
+    new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }),
+    "chat",
+    policy,
+  );
+  assert.deepEqual(
+    calls,
+    words((await whole.json()).choices[0].message.tool_calls ?? []),
+    "the streamed reply and the one-body reply disagree about two calls that name no index",
+  );
+  // The collapse path places the two calls by the same ids, each with its own
+  // arguments: what it reads of the upstream fragments is what the guard read
+  // of them. The names it carries stay as the upstream wrote them — the
+  // accumulator has no tool policy — so the two are compared by the calls
+  // themselves.
+  const collapsed = await collapseResponse(sse(fragments), "chat");
+  assert.equal(collapsed.status, 200);
+  assert.deepEqual(
+    (await collapsed.json()).choices[0].message.tool_calls.map(
+      (call) => `${call.id}:${call.function.arguments}`,
+    ),
+    kept.map((call) => `${call.id}:${call.function.arguments}`),
+    "the collapsed reply places the two calls differently from the streamed one",
+  );
+  // And the bytes the streaming client was handed, collapsed for a client that
+  // reads no stream (provider.mjs collapses the guarded stream), are the same
+  // reply once more.
+  const back = await collapseResponse(sse(guarded), "chat");
+  assert.equal(back.status, 200);
+  assert.deepEqual(
+    words((await back.json()).choices[0].message.tool_calls ?? []),
+    calls,
+    "the streamed reply and its collapsed copy disagree about two calls that name no index",
+  );
+});
+
+// D2 (review round, DEC-4): a call the reply left out, then a call it kept —
+// and the dropped one's arguments frame arrives while the stream is inside the
+// kept one, naming the dropped item by a word its frame never placed. The
+// frame was read as the kept item's, so the client was handed the arguments of
+// an item it had been told was replaced by a note. A word that names a call
+// left out is read before the item the stream is inside, whether or not the
+// frame gives a place of its own.
+test("Responses: a dropped call's arguments frames are not the kept call's", async () => {
+  const dropped = { type: "function_call", id: "fc_1", call_id: "call_1", arguments: "" };
+  const kept = {
+    type: "function_call",
+    id: "fc_2",
+    call_id: "call_2",
+    name: "bash",
+    arguments: "",
+  };
+  for (const word of ["fc_1", "call_1"]) {
+    const text =
+      event({ type: "response.output_item.added", item: dropped }) +
+      event({ type: "response.output_item.added", output_index: 0, item: kept }) +
+      event({
+        type: "response.function_call_arguments.delta",
+        item_id: word,
+        delta: '{"leaked":1}',
+      }) +
+      event({
+        type: "response.function_call_arguments.done",
+        item_id: word,
+        arguments: '{"leaked":1}',
+      }) +
+      event({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_2",
+        delta: '{"k":1}',
+      }) +
+      event(
+        {
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [
+              { ...dropped, arguments: '{"leaked":1}' },
+              { ...kept, arguments: '{"k":1}' },
+            ],
+          },
+        },
+        "response.completed",
+      );
+    const streamed = await guardToolResponse(sse(text), "responses", policy);
+    assert.equal(streamed.status, 200, `the frame naming ${word} was not a reply`);
+    const data = frameData(await streamed.text());
+    assert.deepEqual(
+      data
+        .filter((value) => value.type?.startsWith("response.function_call_arguments"))
+        .map((value) => [value.item_id, value.delta ?? value.arguments]),
+      [["fc_2", '{"k":1}']],
+      `the arguments frame naming ${word} reached the client, or the kept call lost its own`,
+    );
+    assert.deepEqual([...new Set(callsIn("responses", data))], ["Bash"]);
+  }
+});
+
 // #209: an ambiguous fold is still never guessed. Both Bash and BASH are
 // declared, so "bash" folds to two of the agent's tools and the guard cannot
 // tell which one the model meant — it hands the call on as called, and the
@@ -3148,14 +3320,21 @@ test("chat: completed tool buffers release their cumulative budget", { timeout: 
   const bytes = encoder.encode(
     event(chat({ tool_calls: [call("bash", 0, "x".repeat(1024 * 1024))] }, "tool_calls")),
   );
+  // Enough events of their own to put the stream past the limit the guard
+  // reads through, counted from that constant rather than from a literal: a
+  // literal would keep sending the old number of bytes after the constant
+  // grew and test nothing at the boundary. Every event carries a finished
+  // call, so each round's bytes are released as it finishes — which is what
+  // lets more than the limit flow through the buffer at all.
+  const chunks = Math.ceil(MAX_BYTES / bytes.byteLength) + 1;
   const source = new Response(
     new ReadableStream({
       pull(controller) {
-        if (count < 34) {
+        if (count < chunks) {
           count++;
           return controller.enqueue(bytes);
         }
-        if (count++ === 34) return controller.enqueue(encoder.encode(terminal("chat")));
+        if (count++ === chunks) return controller.enqueue(encoder.encode(terminal("chat")));
         controller.close();
       },
     }),
@@ -3172,7 +3351,7 @@ test("chat: completed tool buffers release their cumulative budget", { timeout: 
     assert.equal(data.choices[0].delta.tool_calls[0].function.name, "Bash");
     tools++;
   }
-  assert.equal(tools, 34);
+  assert.equal(tools, chunks);
 });
 
 // 64 MiB through the guard: seconds of work, more under load, so it isn't
@@ -3200,19 +3379,19 @@ test(
 test("text streams larger than 32 MiB are not subject to the pending-tool limit", { timeout: 60_000 }, async () => {
   let count = 0;
   const bytes = encoder.encode(event(chat({ content: "x".repeat(1024 * 1024) })));
+  // Enough chunks of a MiB each to put this stream past `MAX_BYTES`, counted
+  // from that constant rather than from a literal: a literal would keep sending
+  // the old number of bytes after the constant grew and test nothing at the
+  // boundary. The assertion below reads the same constant.
+  const chunks = Math.ceil(MAX_BYTES / bytes.byteLength) + 1;
   const source = new Response(
     new ReadableStream({
       pull(controller) {
-        // 34 chunks of a MiB each is what puts this stream past `MAX_BYTES`,
-        // which the assertion below reads from that constant rather than from a
-        // literal. If the constant ever grows past 34 MiB, this count is what
-        // has to grow with it — growing the constant alone fails loudly instead
-        // of quietly sending fewer bytes than the boundary and testing nothing.
-        if (count < 34) {
+        if (count < chunks) {
           count++;
           return controller.enqueue(bytes);
         }
-        if (count++ === 34) return controller.enqueue(encoder.encode(terminal("chat")));
+        if (count++ === chunks) return controller.enqueue(encoder.encode(terminal("chat")));
         controller.close();
       },
     }),
@@ -3351,4 +3530,13 @@ test("a declared name of separators only is never handed another call (#76 follo
   }
   const exact = await guardToolResponse(Response.json(snapshot("chat", ["_"])), "chat", rules);
   assert.deepEqual(callsIn("chat", [await exact.json()]), ["_"]);
+});
+
+// M-45 (review round): namesIn reads a frame that carries no choices the way
+// its siblings do — a reply with no choices holds no calls, not a TypeError.
+// No caller passes such a frame today; the guard is what keeps the three
+// readers one rule.
+test("chat: a frame that carries no choices reads as no calls", () => {
+  assert.deepEqual(namesIn("chat", {}), []);
+  assert.deepEqual(namesIn("chat", { choices: [] }), []);
 });

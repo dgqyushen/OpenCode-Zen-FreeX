@@ -77,6 +77,21 @@ test("the audit asks about the ids the listing offers, not every id the catalogu
   // on what the shipped one happens to carry
   assert.deepEqual(offeredIds(["x-free"], {}, { "x-free": "systemone" }), []);
   assert.deepEqual(offeredIds(["x-free"], {}, { "x-free": "chat" }), ["x-free"]);
+  // An id named after a member of `Object.prototype` is a name, not a protocol.
+  // `snapshot?.[id]` answered `toString` out of the prototype — a function — and
+  // the `SDK` lookup for it found nothing, so the id was dropped before the
+  // catalogue's own free row was ever read: a model the plugin offers that no
+  // audit spoke for, and a line that said nothing about why. The catalogue
+  // describes every one of these as free, so nothing but the id's own name
+  // stands between them and being offered.
+  const prototypeNames = ["toString", "valueOf", "constructor", "__proto__", "hasOwnProperty"];
+  const freeRow = { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } };
+  const described = Object.fromEntries(prototypeNames.map((id) => [id, freeRow]));
+  assert.deepEqual(
+    offeredIds(prototypeNames, described, {}),
+    prototypeNames,
+    "a free id whose name is a prototype member is still an id the plugin offers",
+  );
   // a listing entry the catalogue marks retired is not offered by the plugin
   // either, so auditing it would report a model nobody can pick
   for (const model of [
@@ -323,9 +338,19 @@ test("the run/import question answers true, false, or an honest nothing", async 
 // a behaviour nothing had exercised. The branch is written once here, both cases
 // take it, and what the runner was told is asserted by the case below: a report
 // that is not a skip fails whether it is a `console.error` or a bare `return`.
+//
+// The answer has to be this function's own, because the two link calls cannot
+// give one: `fs.symlinkSync` and `fs.linkSync` return `undefined` on success, so
+// a caller reading `make()`'s value as "did this host make the link?" read a
+// junction that was built as a host that will not build one — and both cases
+// returned before their first assertion on every host, which is the
+// report-without-verifying this pair of cases exists to prevent. `true` is the
+// only answer that means the fixture was built; whether the link is really there
+// is what the cases' own `statSync` assertions say.
 function linked(t, make, what) {
   try {
-    return make();
+    make();
+    return true;
   } catch (error) {
     // A host that will not make a link — an unprivileged Windows account, a
     // file system with no links — cannot be asked this question at all.
@@ -475,12 +500,26 @@ function pieces(bytes, size) {
 // outright (`fail`). Both leave the reader holding a prefix and its own flag
 // saying the read stopped before the body did — the pair a length rule cannot
 // tell apart from a body that ran past the budget.
+//
+// The stall waits on a promise this fixture owns rather than on one that can
+// never settle: the reader's `cancel()` resolves it, so the fixture ends when
+// the code under test gives up on it. A fixture whose `pull` never settles is
+// indistinguishable from a read that hung, and leaves the stream — and the
+// promise — behind for the life of the process; this one is over as soon as the
+// read releases it, which is what `released` and `settled` below are for.
 function unterminated(chunks, { stop, status = 400 }) {
-  const seen = { pulled: 0, released: false };
+  const seen = { pulled: 0, released: false, settled: false };
+  let release;
   const body = new ReadableStream({
     pull(controller) {
       if (seen.pulled === chunks.length) {
-        if (stop === "stall") return new Promise(() => {});
+        if (stop === "stall")
+          return new Promise((resolve) => {
+            release = () => {
+              seen.settled = true;
+              resolve();
+            };
+          });
         controller.error(new Error("the body failed before the budget"));
         return;
       }
@@ -489,6 +528,7 @@ function unterminated(chunks, { stop, status = 400 }) {
     },
     cancel() {
       seen.released = true;
+      release?.();
     },
   });
   return { seen, response: new Response(body, { status }) };
@@ -514,7 +554,7 @@ async function answering(responses, run) {
   const real = globalThis.fetch;
   const sent = [];
   let shortfall = null;
-  globalThis.fetch = async (url, options) => {
+  const stub = async (url, options) => {
     sent.push({ url: String(url), method: options?.method });
     if (!responses.length) {
       shortfall = new Error(`${EXHAUSTED} — after ${sent.length} call${sent.length === 1 ? "" : "s"}`);
@@ -524,6 +564,10 @@ async function answering(responses, run) {
   };
   let result;
   try {
+    // The patch goes on inside the `try` that takes it off. `fetch` is
+    // process-global, and an assignment made outside the restore's own guard
+    // outlives a failure between the two and becomes the process's fetch.
+    globalThis.fetch = stub;
     result = await run();
   } finally {
     globalThis.fetch = real;
@@ -743,6 +787,11 @@ test(
       "the read has to give up on the wait rather than read the body to its end",
     );
     assert.equal(
+      stalled.seen.settled,
+      true,
+      "and the fixture's own wait is over, because the read released it: a body that can never settle cannot be told from a read that hung",
+    );
+    assert.equal(
       stalledAnswer.result.says,
       wording,
       "the whole wording was in hand, so the length rule sees it as whole and the read's flag does not",
@@ -908,8 +957,10 @@ test("a sibling is measured against the pair the plugin declares, not the catalo
 async function captured(runIt) {
   const real = console.log;
   const lines = [];
-  console.log = (...parts) => lines.push(parts.join(" "));
   try {
+    // As in `answering`: the patch is applied inside the `try` that restores it,
+    // because console is process-global and every file of this run shares it.
+    console.log = (...parts) => lines.push(parts.join(" "));
     await runIt();
     return lines;
   } finally {
@@ -931,18 +982,22 @@ const RUN_CATALOG = {
 // One run, with `fetch` and `console.log` injected, and the exit code read as
 // the run left it. The code is process-global too: a case that leaves it at 1
 // would fail the run the tests themselves live in, so what it was is put back
-// before this returns and the answer is carried out separately.
-async function auditRun(answers, run) {
+// before this returns and the answer is carried out separately. Both globals are
+// patched inside the `try` that restores them, for the reason `answering` gives.
+//
+// The listing and the catalogue are parameters so a case can say what it knows
+// about an id the shared fixture above does not carry; nothing else about the
+// run changes.
+async function auditRun(answers, run, { ids = RUN_IDS, catalog = RUN_CATALOG } = {}) {
   const real = globalThis.fetch;
   const realCode = process.exitCode;
   const sent = [];
-  globalThis.fetch = async (url, options = {}) => {
+  let stray = null;
+  const stub = async (url, options = {}) => {
     const target = String(url);
     sent.push({ url: target, method: options.method });
     if (options.method !== "POST") {
-      const body = target.endsWith("/models")
-        ? { data: RUN_IDS.map((id) => ({ id })) }
-        : RUN_CATALOG;
+      const body = target.endsWith("/models") ? { data: ids.map((id) => ({ id })) } : catalog;
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -952,8 +1007,17 @@ async function auditRun(answers, run) {
     // one endpoint and the model travels in the body. Read from the bytes `ask`
     // really sent, so a case cannot answer for an id it was not asked about.
     const body = JSON.parse(String(options.body ?? "{}"));
-    const id = RUN_IDS.find((candidate) => candidate === body.model);
-    assert.notEqual(id, undefined, `a request this run was not expected to make: ${target} ${body.model}`);
+    const id = ids.find((candidate) => candidate === body.model);
+    if (id === undefined) {
+      // Recorded for the read after the run, not asserted here: `ask()` catches
+      // everything a request can throw — that is what keeps one broken id from
+      // ending the run — so an `assert` in this position was absorbed into the
+      // row as its `says`, and the case went on with a request it never queued
+      // sitting in the run as a `status: 0` row about a model. `answering` above
+      // states the same rule for a queue that runs dry.
+      stray = new Error(`a request this run was not expected to make: ${target} ${body.model}`);
+      throw stray;
+    }
     const answer = answers[id];
     if (!answer) throw new Error("connection refused");
     return new Response(answer.body ?? REFUSAL_BODY, {
@@ -964,6 +1028,7 @@ async function auditRun(answers, run) {
   let lines;
   let code;
   try {
+    globalThis.fetch = stub;
     lines = await captured(() => run());
     // read before the restore below, which is the last thing this helper does
     code = process.exitCode;
@@ -971,6 +1036,10 @@ async function auditRun(answers, run) {
     globalThis.fetch = real;
     process.exitCode = realCode;
   }
+  // Read after the run, for the reason above: a row built from this failure is
+  // not the run's answer about a model, and a case that went on to assert
+  // against one proves nothing about the request it never queued.
+  assert.equal(stray, null, stray?.message ?? "");
   return { lines, sent, code };
 }
 
@@ -1037,6 +1106,93 @@ test("a refusal that names no limit is not an answer about limits", async () => 
   assert.equal(code, 1, `a refusal that states no limit answers nothing\n${printed}`);
 });
 
+// What the stub above must not do with a request it did not expect. `ask()`
+// catches everything a request can throw — one broken id must not end the run —
+// so an `assert` written where the stub answers was absorbed into the row as its
+// `says`: the case went on with a request it had never queued sitting in the run
+// as a `status: 0` row about a model, and only the counts at the end could have
+// caught it. The diagnosis has to survive the run instead, which is what this
+// asks for: an ask for an id outside the fixture, read as the case's own failure.
+test("a request the run did not expect is the case's own failure, with its diagnosis", async () => {
+  const { ask } = await subject();
+  const names = await askingNames();
+  const error = await auditRun({}, () => ask("stray-model-free", names)).then(
+    () => null,
+    (thrown) => thrown,
+  );
+  // Read through the rejection rather than `assert.rejects`, because what this
+  // case has to say is what the failure says: an object handed to `assert.rejects`
+  // is compared key by key, and the `message` of an `AssertionError` — the one a
+  // failed `assert` inside the helper throws — is not compared as a pattern.
+  assert.notEqual(
+    error,
+    null,
+    "the helper returned normally: the request nothing queued was absorbed into a status: 0 row",
+  );
+  assert.match(
+    error?.message ?? "",
+    /^a request this run was not expected to make: .*stray-model-free/,
+    "the failure has to name the request nothing queued",
+  );
+});
+
+// An offered id named after a member of `Object.prototype` is an id, not a
+// protocol. `bootstrapProtocols[id]` answered `constructor` out of the prototype
+// — a function — so `run` read the id as one the snapshot places on a protocol
+// this audit does not speak: it printed the id under "not asked, this audit asks
+// the chat shape only", with a function for a protocol, and never asked it. The
+// catalogue describes this id as free, so the audit is the only thing that
+// speaks for it, and a name is not a reason to stop.
+test("a free id named after Object.prototype is asked, not read as a protocol", async () => {
+  const { run } = await subject();
+  const id = "constructor";
+  const row = { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } };
+  const catalog = { opencode: { models: { [id]: row } } };
+  const { lines, sent, code } = await auditRun({ [id]: {} }, run, { ids: [id], catalog });
+  const printed = lines.join("\n");
+  assert.equal(
+    sent.filter((request) => request.method === "POST").length,
+    1,
+    `the audit has to ask the id it offers\n${printed}`,
+  );
+  assert.equal(printed.includes("not asked"), false, printed);
+  assert.match(
+    printed,
+    /the route names a ceiling of 131072 completion tokens, the catalogue declares 32000/,
+    printed,
+  );
+  assert.equal(code, 0, printed);
+});
+
+// What the run counts as free in the catalogue is models.mjs's own answer — the
+// same one `offeredIds` reads — and not a match on the word. `/free/i` matched
+// anywhere, so a paid id called `free-tier-model` was counted, and a `gone-free`
+// the catalogue has retired was counted too: the line said the catalogue still
+// describes models the plugin has stopped offering, which is exactly the drift
+// between the two sets that this line exists to make visible.
+test("the catalogue count is read with the same free rule the offered set is", async () => {
+  const { run } = await subject();
+  const catalog = {
+    opencode: {
+      models: {
+        "audit-run-a-free": { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } },
+        "free-tier-model": { cost: { input: 3, output: 10 }, limit: { context: 1000000, output: 384000 } },
+        "gone-free": { lifecycle: "retired", cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } },
+      },
+    },
+  };
+  const { lines } = await auditRun({ "audit-run-a-free": {} }, run, {
+    ids: ["audit-run-a-free"],
+    catalog,
+  });
+  const printed = lines.join("\n");
+  assert.match(
+    printed,
+    /the catalogue still describes 1\b/,
+    "a paid id whose name contains free, and a retired free id, are not free ids the catalogue describes",
+  );
+});
+
 // The base URL a deployment sets is a variable, and a trailing slash is what
 // people write. Every URL this file builds is the base plus a path, so a base
 // left with its slash asks for `//models` and `//chat/completions`: a route that
@@ -1045,7 +1201,8 @@ test("a refusal that names no limit is not an answer about limits", async () => 
 // operator checks their network. The rule is read as itself here, because the
 // constant that uses it is fixed at load and would only ever answer for one
 // spelling. `undefined` is the environment variable nobody set, which has to
-// come back as the shipped base rather than as the string "undefined".
+// come back as the shipped base rather than as the string "undefined" — and an
+// exported `ZEN_BASE_URL=` is the same fact written as an empty string.
 test("a base URL with a trailing slash does not become a doubled path", async () => {
   const { baseFrom } = await subject();
   const { DEFAULT_BASE } = await import("./provider.mjs");
@@ -1054,6 +1211,12 @@ test("a base URL with a trailing slash does not become a doubled path", async ()
   assert.equal(baseFrom("https://opencode.ai/inference/v1///"), "https://opencode.ai/inference/v1");
   assert.equal(baseFrom("https://opencode.ai/inference/v1"), "https://opencode.ai/inference/v1");
   assert.equal(baseFrom(undefined), DEFAULT_BASE, "nothing set is the shipped base, not the word");
+  // `??` reads either of these as set, and the base used to become the empty
+  // string: every URL below it then a relative path, fetched from nowhere and
+  // reported as a network or catalogue failure about a variable nobody set.
+  assert.equal(baseFrom(""), DEFAULT_BASE, "an empty base is no base at all");
+  assert.equal(baseFrom("   "), DEFAULT_BASE, "and neither is one that names nothing but whitespace");
+  assert.equal(`${baseFrom("")}/models`, `${DEFAULT_BASE}/models`, "the URL built from it is still absolute");
   // and the reason the rule exists, in the URLs this file really builds
   for (const value of ["https://opencode.ai/inference/v1/", "https://opencode.ai/inference/v1"]) {
     const models = `${baseFrom(value)}/models`;

@@ -194,6 +194,30 @@ const NAMED_OUTPUT = [
 const OBSERVED = new Map();
 const OBSERVED_OUTPUT = new Map();
 
+// The two maps above as a caller can hold them, and a way to put them back where
+// they were found. They are module state on purpose — a refusal this process saw
+// is the route speaking, and it outranks the shipped table for as long as the
+// process runs — but one process is not always one conversation: a second reader
+// of this module, a test run above all, has to be able to answer from the table
+// it shipped with rather than from evidence the first reader happened to
+// collect. Called with nothing it answers with the pair as they stand; called
+// with a pair it makes that pair the state and answers with what it replaced, so
+// the caller can put the first one back in a `finally`. The shape is
+// `limitDiagnostics`'s, which returns the sink it replaced for the same reason.
+export function limitObservations(restore) {
+  const previous = { context: new Map(OBSERVED), output: new Map(OBSERVED_OUTPUT) };
+  if (restore !== undefined) {
+    for (const [map, entries] of [
+      [OBSERVED, restore.context],
+      [OBSERVED_OUTPUT, restore.output],
+    ]) {
+      map.clear();
+      for (const [id, value] of entries ?? []) map.set(id, value);
+    }
+  }
+  return previous;
+}
+
 // Two decisions this file makes leave no trace of themselves: a live value
 // taken from a refusal is applied past the staleness guard and past the
 // raise-only rule, and an entry the catalogue has moved past is void in a way
@@ -314,7 +338,9 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
   // deadline would come back looking like one that ended — and a number at the
   // end of it like a whole one. Measured before this flag existed: a stalled
   // refusal whose last characters were `...is not less or equal to 2621`, out of
-  // `262144`, was stored and applied as a completion ceiling.
+  // `262144`, was stored and applied as a completion ceiling. It is set twice:
+  // here, where the wait is over, and in the loop below, where a cut lands
+  // inside a character and the half of it is dropped rather than kept.
   let cut = false;
   const abort = () => {
     // The wait is over and the bytes already read are all this evidence is
@@ -338,8 +364,27 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
         break;
       }
       // At most one character past the budget: enough to know the body went on,
-      // and the rest of the chunk is dropped rather than materialised.
-      text += decoder.decode(value, { stream: true }).slice(0, limit + 1 - text.length);
+      // and the rest of the chunk is dropped rather than materialised. The cut
+      // is a code-unit cut, so it has to be moved off a surrogate pair: a
+      // character outside the basic plane — an emoji, a rare ideograph, anything
+      // above U+FFFF — is two code units, and keeping the high half on its own
+      // leaves the text ending in half a character, which `String.length` counts
+      // as one and which a caller repeating this body has no way to render. The
+      // half is dropped rather than completed — the character it belongs to is
+      // past the budget either way, and reading a character further to keep a
+      // whole one is exactly the promise this loop does not make — and the read
+      // remembers that it did not keep everything it read: a character the body
+      // held is missing from `text`, so this is not the whole body however the
+      // stream ends. That is `cut`'s own meaning, and the one place it is set
+      // outside the wait being over.
+      const decoded = decoder.decode(value, { stream: true });
+      let taken = Math.min(decoded.length, limit + 1 - text.length);
+      const last = decoded.charCodeAt(taken - 1);
+      if (last >= 0xd800 && last <= 0xdbff) {
+        taken -= 1;
+        cut = true;
+      }
+      text += decoded.slice(0, taken);
     }
   } catch {
     // Keep what was read; a failed read names nothing new. A read that was
@@ -362,8 +407,9 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
   // so its release is nobody's to wait for.
   reader.cancel().catch(() => {});
   // `over` is the read having stopped before the body did — the budget reached,
-  // or the read failed, or the deadline passing — which is the only honest
-  // source for "this may be cut".
+  // the read failed, the deadline passing, or a character the cut broke in half
+  // and this read did not keep — which is the only honest source for "this may
+  // be cut".
   return { text, ended, over: !ended };
 }
 

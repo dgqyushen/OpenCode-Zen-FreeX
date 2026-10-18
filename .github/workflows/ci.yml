@@ -41,17 +41,28 @@ jobs:
       # to one runtime is not itself run by an undeclared third one. The version
       # actually on PATH is asserted too: the pin and the version `setup-bun`
       # resolved were otherwise never compared, and a mismatch would leave the
-      # gate's report describing a runtime the project does not declare.
+      # gate's report describing a runtime the project does not declare. What is
+      # compared is the version in each of the three places, not the spelling of
+      # the field: the manager the field names is checked apart from the version
+      # after its `@`, so the check does not rest on the field reading exactly
+      # `bun@<pin>` while claiming to be about the version alone.
       - name: The pinned Bun is the one package.json declares
         run: |
-          declared="$(bun -e "console.log(require('./package.json').packageManager)")"
-          if [ "$declared" != "bun@$BUN_VERSION" ]; then
-            echo "package.json declares $declared while this workflow pins $BUN_VERSION; bump both together." >&2
+          field="$(bun -e "console.log(require('./package.json').packageManager)")"
+          case "$field" in
+            bun@*) declared="${field#bun@}" ;;
+            *)
+              echo "package.json declares $field, which does not name the Bun this workflow pins; declare it as bun@$BUN_VERSION." >&2
+              exit 1
+              ;;
+          esac
+          if [ "$declared" != "$BUN_VERSION" ]; then
+            echo "package.json declares Bun $declared while this workflow pins $BUN_VERSION; bump both together." >&2
             exit 1
           fi
           actual="$(bun --version)"
           if [ "$actual" != "$BUN_VERSION" ]; then
-            echo "this workflow pins Bun $BUN_VERSION and package.json declares $declared, but the Bun that just ran is $actual; bump both together." >&2
+            echo "package.json declares Bun $declared and this workflow pins $BUN_VERSION, but the Bun that just ran is $actual; bump both together." >&2
             exit 1
           fi
       # These never touch the network: they are the plugin's own behaviour.
@@ -60,9 +71,17 @@ jobs:
   # The free tier moves. This is how a move is noticed rather than reported.
   # It reports, it does not block: Zen being down is not this repository's fault,
   # and a failing build would train everyone to ignore it.
+  #
+  # `needs: test` on its own skips this job whenever the suite is red, which is
+  # the run most likely to have moved something, and the run summary then says
+  # nothing at all. The guard below runs the probe after a red `test` as well as
+  # a green one. A cancelled run is the one case it stays away from: `concurrency`
+  # cancels a superseded push, and a run nobody is waiting for must not reach out
+  # to Zen.
   gate:
     runs-on: ubuntu-latest
     needs: test
+    if: ${{ !cancelled() }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

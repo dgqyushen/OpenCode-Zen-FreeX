@@ -14,13 +14,17 @@ const DISCOVERY_READS = ["/v1/models", "/catalog", "/docs"];
 
 // How many of the calls that reached the fixture were discovery reads, and how
 // many inference requests went with them. A round of discovery is one of each
-// of `DISCOVERY_READS`; the request path's own calls to `/v1/<protocol>` are
-// counted apart from it, since a test that drives two of them expects two.
+// of `DISCOVERY_READS`, so `rounds` is the smallest per-URL count: a case that
+// read one URL twice and the others not at all has read no round, and the
+// largest count would report that second read as a whole round the listener
+// never asked for. The request path's own calls to `/v1/<protocol>` are counted
+// apart from it, since a test that drives two of them expects two.
 const reads = (state) => {
   const urls = state.calls.map((call) => call.url);
   const discovery = urls.filter((url) => DISCOVERY_READS.includes(url));
+  const perURL = DISCOVERY_READS.map((name) => discovery.filter((url) => url === name).length);
   return {
-    rounds: Math.max(...DISCOVERY_READS.map((name) => discovery.filter((url) => url === name).length)),
+    rounds: Math.min(...perURL),
     discovery: discovery.length,
     inference: urls.filter((url) => url.startsWith("/v1/") && url !== "/v1/models").length,
   };
@@ -29,33 +33,44 @@ const reads = (state) => {
 // Hold every read of a discovery at the fixture's gate, and give back the key
 // that releases them. A round held here has read nothing yet, so the requests
 // driving it are all inside it — which is what makes the counts below about
-// concurrency rather than about how fast a loopback answers.
+// concurrency rather than about how fast a loopback answers. Every hold arms a
+// gate of its own: the gate a case released is settled, and a second hold handed
+// that one would wait on a round there is nothing left to release.
 function holdDiscovery(state) {
   state.discoveryHang = true;
   state.discoveryReads = 0;
   state.requests = 0;
-  state.discoveryGate ??= deferred();
+  state.discoveryGate = deferred();
   return state.discoveryGate;
 }
 
 // Wait until a case's own two counters say the requests it is waiting for have
 // arrived. Raced against a watchdog so a request that is never sent reports
-// itself instead of hanging the suite.
-async function awaitReached(state, reached) {
+// itself instead of hanging the suite. The watchdog is the branch that ends a
+// wait early, and the poll it beats is a chain of 1ms timers that nothing
+// awaits: `stopped` is what ends that chain, since `clearTimeout` only reaches
+// the watchdog. A case that has to watch the watchdog win passes its own
+// `watchdogMs` rather than waiting out the default five seconds.
+async function awaitReached(state, reached, watchdogMs = WATCHDOG_MS) {
   let watchdog;
+  let stopped = false;
   try {
     await Promise.race([
       (async () => {
-        while (!reached(state)) await new Promise((resolve) => setTimeout(resolve, 1));
+        while (!stopped && !reached(state)) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
       })(),
       new Promise((_, reject) => {
         watchdog = setTimeout(() => {
+          stopped = true;
           const { requests, discoveryReads } = state;
           reject(new Error(`${requests} requests and ${discoveryReads} discovery reads arrived, not what was waited for`));
-        }, WATCHDOG_MS);
+        }, watchdogMs);
       }),
     ]);
   } finally {
+    stopped = true;
     clearTimeout(watchdog);
   }
 }
@@ -87,6 +102,95 @@ test("the plugin is reached by every name this module offers, and the id comes w
   assert.equal(module.server, module.ZenFreePlugin);
   assert.equal(module.server, module.default.server);
   assert.equal(typeof module.default.id, "string");
+});
+
+// The watchdog is the one branch that can end a wait without what it waited
+// for, and the branch it beats is a chain of 1ms polls that nothing awaits.
+// Left running, that chain outlives the failure it reported: a case that never
+// reaches its count would fail and go on polling for the rest of the run. The
+// predicate below is what says otherwise — it counts its own calls, so a poll
+// still running after the watchdog fires is a count that kept rising. The state
+// it is raced on is that much and no more: the wait reads the two counters it
+// reports in the failure message and nothing else.
+test("a wait the watchdog ends stops polling instead of leaving a timer chain", async () => {
+  let polls = 0;
+  const state = { requests: 0, discoveryReads: 0 };
+  const counted = () => {
+    polls += 1;
+    return false;
+  };
+  // A watchdog of its own, so proving the chain ends does not cost the default
+  // five seconds of a wait that is meant to fail.
+  await assert.rejects(
+    awaitReached(state, counted, 20),
+    /discovery reads arrived, not what was waited for/,
+  );
+  const atFailure = polls;
+  // Long enough that a chain still running would have polled several times,
+  // even on a runner that is busy with the rest of the suite.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    polls,
+    atFailure,
+    "the poll loop kept running after the watchdog ended the wait",
+  );
+});
+
+// A hold that has been released is not a hold: handing it to a second caller
+// would leave that caller waiting on a round whose release has already been
+// spent. The fresh gate is checked as pending as well as different, since the
+// two readings fail apart — a gate resolved on the way out would be a different
+// object and still not a hold.
+test("a second hold of a discovery is handed a gate of its own", async () => {
+  const state = { discoveryHang: false, discoveryReads: 0, requests: 0, discoveryGate: null };
+  const first = holdDiscovery(state);
+  first.settle();
+  await first.promise;
+  const second = holdDiscovery(state);
+  assert.notEqual(second, first, "the second hold was handed the gate the first one released");
+  assert.equal(
+    state.discoveryGate,
+    second,
+    "the fixture waits on the gate the last hold armed",
+  );
+  let settled = 0;
+  first.promise.then(() => {
+    settled += 1;
+  });
+  await Promise.resolve();
+  assert.equal(settled, 1, "the first gate is settled, so a listener on it runs");
+  second.promise.then(() => {
+    settled += 1;
+  });
+  await Promise.resolve();
+  assert.equal(settled, 1, "the second gate is pending: the round it holds is still held");
+  second.settle();
+  await second.promise;
+});
+
+// `rounds` counts complete rounds, and a round is one read of every URL in
+// `DISCOVERY_READS`. Reading one URL twice has not read two rounds, so the
+// count is the smallest per-URL count: the largest would report the second read
+// of one URL as a round the listener never asked for.
+test("a round of discovery is counted only where every URL of it was read", () => {
+  const stateOf = (urls) => ({ calls: urls.map((url) => ({ url })) });
+  assert.deepEqual(reads(stateOf([...DISCOVERY_READS])), {
+    rounds: 1,
+    discovery: 3,
+    inference: 0,
+  });
+  assert.deepEqual(reads(stateOf(["/v1/models", "/v1/models"])), {
+    rounds: 0,
+    discovery: 2,
+    inference: 0,
+  });
+  // A second round of the same URL is not a round while the other two are still
+  // on their first read.
+  assert.deepEqual(reads(stateOf([...DISCOVERY_READS, "/v1/models"])), {
+    rounds: 1,
+    discovery: 4,
+    inference: 0,
+  });
 });
 
 // The names the HTTP stack adds on its own rather than the plugin choosing
@@ -617,11 +721,17 @@ test("two concurrent unknown-model requests share one round of discovery", async
       body: JSON.stringify({ model: "chat-free", stream: true, messages: [{ role: "user", content: question }] }),
     });
   const sent = [ask("a"), ask("b")];
-  // Both inference requests have arrived, so both have taken their turn at the
-  // gate: the round they joined read three times, and no fourth read was sent
-  // by the second one.
-  await awaitReached(state, (now) => now.discoveryReads === 3);
-  gate.settle();
+  try {
+    // Both inference requests have arrived, so both have taken their turn at the
+    // gate: the round they joined read three times, and no fourth read was sent
+    // by the second one.
+    await awaitReached(state, (now) => now.discoveryReads === 3);
+  } finally {
+    // Released on the failing path too: the two requests are waiting on this
+    // gate, and a case that failed while holding it would leave them parked
+    // there for the rest of the run instead of reporting what it saw.
+    gate.settle();
+  }
   const responses = await Promise.all(sent);
   for (const response of responses) await response.text();
   assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 2 });
@@ -1336,7 +1446,15 @@ test("an error body past the read budget is relayed as a refusal that says so", 
   assert.equal(response.headers.get("content-type"), "application/json");
   const { error } = await response.json();
   assert.match(error.message, /HTTP 400/);
-  assert.match(error.message, /ran past the \d+ characters/);
+  // Not the cause: a budget the reader reached, a deadline, a read that failed
+  // and a caller that aborted all arrive as the same prefix, so the message
+  // states the fact it holds — the body was not read to its end — and how much
+  // of it was read.
+  assert.match(error.message, /was not read to the end/);
+  assert.match(error.message, /the \d+ characters read before the read stopped/);
+  // And it names none of those causes: one named here would be a guess about
+  // something this side of the wire cannot see (provider.mjs, `relayedRefusal`).
+  assert.doesNotMatch(error.message, /budget|ran past|deadline|timeout|timed out|abort/i);
   assert.equal(error.upstream, long.slice(0, 512) + "…", "the opening that was read is carried along");
 });
 

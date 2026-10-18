@@ -144,12 +144,22 @@ function relayedHeaders(response) {
 // end of the body — one that got nothing at all included — is answered with a
 // refusal that says what happened, carries the opening that was read under
 // `upstream`, and keeps the status the upstream sent.
+//
+// What that message may say about *why* the read stopped is bounded by what the
+// reader reports: `observeRouteStatement` answers "the read stopped short" for a
+// budget it reached, a deadline that passed, a read that failed and a caller
+// that aborted, and it names none of them. The length read is not a reason
+// either — a body past the budget and one a stalled upstream left half-sent
+// arrive as the same prefix — so the message states the fact it holds (the body
+// was not read to its end) and how much of it was read, and leaves the cause
+// where it is known rather than guessing one here.
 const KEPT_PREFIX = 512;
 
 function relayedRefusal(response, observed) {
   const read = typeof observed.text === "string" ? observed.text : "";
   const why = read
-    ? `its body ran past the ${read.length} characters this plugin reads of a refusal, so only the opening of it came back`
+    ? "its body was not read to the end, so only the opening of it came back, " +
+      `the ${read.length} characters read before the read stopped`
     : "its body could not be read at all";
   return new Response(
     JSON.stringify({
@@ -563,27 +573,59 @@ async function server(_input, options = {}) {
   // waiting for them has gone, and not before. A host that walks away from one
   // request is still a host, so one caller's abandonment must not cancel an
   // answer another is still waiting for.
+  //
+  // A lease is a caller's membership of the flight it waits for, and it is
+  // released by the first of the two things that end that caller's interest: its
+  // own signal aborting, and the flight settling. Both are needed, and neither
+  // alone is enough. Released only on the caller's signal, a lease taken by a
+  // caller that never aborts would outlive every answer it waited for — the
+  // `models()` hook and `refresh()` have no signal to give, so there was one
+  // such lease for every open of a host's model chooser — and the release that
+  // empties the set would then never be the last one, so the reads of a flight
+  // whose callers had all walked away would never end. Released only when the
+  // flight settles, a caller that walked away would go on being counted as one
+  // still waiting, and its abandonment would not end reads nobody wants.
+  //
+  // The release is the removal and nothing else, and it deliberately does not
+  // travel on the caller's own cancel channel (`passing`): aborting that channel
+  // is how a caller is told it has given up, so a release that travelled on it
+  // would say the same thing as an abandonment — the outcome for a caller whose
+  // flight answered would then depend on which of the two promises the race
+  // below saw settle first, and a success could be reported as the caller's own
+  // walking away. Dropping the registry entry has no such ordering to depend on.
   const leases = new Set();
-  const interior = new AbortController();
 
-  // This caller's own way out, and its membership of the flight. Resolved when
-  // the caller's own signal aborts; an already-aborted one — for which no
-  // listener fires — ends the lease here rather than holding it for ever.
-  function leased(outward) {
+  // This caller's own way out, and its membership of the flight. `signal` is
+  // resolved when the caller's own signal aborts; `release` gives the membership
+  // up, and whoever ends that caller's interest first calls it. An
+  // already-aborted caller — for which no listener ever fires — ends its lease
+  // here rather than holding it for ever.
+  function leased(flight, outward) {
     const passing = new AbortController();
-    const end = () => passing.abort(outward?.reason ?? new DOMException("Aborted", "AbortError"));
+    let held = true;
+    const lease = {
+      signal: passing.signal,
+      flight,
+      release() {
+        if (!held) return;
+        held = false;
+        leases.delete(lease);
+        outward?.removeEventListener("abort", end);
+        // The reads are this flight's own, and they are ended only when the last
+        // caller waiting for them has gone while the flight is still running: a
+        // lease released because the flight settled describes reads that have
+        // already ended.
+        if (!leases.size && !flight.settled) flight.control.abort();
+      },
+    };
+    const end = () => {
+      passing.abort(outward?.reason ?? new DOMException("Aborted", "AbortError"));
+      lease.release();
+    };
+    leases.add(lease);
     if (outward?.aborted) end();
     else outward?.addEventListener("abort", end, { once: true });
-    leases.add(passing);
-    passing.signal.addEventListener(
-      "abort",
-      () => {
-        leases.delete(passing);
-        if (!leases.size) interior.abort();
-      },
-      { once: true },
-    );
-    return passing.signal;
+    return lease;
   }
 
   // A caller's wait for a discovery, told which signal says it has given up: a
@@ -604,20 +646,52 @@ async function server(_input, options = {}) {
   // The discovery one caller waits for. Every caller takes a lease, the ones
   // joining a flight included, so giving up is the caller's own.
   function shared(observed) {
-    const mine = leased(observed);
     // A flight that has already answered is not one to join: its result
     // predates this caller's question, which is what the caller is asking
     // again. `inflight` is kept rather than cleared, so this is the same test
     // as "is it still running" and does not race the settle below.
-    if (inflight && !inflight.settled) return waiting(mine, inflight.named);
-    const named = reading(interior.signal);
-    const flight = { named, settled: false };
+    //
+    // A flight whose own controller is already aborted is not one to join
+    // either, and this is a different answer from the settled one: its reads
+    // have ended or are ending, and the answer it is about to give is the abort
+    // that made its last waiting caller leave — so a caller that cancelled
+    // nothing of its own would be refused for somebody else's abandonment and
+    // its own question would go unasked. The three reads reject a turn after
+    // they are aborted, and that flight settles after that, so an arrival in
+    // this window is an ordinary request rather than a race with the settle
+    // below: one reader's abandonment is not another reader's answer.
+    if (inflight && !inflight.settled && !inflight.control.signal.aborted) {
+      const lease = leased(inflight, observed);
+      return waiting(lease.signal, inflight.named);
+    }
+    // One controller per flight, and not one held for the server. A flight whose
+    // last waiting caller walked away is ended by aborting its own controller,
+    // and a signal held for the server instead is that aborted one for every
+    // discovery after it: the listing, the catalogue and the docs would all fail
+    // before they were sent, so the models hook, `refresh()` and a request for a
+    // model the last list did not have would answer with that abort for the life
+    // of the process rather than with the list.
+    const flight = { control: new AbortController(), settled: false, named: null };
     inflight = flight;
+    const lease = leased(flight, observed);
+    const named = reading(flight.control.signal);
+    flight.named = named;
     const settled = () => {
+      // Set before the releases below: a release reads this flag to tell a
+      // flight that has finished its reads from one still running.
       flight.settled = true;
+      // Every caller waiting on this flight has now heard its answer — the
+      // failure of the reads settles this the same way — so none of them is
+      // waiting any more, and the leases go with the flight they were taken on.
+      // Its own leases, and only its own: a flight the last caller walked away
+      // from is aborted and settles a turn later, and the flight that replaced
+      // it can hold leases of its own by then, so releasing those here would
+      // hand on the first flight's abandonment to callers who never asked for
+      // it — the same refusal the join guard above exists to prevent.
+      for (const held of [...leases]) if (held.flight === flight) held.release();
     };
     named.then(settled, settled);
-    return waiting(mine, named);
+    return waiting(lease.signal, named);
   }
 
   // The one gate in front of the reads, and the reason it is here rather than

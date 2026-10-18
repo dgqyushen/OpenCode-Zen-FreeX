@@ -370,11 +370,16 @@ that passes under the stricter of them, since the looser one will not last.
 
 `capture.mjs`, `limits-audit.mjs` and `tools-smoke.mjs` are maintenance tools for
 this repository, not part of what a host loads: they are not in `package.json`'s
-`files`, so a published tarball carries only the modules a host imports plus
-`fingerprint.json`. `package.json`'s `exports` names those public modules one by
-one rather than mapping `./*`, so a file that was never meant to be imported
-cannot be reached as a subpath — `capture.mjs` in particular starts a server and
-rewrites `fingerprint.json` the moment it is imported.
+`files`, so a published tarball carries the modules a host imports,
+`fingerprint.json`, and the four documents beside them (`README.md`,
+`MAINTAINING.md`, `LICENSE`, `NOTICE`) — thirteen files in all, the last being
+`package.json`, which npm packs whatever `files` says. The same list is why
+`npm run` has nothing to run in an installed package: `check:gate`,
+`limits:audit` and `capture` are entry points for a checkout, and the tools they
+name stay here. `package.json`'s `exports` names those public modules one by one
+rather than mapping `./*`, so a file that was never meant to be imported cannot
+be reached as a subpath — `capture.mjs` in particular starts a server and
+rewrites `fingerprint.json` when it runs.
 
 ## Which copy of the icon and the concurrency is authoritative
 
@@ -430,7 +435,7 @@ that name.
 What ships is `package.json`'s `files` list, and it is deliberately narrower than
 the repository: the three maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
 `limits-audit.mjs`) stay here, because a host never loads them and one of them
-rewrites the shipped `fingerprint.json` if it is ever imported. `LICENSE` is
+rewrites the shipped `fingerprint.json` when it is run. `LICENSE` is
 MIT with its text unmodified and both copyright lines in place — upstream's and
 this fork's — so what a licence scanner reads is a standard MIT file; the fork's
 provenance is in `NOTICE`, which is where a reader finds why this fork exists.

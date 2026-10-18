@@ -34,6 +34,14 @@ function captureError(what) {
   return `core-tools: ${what} — ${REMEDY}`;
 }
 
+// A table of fields, and nothing else: `typeof value === "object"` is true of
+// null and of lists, and both are shapes a capture can hold. Every table this
+// module reads — the profile map, a profile, a profile's agent and that agent's
+// per-protocol provider-utils — is read the same way, so the clauses live here
+// once rather than four times, and no one of the four can end up missing the
+// list half of the check.
+const isTable = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+
 // Read once, here, because every answer in this module comes out of it. Guarded
 // because the failure this replaces is a bare ENOENT or SyntaxError thrown out of
 // whichever module imported this one, which reads as *that* module being broken
@@ -46,12 +54,18 @@ function readProfiles() {
   try {
     captured = JSON.parse(readFileSync(CAPTURE, "utf8"));
   } catch (error) {
-    const reason =
-      error.code === "ENOENT"
-        ? "missing"
-        : error instanceof SyntaxError
-          ? "invalid JSON"
-          : `could not be read (${error.code ?? error.message})`;
+    // One reading per line, in the order they can apply: a capture that is not
+    // there, one that is there and did not parse, then whatever else the read
+    // failed with. A parse failure carries no `code`, so the first two cannot
+    // both be true of one error.
+    let reason;
+    if (error.code === "ENOENT") {
+      reason = "missing";
+    } else if (error instanceof SyntaxError) {
+      reason = "invalid JSON";
+    } else {
+      reason = `could not be read (${error.code ?? error.message})`;
+    }
     throw new Error(
       captureError(`the capture at ${fileURLToPath(CAPTURE)} is ${reason}`),
       { cause: error },
@@ -63,12 +77,7 @@ function readProfiles() {
   // lost every profile cannot tell one generation from another and fails now
   // rather than at the first request.
   const profiles = captured?.profiles;
-  if (
-    typeof profiles !== "object" ||
-    profiles === null ||
-    Array.isArray(profiles) ||
-    !Object.keys(profiles).length
-  ) {
+  if (!isTable(profiles) || !Object.keys(profiles).length) {
     throw new Error(
       captureError(`the capture at ${fileURLToPath(CAPTURE)} has no profiles`),
       { cause: captured },
@@ -111,15 +120,24 @@ export function generationOf(tools) {
 // and are made there: `provider.mjs` indexes `PROFILES[...]` directly to read a
 // profile's `tools`, and a capture missing that generation then fails with
 // "Cannot read properties of undefined" instead of the sentence below.
+//
+// The sentence ends with the module's one remedy like every other failure here,
+// and says what a capture can bring rather than promising the name asked for: a
+// generation Zen has started serving is written by a new capture, where a name no
+// capture will ever hold — `undefined` out of a caller that skipped its own
+// default, or a generation that does not exist — never is.
 export function profileFor(generation) {
   if (!Object.hasOwn(PROFILES, generation)) {
     throw new Error(
-      `core-tools: no profile for generation ${JSON.stringify(generation)}; ` +
-        `the capture holds ${Object.keys(PROFILES).join(", ")}`,
+      captureError(
+        `no profile for generation ${JSON.stringify(generation)}; the capture holds ` +
+          `${Object.keys(PROFILES).join(", ")}; a generation Zen has started serving is ` +
+          `written by a new capture`,
+      ),
     );
   }
   const profile = PROFILES[generation];
-  if (typeof profile !== "object" || profile === null || Array.isArray(profile)) {
+  if (!isTable(profile)) {
     throw new Error(
       captureError(
         `the ${JSON.stringify(generation)} profile in the capture is not an object`,
@@ -144,13 +162,15 @@ const filledIn = (value) => typeof value === "string" && value !== "";
  */
 export function agentFor(generation, protocol = "chat") {
   const agent = profileFor(generation).agent;
-  if (typeof agent !== "object" || agent === null || Array.isArray(agent)) {
+  if (!isTable(agent)) {
     throw new Error(
       captureError(`the ${JSON.stringify(generation)} profile in the capture has no agent`),
     );
   }
   // The release shape carries no provider-utils at all, and is composed the same
-  // way whatever protocol was asked for.
+  // way whatever protocol was asked for. The absence is the whole of the test:
+  // this is what selects the release branch, and the check below only ever sees
+  // a field that is there.
   if (!agent.providerUtils) {
     if (![agent.channel, agent.opencode, agent.client].every(filledIn)) {
       throw new Error(
@@ -161,7 +181,11 @@ export function agentFor(generation, protocol = "chat") {
     }
     return `opencode/${agent.channel}/${agent.opencode}/${agent.client}`;
   }
-  if (typeof agent.providerUtils !== "object" || agent.providerUtils === null) {
+  // A list is refused here as well. It is truthy, so the release branch above
+  // does not take it, and it used to pass this check and reach the lookup below,
+  // which then named an empty set of protocols: `Object.keys([])` is empty, so
+  // the message ended at `it holds ` with nothing after it.
+  if (!isTable(agent.providerUtils)) {
     throw new Error(
       captureError(
         `the ${JSON.stringify(generation)} profile in the capture has no per-protocol provider-utils`,
@@ -171,12 +195,18 @@ export function agentFor(generation, protocol = "chat") {
   // `?? "undefined"` used to be interpolated here for a protocol the capture has
   // no provider-utils for, and a prototype member (`toString`) as the version.
   // Zen reads this header, so a malformed one is rejected upstream with an error
-  // that says nothing about where it came from; name the miss instead.
+  // that says nothing about where it came from; name the miss instead. The remedy
+  // is named too, and what it can bring: a capture writes a protocol Zen has
+  // started serving, not a name the capture will never hold — a typo, or one this
+  // plugin does not ask in.
   if (!Object.hasOwn(agent.providerUtils, protocol)) {
     throw new Error(
-      `core-tools: generation ${JSON.stringify(generation)} composes its User-Agent ` +
-        `per protocol, and the capture has no provider-utils for ${JSON.stringify(protocol)}; ` +
-        `it holds ${Object.keys(agent.providerUtils).join(", ")}`,
+      captureError(
+        `generation ${JSON.stringify(generation)} composes its User-Agent per protocol, ` +
+          `and the capture has no provider-utils for ${JSON.stringify(protocol)}; it holds ` +
+          `${Object.keys(agent.providerUtils).join(", ")}; a protocol Zen has started ` +
+          `serving is written by a new capture`,
+      ),
     );
   }
   if (!filledIn(agent.providerUtils[protocol]) || !filledIn(agent.opencode) || !filledIn(agent.runtime)) {

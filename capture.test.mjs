@@ -8,13 +8,21 @@ import { capture, drySummary, fingerprintTarget, invokedDirectly, report } from 
 // The capture itself may not be run here: a real run starts a server and writes
 // a fingerprint. So the two halves either side of that run are driven directly —
 // `capture` with a child the test ends by hand, and `report` with a request the
-// test builds and a **scratch** fingerprint. Nothing here reads or writes the one
-// this repository ships: `report` takes the path it works on, and every fixture
-// below is a file in a temporary directory.
+// test builds and a **scratch** fingerprint.
+//
+// The isolation this file keeps is about writes, and the header said otherwise:
+// nothing here writes the capture this repository ships, and every fingerprint a
+// case writes to is a file in a temporary directory. The shipped capture *is*
+// read — once, for the agent and the required list the fixtures are built from —
+// because a run built on this test's own guesses would compare against something
+// the real file does not say. Reading it cannot change it, and the one path that
+// could (`report`) is handed the scratch path by every case that reaches it.
 
 // The shipped capture, read from the repository. `report` compares a run against
 // this, so a case that wants a particular comparison asks for it through the
-// request; the fixture is only ever the file the result would be written to.
+// request; the fixture is only ever the file the result would be written to. It
+// is read here and nowhere else, which is what keeps the read in one place a
+// reader can check against the claim above.
 const SHIPPED = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8")).profiles["1.x"];
 
 const NAMES = ["bash", "glob", "grep", "read"];
@@ -49,6 +57,24 @@ function scratchFingerprint({ names = NAMES, agent = SHIPPED.agent, required = S
 
 function toolFor(name, extra = {}) {
   return { type: "function", function: { name, description: DESCRIPTION, parameters: SCHEMA, ...extra } };
+}
+
+// A scratch fingerprint carrying the wording this repository ships, for the cases
+// whose subject is *not* a moved tool: a comparison against the shipped profile
+// finds nothing to report only if the fixture stores exactly what the shipped one
+// does, wording and all. `scratchFingerprint` writes this test's own short
+// description instead, so the stored tools are replaced with the shipped ones.
+//
+// The store-and-rewrite was written out in full in each case that needed it, and
+// a case that changed one half of the pair without the other would compare a
+// fixture nobody meant to build. It is one fixture, so it is built once.
+function shippedWording({ required = SHIPPED.required } = {}) {
+  const names = Object.keys(SHIPPED.tools);
+  const scratch = scratchFingerprint({ names, required: [...required] });
+  const stored = scratch.read();
+  stored.profiles["1.x"].tools = Object.fromEntries(names.map((name) => [name, SHIPPED.tools[name]]));
+  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
+  return scratch;
 }
 
 // The body of a request carrying the given tools, so the only difference between
@@ -93,11 +119,12 @@ function fakeChild() {
 // `capture` arms can be seen at all — a real 120 s wait cannot be waited out
 // inside a test. The handle a case is handed is what makes the answer belong to
 // this run rather than to the process: the spy records every handle armed while
-// it is installed, `armed()` reads the ones armed *since the call* and remembers
-// them, and `cleared()` is asked of those handles only. A case that asserts on
-// how many timers exist in the process is asserting on whatever else happened to
-// be running; one that asserts on the handles taken between two points of its own
-// path is asserting on the path.
+// it is installed, `armed()` returns the ones armed since the last call and
+// marks them seen, `cleared()` asks about those handles by identity, and
+// `uncleared()` names the ones still pending so a failure says which. A case
+// that asserts on how many timers exist in the process is asserting on whatever
+// else happened to be running; one that asserts on the handles taken between two
+// points of its own path is asserting on the path.
 function offline(body, { watchTimers = false } = {}) {
   const exit = process.exit;
   const log = console.log;
@@ -108,7 +135,6 @@ function offline(body, { watchTimers = false } = {}) {
   let code;
   const armedWhileWatching = [];
   let watched = [];
-  let armedSince = 0;
   process.exit = (value) => {
     code = value;
     throw new Error(`process.exit(${value})`);
@@ -120,7 +146,7 @@ function offline(body, { watchTimers = false } = {}) {
       // `setTimer`, not `globalThis.setTimeout`: the spy has replaced the global,
       // and calling it back would be the spy calling itself.
       const handle = setTimer(fn, ms, ...rest);
-      armedWhileWatching.push(Object.assign(handle, { cleared: false }));
+      armedWhileWatching.push(Object.assign(handle, { cleared: false, seen: false }));
       return handle;
     };
     globalThis.clearTimeout = (handle) => {
@@ -128,6 +154,12 @@ function offline(body, { watchTimers = false } = {}) {
       return clearTimer(handle);
     };
   }
+  // The handles armed while the spy was installed and not yet claimed by a call
+  // to `armed()`. The claim is a flag on each handle rather than a saved index:
+  // a handle armed after the last `armed()` was armed by this path too, and an
+  // index would have to be trusted to have been read at the right moment, where
+  // a flag is the handle saying so itself.
+  const since = () => armedWhileWatching.filter((handle) => !handle.seen);
   return {
     lines,
     get code() {
@@ -136,18 +168,22 @@ function offline(body, { watchTimers = false } = {}) {
     // From here on, the handles this returns are this path's and nothing else's:
     // whatever was armed before the call belongs to whoever else is running, and
     // is neither counted nor required to have been cleared by this body. The
-    // index is kept rather than a copy so that a handle armed after the call and
-    // after the assertion — a stray one that outlives the case — is still the
-    // path's to answer for.
+    // handles are marked seen as they are handed back, so a second call reads a
+    // second window rather than the same one twice — which is what the assertion
+    // at the end of the case would otherwise be doing, reading a constant.
     armed: () => {
-      armedSince = armedWhileWatching.length;
-      watched = [];
+      watched = since();
+      for (const handle of watched) handle.seen = true;
       return watched;
     },
-    armedCount: () => armedWhileWatching.length - armedSince,
-    cleared: () =>
-      armedWhileWatching.slice(armedSince).every((handle) => handle.cleared) &&
-      watched.every((handle) => handle.cleared),
+    // How many timers this path has armed since the last `armed()`. This is the
+    // window's count, not the process's: a timer armed before the window, or one
+    // already claimed by an earlier call, is not this body's to answer for.
+    armedCount: () => since().length,
+    // The window's handles that are still pending. The empty array is the answer
+    // a case asserts, and the names in it are what a failure prints.
+    uncleared: () => [...since(), ...watched].filter((handle) => !handle.cleared),
+    cleared: () => [...since(), ...watched].every((handle) => handle.cleared),
     run: async () => {
       try {
         await body();
@@ -218,6 +254,18 @@ test("the guard that keeps an import from running the capture", () => {
   // This process imported the file rather than running it, which is what this
   // guard is for. Before it, importing capture.mjs started a server and rewrote
   // the shipped fingerprint — so the file could not be tested at all.
+  //
+  // What this case proves is the `false` half of the guard, and it is worth
+  // being exact about the other half: `invokedDirectly()` is `import.meta.main`
+  // under every runtime this repository runs on, and that flag is a property of
+  // how the process was started. The `true` half — the same file reached by
+  // `bun capture.mjs` — cannot be produced from inside a process that imported
+  // it, and asking for it here would mean running the entry point, which starts
+  // a server and captures a fingerprint. It is covered by the script being used
+  // rather than by this file; what would close it is a child process spawned to
+  // run and report, which is the Lead's call rather than a case this file can
+  // write. The `false` half is still the one that matters for isolation: if it
+  // ever became `true` in a test process, every case below would start a server.
   assert.equal(invokedDirectly(), false);
 });
 
@@ -234,16 +282,53 @@ test("a child a signal killed is a failed run, not exit 0", async () => {
 
 test("a Ctrl-C is a failed run too, and it is the handler that says so", async () => {
   // The other way `ran` goes false, and the one no exit code carries: the
-  // handler that takes the child down with the interrupt. Emitted rather than
-  // delivered — `process.emit` runs the listeners this module installed and
-  // signals nothing — and it is a `once`, so it is off again before the next
-  // case runs.
+  // handler that takes the child down with the interrupt. It is the listener
+  // this module registered that is called, not the whole process's — the case
+  // used to reach it with `process.emit("SIGINT")`, which runs every listener
+  // the process holds and here happened to be none others. A leaked handler was
+  // therefore invisible: with `once` on SIGTERM left armed, the file still
+  // reported 18 pass / 0 fail.
+  //
+  // `process.once` is spied on only long enough to take the function out again,
+  // which is what makes calling the listener under test possible without a
+  // signal and without `process.emit`. The listener is unregistered immediately
+  // in `finally` — on the same `process.off` the module's own settle path uses —
+  // so the process this file runs in is left as it was found, and the counts
+  // below are the proof of that rather than a claim about it.
   const run = fakeChild();
-  const pending = capture("probe", run.spawn);
-  process.emit("SIGINT");
-  const { code, ran } = await pending;
-  assert.equal(ran, false, "an interrupted run is a failed run");
-  assert.equal(code, 1, "and its code is non-zero");
+  const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+  const once = process.once;
+  const off = process.off;
+  const registered = [];
+  process.once = function (event, fn) {
+    registered.push({ event, fn });
+    return once.call(this, event, fn);
+  };
+  let pending;
+  try {
+    pending = capture("probe", run.spawn);
+  } finally {
+    process.once = once;
+  }
+  try {
+    // Both handlers, found by the event they were registered for: what is under
+    // test is the one for SIGINT, and asserting both were registered is what
+    // says the isolation below is about the right two listeners.
+    const listener = registered.find(({ event }) => event === "SIGINT");
+    assert.notEqual(listener, undefined, "the capture must register a SIGINT handler");
+    listener.fn();
+    const { code, ran } = await pending;
+    assert.equal(ran, false, "an interrupted run is a failed run");
+    assert.equal(code, 1, "and its code is non-zero");
+  } finally {
+    for (const { event, fn } of registered) off.call(process, event, fn);
+  }
+  assert.deepEqual(
+    [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
+    before,
+    "the settle path must have taken both handlers off again, and this case must leave the"
+      + " process as it found it",
+  );
 });
 
 test("a clean exit is reported as itself", async () => {
@@ -269,22 +354,31 @@ test("a spawn failure takes the watchdog and the signal handlers with it", async
   // 120 s wait cannot answer inside a test either way.
   const run = fakeChild();
   const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+  let watched;
   const captureRun = offline(async () => {
-    // Taken before the capture starts, so every handle counted below was armed by
-    // this body. The count used to be of the process: `timers.length === 1` was a
-    // claim about whatever else had called setTimeout since the spy went in, and
-    // it happened to hold because nothing else did.
-    const watched = captureRun.armed();
+    // Taken after the capture is started and before it is settled, so what is
+    // handed back is this path's own watchdog and nothing else. A window opened
+    // before `capture` runs could only ever be empty, and an assertion reading it
+    // could not fail — which is what the old `watched.length === 0` was. The
+    // handles are claimed here rather than counted, so the assertions after the
+    // body read the timer this path armed rather than however many timers the
+    // process happened to be holding.
     const pending = capture("probe", run.spawn);
+    watched = captureRun.armed();
     run.emit("error", new Error("ENOENT"));
     assert.deepEqual(await pending, { code: 1, ran: false });
-    assert.equal(captureRun.armedCount(), 1, "the watchdog is the one timer this path arms");
-    // The handle captured above is the watchdog this body armed, and it is asked
-    // about by identity rather than by position in the process's timer list.
-    assert.equal(watched.length, 0, "nothing was armed before the capture started");
   }, { watchTimers: true });
   await captureRun.run();
-  assert.equal(captureRun.armedCount(), 1, "the watchdog is the one timer this path arms");
+  // The handles, not a count: this is the watchdog by identity, so the case reads
+  // what it claims to read. `cleared()` used to carry a `watched` clause that
+  // could not fail — `watched` was only ever assigned a fresh empty array — while
+  // the count it did read was of every timer in the process.
+  assert.equal(watched.length, 1, "the spawn failure arms exactly the watchdog");
+  assert.deepEqual(
+    captureRun.uncleared(),
+    [],
+    "the spawn failure must clear the watchdog it armed, and leave no other timer pending",
+  );
   assert.equal(captureRun.cleared(), true, "and the spawn failure must clear it");
   assert.deepEqual(
     [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
@@ -301,13 +395,19 @@ test("the signal handlers are dropped once the child is gone", async () => {
   // outlive it is the same one.
   const before = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
   const run = fakeChild();
+  let watched;
   const captureRun = offline(async () => {
+    // Claimed between starting the capture and settling it: the watchdog is
+    // armed by the `capture` call itself, so a window opened before that call
+    // holds nothing and an assertion reading it holds nothing either.
     const pending = capture("probe", run.spawn);
+    watched = captureRun.armed();
     run.emit("exit", 0, null);
     assert.deepEqual(await pending, { code: 0, ran: true });
   }, { watchTimers: true });
   await captureRun.run();
-  assert.equal(captureRun.armedCount(), 1, "the exit path arms one watchdog");
+  assert.equal(watched.length, 1, "the exit path arms one watchdog");
+  assert.deepEqual(captureRun.uncleared(), [], "and the exit path must leave no timer pending");
   assert.equal(captureRun.cleared(), true, "and the exit path must clear it");
   assert.deepEqual(
     [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")],
@@ -405,10 +505,7 @@ test("a --dry report names the agent whenever it moved, required list or not", a
   // CHANGED, and the summary was the agent alone. So this is the honest version
   // of the same claim: nothing but the agent moved, and it is still named.
   const names = Object.keys(SHIPPED.tools);
-  const scratch = scratchFingerprint({ names, required: [...SHIPPED.required] });
-  const stored = scratch.read();
-  stored.profiles["1.x"].tools = Object.fromEntries(names.map((name) => [name, SHIPPED.tools[name]]));
-  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
+  const scratch = shippedWording();
   const captureRun = offline(() =>
     report({
       request: requestFor(
@@ -499,10 +596,7 @@ test("an unchanged capture exits 0 and writes nothing", async () => {
   // shipped agent: there is nothing for the comparison to find. The exit path is
   // the point — 0 means the write below it is never reached.
   const names = Object.keys(SHIPPED.tools);
-  const scratch = scratchFingerprint({ names });
-  const stored = scratch.read();
-  stored.profiles["1.x"].tools = Object.fromEntries(names.map((name) => [name, SHIPPED.tools[name]]));
-  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
+  const scratch = shippedWording();
   const before = JSON.stringify(scratch.read());
   const request = requestFor(bodyFor(names.map((name) => ({ type: "function", function: SHIPPED.tools[name] }))));
   const same = offline(() => report({ request, code: 0, fingerprint: scratch.path }));
