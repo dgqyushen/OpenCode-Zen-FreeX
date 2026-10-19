@@ -132,3 +132,36 @@ test("the budget is enough to narrow the widest bracket the ladder produces", as
     `and BUDGET (${BUDGET}) is enough to get there, which took ${spent} requests`,
   );
 });
+
+test("the ladder reaches the largest window the catalogue declares", async () => {
+  const { BUDGET, NARROW_TO, SIZES } = await subject;
+  // A declaration is only testable if the ladder can ask for it. `nemotron` is
+  // declared 1,000,000 tokens, which at the route's own ratio of 3.996 characters
+  // per token needs 3,996,000 characters; the ladder topped out at 2,800,000 and
+  // therefore could neither confirm nor refute the million, so a catalogue that
+  // over-declared there kept over-declaring and every host paid for it in refusals.
+  const CHARS_PER_TOKEN = 3.996;
+  const largestDeclared = 1_000_000;
+  const top = Math.max(...SIZES);
+  assert.ok(
+    top >= largestDeclared * CHARS_PER_TOKEN,
+    `the top rung (${top}) must reach a ${largestDeclared}-token declaration, which needs ${Math.round(largestDeclared * CHARS_PER_TOKEN)} characters`,
+  );
+  // And the rungs are ordered, so the first pass never asks a smaller size after a
+  // larger one and the stop-on-a-low-refusal rule keeps working.
+  for (let at = 1; at < SIZES.length; at += 1)
+    assert.ok(SIZES[at] > SIZES[at - 1], `rung ${at} is larger than the one before it`);
+  // The budget still covers the widest bracket the extra rung can leave.
+  const spentOnLadder = SIZES.length + 1;
+  let far = SIZES[SIZES.length - 1];
+  let near = SIZES[SIZES.length - 2];
+  let needed = 0;
+  while (far - near > far * NARROW_TO) {
+    near = Math.floor((near + far) / 2);
+    needed += 1;
+  }
+  assert.ok(
+    spentOnLadder + needed <= BUDGET,
+    `the ladder (${spentOnLadder}) plus the bisections the widest rung leaves (${needed}) must fit BUDGET (${BUDGET})`,
+  );
+});

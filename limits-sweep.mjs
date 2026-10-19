@@ -55,11 +55,21 @@ const BASE = baseFrom(process.env.ZEN_BASE_URL);
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
 const PROFILE = profileFor(GENERATION);
 
-// The three sizes the first pass asks. The middle one is where this route's
-// walls have actually been found — deepseek's is about 326,700 tokens, which is
-// around 1,520,000 characters — and the outer two are wide enough that a model
-// with no wall in reach is reported as such instead of being chased upwards.
-const SIZES = [1_000_000, 1_600_000, 2_800_000];
+// The sizes the first pass asks. The second one is where this route's walls have
+// actually been found — deepseek's is about 326,700 tokens, which is around
+// 1,520,000 characters — and the outer ones are wide enough that a model with no
+// wall in reach is reported as such instead of being chased upwards.
+//
+// The top rung is 4,200,000 characters because a declaration of 1,000,000 tokens
+// needs 3,996,000 of them to be tested at all, and `nemotron-3.5-lightning-free`
+// carries exactly that declaration. At 2,800,000 the ladder stopped at about
+// 700,000 tokens and could neither confirm nor refute a million, so a catalogue
+// that over-declared there would keep over-declaring: the runtime bracket would
+// declare a window the route refuses, and each refusal is a turn somebody pays
+// for. Asking the size is what turns an unfalsifiable claim into a measurement,
+// and a model whose wall is genuinely above the top rung still reports
+// `openEnded`, which is the honest answer.
+export const SIZES = [1_000_000, 1_600_000, 2_800_000, 4_200_000];
 // A reply is cut off after this many tokens: the question is whether the prompt
 // was accepted, and the answer to that arrives before the first token does.
 const ASK_TOKENS = 16;
