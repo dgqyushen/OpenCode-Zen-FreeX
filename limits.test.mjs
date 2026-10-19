@@ -1438,6 +1438,91 @@ test("the tokens a request holds are estimated from its own text", async () => {
   assert.deepEqual(requestSize({ messages: [{ content: "a".repeat(466) }] }), { tokens: 100 });
 });
 
+test("a body of many strings is read to its end, not to a count of strings", async () => {
+  const { requestText, requestSize } = await subject;
+  // The budget is characters, and it is the quantity being estimated. It used to
+  // be 4096 STRINGS, and a chat body carries one string per role, per content,
+  // per tool-call id, per tool name and per tool arguments: a conversation of a
+  // few hundred turns hit the cap and everything past it went unread. What came
+  // back was not a floor on the request's size but a floor on the part of it the
+  // walk happened to reach, and a wall learned from it lands below a size the
+  // route has already served.
+  const body = { messages: [] };
+  for (let at = 0; at < 3000; at += 1) {
+    body.messages.push({ role: "user", content: `question ${at} ${"x".repeat(200)}` });
+    body.messages.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: `call_${at}`, type: "function", function: { name: "read", arguments: `{"path":"/tmp/${at}"}` } },
+      ],
+    });
+  }
+  const strings = 1 + body.messages.length + 3000 * 2;
+  assert.ok(strings > 4096, `the fixture has to hold more strings than the old budget (${strings})`);
+  // Every character of every string is read: the text the walk returns is as long
+  // as the strings in the body put together, which the old rule could not do.
+  const walked = requestText(body);
+  let real = 0;
+  const count = (value) => {
+    if (typeof value === "string") real += value.length;
+    else if (Array.isArray(value)) value.forEach(count);
+    else if (value && typeof value === "object") Object.values(value).forEach(count);
+  };
+  count(body);
+  assert.equal(walked.length, real, "the walk reads the whole body, not the first 4096 strings of it");
+  // And the estimate follows the body: doubling the tail changes it. Under the
+  // string budget the last 2000 messages contributed nothing at all.
+  const longer = { messages: body.messages.map((message) => ({ ...message })) };
+  for (const message of longer.messages) if (typeof message.content === "string") message.content += "y".repeat(200);
+  assert.ok(requestSize(longer).tokens > requestSize(body).tokens, "the tail of the body is counted");
+});
+
+test("a refusal never declares a window below a size the route has served", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const brackets = new Map();
+  const seeded = 326000;
+  // The VPS on 2026-10-19, replayed: a prompt estimated at 228286 tokens is
+  // served, and the same conversation 227 tokens larger by the estimate is
+  // refused. The bound a refusal draws is a function of the refused size alone,
+  // so floor(228513 * 0.98) = 223942 lands 4344 tokens BELOW the size the route
+  // had just answered.
+  observeServedRequest("inverted-free", { tokens: 228286 }, seeded, brackets, 1000);
+  observeRefusedRequest("inverted-free", { tokens: 228513 }, seeded, brackets, 2000);
+  const refused = limitBracket("inverted-free", brackets);
+  assert.equal(refused.floor, 228286);
+  assert.equal(refused.ceil, 228513);
+  assert.ok(
+    refused.ceiling >= refused.floor,
+    `a declaration (${refused.ceiling}) under a served size (${refused.floor}) is contradicted by its own evidence`,
+  );
+  // It has to stay recoverable as well. The un-refusal guard needs floor >= ceil,
+  // which a refusal this close to the floor never satisfies, so the raise path is
+  // the only way out — and it used to re-derive the same bound every time.
+  let now = 10_000_000;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    observeServedRequest("inverted-free", { tokens: 228286 }, seeded, brackets, now);
+    now += 3_600_000;
+    const raised = limitBracket("inverted-free", brackets);
+    assert.ok(raised.ceiling >= raised.floor, `raise ${attempt + 1} kept the declaration above the floor`);
+  }
+  // A record read back from a state file that already holds the inversion is
+  // repaired by the same clamp rather than republished: `adoptedCeiling` derives
+  // only when the ceiling is unusable, so the clamp is what a persisted 223942
+  // meets on its way out.
+  const persisted = new Map([
+    [
+      "persisted-free",
+      { floor: 228286, ceil: 228513, ceiling: 223942, step: 27992, refusals: 3, seen: 228286 },
+    ],
+  ]);
+  observeServedRequest("persisted-free", { tokens: 228286 }, 326000, persisted, 5_000_000);
+  assert.ok(
+    limitBracket("persisted-free", persisted).ceiling >= 228286,
+    "a state file holding the inversion does not keep publishing it",
+  );
+});
+
 test("a served request proves a floor, and a declaration moves only when the host fills it", async () => {
   const { observeServedRequest, limitBracket } = await subject;
   const brackets = new Map();

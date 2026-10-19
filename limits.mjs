@@ -387,14 +387,27 @@ function scriptCount(text) {
 // which makes this a floor on the request's real size — the one direction that
 // cannot turn a small request into a large claim. Exported for the provider,
 // which has the body in hand before it sends anything.
-export function requestText(body, budget = 4096) {
+//
+// The budget is counted in characters, and that is the whole of a repair: it
+// used to count strings, at 4096 of them, and a chat body holds one string per
+// role, per content, per tool-call id, per tool name and per tool arguments. A
+// long conversation therefore stopped being read at a point that had nothing to
+// do with its size, and what came back was a floor on a floor — a body of
+// 1,012,508 characters was estimated at 44,181 tokens against a true 217,276,
+// because the walk gave up after the four-thousandth string. The estimate is a
+// bracket's unit, so an under-read there is not a rounding error: it is a wall
+// learned at a fifth of the size the route actually saw, and the declaration
+// built on it lands below a size the route has already served. Counting
+// characters makes the cut a bound on the quantity being estimated, which is
+// what `SCAN_LIMIT` already is for the CJK scan below.
+export function requestText(body, budget = SCAN_LIMIT) {
   const parts = [];
   let seen = 0;
   const walk = (value, depth) => {
-    if (seen > budget || depth > 12) return;
+    if (seen >= budget || depth > 12) return;
     if (typeof value === "string") {
       parts.push(value);
-      seen += 1;
+      seen += value.length;
       return;
     }
     if (Array.isArray(value)) {
@@ -490,7 +503,19 @@ function derivedCeiling(record, seeded) {
       : record?.exact === true
         ? Math.min(ceil, cap)
         : Math.min(Math.floor(ceil * (1 - REFUSAL_MARGIN)), cap);
-  return Math.max(1, Math.min(base, Math.max(bound, 1)));
+  // The declaration may never sit below the largest size the route is known to
+  // have SERVED. That is not a preference about margins: `floor` is a request the
+  // route answered, so a declaration under it is a number contradicted by the
+  // evidence that produced it, and the host compacts a conversation it could have
+  // sent. It is reachable because `bound` is a function of `ceil` alone, and a
+  // refusal 227 tokens above the floor puts `ceil * (1 - REFUSAL_MARGIN)` below
+  // it: the VPS on 2026-10-19 held floor 228286, ceil 228513 and declared 223942,
+  // which is 223942 = floor(228513 * 0.98). It was also permanent, because the
+  // un-refusal guard needs `floor >= ceil` (228286 >= 228513 is false), so the
+  // refusal that drew the bound was never voided, and every later raise re-derived
+  // the same bound — four raises in a row came back to 223942. Clamping here is
+  // what makes the bracket an interval by construction rather than by luck.
+  return Math.max(floor, Math.max(1, Math.min(base, Math.max(bound, 1))));
 }
 
 const usable = (value) => Number.isSafeInteger(value) && value > 0;
@@ -644,6 +669,12 @@ export function observeRefusedRequest(
     // above it and not before the cooldown, is what climbs back. A model with no
     // served request yet has no floor, and its declaration is derived from the
     // bound the refusal just put under it.
+    //
+    // `derivedCeiling` is never below the floor, so the smaller of the two is the
+    // floor itself; it is written out rather than assumed because this is the one
+    // line that used to sink the declaration under a size the route had served.
+    // See the note on that clamp: a refusal 227 tokens above the floor put the
+    // declaration 4344 tokens under it, permanently.
     const derived = derivedCeiling(record, seeded);
     record.ceiling =
       record.floor > 0 && usable(derived) ? Math.min(record.floor, derived) : derived;
