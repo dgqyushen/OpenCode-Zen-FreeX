@@ -44,7 +44,8 @@ magpie plugin login opencode-zen-free
 模型名 = `opencode-zen-free/<模型名>`，例如 `opencode-zen-free/big-pickle`。
 
 - **自动发现**：宿主列举模型时重新获取，但一分钟内（`RELIST_AFTER`）重复列举复用上一次结果——magpie 启动一次、其后每小时，所以它每次列举都落到新的一次读取。id 带 `-free`、Zen 的列表里有就提供，**不等**目录。判为下线：`status`/`lifecycle` 为 `retired`/`disabled`、布尔 `deprecated: true`、`deprecated_at`/`retirement_date` 写了日期（不看到期与否），以及 SystemOne 路由的模型；目录只把 `deprecated` 写成 `status`/`lifecycle`、而 Zen 仍在服务的，照常提供。
-- **上限按实测对齐**：目录会少报上下文 / 输出 / `input`，插件按实测与路由自述对齐——例如 `mimo-v2.6-flash-free` 目录 20 万上下文 / 3.2 万输出，厂商自述与实测都是 1048576 / 131072。路由自己否掉的数量也照认：`deepseek-v4.1-flash-free` 的 100 万上下文是 2026-10-15 测出来的，2026-10-19 起路由改用自己的校验，约 32.7 万 token 以上的提示被 `context_length_exceeded` 拒绝且不报数字，这条覆盖随之改成实测能过的最大点向下取整：32.6 万（326,750 实测 3/3 被拒，326,702 是能过的最大值）；输出仍按 38.4 万，路由现在明说自己接受 `max_tokens` 到 393216。依据与复测方法见 [`MAINTAINING.md` 的 “Limits Zen under-reports”](MAINTAINING.md#limits-zen-under-reports)。
+- **上限按实测对齐**：目录会少报上下文 / 输出 / `input`，插件按实测与路由自述对齐——例如 `mimo-v2.6-flash-free` 目录 20 万上下文 / 3.2 万输出，厂商自述 1048576 / 131072，但 2026-10-19 实测这条路由约 40.8 万 token 就拒绝，插件改按能过的最大点声明 34.3 万（343,131 实测被服务）；`glm-5.3-flash-free` 的付费孪生声明 100 万，实测 34.3 万左右被拒，改按 31.1 万。路由自己否掉的数量也照认：`deepseek-v4.1-flash-free` 的 100 万上下文是 2026-10-15 测出来的，2026-10-19 起路由改用自己的校验，约 32.7 万 token 以上的提示被 `context_length_exceeded` 拒绝且不报数字，这条覆盖随之改成实测能过的最大点向下取整：32.6 万（326,750 实测 3/3 被拒，326,702 是能过的最大值）；输出仍按 38.4 万——没有被推翻，但也没有被证实：2026-10-19 有一次超出该上限的提问被回以 `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]`，同一天再问 `max_tokens` 1000000 却直接答 200，所以路由只在部分端点上自报这个上限，插件读到就照用、读不到仍按 38.4 万。依据与复测方法见 [`MAINTAINING.md` 的 “Limits Zen under-reports”](MAINTAINING.md#limits-zen-under-reports)。
+- **这堵墙插件自己会学**：除了上面那张手测表，插件还会从它本来就要转发的请求里学路由当前执行的墙——服务过的最大请求把下限顶上去，路由自己关于窗口的拒绝里最小的那个把上限压下来（5xx、限流、与长度无关的 400 都不算数），不额外发请求去测；学到的值写进本地状态文件，重启后仍在，所以把声明的窗口用满的模型会被一步步试探得更大，而被拒的模型会被自动收回到已经证明能过的尺寸。一个模型最多为这份学习付出四次未被推翻的被拒（路由随后又服务了同一个请求的话，这次被拒连同它占的名额一起退回），之后不再向上试探。学到的值要等宿主下次重建模型列表（启动、其后每小时、或显式刷新）才生效；状态文件位置、调参变量与调试输出见下面的排查表。
 - **目录读不到 ≠ fallback**：Zen 的列表读到了它就是当前该提供的——目录或文档读不到，只影响它们各自描述的那部分。沿用上一次结果只有两种情形：**列表本身**读不到，或距上次读取不到一分钟（见上一条）。
 - 请求一个不再免费的模型 → 404，并列出当时免费的模型；刚转免费的模型会在重新获取列表后照常服务。可用性与限流归 Zen 管，插件看不到剩余额度。
 
@@ -82,6 +83,7 @@ bun run capture             # 确认差异后才写入
 | `uses the public credential` | 存的密钥不是 `public` | 用 `public` 重新登录 |
 | 不带 `FreeTierError` 的 403 | 是别的 403：正文原样透传，只去掉描述旧字节的长度、编码与校验头 | 按 Zen 自己的错误来读，别当成这个插件的 |
 | `400 … context_length_exceeded`，或 `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]` | 路由按模型自己的上限校验请求：提示超出该模型当时执行的上下文，或 `max_tokens` 超出它的范围 | 让宿主压缩对话、把 `max_tokens` 调回范围内；这类拒绝不报窗口数字，别用插件的“模型多大”去推 |
+| 窗口看着偏小、想让它重新学，或新设的 `OPENCODE_ZEN_FREE_*` 变量没生效 | 学到的墙存在本地状态文件里（Windows 是 `%LOCALAPPDATA%\opencode-zen-freex\limits.json`，其他平台是 `$XDG_CACHE_HOME`，都没有就 `~/.cache`）；学到的值要等宿主下次重建模型列表才生效，环境变量则只在宿主进程启动时读一次 | 删掉这个文件就能从头学；把 `OPENCODE_ZEN_FREE_LIMITS_STATE` 设为空字符串则只在内存里学、不落盘；`OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` 会把每次抬高、每次被拒（含路由自报的窗口）以及每次被路由随后服务所推翻的被拒打到 stderr；改完环境变量要重启宿主 |
 
 ## 鸣谢
 

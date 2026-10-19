@@ -257,11 +257,17 @@ test("a shape word alone is an ordinary refusal; protocol wording is a shape ref
 
 test("one upstream model declared twice, unlike, makes the smaller declaration the candidate", async () => {
   const { findings } = await subject();
+  // Rows as a run builds them, with the pair the plugin declares for each id.
+  // These two are the ids that used to be this case's own example and are no
+  // longer unlike: a 2026-10-19 sweep measured both at 343000/131072, so the
+  // under-declaration this list existed to find between them is gone, and what
+  // is left to test is the rule — the smaller declaration of two ids on one
+  // upstream is the candidate.
   const rows = [
     { id: "big-pickle", declared: { context: 200000, output: 32000 }, status: 200, upstream: "mimo-v2.6-flash" },
     {
       id: "mimo-v2.6-flash-free",
-      declared: { context: 1048576, output: 131072 },
+      declared: { context: 343000, output: 131072 },
       status: 200,
       upstream: "mimo-v2.6-flash",
     },
@@ -270,7 +276,7 @@ test("one upstream model declared twice, unlike, makes the smaller declaration t
   assert.equal(lines.length, 1);
   assert.match(
     lines[0],
-    /^big-pickle: declared 200000\/32000, and mimo-v2\.6-flash is also served as mimo-v2\.6-flash-free \(1048576\/131072\)$/,
+    /^big-pickle: declared 200000\/32000, and mimo-v2\.6-flash is also served as mimo-v2\.6-flash-free \(343000\/131072\)$/,
   );
   // an id limits.mjs already carries evidence for is said once, not raised again
   assert.deepEqual(findings(rows, new Set(["big-pickle"])), []);
@@ -907,7 +913,7 @@ test("a case that queued fewer answers than it was asked for fails on the shortf
 test("the pair a row is judged by is the plugin's, not the catalogue's under it", async () => {
   const { withEffective } = await subject();
   // `mimo-v2.6-flash-free` is declared 200000/32000 in the catalogue and
-  // 1048576/131072 by limits.mjs. The row has to carry the second pair, or the
+  // 343000/131072 by limits.mjs. The row has to carry the second pair, or the
   // table would print one number and the findings would compare another.
   const row = withEffective({
     id: "mimo-v2.6-flash-free",
@@ -915,7 +921,7 @@ test("the pair a row is judged by is the plugin's, not the catalogue's under it"
     status: 200,
   });
   assert.deepEqual(row.declared, { context: 200000, output: 32000 }, "the catalogue's own pair stays readable");
-  assert.deepEqual(row.effective, { context: 1048576, output: 131072 });
+  assert.deepEqual(row.effective, { context: 343000, output: 131072 });
   // An id with no evidence is judged by its catalogue pair unchanged.
   const plain = withEffective({ id: "nothing-measured-free", declared: { context: 1000, output: 100 }, status: 200 });
   assert.deepEqual(plain.effective, { context: 1000, output: 100 });
@@ -926,14 +932,14 @@ test("a sibling is measured against the pair the plugin declares, not the catalo
   // Both rows share an upstream and the catalogue lists both at 200000/32000, so
   // a comparison over `declared` sees one pair, skips the group, and never raises
   // the sibling. The plugin's own pair is what the table prints and what a
-  // sibling has to be measured against: 1048576/131072 against 200000/32000 is
+  // sibling has to be measured against: 343000/131072 against 200000/32000 is
   // the under-declaration this list exists to find.
   const rows = [
     withEffective({ id: "mimo-v2.6-flash-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
     withEffective({ id: "sibling-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
   ];
   assert.deepEqual(findings(rows), [
-    "sibling-free: declared 200000/32000, and up is also served as mimo-v2.6-flash-free (1048576/131072)",
+    "sibling-free: declared 200000/32000, and up is also served as mimo-v2.6-flash-free (343000/131072)",
   ]);
   // and the pair printed beside it is the plugin's too, so the line cannot
   // contradict the table it sits under

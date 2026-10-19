@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+// `models()` reads the file the adaptive limits live in, and a test run may not
+// touch the operator's copy of it: an empty value keeps that state in memory,
+// which is what every case here wants. The cases that exercise the file itself
+// are in limits.test.mjs, against a path of their own.
+process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
+
 // Not caught: a syntax error, a renamed file or a failure while models.mjs (or
 // limits.mjs, which it imports) is evaluated has to surface as itself. Swallowed
 // into an empty module it reads as "model discovery must be implemented" or

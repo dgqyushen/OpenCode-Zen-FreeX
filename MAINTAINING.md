@@ -45,14 +45,15 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | id | axis | value | from |
 | --- | --- | --- | --- |
 | `deepseek-v4.1-flash-free` | context | 326000 | the last point this route is measured to serve (326,702), rounded down on 2026-10-19 because its refusal names no number and refuses 326,750 itself |
-| `deepseek-v4.1-flash-free` | output | 384000 | what this route declares for the same upstream model |
-| `mimo-v2.6-flash-free` | context | 1048576 | the route's own refusal, in its own words |
+| `deepseek-v4.1-flash-free` | output | 384000 | the paid twin's figure, and nothing on this route confirms it today: the `[1, 393216]` sentence did not reproduce on a 2026-10-19 re-ask, which was answered 200 |
+| `mimo-v2.6-flash-free` | context | 343000 | the route's own enforcement, found by bracketing on 2026-10-19 (343,131 tokens served, a prompt of about 407,725 refused), not the 1048576 the route used to state |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
-| `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much |
+| `big-pickle` | context | 343000 | the route's own enforcement, found by bracketing on 2026-10-19 (343,131 served, about 407,725 refused), an axis an earlier sweep had left to the catalogue |
+| `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much, named again on a 2026-10-19 re-ask |
 | `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
 | `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
 | `ll-alpha-free` | output | 262144 | the ceiling the route's own refusal names, against a declared 65536 |
-| `glm-5.3-flash-free` | context | 1000000 | what this route declares for the same upstream model, with a 232685-token prompt served as witness |
+| `glm-5.3-flash-free` | context | 311000 | the route's own enforcement, found by bracketing on 2026-10-19 (311,109 served, about 343,348 refused), not the paid twin's 1000000 |
 | `glm-5.3-flash-free` | output | 131072 | what this route declares for the same upstream model |
 | `space-bunny-free` | input | 1048576 | the window this route declares for the same id, with prompts of up to nearly twice the declared input served |
 
@@ -66,7 +67,14 @@ This model's maximum context length is 1048576 tokens. However, you requested
 which is the route stating its own window, and better evidence than any vendor
 page. The output figure is the paid twin's declaration, so the route has already
 published what that model does; a single reply of 306,880 completion tokens
-(`finish_reason: stop`) was watched and is recorded as the witness.
+(`finish_reason: stop`) was watched and is recorded as the witness. The route
+states that ceiling on some endpoints and not others: on 2026-10-19 an ask above
+it was refused with `Invalid max_tokens value, the valid range of max_tokens is
+[1, 393216]`, and a later ask that day for `max_tokens` 1000000 was answered 200
+instead. So 384000 stands — nothing on this route has contradicted it — and
+nothing confirms it either. Where the range sentence does appear, the live
+statement is applied as it stands for the rest of the process, so it outranks the
+twin-derived figure this table carries.
 
 The DeepSeek id was the first entry measured this way and is no longer one: its
 1,048,576-token window was withdrawn on 2026-10-19, when the route began
@@ -97,6 +105,9 @@ compaction.","type":"invalid_request_error","code":"context_length_exceeded"}}
 
 — while the same run's `max_tokens` over the ceiling was refused *with* its
 range: `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]`.
+The route states that ceiling on some endpoints and not others, though: a re-ask
+the same day for `max_tokens` 1000000 was answered 200 with no number in it, so
+that sentence is a statement to read when it appears rather than one to count on.
 Nothing in `limits.mjs` reads the first wording, and it should not be made to:
 it states no number, so any value taken from it would be the reader's guess.
 What is left is a bracket, and it has to be measured in characters rather than
@@ -140,9 +151,16 @@ validates the ceiling refuses and names it — `max_tokens is too large: 1000000
 This model supports at most 131072 completion tokens`, or LongCat's
 `/max_tokens: 1000000 is not less or equal to 262144` — and one that does not
 just begins to answer, so the cost of asking every model is a few tokens each.
-Both wordings are in `limits.mjs` (`namedOutputCap`) and both are read from
-production refusals as well, which is how a ceiling that moves gets noticed
-without anyone running anything.
+There are three wordings now, all of them in `limits.mjs` (`namedOutputCap`) and
+all of them read from production refusals as well, which is how a ceiling that
+moves gets noticed without anyone running anything: the two above, and this
+route's own range — `Invalid max_tokens value, the valid range of max_tokens is
+[1, 393216]` — where the ceiling is the upper end of the interval it says it
+accepts. The range pattern carries its own end, the closing bracket being part of
+it, so a read that stopped inside the digits matches nothing and leaves the axis
+unread; the two older wordings end on their number, and those depend on the
+reader noticing where the read stopped (`digitsEnd`) before it trusts what it
+read.
 
 The output: a paid twin's `limit` in `https://models.opencode.ai/api.json` is
 the stronger source, and re-reading it is the whole job. With no twin — `mimo`
@@ -171,14 +189,175 @@ own, which is the intended end state.
 (`observeRouteStatement`, called from the provider's `fetch`), and it corrects
 that model's window for the rest of the process. The list is rebuilt at every
 start and hourly after, so a route that changes the window it enforces is
-followed without anyone editing this file. Nothing is persisted: a restart falls
-back to what is measured here. The `input` axis has no live form: the refusals
-this route sends name a window and a completion ceiling, and never an input cap.
+followed without anyone editing this file. That correction is not written down: a
+restart falls back to what is measured here and to the bracket below. The `input`
+axis has no live form: the refusals this route sends name a window and a
+completion ceiling, and never an input cap.
+
+**The wall is learned while the plugin runs.** Everything above was measured by
+somebody by hand and written into a table, and that does not scale: the wall this
+route enforces moved under one id on 2026-10-19, and the only reason it was
+noticed is that a conversation filled the window and every request after it was
+refused. The plugin already sees the traffic that would have shown it, so
+`limits.mjs` keeps a bracket per model id and moves it only by what the route
+itself answers, out of requests the host was making anyway. Nothing in this layer
+sends a request of its own: a model nobody asks anything of is never probed, and
+its declaration is exactly what the table and the catalogue said.
+
+The two ends of the bracket are the two answers a route can give. `floor` is the
+largest request the route is known to have served and `ceil` the smallest it is
+known to have refused; `ceiling` is what the plugin then declares, and the one
+number a host acts on, because it is what a conversation is compacted at and what
+decides whether a request is worth sending at all. Both ends are read from the
+characters of the request through one estimate rather than two, because a floor
+and a ceiling read through different estimates are numbers on different scales
+and the search between them would be searching a scale nobody declared in:
+`estimateTokens` counts a Chinese, Japanese or Korean character at 0.7 of a token
+and everything else at the route's own measured 4.66 characters per token, and it
+reads only the strings a request body carries, so the JSON written around them is
+not counted either. The script awareness is the point of it — a window declared
+from a Latin ratio alone would come out at a third of the real one for a wall of
+Chinese text, which is the under-declaration this section exists to remove — and
+what keeps the estimate honest is the structure around it rather than its
+precision.
+
+**What the declaration is, and what moves it.** `ceiling` is the largest of three
+numbers: the proven floor plus the current step, the seed, which is the table's
+value while the catalogue still declares what it was measured against and the
+catalogue's own number when it does not, and the value already declared. It is
+then held under the bound a refusal puts on it and under the cap, and never below
+1. `step` is how far above the proven floor the declaration is willing to go:
+seeded at 5% of the seed and at least 1024, doubled each time a raise is taken
+(by at least 1024, and capped at a quarter of the seed, with 4096 as the smallest
+that cap may be) and halved on every refusal (never below 1024). The bound is the
+size the route refused, once it has refused one: a declaration may not sit on a
+size the route turned down, and where the refusal named no number the bound is 2%
+under it, while a window the route named is exact and may be declared as it
+stands. The cap is `OPENCODE_ZEN_FREE_MAX_WINDOW`, 1048576 by default, and it is
+read as at least the seed, so it only ever holds back a value the search raised
+and never cuts down a number the table or the catalogue declared.
+
+**Not every refusal is about the window.** An answer that is not 200 is not
+evidence about size by itself: the route's failures wear the same clothes, and a
+500, a rate limit and a 400 about a parameter it did not accept arrive as readily
+as a prompt that was too long. Reading one of those as a wall would declare a
+model smaller than the route had just served it, at the cost of part of a budget
+that is four refusals deep: on 2026-10-19 `nemotron-3.5-super-vl-free` answered
+two asks with a 500 and then served the identical sizes, and `space-bunny-free`
+answered a ceiling question with `400 invalid request`. So the axis is decided
+before anything is recorded (`refusalAxis` in `limits.mjs`), and only an answer
+that is about the window moves the window. A number the refusal names decides it
+first, because a numbered sentence is the route stating a limit and cannot be
+anything else; failing that, only 400 and 413 can be about size, and the words
+have to say so — `context_length_exceeded`, a maximum context length or a token
+count the request went past, a prompt or messages said to be too long, or the
+instruction to reduce the length of the messages. A refusal about `max_tokens` is
+the other axis and is recorded as one; an answer that says neither —
+`invalid request`, an empty body, a 500 — is about no axis and moves nothing.
+
+**A refusal the route contradicts stops counting.** `ceil` only ever comes down,
+so a bound drawn by one endpoint that was about to fail would be permanent, and
+the declaration could never again climb over a size the route had in fact served.
+That is not hypothetical: on 2026-10-19 `big-pickle` answered a 1,600,000-character
+prompt with a 400 and then served that identical request, counting 343,131
+tokens. So a served request at or above a size that was refused clears the bound
+and gives the refusal back to the budget, and the note it reports is
+`wall-unrefused`; `refusals` counts the refusals the file still believes rather
+than the refusals that happened. A window the route named in its own words is
+exempt, because that is the route stating a limit rather than one endpoint
+misbehaving: every named number the sweep re-asked held still.
+
+A raise is demand-driven, and that is the whole of the search. The host filling
+the declaration, which is the largest request the route has served reaching 90%
+of what was declared, is the only evidence there is that it wants more room: a
+model whose traffic sits well under its window is left alone rather than given a
+bigger one to not use, and when the host does fill it the step doubles and the
+declaration moves above the floor. A raise also waits out a cooldown
+(`OPENCODE_ZEN_FREE_LIMITS_COOLDOWN_MS`, 900000 by default, which is fifteen
+minutes), and a refusal stamps the same clock, so probes are spaced whichever way
+the last one went. The cost is the part worth being plain about: a probe that
+overshoots costs one refused turn, paid for by whoever was working with the
+model, so a refusal below the bound so far tightens it to 2% under the size it
+refused, halves the step and returns the declaration to the floor, and once four
+refusals the file still believes have accumulated, the search stops raising for
+that model; a record counts those refusals so an entry can be explained
+afterwards. That is what makes the probes converge instead of oscillating: the
+first refusal in a run is the largest, the next probe is under 98% of it, and the
+declaration comes to rest at or under the largest size the route is known to have
+served rather than on one nobody proved.
+
+**What survives a restart.** A bracket forgotten on every restart is a bracket
+re-learned by being refused again, which is the cost this layer exists to avoid,
+so it is written to one small JSON file rather than derived again.
+`OPENCODE_ZEN_FREE_LIMITS_STATE` names that file, and an empty value keeps the
+state in memory only; unset, it is `limits.json` under `opencode-zen-freex` in
+the cache directory the platform uses — `%LOCALAPPDATA%` on Windows, else
+`$XDG_CACHE_HOME`, else `~/.cache`. The write is atomic, a temporary file beside
+the target and a rename over it, because a half-written state file would be read
+as a bracket somebody measured; it happens at most once per
+`OPENCODE_ZEN_FREE_LIMITS_STATE_DEBOUNCE_MS` (5000 by default, and 0 writes
+straight away) and never delays a request. The read is tolerant in the same
+direction: a missing file, an unreadable one, one holding another shape or a
+version this build does not know is simply no state, and the process starts from
+the table; every field is checked before it becomes a record, and the file is
+bounded at 500 models and 256 KiB. Nothing here may fail a request: a file that
+cannot be written is a bracket that is not remembered, and a file that cannot be
+read is a model with no history.
+
+**What a model is actually given.** The context axis has four tiers, and the
+order is the order they are consulted in: a window a refusal named while this
+process was running, which is exact and applied as it stands; then the bracket's
+ceiling, which exists only because a request was served or refused and so speaks
+about the wall as it is enforced now; then the shipped table's entry, while the
+catalogue still declares what it was measured against, which is also what a fresh
+record is seeded from, so the table has the first word and not the last; and last
+the catalogue's own number. The bracket is route evidence by construction and is
+not bound by the raise-only rule the weaker tiers obey, which is the point of it:
+it may lower a declaration as well as raise it, and what it lowers to is the
+largest size the route is known to have served. The output axis keeps its own
+tiers and gains a third wording: besides the completion ceiling an upstream names
+when it refuses the ask — `supports at most N completion tokens` — and LongCat's
+`is not less or equal to` form, it now reads the range this route answers an
+oversized `max_tokens` with, `the valid range of max_tokens is [1, 393216]`, and
+takes the upper end of it, which is the ceiling the route says it accepts up to.
+The `input` axis is unchanged: no refusal this route sends names an input cap, so
+there is nothing to observe into it.
+
+**What this does not do.** It cannot learn a wall above the sizes the host
+actually sends: the declared ceiling is what gives the host a reason to send a
+bigger request, and a host that compacts at the declaration never reaches a wall
+far above it, so the bracket climbs one declaration at a time and only while
+something is filling each one. A learned value also reaches the host at its next
+model-list rebuild — the start, an hour later, or an explicit `refresh()` — and
+not on the request that learned it, which is what keeps this from being a loop:
+the bracket moves on traffic the host sent against the declaration it was given,
+not against the one being computed now. And the estimate is read from characters
+while the route counts tokens, so a bracket proves a size a few per cent away
+from what a tokenizer would say.
+
+**Re-measuring, now that the plugin measures too.** The hand measurement above is
+still the ground truth and still what a bracket is seeded from, and the plugin's
+own learning is no substitute for it, since it can never reach a wall the traffic
+does not touch. A single refusal is not a wall on this route either: the same id
+has refused a prompt and then served the identical request, so what a hand
+measurement looks for is two refused sizes behind one wall, which is the runtime
+counterpart of the bound this layer drops when the route serves past it. What the
+plugin believes is in the state file named above, and each movement is reported as
+it happens when `OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` is set: each raise that moves
+the declaration, each refusal that moves it back, and each refusal the route goes
+on to contradict gets a line of its own, naming the model and the numbers behind
+it — the value the declaration moved to, the size the route served or refused, the
+window a refusal named when it named one, and how many refusals the model has
+cost. A bracket that has learned something wrong is forgotten by deleting that
+file, or by pointing `OPENCODE_ZEN_FREE_LIMITS_STATE` at an empty string for a run
+that should not remember anything. What comes out of the file is not evidence for
+the table in this file: it is one process's traffic, and the table wants a
+measurement.
 
 **The same shape on a second upstream.** `mimo-v2.6-flash-free` is declared
-200000/32000 here too, and its window is a route figure like the one above — an
-850,249 token prompt was served first, its needle echoed back, and then a prompt
-just over the wall was refused with
+200000/32000 in the catalogue, the under-report the DeepSeek id has, and the route
+once named its window in its own words: an 850,249 token prompt was served first,
+its needle echoed back, and then a prompt just over the wall was refused with
 
 ```
 This endpoint's maximum context length is 1048576 tokens. However, you requested
@@ -187,8 +366,12 @@ output).
 ```
 
 which is the route naming its own window, on an upstream that words it
-differently from the DeepSeek ids. Its output is the first figure in this file
-resting on a vendor page: that same refusal came back with the 200000 it was
+differently from the DeepSeek ids. That figure was overtaken on 2026-10-19, when
+a prompt of about 408,000 tokens was refused — less than half of it — so the axis
+is the route's own enforcement found by bracketing (343,131 tokens served,
+1,900,000 characters refused) rather than the number the route stated, the same
+way the DeepSeek id's stated million went. Its output is the first figure in this
+file resting on a vendor page: that same refusal came back with the 200000 it was
 asked for, unclamped, so this route states no completion ceiling of its own, and
 131072 is Xiaomi's entry for `mimo-v2.6-flash` (`api.xiaomimimo.com`, and its
 China token plan). Nothing above 32000 has been watched on this route, and
@@ -205,7 +388,11 @@ are gone (410) or unavailable (400); it writes nothing and measures no window.
 Its first run named
 `big-pickle`'s ceiling and two ids declared below what the route says
 (`nemotron-3.5-lightning-free` at a quarter of its window, `longcat-2.5-preview-free`
-at half its ceiling), which is the whole argument for having it.
+at half its ceiling), which is the whole argument for having it. The run behind
+the 2026-10-19 table above was that work done by hand, and the audit after it
+reports no candidates at all — nothing offered is under-declared relative to the
+sibling the route groups it with — which is the state the table was moved to reach
+rather than a reason to stop asking, since the walls move.
 
 ## The loop
 

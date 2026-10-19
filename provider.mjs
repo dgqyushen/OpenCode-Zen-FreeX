@@ -9,7 +9,14 @@ import {
   configModels,
   parseProtocolDocs,
 } from "./models.mjs";
-import { observeRouteStatement } from "./limits.mjs";
+import {
+  loadLimitState,
+  observeRefusedRequest,
+  observeRouteStatement,
+  observeServedRequest,
+  refusalAxis,
+  requestSize,
+} from "./limits.mjs";
 import { STALE_BODY_HEADERS, collapseResponse } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
 
@@ -834,6 +841,10 @@ async function server(_input, options = {}) {
         },
       ],
       async loader(getAuth) {
+        // What an earlier process learned about these models' walls, before the
+        // first request is built: a bracket that is not read here is a bracket
+        // re-learned by being refused again. It never fails the loader.
+        await loadLimitState();
         const auth = await getAuth();
         if (!auth) return {};
         requirePublic(auth);
@@ -883,6 +894,12 @@ async function server(_input, options = {}) {
             const toolPolicy = normalizeTools(body, protocol);
             if (protocol === "chat")
               body.stream_options = { ...body.stream_options, include_usage: true };
+            // What this request is about to cost the window, read from its own
+            // text before it is sent: the only size limits.mjs has for a refusal
+            // that names nothing, and the floor it learns a served prompt from.
+            // Measured here rather than after the call because the body is what
+            // was sent, and a stream that is rewritten on the way back is not.
+            const size = requestSize(body);
             // Adding a header here is the easiest way to break this plugin: Zen
             // takes a request for one generation of OpenCode or the other, and a
             // header belonging to neither is as good as saying so. The names are
@@ -924,6 +941,24 @@ async function server(_input, options = {}) {
               // that has given up is not waiting for a number out of a refusal.
               signal: request.signal,
             });
+            // The other half of the same reading: what the route's answer says
+            // about this model's wall, learned from a request the host was
+            // making anyway. A refusal names a size the window is under; a
+            // successful one proves a size it can serve. Both are recorded
+            // against the limit the host was told, so the bracket a host is
+            // working inside is the one that moves.
+            //
+            // Only a refusal about the window moves the window. This route
+            // answers a 400 with a body for a rate limit and for a parameter it
+            // did not accept as readily as for a prompt that was too long, and a
+            // declaration lowered by one of those is lowered over a fault that
+            // had nothing to do with length. A refusal about `max_tokens` is the
+            // other axis and has already been recorded as one by the reader
+            // above, so it is not a statement about the window either.
+            const declared = model.limit?.context;
+            if (observed && refusalAxis(response.status, observed.text, observed) === "context")
+              observeRefusedRequest(body.model, size, declared, undefined, undefined, observed.context);
+            else if (response.ok) observeServedRequest(body.model, size, declared);
             const answered = relayed(response, observed);
             const guarded = await guardToolResponse(
               explain(observed?.text ?? null, answered, toolPolicy),
@@ -942,6 +977,11 @@ async function server(_input, options = {}) {
     provider: {
       id: PROVIDER,
       async models(provider, { auth } = {}) {
+        // Read before the list is built, not after: the limits in this answer
+        // are the whole reason the state exists, and a host that was told the
+        // table's number at start would spend its first hour inside a window a
+        // previous process had already measured past.
+        await loadLimitState();
         if (!auth) return provider.models;
         requirePublic(auth);
         // Asked without a signal, and deliberately: the hook has none to give,

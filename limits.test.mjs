@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+// The adaptive cases read and write real files: a state file is the one thing
+// this module puts on disk, and a case with a stubbed file system would not be
+// testing the one promise made about it — that a bracket survives a restart.
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const subject = import("./limits.mjs").catch((error) => {
   assert.fail(`limits.mjs failed to load: ${error?.message ?? error}`);
@@ -133,10 +139,11 @@ test("a free id Zen under-reports is declared at what the route says", async () 
 
 test("a second id on another upstream, whose axes rest on different tiers, is declared the same way", async () => {
   const { limitOverrides } = await subject;
-  // its window is the route's own sentence; its output is the vendor's
+  // its window is the route's own enforcement, found by bracketing after the
+  // window it used to state was contradicted; its output is the vendor's
   // catalogue entry, because this upstream names no completion ceiling
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
-    context: 1048576,
+    context: 343000,
     output: 131072,
   });
 });
@@ -151,11 +158,11 @@ test("the ids the tier added last do not keep the ceilings the catalogue gave th
   assert.deepEqual(limitOverrides("ll-alpha-free", { context: 262144, output: 65536 }), {
     output: 262144,
   });
-  // glm-5.3-flash-free: both axes from the paid id serving the same upstream
-  // model, with a 232685-token prompt served as the witness that the declared
-  // window is too small.
+  // glm-5.3-flash-free: its window is the route's own enforcement, measured on
+  // 2026-10-19 after the paid twin's 1000000 was contradicted by a refusal; its
+  // output is still the twin's, which nothing has contradicted.
   assert.deepEqual(limitOverrides("glm-5.3-flash-free", { context: 200000, output: 32000 }), {
-    context: 1000000,
+    context: 311000,
     output: 131072,
   });
   // and the catalogue moving voids the axis it moved, as it does for every entry
@@ -227,7 +234,7 @@ test("evidence measured against another catalogue is void, and only on its own a
     output: 131072,
   });
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 64000 }), {
-    context: 1048576,
+    context: 343000,
   });
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", {}), {});
   // The DeepSeek id obeys the same rule on both axes: its window was measured
@@ -245,7 +252,10 @@ test("evidence measured against another catalogue is void, and only on its own a
 test("a model with no evidence keeps exactly what the catalogue declared", async () => {
   const { limitOverrides } = await subject;
   assert.deepEqual(limitOverrides("nemotron-3.5-lightning-free", DECLARED), {});
-  assert.deepEqual(limitOverrides("big-pickle", {}), {});
+  // beam-free is one of the two ids the table carries no entry for at all: every
+  // size asked of it up to about 599,000 tokens was served, so there is nothing
+  // measured to declare and the catalogue's own pair stands.
+  assert.deepEqual(limitOverrides("beam-free", {}), {});
   // an id that is not an id at all must not reach the prototype chain for a
   // record: `table["toString"]` is a function, and reading an entry off it
   // would invent evidence for a model nobody declared
@@ -420,7 +430,7 @@ test("a refusal naming a window while the process runs outranks the shipped tabl
     // the same answer the observation above would have given it, read from one
     // place: the entry's own declared pair.
     assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
-      context: 1048576,
+      context: 343000,
       output: 131072,
     });
   } finally {
@@ -484,15 +494,21 @@ test("the observations two cases stored are put back before the next case reads"
   }
 });
 
-test("an id with a route-stated ceiling and an unmeasured window is aligned on one axis only", async () => {
+test("an id whose ceiling the route stated and whose window rests on the catalogue moves one axis only", async () => {
   const { limitOverrides } = await subject;
-  // big-pickle: the ceiling is the route's own sentence; its window was not
-  // measured, and being the same upstream model as another id is not a window
-  assert.deepEqual(limitOverrides("big-pickle", { context: 200000, input: 160000, output: 32000 }), {
-    output: 131072,
+  // longcat-2.5-preview-free: the ceiling is the route's own sentence, and its
+  // window is the catalogue's — the refusal that named 262144 also called the
+  // endpoint's window 1000000, which is what the catalogue already declares, so
+  // there is nothing to override on that axis.
+  assert.deepEqual(
+    limitOverrides("longcat-2.5-preview-free", { context: 1000000, input: 160000, output: 131072 }),
+    { output: 262144 },
+  );
+  // and the axis nothing was measured for is left exactly as the catalogue
+  // declared it, `input` included
+  assert.deepEqual(limitOverrides("longcat-2.5-preview-free", { context: 250000, output: 131072 }), {
+    output: 262144,
   });
-  // and the untouched axis is left exactly as the catalogue declared it
-  assert.deepEqual(limitOverrides("big-pickle", { context: 250000, output: 32000 }), { output: 131072 });
 });
 
 test("the audit's first run named two more, each on the axis its refusal named", async () => {
@@ -510,6 +526,143 @@ test("the audit's first run named two more, each on the axis its refusal named",
     limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }),
     { output: 262144 },
   );
+});
+
+// The third wording this route has for a completion ceiling, and the only one
+// that states it as a range. Measured 2026-10-19 against deepseek-v4.1-flash-free:
+// `max_tokens: 393216` is served, and the number past it comes back in this
+// sentence while the window refusal from the same run names no number at all. So
+// of the two axes this is the one the route still states out loud while it runs,
+// and it states it about the axis the shipped table had only inferred from a twin.
+const RANGE_WORDING =
+  '{"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error",' +
+  '"message":"Upstream request failed: [invalid_request_error] Invalid max_tokens value, ' +
+  'the valid range of max_tokens is [1, 393216] (request_id: c05a28eb)"}}';
+
+test("a ceiling stated as a range is read at the end that is the ceiling", async () => {
+  const { namedOutputCap, namedContextWindow } = await subject;
+  assert.equal(namedOutputCap(RANGE_WORDING), 393216);
+  // The first number is the floor of the range, so the second is the one captured:
+  // a range whose ends differ says which end was read.
+  assert.equal(namedOutputCap("the valid range of max_tokens is [65536, 262144]"), 262144);
+  // A sentence about max_tokens says nothing about the window, and reading the
+  // range's number onto that axis would take the smaller of the two as a budget.
+  assert.equal(namedContextWindow(RANGE_WORDING), undefined);
+  // LongCat's wording puts its ceiling last in the body, where a read that stops
+  // inside the digits leaves a smaller number that still looks complete, so that
+  // one needs the cut guard. This one cannot fail that way: the closing bracket is
+  // part of the pattern, and a read that stops inside the digits matches nothing
+  // and leaves the axis unread, which is the direction this has to fail in.
+  assert.equal(namedOutputCap("the valid range of max_tokens is [1, 39321"), undefined);
+  assert.equal(namedOutputCap("the valid range of max_tokens is [1, 393216"), undefined);
+});
+
+test("a range-stated ceiling goes past the twin-derived number the table carries", async () => {
+  const { observeRouteStatement, limitOverrides, limitObservations } = await subject;
+  // The shipped table gives this id 384000 on the strength of a sibling id and
+  // DeepSeek's own page, which is tier `route-twin` and not a statement about this
+  // route. The route saying 393216 about itself is newer and better, and it is
+  // higher, so it is also the direction the raise-only rule allows on its own.
+  const held = limitObservations();
+  try {
+    assert.deepEqual(
+      await observeRouteStatement("deepseek-v4.1-flash-free", new Response(RANGE_WORDING, { status: 400 })),
+      { context: undefined, output: 393216, text: RANGE_WORDING, ended: true },
+    );
+    assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
+      context: 326000,
+      output: 393216,
+    });
+  } finally {
+    limitObservations(held);
+  }
+  // Put back, and read here on the default path for exactly that reason: a
+  // statement left under this id would answer every later case from a refusal it
+  // never made, including the ones that assert what this id's ceiling is.
+  assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
+    context: 326000,
+    output: 384000,
+  });
+});
+
+// Every body below was captured from this route on 2026-10-19, and the rows that
+// answer `undefined` are the whole reason the classifier exists. This route
+// answers a 5xx, a rate limit and a 400 about a parameter exactly as readily as
+// it answers a prompt that was too long — same status, same content type, a body
+// that parses — and a bracket that took one of those for a wall would declare a
+// model smaller than the route has already served it and spend part of a refusal
+// budget four refusals deep. The statuses are the route's own; the axes are what
+// `namedAxes` reads from the same body, so the two halves of the read are judged
+// together rather than twice.
+const REFUSALS = [
+  [
+    400,
+    '{"error":{"message":"Your request resulted in more tokens than this model\'s maximum context length allows. Please reduce the length of the messages or run compaction.","code":"context_length_exceeded"}}',
+    {},
+    "context",
+    "deepseek-v4.1-flash-free at 1,522,600 characters: the unnamed too-long refusal, which is the one this route sends most",
+  ],
+  [
+    400,
+    '{"error":{"type":"invalid_request_error","message":"Upstream request failed: [invalid_request_error] Requested token count exceeds the model\'s maximum context length of 200000 tokens"}}',
+    {},
+    "context",
+    "big-pickle, seen by `bun run limits:audit`: the same fact in different words, and the words are all there is",
+  ],
+  [
+    400,
+    '{"error":{"type":"server_error","message":"Upstream request failed: [400] This endpoint\'s maximum context length is 1000000 tokens. However, you requested about 1001494 tokens (50 of text input, 1444 of tool input, 1000000 in the output)."}}',
+    { context: 1000000 },
+    "context",
+    "nemotron-3.5-lightning-free: names the window, so the number decides before the words do",
+  ],
+  [
+    400,
+    'data: {"error":{"param":"max_tokens is too large: 1000000. This model supports at most 131072 completion tokens, whereas you provided 1000000.","type":"server_error","message":"Streaming response failed: [400] Param Incorrect"}}',
+    { output: 131072 },
+    "output",
+    "big-pickle: about the completion ceiling, so it says nothing about the window even though the request was refused",
+  ],
+  [
+    400,
+    "Upstream request failed: [invalid_parameter] 参数校验失败: \n/max_tokens: 1000000 is not less or equal to 262144\n",
+    { output: 262144 },
+    "output",
+    "longcat-2.5-preview-free: the second ceiling wording, and not a window either",
+  ],
+  [
+    500,
+    "",
+    {},
+    undefined,
+    "nemotron-3.5-super-vl-free answered this to two asks and then served the identical requests: a fault is not a wall",
+  ],
+  [
+    400,
+    '{"error":{"type":"invalid_request_error","message":"Upstream request failed: [invalid_request_error] invalid request"}}',
+    {},
+    undefined,
+    "space-bunny-free, asked for a ceiling of 1000000: names nothing, so nothing is learned from it",
+  ],
+  [
+    429,
+    '{"error":{"message":"limited","type":"rate_limit_error"}}',
+    {},
+    undefined,
+    "the rate limit this suite's own route answers with: it is about how often, not how much",
+  ],
+  [413, "", {}, undefined, "a status that can be about size with a body that says nothing is still nothing"],
+];
+
+test("a refusal is read for the axis it is about, and a fault is read for no axis", async () => {
+  const { refusalAxis } = await subject;
+  for (const [status, text, axes, axis, why] of REFUSALS)
+    assert.equal(refusalAxis(status, text, axes), axis, `${status} ${why}`);
+  // A status that cannot be about size is not rescued by a body that talks about
+  // it: the same words arrive in the prose of a model's own answer, which is a
+  // 200 and never reaches this, and in the error a gateway wraps around a fault.
+  assert.equal(refusalAxis(502, "maximum context length", {}), undefined);
+  assert.equal(refusalAxis(400, "maximum context length", {}), "context");
 });
 
 // LongCat's wording ends with the digits it captured, and the body is read only
@@ -757,10 +910,10 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
   // the window is the wall this route enforces, with a margin; the output is the
   // paid twin's declaration
   assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 326000, output: 384000 });
-  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 1048576, output: 131072 });
-  // one axis has evidence for this one and the other does not, so only its
-  // output moves and the catalogue's own `input` survives untouched
-  assert.deepEqual(models["big-pickle"].limit, { context: 200000, input: 160000, output: 131072 });
+  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 343000, output: 131072 });
+  // both axes have evidence for this one, and the catalogue's own `input`
+  // survives untouched because nothing on this route has ever named an input cap
+  assert.deepEqual(models["big-pickle"].limit, { context: 343000, input: 160000, output: 131072 });
   // the input axis is one of the axes now: this one's declared input is its own
   // context − output, falsified by prompts of up to nearly twice it served, so
   // the input moves to the window while the window and the ceiling stay as
@@ -909,7 +1062,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
   try {
     assert.deepEqual(
       limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 32000 }, undefined, fresh(), fresh()),
-      { context: 1048576, output: 131072 },
+      { context: 343000, output: 131072 },
     );
     assert.deepEqual(notes, [], "an entry that applies has nothing to explain");
     // the catalogue moved: the window was measured against a question nobody is
@@ -933,7 +1086,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
       kind: "catalogue-drift",
       id: "mimo-v2.6-flash-free",
       axis: "context",
-      value: 1048576,
+      value: 343000,
       measuredAgainst: 200000,
       declared: 250000,
     },
@@ -941,7 +1094,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
       kind: "catalogue-drift",
       id: "mimo-v2.6-flash-free",
       axis: "context",
-      value: 1048576,
+      value: 343000,
       measuredAgainst: 200000,
       declared: undefined,
     },
@@ -969,7 +1122,7 @@ test("the same notes reach stderr when the environment asks for them", async () 
   assert.equal(lines.length, 1, "one line for the one axis the catalogue voided");
   assert.match(
     lines[0],
-    /mimo-v2\.6-flash-free context=1048576 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
+    /mimo-v2\.6-flash-free context=343000 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
   );
 });
 
@@ -1235,4 +1388,280 @@ test("a number the wait cut short is not a limit", async () => {
   } finally {
     clearTimeout(timer);
   }
+});
+
+// ---- the wall this plugin learns while it runs -----------------------------
+//
+// Everything above is a number somebody measured by hand. Below is the other
+// half of the same idea: the bracket a model's own traffic draws, which is what
+// makes the table a starting point rather than the only answer. Every case here
+// holds a bracket map of its own rather than the module's, because the module
+// keeps one state for the whole process and a case that read the default one
+// would be asserting on whatever ran before it.
+
+test("the tokens a request holds are estimated from its own text", async () => {
+  const { estimateTokens, requestText, requestSize } = await subject;
+  // The route's own calibration for Latin filler: 4.66 characters per token,
+  // measured on 2026-10-19. An estimate is an estimate, and this case pins the
+  // ratio rather than a tokenizer this plugin does not have.
+  assert.equal(estimateTokens("a".repeat(466)), 100);
+  // CJK is counted per character: a window declared from a Latin ratio alone
+  // would come out at a third of the real one for a wall of Chinese text, which
+  // is the under-declaration this file exists to remove.
+  assert.equal(estimateTokens("汉".repeat(1000)), 700);
+  assert.equal(estimateTokens(""), 0);
+  assert.equal(estimateTokens(undefined), 0);
+  assert.equal(estimateTokens(7), 0, "a number is not text");
+  // Only strings are counted, and every string in the body is counted whichever
+  // protocol wrote it: what comes back is a floor on the request's size, and the
+  // one direction it may not fail in is calling a small request a large one.
+  assert.equal(
+    requestText({ messages: [{ role: "user", content: "abcd" }], temperature: 0.7 }),
+    "userabcd",
+  );
+  assert.equal(requestText({ system: "ab", input: [{ content: [{ text: "cd" }] }] }), "abcd");
+  assert.deepEqual(requestSize({ messages: [{ content: "a".repeat(466) }] }), { tokens: 100 });
+});
+
+test("a served request proves a floor, and a declaration moves only when the host fills it", async () => {
+  const { observeServedRequest, limitBracket } = await subject;
+  const brackets = new Map();
+  const seeded = 200000;
+  // A request well under the declaration is a fact about the floor and nothing
+  // else: the route serving 100000 tokens says nothing about wanting more room.
+  observeServedRequest("small-free", { tokens: 100000 }, seeded, brackets, 0);
+  assert.equal(limitBracket("small-free", brackets).ceiling, seeded);
+  assert.equal(limitBracket("small-free", brackets).floor, 100000);
+  // The host filling the declaration is the only demand signal there is, and the
+  // first one is held back by the cooldown: a probe costs a turn when it
+  // overshoots, so probes are spaced.
+  observeServedRequest("small-free", { tokens: 190000 }, seeded, brackets, 0);
+  assert.equal(limitBracket("small-free", brackets).ceiling, seeded, "a first raise is held back");
+  observeServedRequest("small-free", { tokens: 190000 }, seeded, brackets, 900001);
+  const raised = limitBracket("small-free", brackets);
+  assert.equal(
+    raised.ceiling,
+    190000 + 20000,
+    "the step doubled, and the declaration went a step above the floor it proved",
+  );
+  // ...and a second raise waits for the cooldown again.
+  observeServedRequest("small-free", { tokens: 215000 }, seeded, brackets, 900002);
+  assert.equal(limitBracket("small-free", brackets).ceiling, raised.ceiling);
+});
+
+test("a refusal halves the step, puts the declaration under the wall, and is never crossed", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const brackets = new Map();
+  const seeded = 200000;
+  observeServedRequest("wall-free", { tokens: 195000 }, seeded, brackets, 1000000);
+  assert.equal(limitBracket("wall-free", brackets).ceiling, 215000);
+  observeRefusedRequest("wall-free", { tokens: 230000 }, seeded, brackets, 2000000);
+  const refused = limitBracket("wall-free", brackets);
+  assert.equal(refused.ceiling, 195000, "back to what the route is known to have served");
+  assert.equal(refused.step, 10000, "the step halved");
+  assert.equal(refused.ceil, 230000, "the size that was refused, kept as the bound");
+  assert.equal(refused.refusals, 1);
+  // The bound is what keeps the search off a size already turned down: the next
+  // raise goes a halved step above the floor, and it needs a served request at
+  // the declaration plus the cooldown before it happens.
+  observeServedRequest("wall-free", { tokens: 196000 }, seeded, brackets, 3000000);
+  observeServedRequest("wall-free", { tokens: 196000 }, seeded, brackets, 3900001);
+  const climbed = limitBracket("wall-free", brackets);
+  assert.ok(climbed.ceiling > refused.ceiling, "it climbs again, on a smaller step");
+  assert.ok(
+    climbed.ceiling <= Math.floor(230000 * 0.98),
+    "and never at or above the size the route refused",
+  );
+});
+
+test("a size the route served at or above a refused one drops that refusal", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const seeded = 200000;
+  const brackets = new Map();
+  observeServedRequest("flaky-free", { tokens: 195000 }, seeded, brackets, 1000000);
+  observeRefusedRequest("flaky-free", { tokens: 210000 }, seeded, brackets, 1000000);
+  const refused = limitBracket("flaky-free", brackets);
+  assert.equal(refused.ceil, 210000, "the refusal put a bound under the wall");
+  assert.equal(refused.refusals, 1, "and spent one of the four a model gets");
+  assert.equal(refused.ceiling, 195000, "and put the declaration back at the floor");
+  // ...and then the route serves the identical request it just turned down. It
+  // does this: on 2026-10-19 big-pickle answered a 1,600,000-character prompt
+  // with a 400 that named no code and then served the same request, counting
+  // 343,131 tokens. Left in place, that bound is permanent — `ceil` only ever
+  // comes down — so the declaration could never again climb over a size the route
+  // had in fact served, and the refusal would keep a quarter of the budget that
+  // turned out not to have been spent on anything.
+  observeServedRequest("flaky-free", { tokens: 210000 }, seeded, brackets, 2000000);
+  const unrefused = limitBracket("flaky-free", brackets);
+  assert.equal(unrefused.ceil, undefined, "the bound that refusal drew is gone");
+  assert.equal(unrefused.refusals, 0, "and the budget it spent is given back");
+  assert.equal(unrefused.floor, 210000, "at the size the route went on to serve");
+  // A window the route named in its own words is not dropped this way. That is
+  // the route stating a limit rather than one endpoint misbehaving, and the same
+  // sweep re-asked every named number it found and had them all hold still.
+  const named = new Map();
+  observeRefusedRequest("named-free", { tokens: 120000 }, seeded, named, 1000000, 100000);
+  assert.equal(limitBracket("named-free", named).exact, true);
+  observeServedRequest("named-free", { tokens: 120000 }, seeded, named, 2000000);
+  const held = limitBracket("named-free", named);
+  assert.equal(held.ceil, 100000, "a named window stands, and it is not widened");
+  assert.equal(held.refusals, 1, "and the refusal it cost is still counted");
+});
+
+test("the search stops after its refusal budget, and a window the route names replaces it", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const seeded = 200000;
+  const brackets = new Map();
+  for (let at = 0; at < 8; at += 1) {
+    observeRefusedRequest("budget-free", { tokens: 240000 }, seeded, brackets, at * 2000000);
+    observeServedRequest("budget-free", { tokens: 196000 }, seeded, brackets, at * 2000000 + 1000000);
+  }
+  const spent = limitBracket("budget-free", brackets);
+  assert.ok(spent.refusals >= 4, "the refusals were counted");
+  assert.equal(spent.ceiling, 196000, "and the declaration sits on the floor it proved");
+  // A refusal that names the window is not a bracket at all: the route stated
+  // its own limit, which is better evidence than any estimate.
+  const namedBrackets = new Map();
+  observeRefusedRequest("named-free", { tokens: 300000 }, seeded, namedBrackets, 0, 262144);
+  const named = limitBracket("named-free", namedBrackets);
+  assert.equal(named.ceiling, 262144);
+  assert.equal(named.exact, true);
+});
+
+test("what the route taught outranks the table for its axis, and a model nothing was asked of keeps the table", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitOverrides } = await subject;
+  const brackets = new Map();
+  const declared = { context: 200000, output: 32000 };
+  observeServedRequest("learned-free", { tokens: 150000 }, declared.context, brackets, 0);
+  observeRefusedRequest("learned-free", { tokens: 170000 }, declared.context, brackets, 1000);
+  // The bracket is route evidence, so the raise-only rule that binds the weaker
+  // tiers does not bind it: 150000 is below the catalogue's 200000 and it is
+  // still what this file declares, because the route refused 170000.
+  assert.deepEqual(
+    limitOverrides("learned-free", declared, {}, new Map(), new Map(), brackets),
+    { context: 150000 },
+  );
+  // ...and it is what this file declares even when the shipped table has an
+  // entry of its own for the id, because a record exists only because a request
+  // was served or refused: the table had the first word, and the route has the
+  // last one. This is the id the table covers, which is the case the bracket was
+  // built for and the one an entry consulted first would hide.
+  const table = {
+    "learned-free": {
+      context: { value: 200000, source: "route", declaredAt: 200000 },
+      output: { value: 64000, source: "route", declaredAt: 32000 },
+    },
+  };
+  assert.deepEqual(
+    limitOverrides("learned-free", declared, table, new Map(), new Map(), brackets),
+    { context: 150000, output: 64000 },
+    "the bracket answers for the axis the route moved, the table for the one it did not",
+  );
+  // A model nothing has been asked of has no record, and its axes are the
+  // table's and nothing else.
+  assert.deepEqual(limitOverrides("learned-free", declared, {}, new Map(), new Map(), new Map()), {});
+  // ...and a window a refusal named this process still outranks the bracket,
+  // because a number the route stated beats one this file estimated.
+  const live = new Map([["learned-free", 262144]]);
+  assert.deepEqual(limitOverrides("learned-free", declared, {}, live, new Map(), brackets), {
+    context: 262144,
+  });
+  // A record is read, never created, by a model list: a list is not evidence
+  // about a wall, and a bracket invented at startup would be a bracket nobody
+  // measured.
+  assert.equal(limitOverrides("never-seen-free", declared, {}, new Map(), new Map(), brackets).context, undefined);
+});
+
+test("a bracket survives a restart through one file, and a file that is not one is no state", async () => {
+  const { observeRefusedRequest, limitBracket, limitAdaptivity, limitStateJSON, loadLimitState, saveLimitState } =
+    await subject;
+  const file = join(tmpdir(), `zen-limits-${process.pid}-${Date.now()}.json`);
+  try {
+    const brackets = new Map();
+    observeRefusedRequest("kept-free", { tokens: 170000 }, 200000, brackets, 1000);
+    assert.equal(await saveLimitState(file, brackets), true);
+    // A fresh process — which is what an empty state and a read of the file
+    // stands in for — gets the bracket back, including the bound the refusal put
+    // under the declaration.
+    limitAdaptivity(new Map());
+    assert.equal(await loadLimitState(file), true);
+    const read = limitBracket("kept-free");
+    // The declaration the search had reached: the seed, held down by the bound
+    // the refusal put under it — a model with no served request yet has no floor
+    // to fall back to, so the estimate is all there is.
+    assert.equal(read.ceiling, Math.floor(170000 * 0.98), "the declaration the search had reached");
+    assert.equal(read.ceil, 170000, "and the bound the refusal put under it");
+    assert.equal(read.refusals, 1);
+    // The write is atomic: a temporary file beside the name, renamed over it, so
+    // a reader never sees half a state file.
+    assert.equal(existsSync(`${file}.${process.pid}.tmp`), false, "no temporary file is left behind");
+    assert.deepEqual(JSON.parse(limitStateJSON(brackets)).models["kept-free"].ceil, 170000);
+  } finally {
+    limitAdaptivity(new Map());
+    rmSync(file, { force: true });
+  }
+});
+
+test("a state file is read field by field, and none of it may become a bracket nobody measured", async () => {
+  const { limitAdaptivity, limitBracket, limitStateJSON, loadLimitState } = await subject;
+  const at = `${tmpdir()}/zen-limits-${process.pid}-${Date.now()}`;
+  const write = (name, body) => {
+    writeFileSync(`${at}-${name}.json`, body);
+    return `${at}-${name}.json`;
+  };
+  try {
+    // Round trip: the writer and the reader are one shape, so nothing the search
+    // needs is lost between them.
+    const map = new Map([
+      ["round-free", { floor: 120000, ceil: 140000, ceiling: 130000, step: 4096, refusals: 2, seen: 120000 }],
+    ]);
+    const parsed = JSON.parse(limitStateJSON(map));
+    assert.equal(parsed.version, 1);
+    assert.deepEqual(
+      { ...parsed.models["round-free"], raisedAt: 0, refusedAt: 0, seenAt: 0 },
+      { floor: 120000, ceil: 140000, ceiling: 130000, step: 4096, refusals: 2, seen: 120000, raisedAt: 0, refusedAt: 0, seenAt: 0 },
+    );
+    // A version this file does not write is not a state file: reading one as a
+    // bracket would be reading somebody else's fields as measurements.
+    assert.equal(await loadLimitState(write("version", JSON.stringify({ version: 99, models: { x: { ceiling: 5 } } }))), false);
+    // A record with nothing usable in it is dropped, and the file with only that
+    // record is read as no state rather than as a model with no window.
+    assert.equal(await loadLimitState(write("junk", JSON.stringify({ version: 1, models: { x: { ceiling: "big", floor: null } } }))), false);
+    assert.equal(await loadLimitState(write("broken", "{not json")), false);
+    assert.equal(await loadLimitState(write("empty", "")), false);
+    // And a file that really is one is read, with the junk fields of a record
+    // that also holds good ones defaulted rather than trusted.
+    const good = write(
+      "good",
+      JSON.stringify({
+        version: 1,
+        models: { "half-free": { floor: 90000, ceiling: 100000, step: -3, refusals: "many", ceil: 0 } },
+      }),
+    );
+    assert.equal(await loadLimitState(good), true);
+    const read = limitBracket("half-free");
+    assert.equal(read.floor, 90000);
+    assert.equal(read.ceiling, 100000);
+    assert.ok(read.step > 0, "a step that is not a size is re-seeded rather than read");
+    assert.equal(read.refusals, 0);
+    assert.equal(read.ceil, undefined, "a bound of zero is not a bound");
+  } finally {
+    limitAdaptivity(new Map());
+    for (const name of ["version", "junk", "broken", "empty", "good"]) rmSync(`${at}-${name}.json`, { force: true });
+  }
+});
+
+test("a report of a state file cannot itself become the state, and a state with no models in it is not written", async () => {
+  const { limitAdaptivity, limitStateJSON } = await subject;
+  // A map with nothing in it writes a file with nothing in it, which is read
+  // back as no state: writing one would be a file that says a bracket exists.
+  assert.equal(limitStateJSON(new Map()), JSON.stringify({ version: 1, models: {} }));
+  // Restoring a state hands back a copy: a caller that mutates what it was given
+  // is mutating its own record and not the one the plugin reads.
+  const held = limitAdaptivity(new Map([["copy-free", { floor: 10, ceiling: 20 }]]));
+  const first = limitAdaptivity();
+  first.get("copy-free").floor = 999;
+  assert.equal(limitAdaptivity().get("copy-free").floor, 10);
+  limitAdaptivity(new Map());
+  limitAdaptivity(held);
 });

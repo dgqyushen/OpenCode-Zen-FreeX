@@ -6,6 +6,14 @@ import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
 import { requestFor } from "./tools-smoke.mjs";
 
+// The limits this plugin learns live in a file in the operator's cache
+// directory, and a test run may not read or write it: every case below would
+// otherwise answer from whatever the last run of the suite happened to leave
+// behind, which is the one thing a suite may not depend on. An empty value is
+// the documented way to keep the state in memory, and the case that tests the
+// file itself names a path of its own.
+process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
+
 // The names the discovery reads are counted by. Zen's own list is also the
 // endpoint the fixture's `models` handler answers, so the three are named here
 // rather than written out at each assertion: what a test holds is the shape of
@@ -244,6 +252,13 @@ function lastCall(state) {
 }
 
 async function fixture(t, input = {}) {
+  // Every case gets the state its own traffic draws and no more. The adaptive
+  // limits are module state — a refusal one case provokes would otherwise move
+  // the declaration the next case's model list reports, and the suite would
+  // depend on the order its cases ran in.
+  const { limitAdaptivity } = await import("./limits.mjs");
+  const heldLimits = limitAdaptivity(new Map());
+  t.after(() => limitAdaptivity(heldLimits));
   const state = {
     calls: [],
     status: 200,
@@ -1782,4 +1797,133 @@ test("one turn end to end: discover, ask, be refused, be told what to update", a
   assert.deepEqual(names, [...declaredTools("chat").map((tool) => tool.function.name), "bash", "glob", "grep", "read"]);
   assert.equal(new Set(names).size, names.length, "no name goes out twice");
   assert.equal(sent.body.stream, true, "upstream streaming is forced even for a client that does not stream");
+});
+
+// The adaptive half of the limits reader, driven through the plugin rather than
+// through limits.mjs: a bracket is worth nothing unless the request path is what
+// fills it, and unless what it learns is what the next model list declares. The
+// case below is the whole loop — a served request, a refused one, and the model
+// list answering differently afterwards — with the sizes read from the request's
+// own text the way the plugin reads them.
+
+test("a served request and a refusal move what the model list declares", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  // A window small enough to fill with a test payload: 5000 tokens is about
+  // 23000 characters at the ratio the estimator uses.
+  state.ids = ["small-free"];
+  state.catalogRows = {
+    "small-free": { name: "Small Free", cost: { input: 0, output: 0 }, limit: { context: 5000, output: 1024 } },
+  };
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(models["small-free"].limit.context, 5000, "the catalogue's own window, to begin with");
+  const loader = await plugin.auth.loader(publicAuth);
+  const send = (text) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "small-free", stream: true, messages: [{ role: "user", content: text }] }),
+    });
+  // A served request is proof of a floor, and the host has not filled the
+  // declaration yet, so the next list still declares exactly what it declared.
+  const served = await send("a".repeat(10000)); // about 2146 tokens
+  await served.text();
+  // `refresh()` rather than `models()`: a list rebuilt inside the relist budget
+  // is the list the host was already given, and what this case is about is what
+  // a rebuilt list says.
+  const afterServe = await plugin.refresh();
+  assert.equal(afterServe["small-free"].limit.context, 5000, "a floor is not a reason to move a window");
+  // ...and then the route refuses one that is over the wall. What the list
+  // declares afterwards is the largest size the route is known to have served,
+  // which is the only number a refusal leaves standing.
+  state.status = 400;
+  state.body = JSON.stringify({
+    error: {
+      message:
+        "Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.",
+      type: "invalid_request_error",
+      code: "context_length_exceeded",
+    },
+  });
+  const refused = await send("a".repeat(23250)); // about 4989 tokens of text, plus the tools
+  assert.equal(refused.status, 400, "the refusal is the route's, and it is handed on");
+  await refused.text();
+  const afterRefusal = await plugin.refresh();
+  // The rule, not the number: the declaration comes back to the largest size
+  // the route is known to have served, and stays under the window it began with.
+  // The numbers themselves are not written into this case because the size of a
+  // request is read from the whole prompt — the tool descriptions this plugin
+  // fills in for a host that has none of them are part of what the route counts,
+  // and a case that pinned a total would be pinning fingerprint.json's wording
+  // as much as the reader.
+  const { limitBracket } = await import("./limits.mjs");
+  const bracket = limitBracket("small-free");
+  assert.ok(bracket.floor > 0, "the served request proved a floor");
+  assert.ok(bracket.floor < 5000, "and it is under the window the catalogue declared");
+  assert.equal(
+    afterRefusal["small-free"].limit.context,
+    bracket.floor,
+    "the declaration is back at the floor the route proved",
+  );
+  assert.ok(bracket.ceil >= bracket.floor, "and the refusal put a bound above the floor");
+  // The output axis is not the one that moved: a window refusal says nothing
+  // about the completion ceiling, and the catalogue's is left where it was.
+  assert.equal(afterRefusal["small-free"].limit.output, 1024);
+});
+
+test("a refusal that is not about the window leaves the window where it was", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  state.ids = ["faulted-free"];
+  state.catalogRows = {
+    "faulted-free": {
+      name: "Faulted Free",
+      cost: { input: 0, output: 0 },
+      limit: { context: 5000, output: 1024 },
+    },
+  };
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const send = (text) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "faulted-free", stream: true, messages: [{ role: "user", content: text }] }),
+    });
+  // A served request first, so the bracket has a floor and a refusal would have
+  // something to pull the declaration back down to. Without one this case could
+  // pass on a bracket that never moved because it never could.
+  const served = await send("a".repeat(10000));
+  await served.text();
+  const { limitBracket } = await import("./limits.mjs");
+  assert.ok(limitBracket("faulted-free").floor > 0, "the route served something to begin with");
+  // Three answers this route really sends and none of which is about length: the
+  // endpoint failing, a 400 that names nothing, and a 400 about the completion
+  // ceiling. On 2026-10-19 nemotron-3.5-super-vl-free answered the first to two
+  // asks and then served the identical requests, and space-bunny-free answered
+  // the second when it was asked for a ceiling of 1000000.
+  const faults = [
+    [500, ""],
+    [
+      400,
+      '{"error":{"type":"invalid_request_error","message":"Upstream request failed: [invalid_request_error] invalid request"}}',
+    ],
+    [
+      400,
+      'data: {"error":{"param":"max_tokens is too large: 1000000. This model supports at most 131072 completion tokens, whereas you provided 1000000.","type":"server_error","message":"Streaming response failed: [400] Param Incorrect"}}',
+    ],
+  ];
+  for (const [status, body] of faults) {
+    state.status = status;
+    state.body = body;
+    const refused = await send("a".repeat(23250)); // about 4989 tokens of text, plus the tools
+    assert.equal(refused.status, status, "the answer is the route's, and it is handed on");
+    await refused.text();
+  }
+  const bracket = limitBracket("faulted-free");
+  assert.equal(bracket.refusals, 0, "none of the three was a refusal about the window");
+  assert.equal(bracket.ceil, undefined, "so none of them put a bound under the declaration");
+  const after = await plugin.refresh();
+  assert.equal(after["faulted-free"].limit.context, 5000, "and the window is the one it began with");
+  // The completion ceiling the third answer named is still read, on its own axis.
+  // It is a refusal and it is worth knowing; it is just not about the window, and
+  // a declaration pulled down by it would be a window narrowed over a number that
+  // was never about the window at all.
+  assert.equal(after["faulted-free"].limit.output, 131072);
 });

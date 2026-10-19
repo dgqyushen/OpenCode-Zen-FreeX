@@ -1,3 +1,7 @@
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
 // Zen's catalogue is where a model's limits are declared from, and for some
 // free ids it under-reports them. A free id and its paid twin are the same
 // upstream model — x-opencode-upstream-model-id answers
@@ -20,7 +24,6 @@
 // what a user is shown as the model's size.
 //
 // Only evidence moves a value here, and evidence is sorted:
-//
 //   route       the route's own answer about its own limit: the words of a
 //               refusal, or what its own service demonstrates
 //   route-twin  what this route declares for the same upstream model
@@ -58,17 +61,19 @@ export const LIMITS = {
   // The catalogue remains the fallback if this entry is ever voided, and it is
   // the one window Zen itself states.
   //
-  // The output axis is untouched: it was measured from the paid twin, and the
-  // route now confirms the ceiling it enforces is above it — `max_tokens` over
-  // 393216 is refused with "Invalid max_tokens value, the valid range of
-  // max_tokens is [1, 393216]".
+  // The output axis is untouched, and the route is less forthcoming about it than
+  // it was: over 393216 it answered "Invalid max_tokens value, the valid range of
+  // max_tokens is [1, 393216]", which is the only sentence seen anywhere on this
+  // route that states a completion ceiling as a range, and asking for 1000000
+  // later the same day was answered 200 instead. 384000 stays what it was — a
+  // figure from the paid twin, which that sentence did not contradict.
   "deepseek-v4.1-flash-free": {
     context: {
       value: 326000,
       source: "route",
       declaredAt: 200000,
       measured: "2026-10-19",
-      samples: "326,702 tokens served (1,522,400 characters); 1,522,600 characters (about 326,745 tokens) refused 3/3 with context_length_exceeded, as was 1,522,800 and 1,050,000 tokens; 250,413 served from six different sessions. The same day, 254,196- and 279,095-token requests were refused while a 331,989-token one was served, so not every endpoint behind this id draws the wall in the same place.",
+      samples: "326,702 tokens served (1,522,400 characters); 1,522,600 characters (about 326,745 tokens) refused 3/3 with context_length_exceeded, as was 1,522,800 and 1,050,000 tokens; 250,413 served from six different sessions. The same day, 254,196- and 279,095-token requests were refused while a 331,989-token one was served, so not every endpoint behind this id draws the wall in the same place. A second sweep the same day served 1,000,000 characters (215,178 tokens) and refused 1,600,000 and 2,800,000, which places the wall in the same region without narrowing it.",
       how: "the route's own enforcement, found by bracketing because its refusal names no number; 326000 is the largest served sample (326,702) rounded down, with room for a host's count to differ from the route's, and not a figure the route ever stated. 326,750 was asked three times and refused three times, so the wall itself cannot be the declared budget. The 1048576 measured on 2026-10-15 is withdrawn: the route that stated it now refuses prompts a third that size.",
     },
     output: {
@@ -76,36 +81,44 @@ export const LIMITS = {
       source: "route-twin",
       declaredAt: 32000,
       measured: "2026-10-15",
-      samples: "one reply of 306,880 completion tokens, finish=stop; nothing above it observed",
+      samples: "one reply of 306,880 completion tokens, finish=stop; nothing above it observed. The `[1, 393216]` sentence below did not reproduce on a 2026-10-19 re-ask, which was answered 200, so nothing on this route confirms or contradicts 384000 today",
       how: "deepseek-v4.1-flash, the paid id serving the same upstream model, is declared 384000 in this same catalogue; DeepSeek's own page says 384K, which is 393216 read as binary K",
     },
   },
   "mimo-v2.6-flash-free": {
     context: {
-      value: 1048576,
+      value: 343000,
       source: "route",
       declaredAt: 200000,
-      measured: "2026-10-15",
-      samples: "an 850,249 token prompt served, its needle echoed back; a prompt just over the window refused 400",
-      how: "a different upstream from the DeepSeek ids, and it says so in its own words: \"This endpoint's maximum context length is 1048576 tokens. However, you requested about 1496523 tokens (1295079 of text input, 1444 of tool input, 200000 in the output).\"",
+      measured: "2026-10-19",
+      samples: "343,131 tokens served (1,600,000 characters, counted by the route); 1,900,000 characters (about 407,725 tokens) refused with context_length_exceeded, as were 2,200,000 and 2,800,000 characters. The window the route stated on 2026-10-15 — 1048576, in a refusal that named it — was not reached then either: an 850,249-token prompt was served that day and a prompt of about 1,496,523 tokens was refused.",
+      how: "the route's own enforcement, found by bracketing, and 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: a prompt of about 408,000 tokens is refused now, less than half of it, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 343,131 and about 407,725 tokens is not known — the sweep stopped at the first refusal — and the figure declared sits under both.",
     },
     output: {
       value: 131072,
       source: "vendor",
       declaredAt: 32000,
       measured: "2026-10-15",
-      samples: "nothing above 32000 watched on this route; that same refusal came back with the requested 200000 unclamped",
+      samples: "nothing above 32000 watched on this route; that same refusal came back with the requested 200000 unclamped, and a 2026-10-19 ask for max_tokens 1000000 was answered rather than refused, so this route states no completion ceiling for this id at all",
       how: "Xiaomi's own entry for mimo-v2.6-flash, api.xiaomimimo.com and its China token plan, declares 1048576/131072, as do DeepInfra and nan; this route declares 32000 for the free id and states no completion ceiling of its own",
     },
   },
   "big-pickle": {
+    context: {
+      value: 343000,
+      source: "route",
+      declaredAt: 200000,
+      measured: "2026-10-19",
+      samples: "343,131 tokens served (1,600,000 characters, counted by the route, and identical to mimo-v2.6-flash-free at every shared size); 1,900,000, 2,200,000 and 2,800,000 characters all refused with context_length_exceeded. The first ask at 1,600,000 characters answered 400 with no code field at all, and that same request was then served — one endpoint declining a prompt the next one took.",
+      how: "the route's own enforcement, found by bracketing; 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. This entry used to say the axis was left to the catalogue because the one attempt to measure it answered 200 with an empty body, which is not an answer: a 2026-10-19 sweep did measure it, and the catalogue's 200000 is a third of what the route serves.",
+    },
     output: {
       value: 131072,
       source: "route",
       declaredAt: 32000,
       measured: "2026-10-15",
-      samples: "the endpoint refused the request asking for 200000 and named its own ceiling; nothing watched above 32000",
-      how: "\"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.\" — an upstream that validates the requested ceiling and states its own. No context entry: this id is the same upstream model as mimo-v2.6-flash-free (x-opencode-upstream-model-id answers mimo-v2.6-flash) on a different endpoint, and two endpoints of one model are not one window — the attempt to measure this one answered 200 with an empty body, which is not an answer, so that axis stays with the catalogue.",
+      samples: "the endpoint refused the request asking for 200000 and named its own ceiling; nothing watched above 32000. Re-asked with max_tokens 1000000 on 2026-10-19 and named the same 131072, so the number holds",
+      how: "\"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.\" — an upstream that validates the requested ceiling and states its own. This id is the same upstream model as mimo-v2.6-flash-free (x-opencode-upstream-model-id answers mimo-v2.6-flash) on a different endpoint, which is why the two share their measurements above and are still measured apart.",
     },
   },
   "nemotron-3.5-lightning-free": {
@@ -144,12 +157,12 @@ export const LIMITS = {
   },
   "glm-5.3-flash-free": {
     context: {
-      value: 1000000,
-      source: "route-twin",
+      value: 311000,
+      source: "route",
       declaredAt: 200000,
-      measured: "2026-10-16",
-      samples: "a 232685-token prompt was served and answered from (usage.prompt_tokens 232685), so the declared 200000 is already known to be small; nothing above it was refused, because this upstream refuses no max_tokens at all",
-      how: "glm-5.3-flash, the paid id serving the same upstream model — the catalogue's own canonical_model_id for this free id is zhipuai/glm-5.3-flash — is declared 1000000 in this same catalogue",
+      measured: "2026-10-19",
+      samples: "311,109 tokens served (1,450,000 characters, counted by the route) and 279,086 before it (1,300,000 characters), both answered from; 1,600,000 characters (about 343,348 tokens) refused with context_length_exceeded, as was 2,800,000 characters. The 232,685-token prompt served on 2026-10-16 still fits inside what is declared here.",
+      how: "the route's own enforcement, found by bracketing, and 311,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: a prompt of about 343,000 tokens is refused, so the paid id's window is not one this endpoint serves. The wall's exact position between 311,109 and about 343,348 tokens is not known — the sweep stopped at the first refusal.",
     },
     output: {
       value: 131072,
@@ -210,6 +223,17 @@ const NAMED_OUTPUT = [
   // "/max_tokens: 1000000 is not less or equal to 262144" — LongCat's wording for
   // the same fact, where the ceiling is the number it has to stay under.
   /max_tokens:?\s*\d+\s+is not less or equal to\s+(\d+)/id,
+  // "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]" —
+  // the DeepSeek upstream's wording, and the only sentence seen on this route
+  // that states a completion ceiling as a range. The upper end is the ceiling:
+  // the number the route says it accepts up to, which is what a declaration of
+  // this axis has to stay inside. It is not a sentence to rely on: measured
+  // 2026-10-19, and asking for 1000000 later the same day was answered 200 rather
+  // than refused, so the route states this ceiling on some endpoints and not
+  // others. The pattern stays because reading it costs nothing when it does not
+  // appear, and a ceiling the route does state is the one number on this axis
+  // that does not have to be guessed at.
+  /valid range of max_tokens is \[\s*\d+\s*,\s*(\d+)\s*\]/id,
 ];
 
 // Names a refusal made while this process is running, by model id. Not
@@ -242,6 +266,540 @@ export function limitObservations(restore) {
   return previous;
 }
 
+// ---- the wall the route enforces, learned from the traffic it serves -------
+//
+// Everything above this line is a measurement somebody took by hand and wrote
+// down. That does not scale: the wall this route enforces moved under one id on
+// 2026-10-19, and the only reason it was noticed is that a conversation filled
+// the window and every request after it was refused. The same wall sits in front
+// of every offered model, it is not the number the catalogue publishes, and it
+// moves without notice.
+//
+// So each model gets a bracket, kept while the plugin runs and carried across
+// restarts in one small file, and the bracket is moved only by what the route
+// itself answers:
+//
+//   floor   the largest request the route is known to have SERVED, read from the
+//           characters of the request that was sent through one estimate, in the
+//           same units as `ceil` below: a bracket whose ends were read through
+//           different estimates would be two numbers about two scales.
+//   ceil    the smallest request the route is known to have REFUSED, in those
+//           same units. It is the bound the declaration may not cross, which is
+//           what stops a search from asking for a size already turned down.
+//   ceiling what this file declares to the host, and the one number a host acts
+//           on: it compacts a conversation at it and decides what is worth
+//           sending at all.
+//   step    how far above the proven floor the declaration is willing to go. It
+//           doubles every time the host is seen to have filled the declaration,
+//           and halves on every refusal, which is the whole of the search: each
+//           refusal narrows the bracket, and the overshoot that caused it is
+//           half the size of the one before.
+//
+// Nothing here sends a request of its own. Every observation is a request the
+// host was already making, which is why this can be on by default: the cost of a
+// wrong guess is one refused turn, and the step halving is what makes those
+// refusals both rarer and smaller. A model nothing is asked of is never probed
+// at all, and its declaration is exactly what the table and the catalogue said.
+//
+// The host sees a learned ceiling at its next list rebuild — the start, an hour
+// later, or a `refresh()` — which is also what keeps this from being a loop: the
+// bracket moves on the traffic the host sends against the declaration it was
+// given, not on the declaration it is being given now.
+//
+// One estimate, used at both ends of the bracket, because a floor and a ceiling
+// read through different estimates are two numbers about different scales and
+// the search between them would be searching a scale nobody declared in. What
+// keeps this honest is the structure around it — the step halving on every
+// refusal, the bound a refusal puts under the declaration, and the refusal
+// budget that ends the search — and not the precision of a character count.
+//
+// It is deliberately script-aware: a window declared from a Latin ratio alone
+// would come out at a third of the real one for a wall of Chinese text, which is
+// the silent under-declaration this file exists to remove.
+const CJK = /[\u2e80-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+const SCAN_LIMIT = 32 * 1024 * 1024;
+const CJK_TOKENS_PER_CHAR = 0.7;
+const LATIN_CHARS_PER_TOKEN = 4.66;
+
+// The tokens a request's own text holds. An estimate, and used as one: the route
+// counts tokens with a tokenizer this plugin does not have, so every size below
+// is read from characters through the route's own calibration for Latin filler
+// (4.66 characters per token, measured on 2026-10-19) with CJK counted at about
+// 0.7 of a token per character.
+export function estimateTokens(text) {
+  const { cjk, other } = scriptCount(text);
+  return Math.round(cjk * CJK_TOKENS_PER_CHAR + other / LATIN_CHARS_PER_TOKEN);
+}
+
+function scriptCount(text) {
+  if (typeof text !== "string" || text === "") return { cjk: 0, other: 0 };
+  const scan = text.length > SCAN_LIMIT ? text.slice(0, SCAN_LIMIT) : text;
+  // A string with no CJK at all — nearly every request to this route — is
+  // answered without walking it, which is what keeps this cheap on a prompt of
+  // several megabytes. `test` bails at the first match, so the walk below only
+  // happens for text that really holds one.
+  if (!CJK.test(scan)) return { cjk: 0, other: scan.length };
+  let cjk = 0;
+  for (let at = 0; at < scan.length; at += 1) {
+    const code = scan.charCodeAt(at);
+    if (code >= 0x2e80 && code <= 0xd7ff) cjk += 1;
+  }
+  return { cjk, other: scan.length - cjk };
+}
+
+// Every character of a request body this file can see, as one string, so that a
+// caller with a parsed body does not have to know which protocol wrote it. Only
+// strings are counted; a number, a flag or a nested object contributes nothing,
+// which makes this a floor on the request's real size — the one direction that
+// cannot turn a small request into a large claim. Exported for the provider,
+// which has the body in hand before it sends anything.
+export function requestText(body, budget = 4096) {
+  const parts = [];
+  let seen = 0;
+  const walk = (value, depth) => {
+    if (seen > budget || depth > 12) return;
+    if (typeof value === "string") {
+      parts.push(value);
+      seen += 1;
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+    if (value && typeof value === "object")
+      for (const item of Object.values(value)) walk(item, depth + 1);
+  };
+  walk(body, 0);
+  return parts.join("");
+}
+
+// The size of one request, as the observers below take it.
+export function requestSize(body) {
+  return { tokens: estimateTokens(requestText(body)) };
+}
+
+// The brackets, by model id, as this process has them. A Map like the two
+// observation maps above, for the same reason: what a route answered about one
+// model is that model's, and a caller has to be able to read and replace the
+// whole of the state — a test above all, whose assertions would otherwise depend
+// on the order requests happened to be made in.
+const BRACKETS = new Map();
+
+// The state as a caller can hold it, and a way to put it back, in the shape
+// `limitObservations` uses. Called with nothing it answers with a copy of the
+// records as they stand; called with a Map it makes that map the state and
+// answers with what it replaced. The records are copied rather than shared, so a
+// caller that puts one back cannot be surprised by the observer that ran in
+// between: a record is the one mutable thing in this file.
+export function limitAdaptivity(restore) {
+  const previous = new Map();
+  for (const [id, record] of BRACKETS) previous.set(id, { ...record });
+  if (restore !== undefined) {
+    BRACKETS.clear();
+    for (const [id, record] of restore ?? [])
+      if (isUsableId(id) && record && typeof record === "object") BRACKETS.set(id, { ...record });
+  }
+  return previous;
+}
+
+// One record, copied, or undefined when this model has never been observed.
+// Copied for the same reason `limitAdaptivity` copies: the caller reads a
+// bracket, and a bracket it can mutate is a bracket the next request reads back.
+export function limitBracket(id, brackets = BRACKETS) {
+  const record = brackets && typeof brackets.get === "function" ? brackets.get(id) : undefined;
+  return record && typeof record === "object" ? { ...record } : undefined;
+}
+
+// What this file declares for a model because the route taught it something.
+// A record answers with the ceiling it holds — the observers are the only thing
+// that moves one, so reading a bracket never raises a declaration the search did
+// not decide on: a refusal that put the ceiling back at the floor would be undone
+// by the next model list otherwise, which is how a search turns into a loop. A
+// record with no ceiling yet derives one from its seed. A model with no record
+// answers with nothing, and keeps every tier above this one.
+function adoptedCeiling(id, seeded, brackets) {
+  const record = brackets && typeof brackets.get === "function" ? brackets.get(id) : undefined;
+  if (!record || typeof record !== "object") return undefined;
+  if (!usable(record.ceiling)) record.ceiling = derivedCeiling(record, seeded);
+  return record.ceiling;
+}
+
+// The declaration a record comes to, from what the route proved and what the
+// caller would have said anyway. The upper bound is the whole point of `ceil`: a
+// refusal puts a size under it, and this stops the search from ever declaring
+// one the route has already turned down. A record whose own numbers are not
+// usable — a state file somebody edited, a version that wrote another shape —
+// falls back to the seed rather than to a guess.
+function derivedCeiling(record, seeded) {
+  const seed =
+    Number.isSafeInteger(seeded) && seeded > 0
+      ? seeded
+      : Number.isSafeInteger(record?.seededFrom) && record.seededFrom > 0
+        ? record.seededFrom
+        : undefined;
+  const cap = Math.max(seed ?? 0, maxWindow());
+  const floor = usable(record?.floor) ? record.floor : 0;
+  const step = usable(record?.step) ? record.step : seedStep(seed);
+  const ceil = usable(record?.ceil) ? record.ceil : undefined;
+  // A record with neither a seed nor anything the route proved has nothing to
+  // declare: answering `cap` would invent a window out of a constant.
+  if (seed === undefined && floor === 0) return undefined;
+  const base = Math.max(floor + step, seed ?? 0, usable(record?.ceiling) ? record.ceiling : 0);
+  // The bound a refusal puts under the declaration. A window the route named is
+  // its own number and may be declared as it stands; one this file estimated is
+  // a character count, so it is stepped under rather than sat on — declaring the
+  // exact size that was just refused is how a search turns into a loop.
+  const bound =
+    ceil === undefined
+      ? cap
+      : record?.exact === true
+        ? Math.min(ceil, cap)
+        : Math.min(Math.floor(ceil * (1 - REFUSAL_MARGIN)), cap);
+  return Math.max(1, Math.min(base, Math.max(bound, 1)));
+}
+
+const usable = (value) => Number.isSafeInteger(value) && value > 0;
+
+function maxWindow(env = globalThis.process?.env) {
+  const named = Number.parseInt(env?.[MAX_WINDOW_ENV] ?? "", 10);
+  return Number.isSafeInteger(named) && named > 0 ? named : DEFAULT_MAX_WINDOW;
+}
+
+function seedStep(seeded) {
+  const base = usable(seeded) ? seeded : DEFAULT_MAX_WINDOW;
+  return Math.max(MIN_STEP, Math.floor(base * STEP_SEED_RATIO));
+}
+
+function stepMax(seeded) {
+  const base = usable(seeded) ? seeded : DEFAULT_MAX_WINDOW;
+  return Math.max(MIN_STEP * 4, Math.floor(base * STEP_MAX_RATIO));
+}
+
+// Whether a raise is allowed at all right now. A probe costs a turn when it
+// overshoots, so they are spaced: one per model per cooldown, whichever way the
+// last one went. A model the host is working in does not need a window found to
+// the token, and one it is not working in is not probed at all — a raise needs
+// the host to have filled the declaration, which is the only demand signal there
+// is.
+function raisesAllowed(record, now) {
+  const last = Number.isFinite(record?.raisedAt) ? record.raisedAt : 0;
+  return now - last >= raiseCooldown();
+}
+
+function raiseCooldown(env = globalThis.process?.env) {
+  const named = Number.parseInt(env?.[RAISE_COOLDOWN_ENV] ?? "", 10);
+  return Number.isSafeInteger(named) && named >= 0 ? named : RAISE_COOLDOWN_MS;
+}
+
+function recordFor(brackets, id, seeded, now) {
+  const held = brackets.get(id);
+  if (held && typeof held === "object") return held;
+  const record = {
+    floor: 0,
+    ceil: undefined,
+    exact: false,
+    ceiling: usable(seeded) ? seeded : undefined,
+    step: seedStep(seeded),
+    refusals: 0,
+    seen: 0,
+    seededFrom: usable(seeded) ? seeded : undefined,
+    raisedAt: 0,
+    refusedAt: 0,
+    seenAt: now,
+  };
+  brackets.set(id, record);
+  return record;
+}
+
+// A request the route served. Its size is a fact about the floor and nothing
+// else: a 200 says the prompt fitted, not that the window is exactly this large.
+// The raise is the interesting half — the host filling the declaration is the
+// only evidence there is that it wants more room, and without it a bracket would
+// freeze at whatever the table said.
+export function observeServedRequest(id, size, seeded, brackets = BRACKETS, now = Date.now()) {
+  if (!isUsableId(id) || !brackets || typeof brackets.set !== "function") return undefined;
+  const floor = usable(size?.tokens) ? size.tokens : 0;
+  if (floor === 0) return undefined;
+  const record = recordFor(brackets, id, seeded, now);
+  if (floor > record.floor) record.floor = floor;
+  if (floor > record.seen) record.seen = floor;
+  record.seenAt = now;
+  // A size the route served at or above one it turned down voids that refusal.
+  // Refusing and then serving the identical request is something this route does:
+  // on 2026-10-19 big-pickle answered a 1,600,000-character prompt with a 400
+  // that named no code and then served the same request, counting 343,131 tokens,
+  // and nemotron-3.5-super-vl-free answered two asks with a 500 before serving
+  // all three sizes. A bound drawn by an endpoint that was about to fail is not
+  // the wall's, and left in place it is permanent — `ceil` only ever comes down,
+  // so the declaration could never climb back over a size the route had in fact
+  // served. The refusal it cost is given back with it, because the budget in
+  // MAX_REFUSALS is for refusals this file still believes.
+  //
+  // A window the route named in its own words is left alone: that is the route
+  // stating a limit, not one endpoint misbehaving, and the same sweep found every
+  // named number it re-asked hold still.
+  if (!record.exact && usable(record.ceil) && floor >= record.ceil) {
+    const was = record.ceil;
+    record.ceil = undefined;
+    // Counted after the give-back, the way `observeRefusedRequest` counts after
+    // the increment: the line says how many refusals this model has cost, and a
+    // number that includes the one being handed back would say one more than
+    // stands.
+    if (record.refusals > 0) record.refusals -= 1;
+    note({ kind: "wall-unrefused", id, value: was, served: floor, refusals: record.refusals });
+  }
+  const ceiling = usable(record.ceiling) ? record.ceiling : seeded;
+  if (
+    record.refusals < MAX_REFUSALS &&
+    usable(ceiling) &&
+    record.seen >= ceiling * RAISE_AT &&
+    raisesAllowed(record, now)
+  ) {
+    const was = ceiling;
+    record.step = Math.min(Math.max(record.step * 2, record.step + MIN_STEP), stepMax(seeded));
+    record.raisedAt = now;
+    record.ceiling = derivedCeiling(record, seeded);
+    if (record.ceiling !== was)
+      note({
+        kind: "wall-raised",
+        id,
+        value: record.ceiling,
+        was,
+        floor: record.seen,
+        step: record.step,
+      });
+  }
+  scheduleSave();
+  return { ...record };
+}
+
+// A request the route refused. The refusal is the upper bound, and the
+// declaration goes back to what the route is known to have served: the size it
+// just turned down is not a size to declare again, and a step that overshot is
+// halved before the next one. A refusal that named a window states the wall
+// itself, which is better than any bracket and replaces it.
+export function observeRefusedRequest(
+  id,
+  size,
+  seeded,
+  brackets = BRACKETS,
+  now = Date.now(),
+  named,
+) {
+  if (!isUsableId(id) || !brackets || typeof brackets.set !== "function") return undefined;
+  const ceil = usable(size?.tokens) ? size.tokens : 0;
+  if (ceil === 0 && !usable(named)) return undefined;
+  const record = recordFor(brackets, id, seeded, now);
+  record.refusals += 1;
+  record.refusedAt = now;
+  record.raisedAt = now;
+  record.step = Math.max(Math.floor(record.step / 2), MIN_STEP);
+  if (ceil > 0 && (record.ceil === undefined || ceil < record.ceil)) record.ceil = ceil;
+  if (usable(named)) {
+    // The route named the window in its own words: an exact number outranks
+    // everything here, including the floor, and it is also the refusal bound.
+    record.ceiling = named;
+    record.ceil = Math.min(record.ceil ?? named, named);
+    record.exact = true;
+    record.seededFrom = usable(seeded) ? seeded : record.seededFrom;
+  } else {
+    // Back to the largest size the route is known to have served. A refusal is
+    // evidence that what was declared is too big, and the floor is the only
+    // number that is evidence of the opposite; the next raise, a halved step
+    // above it and not before the cooldown, is what climbs back. A model with no
+    // served request yet has no floor, and its declaration is derived from the
+    // bound the refusal just put under it.
+    const derived = derivedCeiling(record, seeded);
+    record.ceiling =
+      record.floor > 0 && usable(derived) ? Math.min(record.floor, derived) : derived;
+  }
+  note({
+    kind: "wall-refused",
+    id,
+    value: record.ceiling,
+    refused: ceil,
+    named: usable(named) ? named : undefined,
+    refusals: record.refusals,
+  });
+  scheduleSave();
+  return { ...record };
+}
+
+const isUsableId = (id) => typeof id === "string" && id !== "";
+
+// ---- what survives a restart ----------------------------------------------
+//
+// A bracket that is forgotten on every restart is a bracket that is re-learned
+// by being refused again, which is the cost this whole section exists to avoid.
+// So the state is one small JSON file: no directory walking, no per-model files,
+// nothing that has to be cleaned up by hand. It is written atomically — a
+// temporary file beside it and a rename over it — because a half-written state
+// file is worse than none: it would be read as a bracket somebody measured.
+//
+// Nothing here may fail a request. A file that cannot be written is a bracket
+// that is not remembered; a file that cannot be read is a model with no history.
+// Both are silent by design, and both are visible when the diagnostics sink is
+// installed.
+export const LIMITS_STATE_ENV = "OPENCODE_ZEN_FREE_LIMITS_STATE";
+export const MAX_WINDOW_ENV = "OPENCODE_ZEN_FREE_MAX_WINDOW";
+export const RAISE_COOLDOWN_ENV = "OPENCODE_ZEN_FREE_LIMITS_COOLDOWN_MS";
+const DEFAULT_MAX_WINDOW = 1_048_576;
+const RAISE_AT = 0.9;
+const RAISE_COOLDOWN_MS = 15 * 60 * 1000;
+const MIN_STEP = 1024;
+const STEP_SEED_RATIO = 0.05;
+const STEP_MAX_RATIO = 0.25;
+// How many refusals one model may cost before the search stops. Every raise is
+// a size the route has not been asked for yet, so an overshoot is a refused turn
+// the user pays for; four of them, each half the size of the last, bracket the
+// wall to a fraction of a per cent and then the declaration stops moving. A
+// budget rather than a rule about precision, because what it bounds is the cost
+// to somebody's conversation and not the quality of the bracket.
+const MAX_REFUSALS = 4;
+const REFUSAL_MARGIN = 0.02;
+const STATE_VERSION = 1;
+const STATE_ENTRIES = 500;
+const STATE_LIMIT = 256 * 1024;
+const SAVE_DEBOUNCE_MS = 5000;
+
+// Where the state is kept: whatever the environment names, an empty string
+// meaning "keep it in memory only", and otherwise one file in the cache
+// directory this platform uses. `homedir` is the one of these that exists
+// everywhere, so it is the last fallback rather than the first.
+export function limitStatePath(explicit, env = globalThis.process?.env) {
+  if (explicit !== undefined) return explicit;
+  const named = env?.[LIMITS_STATE_ENV];
+  if (typeof named === "string") return named;
+  const home = homedir();
+  const base = env?.LOCALAPPDATA || env?.XDG_CACHE_HOME || (home ? join(home, ".cache") : "");
+  return base ? join(base, "opencode-zen-freex", "limits.json") : "";
+}
+
+let stateLoads = new Map();
+let saveTimer = null;
+
+// Read the state, once per file. Answers whether anything was read; a missing
+// file, an unreadable one and one holding another shape all answer the same way,
+// because they all mean the same thing: this process starts with what the table
+// says. Keyed by the file rather than remembered once, so a caller that names a
+// path of its own — a test, or a host keeping its state somewhere else — is not
+// answered with the result of somebody else's read.
+export async function loadLimitState(file = limitStatePath()) {
+  if (!file) return false;
+  const held = stateLoads.get(file);
+  if (held) return held;
+  const load = (async () => {
+    try {
+      const text = await readFile(file, { encoding: "utf8" });
+      if (typeof text !== "string" || text.length > STATE_LIMIT) return false;
+      const parsed = JSON.parse(text);
+      const models = parsed?.models;
+      if (!models || typeof models !== "object" || parsed?.version !== STATE_VERSION) return false;
+      let read = 0;
+      for (const id of Object.keys(models).slice(0, STATE_ENTRIES)) {
+        if (!isUsableId(id) || read >= STATE_ENTRIES) continue;
+        const record = readRecord(models[id]);
+        if (!record) continue;
+        if (!BRACKETS.has(id)) BRACKETS.set(id, record);
+        read += 1;
+      }
+      return read > 0;
+    } catch {
+      return false;
+    }
+  })();
+  stateLoads.set(file, load);
+  return load;
+}
+
+// A record as it can be trusted: own values, integers of the right sign, and
+// nothing else carried in. A state file is a file, and one that has been edited
+// by hand, truncated by a full disk or written by another version is not
+// evidence about a model until every field has been checked.
+function readRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const floor = usable(raw.floor) ? raw.floor : 0;
+  const ceiling = usable(raw.ceiling) ? raw.ceiling : undefined;
+  if (!floor && ceiling === undefined) return undefined;
+  const record = { floor, ceiling };
+  record.ceil = usable(raw.ceil) ? raw.ceil : undefined;
+  record.exact = raw.exact === true;
+  record.step = usable(raw.step) ? raw.step : seedStep(ceiling);
+  record.refusals = Number.isSafeInteger(raw.refusals) && raw.refusals >= 0 ? raw.refusals : 0;
+  record.seen = usable(raw.seen) ? raw.seen : 0;
+  record.seededFrom = usable(raw.seededFrom) ? raw.seededFrom : ceiling;
+  record.raisedAt = Number.isFinite(raw.raisedAt) ? raw.raisedAt : 0;
+  record.refusedAt = Number.isFinite(raw.refusedAt) ? raw.refusedAt : 0;
+  record.seenAt = Number.isFinite(raw.seenAt) ? raw.seenAt : 0;
+  return record;
+}
+
+// Write the state, at most once per debounce window: a bracket moves on a
+// request, and a request is not a reason to write a file. The write is
+// deliberately not awaited by anyone — a request that has already been answered
+// must not wait for a disk — and a failure is dropped rather than raised.
+function scheduleSave() {
+  if (saveTimer) return;
+  const wait = saveDebounce();
+  if (wait === 0) {
+    void saveLimitState();
+    return;
+  }
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    void saveLimitState();
+  }, wait);
+  saveTimer?.unref?.();
+}
+
+function saveDebounce(env = globalThis.process?.env) {
+  const named = Number.parseInt(env?.[`${LIMITS_STATE_ENV}_DEBOUNCE_MS`] ?? "", 10);
+  return Number.isSafeInteger(named) && named >= 0 ? named : SAVE_DEBOUNCE_MS;
+}
+
+// The file this process would write, as JSON. Exported so a test can hold the
+// bytes rather than the file, and so a caller that writes its own state has one
+// shape to write.
+export function limitStateJSON(brackets = BRACKETS) {
+  const models = {};
+  let written = 0;
+  for (const [id, record] of brackets) {
+    if (!isUsableId(id) || written >= STATE_ENTRIES) continue;
+    const row = {
+      floor: usable(record.floor) ? record.floor : 0,
+      ceiling: usable(record.ceiling) ? record.ceiling : undefined,
+      step: usable(record.step) ? record.step : undefined,
+      refusals: Number.isSafeInteger(record.refusals) ? record.refusals : 0,
+      seen: usable(record.seen) ? record.seen : 0,
+      seededFrom: usable(record.seededFrom) ? record.seededFrom : undefined,
+      raisedAt: Number.isFinite(record.raisedAt) ? record.raisedAt : 0,
+      refusedAt: Number.isFinite(record.refusedAt) ? record.refusedAt : 0,
+      seenAt: Number.isFinite(record.seenAt) ? record.seenAt : 0,
+    };
+    if (usable(record.ceil)) row.ceil = record.ceil;
+    if (record.exact === true) row.exact = true;
+    models[id] = row;
+    written += 1;
+  }
+  return JSON.stringify({ version: STATE_VERSION, models });
+}
+
+export async function saveLimitState(file = limitStatePath(), brackets = BRACKETS) {
+  if (!file || brackets.size === 0) return false;
+  try {
+    const text = limitStateJSON(brackets);
+    if (text.length > STATE_LIMIT) return false;
+    await mkdir(dirname(file), { recursive: true });
+    const temporary = `${file}.${process.pid}.tmp`;
+    await writeFile(temporary, text, { encoding: "utf8" });
+    await rename(temporary, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Two decisions this file makes leave no trace of themselves: a live value
 // taken from a refusal is applied past the staleness guard and past the
 // raise-only rule, and an entry the catalogue has moved past is void in a way
@@ -271,9 +829,15 @@ function note(entry) {
   }
 }
 
-function describe({ kind, id, axis, value, measuredAgainst, declared }) {
+function describe({ kind, id, axis, value, measuredAgainst, declared, was, floor, step, refused, named, served, refusals }) {
   if (kind === "route-statement")
     return `${id} ${axis}=${value} — named by a refusal this process saw, so it is applied as it stands (the catalogue declares ${declared === undefined ? "nothing for this axis" : declared})`;
+  if (kind === "wall-raised")
+    return `${id} context=${value} — up from ${was}: the host filled ${floor} of it and the route served that, so the declaration is probing ${step} further`;
+  if (kind === "wall-refused")
+    return `${id} context=${value} — back under the wall: the route refused a request of about ${refused} tokens${named === undefined ? "" : ` and named a window of ${named}`}, ${refusals} refused so far`;
+  if (kind === "wall-unrefused")
+    return `${id} context — the refusal of about ${value} tokens is dropped: the route went on to serve ${served}, which that bound had ruled out, and the refusal it cost is given back (${refusals} refused so far)`;
   return `${id} ${axis}=${value} was measured against a catalogue that declared ${measuredAgainst}, and this one declares ${declared === undefined ? "nothing for this axis" : declared}: not applied`;
 }
 
@@ -515,6 +1079,51 @@ export function namedAxes(text, limit, cut) {
   };
 }
 
+// Which axis a refusal is about, or none at all. This route answers a 400 with a
+// body for everything it does not like, and only some of those say anything
+// about a size: a rate limit, a gateway fault, and a 400 about a parameter this
+// route did not accept all arrive the same way. Feeding one of those to the
+// bracket lowers a declaration over a fault that had nothing to do with length,
+// and it spends part of a refusal budget that is four refusals deep.
+//
+// So the axis is read from what the refusal says. A number it names decides it
+// first, because a numbered sentence is the route stating a limit and cannot be
+// anything else. A refusal that names no number is read from its own words, and
+// the unnamed too-long refusal this route sends most often is in those words:
+// `context_length_exceeded`, and a sentence about the maximum context length the
+// request went past. A refusal about `max_tokens` is the other axis, and one
+// that says neither — `invalid request`, an empty body, a 500 — is about no axis
+// and moves nothing.
+//
+// Only 400 and 413 can be about size. A 5xx is the endpoint failing rather than
+// the request being long, which is not a distinction to guess at: on 2026-10-19
+// nemotron-3.5-super-vl-free answered 500 to two asks and then served the
+// identical requests, and a 500 read as a refusal would have declared that model
+// a third smaller than it is. A 401 or a 429 says nothing about the request that
+// was sent at all.
+const SIZE_STATUS = new Set([400, 413]);
+const CONTEXT_TALK = [
+  /context length/i,
+  /context_length_exceeded/i,
+  /token count exceeds/i,
+  /reduce the length of the messages/i,
+  /prompt is too long/i,
+  /messages are too long/i,
+  /exceeds the maximum/i,
+];
+const OUTPUT_TALK = [/max_tokens/i, /completion tokens/i];
+
+export function refusalAxis(status, text, axes = {}) {
+  const named = axes && typeof axes === "object" ? axes : {};
+  if (usable(named.context)) return "context";
+  if (usable(named.output)) return "output";
+  if (!SIZE_STATUS.has(status)) return undefined;
+  const said = typeof text === "string" ? text : "";
+  if (CONTEXT_TALK.some((pattern) => pattern.test(said))) return "context";
+  if (OUTPUT_TALK.some((pattern) => pattern.test(said))) return "output";
+  return undefined;
+}
+
 const ROUTE_TIERS = new Set(["route", "route-twin"]);
 
 // What this plugin declares for a model instead of what the catalogue says, as
@@ -527,6 +1136,7 @@ export function limitOverrides(
   table = LIMITS,
   observed = OBSERVED,
   observedOutput = OBSERVED_OUTPUT,
+  brackets = BRACKETS,
 ) {
   const overrides = {};
   // A record has to be this table's own. `table[id]` otherwise answers out of
@@ -559,9 +1169,21 @@ export function limitOverrides(
     // has to have been measured against the catalogue in front of us now: the
     // value it was measured against has to exist and still be the declaration,
     // and one that names no such value was measured against nothing.
+    //
+    // The bracket the route taught this process comes before the table, not
+    // after it: a record exists only because a request was served or refused,
+    // which makes it evidence about the wall as it is enforced now, while the
+    // table is a measurement of the same axis taken earlier. A record is seeded
+    // from the table's own number when it is created, so the table still has the
+    // first word — it just does not have the last one. A model nothing has been
+    // asked of has no record, and its axes are the table's and nothing else.
+    const seeded = seededFor(entry, declaredValue);
+    const adopted = axis === "context" ? adoptedCeiling(id, seeded, brackets) : undefined;
     let value;
     if (live !== undefined) {
       value = live;
+    } else if (adopted !== undefined) {
+      value = adopted;
     } else if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) {
       value = entry.value;
     } else if (entry) {
@@ -584,6 +1206,7 @@ export function limitOverrides(
     // refusal is the route itself and is taken as it stands, entry or no entry.
     if (
       live === undefined &&
+      adopted === undefined &&
       entry &&
       !ROUTE_TIERS.has(entry.source) &&
       Number.isSafeInteger(declaredValue) &&
@@ -597,4 +1220,14 @@ export function limitOverrides(
     if (live !== undefined) note({ kind: "route-statement", id, axis, value, declared: declaredValue });
   }
   return overrides;
+}
+
+// What the caller would have declared for this axis with no bracket in play: the
+// shipped entry when it still applies, and the catalogue's own number when it
+// does not. It is the seed a record is created from, and the value a search that
+// has not moved yet derives from — never a second opinion about a record that
+// already has one.
+function seededFor(entry, declaredValue) {
+  if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) return entry.value;
+  return declaredValue;
 }
