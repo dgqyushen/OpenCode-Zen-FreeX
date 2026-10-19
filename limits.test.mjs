@@ -1776,6 +1776,58 @@ test("the search stops after its refusal budget, and a window the route names re
   assert.equal(named.exact, true);
 });
 
+test("a raise is paid for by demand the host has shown since the last one", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const seeded = 326000;
+  const wall = 330000;
+  const brackets = new Map();
+  // The host's real demand is 326000 tokens and the route refuses at 330000. A
+  // raise used to be granted whenever the largest request carried was above 90% of
+  // the declaration, and the declaration was what the previous raise had just
+  // moved: the same unanswered 326000 therefore paid for two raises in a row, to
+  // 358600 and then 391200. The host built to 391200, was refused, and did that
+  // again until all four refusals were gone — leaving the declaration at 326000 for
+  // good, 4000 tokens under a wall the route had already shown.
+  let now = 0;
+  let firstRaise;
+  for (let round = 0; round < 10; round += 1) {
+    now += 900001;
+    observeServedRequest("demand-free", { tokens: 326000 }, seeded, brackets, now);
+    const held = limitBracket("demand-free", brackets);
+    if (round === 0) {
+      // The host filling the declaration is real demand, so the first raise is
+      // granted: that is the whole point of the search.
+      firstRaise = held.ceiling;
+      assert.ok(firstRaise > 326000, `filling the declaration buys one raise, got ${firstRaise}`);
+    } else {
+      // But the same unanswered request cannot pay for a second one. This is the
+      // difference the defect made: two raises in a row off one 326000 request, to
+      // 358600 and then 391200.
+      assert.equal(
+        held.ceiling,
+        firstRaise,
+        `round ${round + 1}: an unchanged request does not buy another raise, got ${held.ceiling}`,
+      );
+    }
+  }
+  const quiet = limitBracket("demand-free", brackets);
+  assert.equal(quiet.refusals, 0, "and no refusal was spent speculating");
+
+  // Demand that really grows still climbs: this is the half the rule must not cost.
+  const climbing = new Map();
+  let demand = 190000;
+  let at = 0;
+  for (let round = 0; round < 4; round += 1) {
+    at += 900001;
+    observeServedRequest("growing-free", { tokens: demand }, 200000, climbing, at);
+    demand += 20000;
+  }
+  assert.ok(
+    limitBracket("growing-free", climbing).ceiling > 200000,
+    `a growing conversation still lifts the declaration, got ${limitBracket("growing-free", climbing).ceiling}`,
+  );
+});
+
 test("what the route taught outranks the table for its axis, and a model nothing was asked of keeps the table", async () => {
   const { observeServedRequest, observeRefusedRequest, limitOverrides } = await subject;
   const brackets = new Map();
@@ -1874,6 +1926,7 @@ test("a state file is read field by field, and none of it may become a bracket n
         step: 4096,
         scale: ESTIMATE_SCALE,
         refusals: 2,
+        raisedAtSeen: 0,
         seen: 120000,
         raisedAt: 0,
         refusedAt: 0,

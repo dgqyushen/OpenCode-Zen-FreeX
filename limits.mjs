@@ -608,6 +608,11 @@ function recordFor(brackets, id, seeded, now) {
     scale: ESTIMATE_SCALE,
     refusals: 0,
     seen: 0,
+    // The largest request that had been carried when the last raise happened, so a
+    // second raise can ask whether anything has been asked of the declaration since
+    // the first one moved it. Seeded at zero: a model nothing has asked anything of
+    // has nothing to pay a raise with either.
+    raisedAtSeen: 0,
     seededFrom: usable(seeded) ? seeded : undefined,
     raisedAt: 0,
     refusedAt: 0,
@@ -655,15 +660,32 @@ export function observeServedRequest(id, size, seeded, brackets = BRACKETS, now 
     note({ kind: "wall-unrefused", id, value: was, served: floor, refusals: record.refusals });
   }
   const ceiling = usable(record.ceiling) ? record.ceiling : seeded;
+  // A raise has to be paid for by demand the host has shown SINCE the last one.
+  // `seen` is the largest request this model has carried, so it stands still while
+  // the host keeps sending the same conversation: comparing it against a ceiling
+  // that a previous raise just moved is comparing old evidence to a new question.
+  // The VPS shape makes it concrete — a host whose real demand was 326000 against a
+  // wall at 330000 got the declaration lifted to 358600 and then to 391200 on two
+  // consecutive rounds with no new request behind either, so the host built to
+  // 391200, was refused, and spent the refusal budget on a size nothing had asked
+  // for. Four rounds of that exhausted all four refusals and left the declaration
+  // at 326000 for good, 4000 tokens under a wall it had already been told about.
+  //
+  // A raise is therefore allowed only when the largest request has grown past what
+  // it was when the last raise happened. A host that never fills the declaration is
+  // never guessed at, which is the same rule that keeps an idle model from being
+  // probed at all.
   if (
     record.refusals < MAX_REFUSALS &&
     usable(ceiling) &&
     record.seen >= ceiling * RAISE_AT &&
+    record.seen > (usable(record.raisedAtSeen) ? record.raisedAtSeen : 0) &&
     raisesAllowed(record, now)
   ) {
     const was = ceiling;
     record.step = Math.min(Math.max(record.step * 2, record.step + MIN_STEP), stepMax(seeded));
     record.raisedAt = now;
+    record.raisedAtSeen = record.seen;
     record.ceiling = derivedCeiling(record, seeded);
     if (record.ceiling !== was)
       note({
@@ -864,6 +886,7 @@ function readRecord(raw) {
   record.step = usable(raw.step) ? raw.step : seedStep(ceiling);
   record.scale = ESTIMATE_SCALE;
   record.refusals = Number.isSafeInteger(raw.refusals) && raw.refusals >= 0 ? raw.refusals : 0;
+  record.raisedAtSeen = usable(raw.raisedAtSeen) ? raw.raisedAtSeen : 0;
   record.seen = usable(raw.seen) ? raw.seen : 0;
   record.seededFrom = usable(raw.seededFrom) ? raw.seededFrom : ceiling;
   record.raisedAt = Number.isFinite(raw.raisedAt) ? raw.raisedAt : 0;
@@ -909,6 +932,7 @@ export function limitStateJSON(brackets = BRACKETS) {
       step: usable(record.step) ? record.step : undefined,
       scale: ESTIMATE_SCALE,
       refusals: Number.isSafeInteger(record.refusals) ? record.refusals : 0,
+      raisedAtSeen: usable(record.raisedAtSeen) ? record.raisedAtSeen : 0,
       seen: usable(record.seen) ? record.seen : 0,
       seededFrom: usable(record.seededFrom) ? record.seededFrom : undefined,
       raisedAt: Number.isFinite(record.raisedAt) ? record.raisedAt : 0,
