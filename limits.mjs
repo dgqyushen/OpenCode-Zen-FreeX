@@ -426,6 +426,20 @@ export function requestSize(body) {
   return { tokens: estimateTokens(requestText(body)) };
 }
 
+// Which scale `requestSize` measures in. A bracket is a pair of numbers this file
+// took from that scale, so a record is only evidence while the scale that produced
+// it is the scale still in use: the estimator once counted strings instead of
+// characters and under-read a long conversation to a fifth of its size, which put
+// a floor and a ceiling on a deflated scale and then bounded a window measured on
+// the right one. A record carrying another number was measured by a different
+// instrument and says nothing about this one.
+//
+// The number moves whenever the estimate changes meaning, and a record that
+// disagrees is dropped rather than repaired: the floor is the largest size the
+// route was seen to serve AS THIS FILE COUNTED IT, and there is nothing to salvage
+// from a count whose unit was wrong.
+export const ESTIMATE_SCALE = 2;
+
 // The brackets, by model id, as this process has them. A Map like the two
 // observation maps above, for the same reason: what a route answered about one
 // model is that model's, and a caller has to be able to read and replace the
@@ -573,6 +587,7 @@ function recordFor(brackets, id, seeded, now) {
     exact: false,
     ceiling: usable(seeded) ? seeded : undefined,
     step: seedStep(seeded),
+    scale: ESTIMATE_SCALE,
     refusals: 0,
     seen: 0,
     seededFrom: usable(seeded) ? seeded : undefined,
@@ -813,6 +828,15 @@ export async function loadLimitState(file = limitStatePath()) {
 // evidence about a model until every field has been checked.
 function readRecord(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  // A record measured on another scale is not this record. The floor and the
+  // ceiling are token counts this file produced, so a file written by an
+  // estimator that counted something else holds numbers about a different
+  // quantity: a floor of 228286 taken while a long conversation was read to a
+  // fifth of its length is not a size the route was shown to serve on the scale
+  // used now. Dropping it leaves the model with the table's own number, which is
+  // the measurement the sweep made on this scale, instead of bounding it with a
+  // count whose unit was wrong.
+  if (raw.scale !== ESTIMATE_SCALE) return undefined;
   const floor = usable(raw.floor) ? raw.floor : 0;
   const ceiling = usable(raw.ceiling) ? raw.ceiling : undefined;
   if (!floor && ceiling === undefined) return undefined;
@@ -820,6 +844,7 @@ function readRecord(raw) {
   record.ceil = usable(raw.ceil) ? raw.ceil : undefined;
   record.exact = raw.exact === true;
   record.step = usable(raw.step) ? raw.step : seedStep(ceiling);
+  record.scale = ESTIMATE_SCALE;
   record.refusals = Number.isSafeInteger(raw.refusals) && raw.refusals >= 0 ? raw.refusals : 0;
   record.seen = usable(raw.seen) ? raw.seen : 0;
   record.seededFrom = usable(raw.seededFrom) ? raw.seededFrom : ceiling;
@@ -864,6 +889,7 @@ export function limitStateJSON(brackets = BRACKETS) {
       floor: usable(record.floor) ? record.floor : 0,
       ceiling: usable(record.ceiling) ? record.ceiling : undefined,
       step: usable(record.step) ? record.step : undefined,
+      scale: ESTIMATE_SCALE,
       refusals: Number.isSafeInteger(record.refusals) ? record.refusals : 0,
       seen: usable(record.seen) ? record.seen : 0,
       seededFrom: usable(record.seededFrom) ? record.seededFrom : undefined,

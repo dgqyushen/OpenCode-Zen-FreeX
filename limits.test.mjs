@@ -1478,6 +1478,62 @@ test("a body of many strings is read to its end, not to a count of strings", asy
   assert.ok(requestSize(longer).tokens > requestSize(body).tokens, "the tail of the body is counted");
 });
 
+test("a bracket measured by another estimator never bounds the table's own measurement", async () => {
+  const { ESTIMATE_SCALE, limitAdaptivity, limitOverrides, limitStateJSON, loadLimitState } = await subject;
+  const at = `${tmpdir()}/zen-scale-${process.pid}-${Date.now()}.json`;
+  try {
+    // The estimator once counted strings instead of characters, so a long
+    // conversation was read to a fifth of its length and every size it produced was
+    // deflated by the same factor. The bracket built on that scale is not a
+    // measurement of the window — it is a measurement of a different quantity, and
+    // the table's 326000 was taken by the sweep on the scale in use now.
+    //
+    // This is the VPS on 2026-10-19: floor 228286 and ceiling 223942, both produced
+    // by the string-counting walk, bounding a table that says 326000.
+    const table = { context: 326000, output: 384000 };
+    // The file a previous version wrote: no scale field, because there was none.
+    writeFileSync(
+      at,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "deepseek-v4.1-flash-free": {
+            floor: 228286,
+            ceiling: 223942,
+            ceil: 226020,
+            step: 27992,
+            refusals: 4,
+            seen: 228286,
+            seededFrom: 326000,
+          },
+        },
+      }),
+    );
+    assert.equal(await loadLimitState(at), false, "a record that names no scale is from before there was one");
+    // Which is the whole point: with the record dropped, the table's own
+    // measurement is what the host is told. The window is not narrowed to a count
+    // taken by an instrument that read a fifth of the request.
+    assert.deepEqual(
+      limitOverrides("deepseek-v4.1-flash-free", table, undefined, undefined, undefined, undefined, new Map()),
+      {},
+      "the table needs no override, because nothing on this scale contradicted it",
+    );
+    // A file written now carries the scale beside the numbers it belongs to, and is
+    // read back, so the gate is about the instrument and not about never persisting.
+    // A second path, because a load is memoised per file: the point here is a file
+    // that was never read before, which is what a restart sees.
+    const written = JSON.parse(limitStateJSON(new Map([["scaled-free", { floor: 90000, ceiling: 100000 }]])));
+    assert.equal(written.models["scaled-free"].scale, ESTIMATE_SCALE);
+    const fresh = `${at}.current`;
+    writeFileSync(fresh, limitStateJSON(new Map([["scaled-free", { floor: 90000, ceiling: 100000 }]])));
+    assert.equal(await loadLimitState(fresh), true, "a record on the current scale is still evidence");
+    rmSync(fresh, { force: true });
+  } finally {
+    limitAdaptivity(new Map());
+    rmSync(at, { force: true });
+  }
+});
+
 test("a refusal never declares a window below a size the route has served", async () => {
   const { observeServedRequest, observeRefusedRequest, limitBracket, limitOverrides } = await subject;
   const brackets = new Map();
@@ -1752,7 +1808,7 @@ test("a bracket survives a restart through one file, and a file that is not one 
 });
 
 test("a state file is read field by field, and none of it may become a bracket nobody measured", async () => {
-  const { limitAdaptivity, limitBracket, limitStateJSON, loadLimitState } = await subject;
+  const { ESTIMATE_SCALE, limitAdaptivity, limitBracket, limitStateJSON, loadLimitState } = await subject;
   const at = `${tmpdir()}/zen-limits-${process.pid}-${Date.now()}`;
   const write = (name, body) => {
     writeFileSync(`${at}-${name}.json`, body);
@@ -1768,23 +1824,63 @@ test("a state file is read field by field, and none of it may become a bracket n
     assert.equal(parsed.version, 1);
     assert.deepEqual(
       { ...parsed.models["round-free"], raisedAt: 0, refusedAt: 0, seenAt: 0 },
-      { floor: 120000, ceil: 140000, ceiling: 130000, step: 4096, refusals: 2, seen: 120000, raisedAt: 0, refusedAt: 0, seenAt: 0 },
+      {
+        floor: 120000,
+        ceil: 140000,
+        ceiling: 130000,
+        step: 4096,
+        scale: ESTIMATE_SCALE,
+        refusals: 2,
+        seen: 120000,
+        raisedAt: 0,
+        refusedAt: 0,
+        seenAt: 0,
+      },
     );
     // A version this file does not write is not a state file: reading one as a
     // bracket would be reading somebody else's fields as measurements.
     assert.equal(await loadLimitState(write("version", JSON.stringify({ version: 99, models: { x: { ceiling: 5 } } }))), false);
     // A record with nothing usable in it is dropped, and the file with only that
     // record is read as no state rather than as a model with no window.
-    assert.equal(await loadLimitState(write("junk", JSON.stringify({ version: 1, models: { x: { ceiling: "big", floor: null } } }))), false);
+    assert.equal(
+      await loadLimitState(
+        write("junk", JSON.stringify({ version: 1, models: { x: { ceiling: "big", floor: null, scale: ESTIMATE_SCALE } } })),
+      ),
+      false,
+    );
     assert.equal(await loadLimitState(write("broken", "{not json")), false);
     assert.equal(await loadLimitState(write("empty", "")), false);
+    // A record measured on another scale is dropped rather than read: the floor it
+    // carries is a size the route was seen to serve as a DIFFERENT estimator
+    // counted it, and this file cannot turn that into a token count. The file is
+    // read as no state, which leaves the model with the table's own measurement
+    // instead of bounding it with a count whose unit was wrong.
+    assert.equal(
+      await loadLimitState(
+        write(
+          "scale",
+          JSON.stringify({ version: 1, models: { "old-scale-free": { floor: 228286, ceiling: 223942, scale: 1 } } }),
+        ),
+      ),
+      false,
+      "a record from another estimator is not evidence on this one",
+    );
+    assert.equal(
+      await loadLimitState(
+        write("noscale", JSON.stringify({ version: 1, models: { "no-scale-free": { floor: 228286, ceiling: 223942 } } })),
+      ),
+      false,
+      "and a record that names no scale is from before there was one",
+    );
     // And a file that really is one is read, with the junk fields of a record
     // that also holds good ones defaulted rather than trusted.
     const good = write(
       "good",
       JSON.stringify({
         version: 1,
-        models: { "half-free": { floor: 90000, ceiling: 100000, step: -3, refusals: "many", ceil: 0 } },
+        models: {
+          "half-free": { floor: 90000, ceiling: 100000, step: -3, refusals: "many", ceil: 0, scale: ESTIMATE_SCALE },
+        },
       }),
     );
     assert.equal(await loadLimitState(good), true);
@@ -1796,7 +1892,8 @@ test("a state file is read field by field, and none of it may become a bracket n
     assert.equal(read.ceil, undefined, "a bound of zero is not a bound");
   } finally {
     limitAdaptivity(new Map());
-    for (const name of ["version", "junk", "broken", "empty", "good"]) rmSync(`${at}-${name}.json`, { force: true });
+    for (const name of ["version", "junk", "broken", "empty", "good", "scale", "noscale"])
+      rmSync(`${at}-${name}.json`, { force: true });
   }
 });
 
