@@ -395,6 +395,19 @@ is also what a record is seeded from, so a wall that moved and was measured agai
 is the number the runtime bracket searches around rather than the one the
 catalogue still prints.
 
+**What a maintainer does with a run.** A run that measured something new leaves one
+changed file on a branch, so the review is the report in the pull request body and
+the diff beside it: a row per model, the sizes that were served, the sizes that
+were refused and the two labels above. Merging is what publishes it — for an id
+`limits.mjs` does not name, or one whose catalogue value has moved since its entry
+was written, the merged row is the window a host is told — and that is the whole
+reason the result is a pull request rather than a push to `main`: a measurement can
+be wrong in a way a person can see (an endpoint that answered a size it should not
+have, a model measured on the wrong protocol), and nothing here is in a hurry. A
+host picks the file up when it next starts, because it is read once per process;
+an id that appeared on Zen is offered whether or not this file mentions it, at
+whatever the catalogue declares, until that happens.
+
 **What this does not do.** It cannot learn a wall above the sizes the host
 actually sends: the declared ceiling is what gives the host a reason to send a
 bigger request, and a host that compacts at the declaration never reaches a wall
