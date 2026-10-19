@@ -1,0 +1,147 @@
+name: walls
+
+# The free tier moves, and the limits table is what every host behind this plugin
+# plans a conversation from. `ci.yml`'s gate notices that Zen has moved; this
+# notices that a number in `limits.mjs` is no longer true, and by how much.
+#
+# It reports through a pull request rather than by committing. The table is not
+# derived data — it is a set of measurements a person took, and a value a
+# scheduled job wrote on its own is a value nobody has ever checked. What is
+# automated here is the measuring, which is the part that costs an afternoon and
+# a million tokens; the deciding stays with whoever merges the branch.
+on:
+  schedule:
+    # Daily at 03:17 UTC. The minute is not :00 because every scheduled workflow
+    # in the world asks at :00, and this one spends somebody's shared free
+    # credential on megabyte-sized prompts.
+    - cron: "17 3 * * *"
+  # The way to find out whether this works without waiting for tomorrow, and the
+  # way to re-measure one model by hand: run it from the Actions page.
+  workflow_dispatch:
+    inputs:
+      sweep_all:
+        description: Re-measure every offered id, not only the ones with no measurement
+        type: boolean
+        default: false
+
+# A scheduled run has no user waiting for it, so it must not be able to cancel
+# the previous one halfway through a measurement, and two of them must not spend
+# the route's budget at once.
+concurrency:
+  group: walls
+  cancel-in-progress: false
+
+# The default for anything in this file that is not overridden: this workflow
+# reads a repository and asks Zen. `measure` overrides it below, because opening
+# the pull request is the one thing here that writes anything.
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: 1.4.3
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    # Job-level rather than step-level, because GitHub scopes permissions to the
+    # job and not to a step: every step in here holds these, and the honest fix
+    # for that is a job that only measures and a second one that only publishes.
+    # That split is not here yet — it is one job because the measurement has to
+    # reach the publisher through the working tree, and putting the write token
+    # on a job whose only output is a file is the smaller of the two costs.
+    permissions:
+      contents: write
+      pull-requests: write
+    # Nine models, six requests each, five seconds apart, and a 180-second abort
+    # per request: the arithmetic is why this is not ten minutes.
+    timeout-minutes: 45
+    steps:
+      # Pinned to the commit its version names, as in `ci.yml`: a tag can be moved
+      # under a workflow that holds a token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      # The trio the gate reports on: whether the route still offers what the
+      # table describes, which ids have never been measured, and — for the ones
+      # that have not — where their wall is.
+      #
+      # Allowed to fail, and the job is not: Zen being unreachable is not this
+      # repository's fault, and a red scheduled build is one everybody learns to
+      # ignore. What the step printed is the finding either way.
+      - name: What is offered, against what was measured
+        id: watch
+        continue-on-error: true
+        # `--all` re-measures every offered id; the scheduled run measures only
+        # the ids that have never been measured, which is the whole reason the
+        # snapshot exists. `inputs.sweep_all` is empty on a schedule and a boolean
+        # on a dispatch, so the comparison is against `true` rather than truthy.
+        env:
+          ALL: ${{ inputs.sweep_all == true && '--all' || '' }}
+        run: |
+          set -o pipefail
+          bun limits-watch.mjs --sweep $ALL --write 2>&1 | tee watch-report.txt
+      - name: Publish the report
+        if: always()
+        run: |
+          {
+            echo "## Wall survey — ${{ steps.watch.outcome }}"
+            echo
+            echo '```'
+            cat watch-report.txt 2>/dev/null || echo 'The run printed nothing, so it may never have asked.'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # A run that could not ask says so, and stops rather than opening a pull
+      # request about a route it never reached.
+      - name: Stop when the route was not reached
+        if: steps.watch.outcome == 'failure'
+        run: |
+          echo "::warning title=Wall survey did not finish::The survey did not finish; read the run summary for what it managed to ask."
+          exit 1
+      - name: Is there anything to show?
+        id: diff
+        run: |
+          if git diff --quiet -- limits-observed.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing measured has changed, so there is nothing to open."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff --stat -- limits-observed.json
+          fi
+      # The branch name carries the date and the run, because a branch is one
+      # run's measurement rather than a feature: two runs are two things to look
+      # at, and a second run on the same day must not try to reuse the first
+      # run's branch, which `git checkout -b` would refuse. A run that finds
+      # nothing leaves no branch behind at all.
+      - name: Open a pull request with the measurement
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="walls/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add limits-observed.json
+          git commit -m "chore: record the walls measured on $(date -u +%Y-%m-%d)"
+          git push -u origin "$branch"
+          {
+            echo "A scheduled survey measured the free tier on $(date -u +%Y-%m-%d) and found something"
+            echo "that is not what the last run recorded."
+            echo
+            echo "**What is in this pull request is only the snapshot.** \`limits-observed.json\`"
+            echo "records what was measured; it is not what hosts read. If a measurement here"
+            echo "contradicts \`limits.mjs\`, the table is what has to change, by hand, with the"
+            echo "numbers below as the reason."
+            echo
+            echo '```'
+            cat watch-report.txt
+            echo '```'
+            echo
+            echo "The rules the sweep applies — a refusal is asked twice before it counts, a wall"
+            echo "needs two refused sizes behind a served one, six requests per model — are in"
+            echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
+            echo "\`single-refusal\` rather than smoothed into a wall."
+          } > pr-body.md
+          gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"

@@ -911,9 +911,10 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
   // paid twin's declaration
   assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 326000, output: 384000 });
   assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 343000, output: 131072 });
-  // both axes have evidence for this one, and the catalogue's own `input`
-  // survives untouched because nothing on this route has ever named an input cap
-  assert.deepEqual(models["big-pickle"].limit, { context: 343000, input: 160000, output: 131072 });
+  // all three axes have evidence for this one: the catalogue's `input` of 160000
+  // was falsified by the same served prompt that set the window, at more than
+  // twice the declaration
+  assert.deepEqual(models["big-pickle"].limit, { context: 343000, input: 343000, output: 131072 });
   // the input axis is one of the axes now: this one's declared input is its own
   // context − output, falsified by prompts of up to nearly twice it served, so
   // the input moves to the window while the window and the ceiling stay as

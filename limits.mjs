@@ -120,6 +120,22 @@ export const LIMITS = {
       samples: "the endpoint refused the request asking for 200000 and named its own ceiling; nothing watched above 32000. Re-asked with max_tokens 1000000 on 2026-10-19 and named the same 131072, so the number holds",
       how: "\"max_tokens is too large: 200000. This model supports at most 131072 completion tokens, whereas you provided 200000.\" — an upstream that validates the requested ceiling and states its own. This id is the same upstream model as mimo-v2.6-flash-free (x-opencode-upstream-model-id answers mimo-v2.6-flash) on a different endpoint, which is why the two share their measurements above and are still measured apart.",
     },
+    // The catalogue declares `input: 160000` for this id, and a prompt of
+    // 343,131 tokens was served on 2026-10-19 — a prompt more than twice it, so
+    // the declaration is falsified rather than merely small. It matters more than
+    // a stale number usually does, because `input` is the axis a gateway reads as
+    // the prompt budget: magpie answers `context_window` with the smaller of
+    // `context` and `input`, so with 160000 left in place this model was offered
+    // a 160000-token window to every host behind it no matter what `context`
+    // said. Measured the same way as the window above and from the same sweep.
+    input: {
+      value: 343000,
+      source: "route",
+      declaredAt: 160000,
+      measured: "2026-10-19",
+      samples: "343,131 tokens served (1,600,000 characters), against a declared input of 160000 — more than twice the declaration, which no margin accounts for",
+      how: "the prompt the route was measured to serve, which is the same bracket as the context entry above and is what an input axis can be: this route never names an input cap in a refusal, so nothing here is a figure it stated. Declared at the window rather than at the sample, so a host planning a prompt from it and a host planning from the context are told the same thing — the precedent space-bunny-free set when its own input was found to be half of what it serves.",
+    },
   },
   "nemotron-3.5-lightning-free": {
     context: {

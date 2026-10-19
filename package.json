@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -29,18 +29,36 @@
     "LICENSE",
     "NOTICE"
   ],
-  "keywords": ["opencode", "opencode-plugin", "zen", "free", "magpie"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "zen",
+    "free",
+    "magpie"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/tkhs101/OpenCode-Zen-FreeX.git" },
-  "bugs": { "url": "https://github.com/tkhs101/OpenCode-Zen-FreeX/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tkhs101/OpenCode-Zen-FreeX.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tkhs101/OpenCode-Zen-FreeX/issues"
+  },
   "homepage": "https://github.com/tkhs101/OpenCode-Zen-FreeX#readme",
-  "engines": { "node": ">=18.17.0" },
+  "engines": {
+    "node": ">=18.17.0"
+  },
   "scripts": {
     "test": "bun test",
     "check:gate": "bun tools-smoke.mjs",
     "limits:audit": "bun limits-audit.mjs",
-    "capture": "bun capture.mjs"
+    "capture": "bun capture.mjs",
+    "limits:sweep": "bun limits-sweep.mjs",
+    "limits:watch": "bun limits-watch.mjs"
   },
   "packageManager": "bun@1.4.3",
-  "magpie": { "icon": "https://opencode.ai/favicon-v3.ico", "maxConcurrency": 2 }
+  "magpie": {
+    "icon": "https://opencode.ai/favicon-v3.ico",
+    "maxConcurrency": 2
+  }
 }
