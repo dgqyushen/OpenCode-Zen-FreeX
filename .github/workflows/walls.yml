@@ -108,12 +108,15 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git --no-pager diff --stat -- limits-observed.json
           fi
-      # The branch name carries the date and the run, because a branch is one
-      # run's measurement rather than a feature: two runs are two things to look
-      # at, and a second run on the same day must not try to reuse the first
-      # run's branch, which `git checkout -b` would refuse. A run that finds
-      # nothing leaves no branch behind at all.
+      # A repository can forbid Actions from opening pull requests — it forbids it
+      # by default, and this workflow met that: the branch pushed and the pull
+      # request was refused, which reddened a run whose measurement was fine. So
+      # the refusal is reported as what to do about it rather than as a failure,
+      # and the link goes to the run summary. A repository that has allowed it
+      # gets the pull request; one that has not gets a branch and a link, which is
+      # a person's click rather than a red run.
       - name: Open a pull request with the measurement
+        id: open
         if: steps.diff.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -126,6 +129,8 @@ jobs:
           git add limits-observed.json
           git commit -m "chore: record the walls measured on $(date -u +%Y-%m-%d)"
           git push -u origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "compare=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1" >> "$GITHUB_OUTPUT"
           {
             echo "A scheduled survey measured the free tier on $(date -u +%Y-%m-%d) and found something"
             echo "that is not what the last run recorded."
@@ -144,4 +149,25 @@ jobs:
             echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
             echo "\`single-refusal\` rather than smoothed into a wall."
           } > pr-body.md
-          gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"
+          if gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"; then
+            echo "opened=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "opened=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Pull request not opened::This repository does not let GitHub Actions open pull requests, so the branch was pushed and no pull request was made. Open it from the link in the run summary, or allow it under Settings > Actions > General > Workflow permissions."
+          fi
+      - name: Where the measurement is
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          {
+            echo
+            echo "## The measurement is on a branch"
+            echo
+            if [ "${{ steps.open.outputs.opened }}" = "true" ]; then
+              echo "A pull request was opened for \`${{ steps.open.outputs.branch }}\`."
+            else
+              echo "This repository does not let GitHub Actions open pull requests, so the branch"
+              echo "\`${{ steps.open.outputs.branch }}\` was pushed and the pull request is a click:"
+              echo
+              echo "${{ steps.open.outputs.compare }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

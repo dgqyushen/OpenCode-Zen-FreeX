@@ -12,21 +12,30 @@
       "servedTokens": 343131,
       "servedChars": 1600000,
       "refusedChars": 2200000,
-      "refusedSizes": [2200000, 2800000],
+      "refusedSizes": [
+        2200000,
+        2800000
+      ],
       "wall": "bracketed"
     },
     "deepseek-v4.1-flash-free": {
       "servedTokens": 215178,
       "servedChars": 1000000,
       "refusedChars": 1600000,
-      "refusedSizes": [1600000, 2800000],
+      "refusedSizes": [
+        1600000,
+        2800000
+      ],
       "wall": "bracketed"
     },
     "glm-5.3-flash-free": {
       "servedTokens": 311109,
       "servedChars": 1450000,
       "refusedChars": 1600000,
-      "refusedSizes": [1600000, 2800000],
+      "refusedSizes": [
+        1600000,
+        2800000
+      ],
       "wall": "bracketed"
     },
     "longcat-2.5-preview-free": {
@@ -40,7 +49,11 @@
       "servedTokens": 343131,
       "servedChars": 1600000,
       "refusedChars": 1900000,
-      "refusedSizes": [1900000, 2200000, 2800000],
+      "refusedSizes": [
+        1900000,
+        2200000,
+        2800000
+      ],
       "wall": "bracketed"
     },
     "nemotron-3.5-lightning-free": {
