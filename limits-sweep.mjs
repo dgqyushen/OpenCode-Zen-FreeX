@@ -71,6 +71,12 @@ const READ_BUDGET = 256 * 1024;
 const PACE_MS = 5000;
 // Per model, first pass included.
 const BUDGET = 6;
+// How close a bracket is worth closing to, as a fraction of the refused size. The
+// declared floor is within this of the wall once the loop stops, and a host cannot
+// act on a difference this small: the margin the plugin declares under a measured
+// wall is the same order. Asking past it spends the shared free credential on a
+// number that would not change any declaration.
+const NARROW_TO = 0.02;
 // A failure that is about the request being unanswerable rather than about its
 // size: retried, never counted.
 const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
@@ -161,6 +167,26 @@ export function tally(asked) {
   return { servedChars, servedTokens, refusedSizes, refused: over };
 }
 
+// The next size to ask, or undefined when the bracket is as tight as the budget
+// or the precision rule allows. Separated from the loop that spends it so the rule
+// can be checked against a known wall without six live requests: the loop itself
+// was wrong for as long as it existed and no test could see it, because the only
+// thing exported was the reduction.
+//
+// `NARROW_TO` is a fraction of the refused size, so the rule is about the gap that
+// would still be left rather than a fixed number of requests: a 1,600,000-character
+// bracket needs six bisections to close to 2%, while a bracket already inside that
+// stops at once and costs nothing.
+export function nextAsk(bracket, spent) {
+  if (spent >= BUDGET) return undefined;
+  const low = bracket?.servedChars;
+  const high = bracket?.refusedSizes?.[0];
+  if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)) return undefined;
+  if (high - low <= high * NARROW_TO) return undefined;
+  const mid = Math.floor((low + high) / 2);
+  return mid > low && mid < high ? mid : undefined;
+}
+
 // The bracket for one model. `spent` and `asked` are reported so a reader can see
 // how much of the budget a result cost, and what it was spent on.
 async function sweep(model, log) {
@@ -213,21 +239,25 @@ async function sweep(model, log) {
     if (chars === SIZES[0] && now.servedChars === undefined && now.refusedSizes.length > 0) break;
   }
 
-  // Narrowing. One refused size is an endpoint's opinion; two refused sizes with
-  // a served one under them is a wall, and the only way to get the second inside
-  // a budget is to bisect the gap. Each step lands halfway between the largest
-  // size served and the smallest refused, so the gap halves and the budget buys a
-  // bracket as narrow as the requests allow rather than a wide one that was
-  // always going to be wide.
+  // Narrowing. The bound this file can declare is the largest size SERVED, so what
+  // a bracket is worth is the distance between that and the smallest refusal — not
+  // how many refusals were collected. The three ladder sizes already produce two
+  // refusals whenever the wall is under the top rung (1,600,000 and 2,800,000), so
+  // counting refusals stopped this loop on entry and no bracket was ever narrowed:
+  // every size in the shipped snapshot is a ladder point and never a midpoint, and
+  // `deepseek` was left reporting a floor of 215,000 against a wall this route is
+  // measured to serve at 326,702 — a third of the window lost, on the one number
+  // the whole sweep exists to produce.
+  //
+  // The loop therefore runs on the gap. While the budget holds and the interval is
+  // wider than `NARROW_TO` of the refused size, it asks the midpoint of (served,
+  // refused): a served midpoint raises the floor without spending a refusal, and a
+  // refused one halves what is left, so each step buys up to half of the gap.
   for (;;) {
     const now = tally(asked);
-    if (now.refusedSizes.length >= 2) break;
-    if (spent >= BUDGET || now.servedChars === undefined || now.refusedSizes.length === 0) break;
-    const low = now.servedChars;
-    const high = now.refusedSizes[0];
-    const mid = Math.floor((low + high) / 2);
-    if (mid <= low || mid >= high) break;
-    const result = await believe(mid);
+    const next = nextAsk(now, spent);
+    if (next === undefined) break;
+    const result = await believe(next);
     if (result === undefined || result.kind === "error") break;
   }
 

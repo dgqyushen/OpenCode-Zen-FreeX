@@ -62,3 +62,30 @@ test("a void refusal is a served size, and the point it was voided by is not a s
   assert.equal(bracket.servedTokens, 407000);
   assert.deepEqual(bracket.refusedSizes, []);
 });
+
+test("a bracket is narrowed on its gap, not on how many refusals it collected", async () => {
+  const { nextAsk, tally } = await subject;
+  // The three ladder sizes produce two refusals whenever the wall is under the top
+  // rung, and the narrowing loop used to stop on exactly that count. It therefore
+  // stopped on entry, and no bracket was ever widened past its second rung: the
+  // shipped snapshot held `deepseek` at a floor of 215,000 against a wall this
+  // route serves at 326,702, a third of the window lost.
+  const ladder = tally([served(1000000, 215178), refused(1600000), refused(2800000)]);
+  assert.deepEqual(ladder.refusedSizes, [1600000, 2800000], "the ladder already holds two refusals");
+  const first = nextAsk(ladder, 3);
+  assert.equal(first, 1300000, "and it still asks the midpoint of (served, refused)");
+  // Asking is what raises the floor: a served midpoint replaces the 1,000,000 with
+  // itself, and the next ask lands between it and the refusal.
+  const raised = tally([served(1300000, 279223), refused(1600000), refused(2800000)]);
+  assert.equal(nextAsk(raised, 4), 1450000, "the gap halves, so the asks converge on the wall");
+  // The rule runs on the budget as well: with the budget spent nothing more is
+  // asked, however wide the bracket still is.
+  assert.equal(nextAsk(ladder, 6), undefined, "a spent budget asks nothing");
+  // And a bracket already inside the precision rule costs nothing: this is what
+  // keeps a model that was asked once from being asked six times.
+  const tight = tally([served(1600000, 343131), refused(1620000)]);
+  assert.equal(nextAsk(tight, 0), undefined, "a bracket inside NARROW_TO needs no further ask");
+  // A bracket with no refused size above the floor has no interval to halve.
+  assert.equal(nextAsk(tally([served(2800000, 598923)]), 1), undefined, "no refusal, nothing to narrow");
+  assert.equal(nextAsk(tally([refused(1000000)]), 1), undefined, "no served floor, nothing to narrow");
+});
