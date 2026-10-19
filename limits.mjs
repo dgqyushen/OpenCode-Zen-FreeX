@@ -353,13 +353,25 @@ export function limitObservations(restore) {
 const CJK = /[\u2e80-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const SCAN_LIMIT = 32 * 1024 * 1024;
 const CJK_TOKENS_PER_CHAR = 0.7;
-const LATIN_CHARS_PER_TOKEN = 4.66;
+// The characters one token covers, measured against the route's own
+// `usage.prompt_tokens` on the bodies a host actually sends — 3.938, 4.015 and
+// 4.034 on conversations of 12,546, 60,796 and 292,396 tokens, so 3.996.
+//
+// The 4.66 this used to be was calibrated on repeated filler text, which tokenises
+// far better than a coding conversation: same words, no JSON, no tool-call ids, no
+// punctuation between fragments. Against real traffic it read the prompt about 14%
+// short — the three points above came back at 0.845, 0.862 and 0.866 of the route's
+// count — and a floor read 14% short is a window declared 14% short, which is the
+// one direction this file exists to stop. 4.66 is kept named below as what it was,
+// because the difference between the two is the evidence for the change.
+const LATIN_CHARS_PER_TOKEN = 3.996;
 
 // The tokens a request's own text holds. An estimate, and used as one: the route
-// counts tokens with a tokenizer this plugin does not have, so every size below
-// is read from characters through the route's own calibration for Latin filler
-// (4.66 characters per token, measured on 2026-10-19) with CJK counted at about
-// 0.7 of a token per character.
+// counts tokens with a tokenizer this plugin does not have, so every size below is
+// read from characters through the ratios above. The sweep does not use this at
+// all — it asks the route and reads `prompt_tokens` — so the table's numbers are
+// the route's own count, while a bracket learned while a host is running is
+// measured with this. Aligning the two is what this ratio is for.
 export function estimateTokens(text) {
   const { cjk, other } = scriptCount(text);
   return Math.round(cjk * CJK_TOKENS_PER_CHAR + other / LATIN_CHARS_PER_TOKEN);

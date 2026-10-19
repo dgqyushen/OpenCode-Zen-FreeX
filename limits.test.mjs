@@ -1416,10 +1416,13 @@ test("a number the wait cut short is not a limit", async () => {
 
 test("the tokens a request holds are estimated from its own text", async () => {
   const { estimateTokens, requestText, requestSize } = await subject;
-  // The route's own calibration for Latin filler: 4.66 characters per token,
-  // measured on 2026-10-19. An estimate is an estimate, and this case pins the
+  // The route's own count, on the bodies a host actually sends: 3.996 characters
+  // per token. Measured against `usage.prompt_tokens` at three sizes — 3.938,
+  // 4.015 and 4.034 — where the old 4.66, calibrated on repeated filler, read the
+  // prompt about 14% short. An estimate is an estimate, and this case pins the
   // ratio rather than a tokenizer this plugin does not have.
-  assert.equal(estimateTokens("a".repeat(466)), 100);
+  assert.equal(estimateTokens("a".repeat(3996)), 1000);
+  assert.equal(estimateTokens("a".repeat(400)), 100);
   // CJK is counted per character: a window declared from a Latin ratio alone
   // would come out at a third of the real one for a wall of Chinese text, which
   // is the under-declaration this file exists to remove.
@@ -1435,7 +1438,7 @@ test("the tokens a request holds are estimated from its own text", async () => {
     "userabcd",
   );
   assert.equal(requestText({ system: "ab", input: [{ content: [{ text: "cd" }] }] }), "abcd");
-  assert.deepEqual(requestSize({ messages: [{ content: "a".repeat(466) }] }), { tokens: 100 });
+  assert.deepEqual(requestSize({ messages: [{ content: "a".repeat(3996) }] }), { tokens: 1000 });
 });
 
 test("a body of many strings is read to its end, not to a count of strings", async () => {
