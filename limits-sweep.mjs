@@ -24,9 +24,12 @@
 //
 //   * A wall needs two refused sizes behind it. One refusal proves one endpoint
 //     said no; two prove the prompt is past something this model enforces. A
-//     bracket that could not get a second refused size is reported as
-//     `openEnded` with the largest size that was served, and nothing is declared
-//     from it beyond that floor.
+//     bracket that could not get a second refused size is not a wall and is
+//     labelled for what it is: `single-refusal` with the one size that was
+//     refused, `openEnded` with the largest size that was served when nothing was
+//     refused at all. Nothing is declared from either beyond the floor underneath
+//     it, so a reader treats both the same way — only `bracketed` settles an
+//     axis.
 //
 //   * A request that failed for a reason that is not about size — a 5xx, a rate
 //     limit, a transport error — is retried twice and is never a verdict. Being

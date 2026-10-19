@@ -135,10 +135,13 @@ jobs:
             echo "A scheduled survey measured the free tier on $(date -u +%Y-%m-%d) and found something"
             echo "that is not what the last run recorded."
             echo
-            echo "**What is in this pull request is only the snapshot.** \`limits-observed.json\`"
-            echo "records what was measured; it is not what hosts read. If a measurement here"
-            echo "contradicts \`limits.mjs\`, the table is what has to change, by hand, with the"
-            echo "numbers below as the reason."
+            echo "**What is in this pull request is the snapshot, and the snapshot is read.**"
+            echo "\`limits-observed.json\` is an input at run time and not only a report: for an id"
+            echo "\`limits.mjs\` does not name, or an axis whose catalogue value has moved since its"
+            echo "entry was written, this is the window a host is told, so merging is what"
+            echo "publishes those numbers. Where \`limits.mjs\` does name an id its entry keeps the"
+            echo "first word, because the samples behind it are there - a measurement here that"
+            echo "contradicts one of those entries is the reason to rewrite the entry."
             echo
             echo '```'
             cat watch-report.txt
@@ -170,4 +173,10 @@ jobs:
               echo
               echo "${{ steps.open.outputs.compare }}"
             fi
+            echo
+            echo "\`limits-observed.json\` is not only a report. The plugin reads it when it"
+            echo "starts, so a measurement merged to \`main\` is the window a host shows for an"
+            echo "id \`limits.mjs\` does not name - which is what a model Zen made free after this"
+            echo "table was written is. Until it is merged, the catalogue's own numbers are what"
+            echo "is published for those ids."
           } >> "$GITHUB_STEP_SUMMARY"

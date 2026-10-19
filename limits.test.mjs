@@ -6,12 +6,24 @@ import test from "node:test";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const subject = import("./limits.mjs").catch((error) => {
   assert.fail(`limits.mjs failed to load: ${error?.message ?? error}`);
 });
 
 const DECLARED = { context: 200000, output: 32000 };
+
+// Every case here that is about the table, the catalogue or the bracket is
+// answered with no sweep beside it — an empty string is how the environment says
+// the snapshot is not there. The shipped file holds a measurement of the live
+// route, which is not what these cases are asking about, and a suite whose
+// expectations moved every time a scheduled run committed a new reading would be
+// a suite nobody could keep green. The sweep's own tier has its cases at the end
+// of this file, where it is handed a map or a file of its own.
+const SNAPSHOT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT";
+process.env[SNAPSHOT_ENV] = "";
+const SHIPPED_SNAPSHOT = fileURLToPath(new URL("./limits-observed.json", import.meta.url));
 
 // A read that never ends is the shape of the defect this file's first fix is
 // about: `readBoundedText` used to cancel a branch of `response.clone()`'s tee,
@@ -188,8 +200,10 @@ test("an input the catalogue derives, and the route does not enforce, is raised 
   );
   // and the other two axes stay exactly as declared
   assert.deepEqual(limitOverrides("space-bunny-free", { context: 1048576, output: 524288 }), {});
-  // a live window does not stand in for an input nobody named: the maps carry
-  // refusals, and no refusal names this axis
+  // a live window is the strongest answer this axis has, and an input the
+  // catalogue declares under it follows like any other measured window: left at
+  // 180000, magpie reads `context_window` from the smaller of the two axes and the
+  // window the route just named is never on screen at all
   const live = new Map([["live-input-free", 900000]]);
   const liveOutput = new Map([["live-input-free", 64000]]);
   assert.deepEqual(
@@ -200,8 +214,8 @@ test("an input the catalogue derives, and the route does not enforce, is raised 
       live,
       liveOutput,
     ),
-    { context: 900000, output: 64000 },
-    "the input axis has no live form",
+    { context: 900000, input: 900000, output: 64000 },
+    "an input under a live window is raised to it",
   );
 });
 
@@ -1665,4 +1679,367 @@ test("a report of a state file cannot itself become the state, and a state with 
   assert.equal(limitAdaptivity().get("copy-free").floor, 10);
   limitAdaptivity(new Map());
   limitAdaptivity(held);
+});
+
+// The sweep's tier. Everything above this point is answered with no snapshot
+// beside it; these are the cases that hand one in, because what a scheduled run
+// commits is the one piece of this file's evidence that arrives without anybody
+// editing this file.
+const HIT = { value: 343000, settles: true, wall: "bracketed", at: "2026-10-19" };
+const FLOOR = { value: 599000, settles: false, wall: "openEnded", at: "2026-10-19" };
+const NO_WALLS = new Map();
+
+test("a wall the sweep measured answers for an id the table never named", async () => {
+  const { limitOverrides } = await subject;
+  const walls = new Map([["new-free", HIT]]);
+  // above the declaration: the catalogue under-reports, which is the case the
+  // table was written for and a new model never gets a table entry for
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 200000, output: 32000 }, undefined, undefined, undefined, NO_WALLS, walls),
+    { context: 343000 },
+  );
+  // and below it: a catalogue that declares a million while the route refuses
+  // past about 407,000 tokens is the same defect the other way round, which a
+  // raise-only rule would leave standing
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 1048576, output: 32000 }, undefined, undefined, undefined, NO_WALLS, walls),
+    { context: 343000 },
+  );
+  // an axis the catalogue does not declare at all is answered the same way
+  assert.deepEqual(limitOverrides("new-free", {}, undefined, undefined, undefined, NO_WALLS, walls), {
+    context: 343000,
+  });
+});
+
+test("a wall the sweep never hit may only raise the declaration", async () => {
+  const { limitOverrides } = await subject;
+  const walls = new Map([["new-free", FLOOR]]);
+  // Nothing was refused, so the largest served prompt is a floor and not a
+  // ceiling: declaring it over a bigger catalogue number would narrow a window on
+  // the strength of a request that was never turned down.
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 1048576, output: 32000 }, undefined, undefined, undefined, NO_WALLS, walls),
+    {},
+  );
+  // Over a smaller one it is still a demonstration that the route serves that
+  // much, which is what the raise is.
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 200000, output: 32000 }, undefined, undefined, undefined, NO_WALLS, walls),
+    { context: 599000 },
+  );
+  // and a floor that is exactly the declaration says nothing either way
+  assert.deepEqual(limitOverrides("new-free", { context: 599000 }, undefined, undefined, undefined, NO_WALLS, walls), {});
+});
+
+test("the table keeps the first word for an id it names, whatever the sweep measured", async () => {
+  const { limitOverrides } = await subject;
+  const empty = new Map();
+  // deepseek-v4.1-flash-free: the table's 326000 is the same kind of measurement
+  // taken by hand and the largest served sample is beside it, so a sweep that
+  // stopped at the first refusal — 215,178 tokens, its own record — does not get
+  // to lower it
+  assert.deepEqual(
+    limitOverrides(
+      "deepseek-v4.1-flash-free",
+      { context: 200000, output: 32000 },
+      undefined,
+      empty,
+      empty,
+      empty,
+      new Map([["deepseek-v4.1-flash-free", { value: 215000, settles: true, wall: "bracketed" }]]),
+    ),
+    { context: 326000, output: 384000 },
+  );
+  // and the entry only has the first word while it still applies: against a
+  // catalogue that has moved past it, the swept window is what there is
+  assert.deepEqual(
+    limitOverrides(
+      "deepseek-v4.1-flash-free",
+      { context: 250000, output: 32000 },
+      undefined,
+      empty,
+      empty,
+      empty,
+      new Map([["deepseek-v4.1-flash-free", { value: 215000, settles: true, wall: "bracketed" }]]),
+    ),
+    { context: 215000, output: 384000 },
+  );
+});
+
+test("a sweep value seeds the search, so a bracket starts where the route was measured", async () => {
+  const { limitOverrides } = await subject;
+  // A record with no ceiling derives one from its seed. The seed is the settled
+  // value, so a model whose window the sweep measured is searched from that window
+  // rather than from the catalogue's optimistic number — which is the difference
+  // between one probe and six.
+  assert.deepEqual(
+    limitOverrides(
+      "new-free",
+      { context: 1048576, output: 32000 },
+      undefined,
+      undefined,
+      undefined,
+      new Map([["new-free", {}]]),
+      new Map([["new-free", HIT]]),
+    ),
+    { context: 343000 },
+  );
+  // with no sweep and no bracket the same declaration stands
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 1048576, output: 32000 }, undefined, undefined, undefined, NO_WALLS, NO_WALLS),
+    {},
+  );
+});
+
+test("a sweep answers the context axis and nothing else", async () => {
+  const { limitOverrides } = await subject;
+  // The sweep asks for sixteen completion tokens, so nothing it watched says
+  // anything about a completion ceiling: it must not invent one.
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 200000, output: 32000 }, {}, new Map(), new Map(), new Map(), new Map([["new-free", HIT]])),
+    { context: 343000 },
+  );
+});
+
+test("a sweep value reaches the diagnostics sink with the wall and the day it was measured", async () => {
+  const { limitOverrides, limitDiagnostics } = await subject;
+  const seen = [];
+  const previous = limitDiagnostics((entry) => seen.push(entry));
+  try {
+    limitOverrides("new-free", { context: 200000, output: 32000 }, {}, new Map(), new Map(), new Map(), new Map([["new-free", HIT]]));
+  } finally {
+    limitDiagnostics(previous);
+  }
+  assert.deepEqual(seen, [
+    {
+      kind: "sweep-statement",
+      id: "new-free",
+      axis: "context",
+      value: 343000,
+      declared: 200000,
+      wall: "bracketed",
+      at: "2026-10-19",
+    },
+  ]);
+});
+
+test("a served sample is floored to a whole thousand, and a wall nobody hit is a floor", async () => {
+  const { measuredWalls } = await subject;
+  const at = join(tmpdir(), `zen-sweep-${process.pid}-${Date.now()}.json`);
+  try {
+    writeFileSync(
+      at,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "bracketed-free": {
+            servedTokens: 343131,
+            servedChars: 1600000,
+            refusedChars: 1900000,
+            refusedSizes: [1900000],
+            wall: "bracketed",
+            at: "2026-10-19",
+          },
+          "open-free": { servedTokens: 599561, servedChars: 2800000, refusedChars: null, refusedSizes: [], wall: "openEnded" },
+          "never-served-free": { servedTokens: null, wall: "single-refusal" },
+          "no-tokens-free": { servedChars: 2800000, wall: "openEnded" },
+          "too-small-free": { servedTokens: 999, wall: "bracketed" },
+        },
+      }),
+    );
+    const walls = measuredWalls(at);
+    assert.deepEqual(walls.get("bracketed-free"), {
+      value: 343000,
+      settles: true,
+      wall: "bracketed",
+      at: "2026-10-19",
+    });
+    assert.deepEqual(walls.get("open-free"), { value: 599000, settles: false, wall: "openEnded", at: undefined });
+    // A run that only ever saw refusals has no sample to declare, and a sample
+    // that floors to nothing is not a window.
+    assert.equal(walls.has("never-served-free"), false);
+    assert.equal(walls.has("no-tokens-free"), false);
+    assert.equal(walls.has("too-small-free"), false);
+  } finally {
+    rmSync(at, { force: true });
+  }
+});
+
+test("the sweep is read once per file, and a file that is not one is no measurement", async () => {
+  const { measuredWalls } = await subject;
+  const at = join(tmpdir(), `zen-sweep-once-${process.pid}-${Date.now()}.json`);
+  const broken = join(tmpdir(), `zen-broken-${process.pid}-${Date.now()}.json`);
+  const listed = join(tmpdir(), `zen-listed-${process.pid}-${Date.now()}.json`);
+  try {
+    writeFileSync(at, JSON.stringify({ models: { "once-free": { servedTokens: 100000, wall: "bracketed" } } }));
+    assert.equal(measuredWalls(at).get("once-free").value, 100000);
+    // The file is an input that changes when somebody commits a run's result, not
+    // while a process serves requests: what is already read stands, so the same
+    // path is never a syscall per model list.
+    writeFileSync(at, JSON.stringify({ models: { "once-free": { servedTokens: 900000, wall: "bracketed" } } }));
+    assert.equal(measuredWalls(at).get("once-free").value, 100000);
+    // A path that is not there, one holding something else, and one whose models
+    // are not a map all answer the way a build with no snapshot answers.
+    assert.equal(measuredWalls(join(tmpdir(), `zen-absent-${process.pid}-${Date.now()}.json`)).size, 0);
+    writeFileSync(broken, "{ this is not json");
+    assert.equal(measuredWalls(broken).size, 0);
+    writeFileSync(listed, JSON.stringify({ models: ["a", "b"] }));
+    assert.equal(measuredWalls(listed).size, 0);
+  } finally {
+    rmSync(at, { force: true });
+    rmSync(broken, { force: true });
+    rmSync(listed, { force: true });
+  }
+});
+
+test("the environment says where the sweep's file is, and an empty answer says it is nowhere", async () => {
+  const { limitsSnapshotPath, LIMITS_SNAPSHOT_ENV } = await subject;
+  assert.equal(limitsSnapshotPath("C:/named/by/a/caller.json"), "C:/named/by/a/caller.json");
+  assert.equal(
+    limitsSnapshotPath(undefined, { [LIMITS_SNAPSHOT_ENV]: "C:/named/by/the/env.json" }),
+    "C:/named/by/the/env.json",
+  );
+  assert.equal(limitsSnapshotPath(undefined, { [LIMITS_SNAPSHOT_ENV]: "" }), "");
+  // and with nothing said at all it is the file the sweep writes beside this
+  // module: the one the scheduled run commits.
+  assert.equal(limitsSnapshotPath(undefined, {}), SHIPPED_SNAPSHOT);
+});
+
+test("the shipped snapshot holds whole thousands and nothing else", async () => {
+  const { measuredWalls } = await subject;
+  // Read by path rather than through the environment, which this file has already
+  // told that there is no snapshot. What is asserted is the shape of the file and
+  // not the numbers in it: the scheduled run rewrites those, and a suite that
+  // pinned them would go red every time the route moved.
+  if (!existsSync(SHIPPED_SNAPSHOT)) return;
+  const walls = measuredWalls(SHIPPED_SNAPSHOT);
+  assert.ok(walls.size > 0, "the committed measurement names at least one model");
+  for (const [id, wall] of walls) {
+    assert.equal(typeof id, "string");
+    assert.ok(id.length > 0);
+    assert.ok(Number.isSafeInteger(wall.value) && wall.value >= 1000 && wall.value % 1000 === 0, `${id}: ${wall.value}`);
+    assert.equal(typeof wall.settles, "boolean");
+    assert.ok(wall.wall === "bracketed" || wall.wall === "openEnded", `${id}: ${wall.wall}`);
+  }
+});
+
+test("an input the catalogue declares under a measured window is raised to it, and never lowered", async () => {
+  const { limitOverrides } = await subject;
+  // The catalogue declares a 160000 input cap for a model the sweep watched serve
+  // 343000 tokens, and magpie shows `context_window` as the smaller of the two
+  // axes: left alone, that 160000 is the model's size on screen.
+  assert.deepEqual(
+    limitOverrides(
+      "new-free",
+      { context: 200000, input: 160000, output: 32000 },
+      {},
+      new Map(),
+      new Map(),
+      new Map(),
+      new Map([["new-free", HIT]]),
+    ),
+    { context: 343000, input: 343000 },
+  );
+  // An input the catalogue declares above the measured window is left where it is:
+  // the window already bounds what is shown, and lowering an axis nothing here
+  // measured would be inventing a cap.
+  assert.deepEqual(
+    limitOverrides(
+      "new-free",
+      { context: 200000, input: 1048576, output: 32000 },
+      {},
+      new Map(),
+      new Map(),
+      new Map(),
+      new Map([["new-free", HIT]]),
+    ),
+    { context: 343000 },
+  );
+  // With no input declared there is nothing to raise: magpie's own fallback reads
+  // the window already.
+  assert.deepEqual(
+    limitOverrides("new-free", { context: 200000, output: 32000 }, {}, new Map(), new Map(), new Map(), new Map([["new-free", HIT]])),
+    { context: 343000 },
+  );
+  // And it holds for a window the table measured, not only for the sweep's: this
+  // is the shape big-pickle and space-bunny-free needed written out by hand.
+  assert.deepEqual(
+    limitOverrides(
+      "mimo-v2.6-flash-free",
+      { context: 200000, input: 160000, output: 32000 },
+      undefined,
+      new Map(),
+      new Map(),
+      new Map(),
+      NO_WALLS,
+    ),
+    { context: 343000, input: 343000, output: 131072 },
+  );
+});
+
+test("a window named while the process runs raises an input the catalogue left behind", async () => {
+  const { limitOverrides } = await subject;
+  // The strongest answer this axis has is a window the route named, and the input
+  // axis follows it like any other measured window: without that, magpie's
+  // `context_window` would be the smaller catalogue input and the route's own
+  // statement would never reach the screen.
+  assert.deepEqual(
+    limitOverrides(
+      "new-free",
+      { context: 200000, input: 160000, output: 32000 },
+      {},
+      new Map([["new-free", 900000]]),
+      new Map(),
+      new Map(),
+      NO_WALLS,
+    ),
+    { context: 900000, input: 900000 },
+  );
+  // A live window below the declared input leaves the declaration where it is: the
+  // smaller of the two is already what is shown, and this file does not lower an
+  // axis it has nothing else to say about.
+  assert.deepEqual(
+    limitOverrides(
+      "new-free",
+      { context: 200000, input: 1048576, output: 32000 },
+      {},
+      new Map([["new-free", 900000]]),
+      new Map(),
+      new Map(),
+      NO_WALLS,
+    ),
+    { context: 900000 },
+  );
+});
+
+test("a snapshot past the read ceiling is no measurement, and one naming the prototype keys is only ever keys", async () => {
+  const { measuredWalls, limitOverrides } = await subject;
+  const big = join(tmpdir(), `zen-sweep-big-${process.pid}-${Date.now()}.json`);
+  const proto = join(tmpdir(), `zen-sweep-proto-${process.pid}-${Date.now()}.json`);
+  try {
+    // The file is read on a path that must not be talked into a large read, and the
+    // ceiling is the one the state file is read under. A row invented to fill it is
+    // refused whole rather than read in part, because half a model listing is not a
+    // smaller listing.
+    writeFileSync(
+      big,
+      JSON.stringify({ models: { "filler-free": { servedTokens: 300000, wall: "bracketed" }, pad: "x".repeat(300 * 1024) } }),
+    );
+    assert.equal(measuredWalls(big).size, 0);
+    // `__proto__` and `toString` are keys like any other in a Map, and reading them
+    // as evidence for an id named that way says nothing about any other model: the
+    // catalogue never offers such an id, and the ids this reads for are the ones
+    // the file names. What matters is that nothing inherited becomes a measurement,
+    // which `Object.entries` over a parsed object cannot produce.
+    writeFileSync(proto, '{"models":{"__proto__":{"servedTokens":900000,"wall":"bracketed"},"toString":{"servedTokens":900000,"wall":"bracketed"}}}');
+    const walls = measuredWalls(proto);
+    assert.equal(walls.size, 2);
+    assert.equal(walls.get("__proto__").value, 900000);
+    // and an id the file does not name is answered by the declaration it was handed,
+    // prototype chain and all
+    assert.deepEqual(limitOverrides("valueOf", { context: 200000 }, {}, new Map(), new Map(), new Map(), walls), {});
+  } finally {
+    rmSync(big, { force: true });
+    rmSync(proto, { force: true });
+  }
 });

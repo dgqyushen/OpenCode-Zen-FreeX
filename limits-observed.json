@@ -6,7 +6,8 @@
       "servedChars": 2800000,
       "refusedChars": null,
       "refusedSizes": [],
-      "wall": "openEnded"
+      "wall": "openEnded",
+      "at": "2026-10-19"
     },
     "big-pickle": {
       "servedTokens": 343131,
@@ -16,7 +17,8 @@
         2200000,
         2800000
       ],
-      "wall": "bracketed"
+      "wall": "bracketed",
+      "at": "2026-10-19"
     },
     "deepseek-v4.1-flash-free": {
       "servedTokens": 215178,
@@ -26,56 +28,62 @@
         1600000,
         2800000
       ],
-      "wall": "bracketed"
+      "wall": "bracketed",
+      "at": "2026-10-19"
     },
     "glm-5.3-flash-free": {
-      "servedTokens": 311109,
-      "servedChars": 1450000,
+      "servedTokens": 215041,
+      "servedChars": 1000000,
       "refusedChars": 1600000,
       "refusedSizes": [
         1600000,
         2800000
       ],
-      "wall": "bracketed"
+      "wall": "bracketed",
+      "at": "2026-10-19"
     },
     "longcat-2.5-preview-free": {
       "servedTokens": 599264,
       "servedChars": 2800000,
       "refusedChars": null,
       "refusedSizes": [],
-      "wall": "openEnded"
+      "wall": "openEnded",
+      "at": "2026-10-19"
     },
     "mimo-v2.6-flash-free": {
       "servedTokens": 343131,
       "servedChars": 1600000,
-      "refusedChars": 1900000,
+      "refusedChars": 2200000,
       "refusedSizes": [
-        1900000,
         2200000,
         2800000
       ],
-      "wall": "bracketed"
+      "wall": "bracketed",
+      "at": "2026-10-19"
     },
     "nemotron-3.5-lightning-free": {
       "servedTokens": 599561,
       "servedChars": 2800000,
       "refusedChars": null,
       "refusedSizes": [],
-      "wall": "openEnded"
+      "wall": "openEnded",
+      "at": "2026-10-19"
     },
     "nemotron-3.5-super-vl-free": {
       "servedTokens": 599561,
       "servedChars": 2800000,
       "refusedChars": null,
       "refusedSizes": [],
-      "wall": "openEnded"
+      "wall": "openEnded",
+      "at": "2026-10-19"
     },
     "space-bunny-free": {
       "servedTokens": 599516,
       "servedChars": 2800000,
       "refusedChars": null,
       "refusedSizes": [],
-      "wall": "openEnded"
+      "wall": "openEnded",
+      "at": "2026-10-19"
     }
   }
 }

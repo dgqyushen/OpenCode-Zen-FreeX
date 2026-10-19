@@ -29,8 +29,11 @@ declared window does not allow. `space-bunny-free` under-reports on a third
 axis, its `input`: the catalogue derives that number from its own pair
 (`context − output`, 524288) while prompts of 535,110, 935,110 and 979,550
 tokens were served through the free id, and the axis is what a host that shows
-a window shows — magpie's `context_window` and `max_input_tokens` both follow
-it, so the derivation was on screen as half a window.
+a window shows: magpie's `context_window` and `max_input_tokens` both follow it
+when one is declared, and the window it reports is the smaller of the two, so
+the derivation was on screen as half a window. That is the same fact the rule
+below restates at run time, which is why an under-declared `input` now follows
+the window, wherever that window came from.
 
 All of these numbers are acted on. The window decides when a conversation is
 compacted and how much of it is ever sent; the output cap is sent as
@@ -143,7 +146,11 @@ measured by serving. A prompt sized past the declared input is the measurement
 (535,110, 935,110 and 979,550-token prompts each came back with the needle at
 their end echoed, and `usage.prompt_tokens` is the count that says how much was
 served), and the window the catalogue declares for the same id bounds the value
-from above: a request placed over it is refused.
+from above: a request placed over it is refused. A measurement of its own is no
+longer the only way the axis moves: at run time the axis follows the window, from
+the table, from the sweep or from a window the route names while the plugin runs,
+and an `input` the catalogue declares under that window is raised to it, which is
+the rule stated in full under what a model is actually given below.
 
 The ceiling, which is cheaper than the window: ask for `max_tokens: 1000000` on a
 short prompt and stop reading as soon as the answer starts. An upstream that
@@ -171,10 +178,14 @@ under a short prompt answers 200 and writes nothing like it, and `mimo`'s refusa
 came back with the 200000 it was asked for rather than with a ceiling — and
 neither is a generation nobody watched finish.
 
-`witnessed`, the fourth evidence tier, is used by nothing that ships here. The
-table draws on `route`, `route-twin` and `vendor` only; `witnessed` — a
-generation somebody watched finish — is accepted because `limitOverrides` is
-exported and a caller may hand it a table that says so, and no shipped entry
+The evidence tiers are `route`, `route-twin`, `route-sweep`, `vendor` and
+`witnessed`, in that order. The table here draws on `route`, `route-twin` and
+`vendor` only: `route-sweep` is a measurement on this same route taken by a
+machine rather than by hand, read at run time from the file the scheduled sweep
+writes rather than written into this file, and it answers where the table has
+nothing to say (below); `witnessed` - a generation somebody watched finish - is
+used by nothing that ships here, and is accepted because `limitOverrides` is
+exported and a caller may hand it a table that says so, while no shipped entry
 says it. A live refusal is not an entry either: `observeRouteStatement` applies
 one to the running process, for the rest of that process, and needs no record in
 this file.
@@ -191,8 +202,12 @@ that model's window for the rest of the process. The list is rebuilt at every
 start and hourly after, so a route that changes the window it enforces is
 followed without anyone editing this file. That correction is not written down: a
 restart falls back to what is measured here and to the bracket below. The `input`
-axis has no live form: the refusals this route sends name a window and a
-completion ceiling, and never an input cap.
+axis has no live form of its own: the refusals this route sends name a window and
+a completion ceiling, and never an input cap. It does follow a window this
+process was told about, though, exactly as it follows one from the table or from
+the sweep: where the route names a window that the catalogue's `input` sits
+under, that `input` is raised to it for the rest of the process, which is what
+keeps the route's own answer from being shown as a smaller catalogue number.
 
 **The wall is learned while the plugin runs.** Everything above was measured by
 somebody by hand and written into a table, and that does not scale: the wall this
@@ -304,24 +319,81 @@ bounded at 500 models and 256 KiB. Nothing here may fail a request: a file that
 cannot be written is a bracket that is not remembered, and a file that cannot be
 read is a model with no history.
 
-**What a model is actually given.** The context axis has four tiers, and the
+**What a model is actually given.** The context axis has five tiers, and the
 order is the order they are consulted in: a window a refusal named while this
 process was running, which is exact and applied as it stands; then the bracket's
 ceiling, which exists only because a request was served or refused and so speaks
 about the wall as it is enforced now; then the shipped table's entry, while the
-catalogue still declares what it was measured against, which is also what a fresh
-record is seeded from, so the table has the first word and not the last; and last
-the catalogue's own number. The bracket is route evidence by construction and is
-not bound by the raise-only rule the weaker tiers obey, which is the point of it:
-it may lower a declaration as well as raise it, and what it lowers to is the
-largest size the route is known to have served. The output axis keeps its own
-tiers and gains a third wording: besides the completion ceiling an upstream names
-when it refuses the ask — `supports at most N completion tokens` — and LongCat's
-`is not less or equal to` form, it now reads the range this route answers an
-oversized `max_tokens` with, `the valid range of max_tokens is [1, 393216]`, and
-takes the upper end of it, which is the ceiling the route says it accepts up to.
-The `input` axis is unchanged: no refusal this route sends names an input cap, so
-there is nothing to observe into it.
+catalogue still declares what it was measured against, so the table has the first
+word for an id it names; then what the scheduled sweep measured on this same
+route, which is the tier that answers for an id the table never named and for an
+axis whose catalogue value has moved since, and which may lower a declaration
+only when the wall behind it was bracketed; and last the catalogue's own number.
+Whichever of them settles an axis is also what a fresh record is seeded from, so
+the search starts from the table's number where the table answers and from the
+sweep's where it does not, while the bracket the route teaches keeps the last
+word either way. The bracket is route evidence by construction and is not bound
+by the raise-only rule the weaker tiers obey, which is the point of it: it may
+lower a declaration as well as raise it, and what it lowers to is the largest
+size the route is known to have served. The output axis keeps its own tiers and
+gains a third wording: besides the completion ceiling an upstream names when it
+refuses the ask — `supports at most N completion tokens` — and LongCat's `is not
+less or equal to` form, it now reads the range this route answers an oversized
+`max_tokens` with, `the valid range of max_tokens is [1, 393216]`, and takes the
+upper end of it, which is the ceiling the route says it accepts up to. The
+`input` axis still has no refusal form - no refusal this route sends names an
+input cap - but it is not static any more: it follows the window, and the window
+may be answered by the table's entry while that entry still applies, by the
+sweep, or by a refusal that named it while this process was running, which is the
+strongest of the three and is taken as it stands. Where the catalogue declares an
+`input` under that window, the axis is raised to it, because the two axes are one
+fact stated twice and magpie reads `context_window` from the smaller of them. The
+raise goes one way only - a declared `input` above the window is left alone - and
+it happens only where the catalogue declares an `input` at all, since with none
+declared magpie's own fallback already reads the window, and the table's own
+entry for this axis wins while that entry still applies, because the entry
+carries the samples behind it.
+
+**What the sweep leaves, and how it is read back.** The scheduled workflow
+(`.github/workflows/walls.yml`, once a day) runs `limits-watch.mjs --sweep`,
+which measures the ids the listing offers and the snapshot does not name yet and
+folds each result into `limits-observed.json` beside `limits.mjs`: the file is
+pushed as a branch, with a pull request opened where the repository lets Actions
+open one and a compare link in the run summary where it does not, and never a
+commit to `main`. A wall that moves under an id already measured is not
+re-measured on that timer, and `--all` is a person asking for a fresh reading of
+everything. That file is an input at run time now rather than only a workflow
+artifact: `measuredWalls()` reads it once per path and keeps the answer, taking
+the path from its argument, else `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the
+file beside the module, with an empty value of that variable meaning no snapshot
+at all. A missing file, an unreadable one, one that is not JSON, one whose
+`models` is not an object and one past 256 KiB answer the same way - no
+measurement - because a build that cannot read a measurement declares what its
+table and its catalogue say, and nothing here may fail a request.
+
+Each row contributes two facts and no more: the largest prompt the route was
+watched to serve, floored to a whole thousand, the same rounding and for the same
+reason as the numbers in the table above; and whether the sweep hit a wall at
+all, which is whether its `wall` is `bracketed`. A bracketed wall had two refused
+sizes behind it, so the served sample is a point the wall is known to sit above
+and the axis may be answered with it either way, which is what lets a sweep value
+lower a declaration as well as raise one. A wall the sweep never hit is a floor -
+the route served this much and said nothing about the rest - and a floor under
+the declaration says nothing about the declaration, so it may only raise one. The
+sweep's other two labels, `openEnded` and `single-refusal`, are that same floor
+when the row has a served sample; a row with none, which is what a sweep that was
+refused everything leaves behind, is no measurement at all. The sweep asks
+for sixteen completion tokens and measures a prompt, so it answers the context
+axis only: the output axis is still the table and the catalogue, and `input` is
+still measured by nothing here, though the window that axis follows may be the
+one the sweep settled rather than the table's (above).
+
+Applying one is reported as it happens: `OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` gets a
+`sweep-statement` line naming the model, the axis, the value, the wall behind it
+and the date the sweep wrote. Where the sweep is what settles an axis, its value
+is also what a record is seeded from, so a wall that moved and was measured again
+is the number the runtime bracket searches around rather than the one the
+catalogue still prints.
 
 **What this does not do.** It cannot learn a wall above the sizes the host
 actually sends: the declared ceiling is what gives the host a reason to send a
@@ -336,9 +408,11 @@ while the route counts tokens, so a bracket proves a size a few per cent away
 from what a tokenizer would say.
 
 **Re-measuring, now that the plugin measures too.** The hand measurement above is
-still the ground truth and still what a bracket is seeded from, and the plugin's
-own learning is no substitute for it, since it can never reach a wall the traffic
-does not touch. A single refusal is not a wall on this route either: the same id
+still the ground truth where it speaks, and is still what a bracket is seeded
+from for an id it names while the catalogue has not moved; for an id it does not
+name, the sweep's measurement is that seed instead, and the plugin's own learning
+is no substitute for either, since it can never reach a wall the traffic does not
+touch. A single refusal is not a wall on this route either: the same id
 has refused a prompt and then served the identical request, so what a hand
 measurement looks for is two refused sizes behind one wall, which is the runtime
 counterpart of the bound this layer drops when the route serves past it. What the
@@ -350,9 +424,9 @@ it — the value the declaration moved to, the size the route served or refused,
 window a refusal named when it named one, and how many refusals the model has
 cost. A bracket that has learned something wrong is forgotten by deleting that
 file, or by pointing `OPENCODE_ZEN_FREE_LIMITS_STATE` at an empty string for a run
-that should not remember anything. What comes out of the file is not evidence for
-the table in this file: it is one process's traffic, and the table wants a
-measurement.
+that should not remember anything. What comes out of the state file is not
+evidence for the table in this file: it is one process's traffic, and the table
+wants a measurement.
 
 **The same shape on a second upstream.** `mimo-v2.6-flash-free` is declared
 200000/32000 in the catalogue, the under-report the DeepSeek id has, and the route
@@ -597,19 +671,24 @@ that passes under the stricter of them, since the looser one will not last.
 | `limits.mjs` | what a model's limits are, where the catalogue under-reports them |
 | `stream.mjs`, `tool-response.mjs` | replies Zen cuts short, and tool calls |
 | `limits-audit.mjs` | asks the route which ids it still offers and which look under-declared (`limits:audit`) |
+| `limits-sweep.mjs` | brackets one id's prompt wall on the live route (`limits:sweep`) |
+| `limits-watch.mjs` | the scheduled diff and sweep: what is offered, what was measured, what to measure (`limits:watch`) |
+| `limits-observed.json` | what the last scheduled run measured: read at run time as the `route-sweep` tier |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
 
-`capture.mjs`, `limits-audit.mjs` and `tools-smoke.mjs` are maintenance tools for
-this repository, not part of what a host loads: they are not in `package.json`'s
-`files`, so a published tarball carries the modules a host imports,
-`fingerprint.json`, and the four documents beside them (`README.md`,
-`MAINTAINING.md`, `LICENSE`, `NOTICE`) — thirteen files in all, the last being
-`package.json`, which npm packs whatever `files` says. The same list is why
-`npm run` has nothing to run in an installed package: `check:gate`,
-`limits:audit` and `capture` are entry points for a checkout, and the tools they
-name stay here. `package.json`'s `exports` names those public modules one by one
-rather than mapping `./*`, so a file that was never meant to be imported cannot
+`capture.mjs`, `limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs` and
+`tools-smoke.mjs` are maintenance tools for this repository, not part of what a
+host loads: they are not in `package.json`'s `files`, so a published tarball
+carries the modules a host imports, `fingerprint.json`, `limits-observed.json`
+(which `limits.mjs` does read at run time) and the four documents beside them
+(`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - fourteen files in all, the
+last being `package.json`, which npm packs whatever `files` says. The same list
+is why `npm run` has nothing to run in an installed package: `check:gate`,
+`limits:audit`, `capture`, `limits:sweep` and `limits:watch` are entry points for
+a checkout, and the tools they name stay here. `package.json`'s `exports` names
+those public modules one by one rather than mapping `./*`, so a file that was
+never meant to be imported cannot
 be reached as a subpath — `capture.mjs` in particular starts a server and
 rewrites `fingerprint.json` when it runs.
 
@@ -630,9 +709,10 @@ each other). Change both, and keep them saying the same thing.
 ## What runs this
 
 Every script in `package.json` names `bun`: `bun test` is the suite, and
-`check:gate`, `limits:audit` and `capture` are the tools. `bun test` is what CI
-runs, at the version pinned in `.github/workflows/ci.yml` so a run says something
-about the commit rather than about whatever Bun was newest that morning.
+`check:gate`, `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are
+the tools. `bun test` is what CI runs, at the version pinned in
+`.github/workflows/ci.yml` so a run says something about the commit rather than
+about whatever Bun was newest that morning.
 
 Nothing here is installed with Bun — there are no dependencies — so Bun is the
 tools only, and the floor a host's runtime has to clear is the newest API the
@@ -673,9 +753,11 @@ built from are one thing. `magpie plugin add opencode-zen-freex` installs it by
 that name.
 
 What ships is `package.json`'s `files` list, and it is deliberately narrower than
-the repository: the three maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
-`limits-audit.mjs`) stay here, because a host never loads them and one of them
-rewrites the shipped `fingerprint.json` when it is run. `LICENSE` is
+the repository: the five maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
+`limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs`) stay here, because a
+host never loads them and one of them rewrites the shipped `fingerprint.json`
+when it is run, while `limits-observed.json` does ship, because `limits.mjs`
+reads it at run time. `LICENSE` is
 MIT with its text unmodified and both copyright lines in place — upstream's and
 this fork's — so what a licence scanner reads is a standard MIT file; the fork's
 provenance is in `NOTICE`, which is where a reader finds why this fork exists.

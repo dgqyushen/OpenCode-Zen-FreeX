@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Zen's catalogue is where a model's limits are declared from, and for some
 // free ids it under-reports them. A free id and its paid twin are the same
@@ -27,14 +29,30 @@ import { dirname, join } from "node:path";
 //   route       the route's own answer about its own limit: the words of a
 //               refusal, or what its own service demonstrates
 //   route-twin  what this route declares for the same upstream model
+//   route-sweep what the scheduled sweep measured against this same route and
+//               checked in beside this file as `limits-observed.json`: the same
+//               bracket the route tier records, taken by machine rather than by
+//               hand, and the tier that answers for a model this file has never
+//               named — which is what a model Zen made free this morning is
 //   vendor      the model vendor's published page
 //   witnessed   a generation somebody watched finish
 //
+// The hand-kept table still has the first word for an id it names, because the
+// samples and the reasoning are beside its number. The sweep has the last word
+// for the ids and axes it does not: a window nobody measured is a window every
+// host gets wrong, and waiting for somebody to write a table entry by hand is
+// how a new model stays wrong for a week. A sweep says nothing about the output
+// axis — it asks no completion for anything — so that axis is still answered by
+// the table and the catalogue alone.
+//
 // Being accepted is not evidence. Zen answers 200 to max_tokens 2000000 under a
 // short prompt, so a value that is accepted says something about the request
-// and nothing about what the model writes. A route or route-twin value may set
-// any number; a vendor or witnessed one may only raise, because lowering a
-// limit on weaker evidence invents a restriction nobody asked for.
+// and nothing about what the model writes. A route, route-twin or route-sweep
+// value may set any number; a vendor or witnessed one may only raise, because
+// lowering a limit on weaker evidence invents a restriction nobody asked for.
+// A sweep that found no wall is in the same position: making the largest
+// prompt it served into a declaration would turn "nothing refused this" into
+// "this is the ceiling", so a wall the sweep never hit may only raise too.
 //
 // Every axis carries the catalogue value it was measured against. A catalogue
 // that moves voids that axis rather than leaving a stale number behind, and a
@@ -658,6 +676,7 @@ const isUsableId = (id) => typeof id === "string" && id !== "";
 // Both are silent by design, and both are visible when the diagnostics sink is
 // installed.
 export const LIMITS_STATE_ENV = "OPENCODE_ZEN_FREE_LIMITS_STATE";
+export const LIMITS_SNAPSHOT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT";
 export const MAX_WINDOW_ENV = "OPENCODE_ZEN_FREE_MAX_WINDOW";
 export const RAISE_COOLDOWN_ENV = "OPENCODE_ZEN_FREE_LIMITS_COOLDOWN_MS";
 const DEFAULT_MAX_WINDOW = 1_048_576;
@@ -678,6 +697,21 @@ const STATE_VERSION = 1;
 const STATE_ENTRIES = 500;
 const STATE_LIMIT = 256 * 1024;
 const SAVE_DEBOUNCE_MS = 5000;
+
+// Where the sweep writes what it measured, and how much of it is worth reading.
+// The file is checked in beside this module, so the path is this module's own
+// directory rather than anything the environment has to say; the ceiling is the
+// same one the state file is read under, and for the same reason — it is read by
+// a request path that must not be talked into a large read.
+const DEFAULT_SNAPSHOT_URL = new URL("./limits-observed.json", import.meta.url);
+const SNAPSHOT_LIMIT = 256 * 1024;
+
+// What a served sample is floored to before it is declared. The route counts the
+// prompt it was sent and the host counts the prompt it is planning, and the two
+// never agree exactly; a whole thousand is the margin the table's own entries
+// were rounded by, so a sweep value and a hand-written one are the same kind of
+// number.
+const SNAPSHOT_STEP = 1000;
 
 // Where the state is kept: whatever the environment names, an empty string
 // meaning "keep it in memory only", and otherwise one file in the cache
@@ -845,9 +879,11 @@ function note(entry) {
   }
 }
 
-function describe({ kind, id, axis, value, measuredAgainst, declared, was, floor, step, refused, named, served, refusals }) {
+function describe({ kind, id, axis, value, measuredAgainst, declared, was, floor, step, refused, named, served, refusals, wall, at }) {
   if (kind === "route-statement")
     return `${id} ${axis}=${value} — named by a refusal this process saw, so it is applied as it stands (the catalogue declares ${declared === undefined ? "nothing for this axis" : declared})`;
+  if (kind === "sweep-statement")
+    return `${id} ${axis}=${value} — measured by the scheduled sweep (${wall === undefined ? "wall not recorded" : wall}${at === undefined ? "" : `, ${at}`}), so it is applied as it stands (the catalogue declares ${declared === undefined ? "nothing for this axis" : declared})`;
   if (kind === "wall-raised")
     return `${id} context=${value} — up from ${was}: the host filled ${floor} of it and the route served that, so the declaration is probing ${step} further`;
   if (kind === "wall-refused")
@@ -1140,7 +1176,73 @@ export function refusalAxis(status, text, axes = {}) {
   return undefined;
 }
 
-const ROUTE_TIERS = new Set(["route", "route-twin"]);
+const ROUTE_TIERS = new Set(["route", "route-twin", "route-sweep"]);
+
+// The tier a measured wall is published under, and the wording the diagnostics
+// sink uses for it.
+const SWEEP_SOURCE = "route-sweep";
+
+// Where the last sweep's measurements are read from: whatever the environment
+// names, and otherwise the file the sweep writes beside this module. Returned as
+// a path rather than read here, so a caller that names one of its own — a test,
+// a host keeping the file somewhere else — is answered with its own file.
+export function limitsSnapshotPath(explicit, env = globalThis.process?.env) {
+  if (explicit !== undefined) return explicit;
+  const named = env?.[LIMITS_SNAPSHOT_ENV];
+  if (typeof named === "string") return named;
+  return fileURLToPath(DEFAULT_SNAPSHOT_URL);
+}
+
+// The measurements, one read per file and never a second one: the file is an
+// input that changes when somebody commits a run's result, not while a process
+// serves requests, and re-reading it on every model list would be a syscall per
+// listing for an answer that cannot have moved.
+const wallReads = new Map();
+
+// What the sweep measured, as the context axis may use it. One entry per id that
+// has a served sample: the largest prompt the route was watched to serve, floored
+// to a whole thousand so a host whose count differs from the route's is still
+// under it — the same rounding, and for the same reason, as the values in the
+// table above.
+//
+// `settles` is whether the sweep hit the wall at the number: a bracketed wall had
+// something bigger refused, so the sample is a point the wall is known to sit
+// above and the axis can be answered with it either way. A wall the sweep never
+// hit is a floor — the route served this much and said nothing about the rest —
+// and a floor under the declaration says nothing about the declaration, so it may
+// only raise.
+//
+// A missing file, an unreadable one and one holding another shape all answer the
+// same way — no measurement — because they all mean the same thing: this build
+// declares what its table and its catalogue say and nothing else. Nothing here
+// may fail a request, so nothing here throws.
+export function measuredWalls(file) {
+  const path = limitsSnapshotPath(file);
+  if (!path) return new Map();
+  const held = wallReads.get(path);
+  if (held !== undefined) return held;
+  const walls = new Map();
+  wallReads.set(path, walls);
+  try {
+    const text = readFileSync(path, { encoding: "utf8" });
+    if (typeof text !== "string" || text.length > SNAPSHOT_LIMIT) return walls;
+    const models = JSON.parse(text)?.models;
+    if (!models || typeof models !== "object" || Array.isArray(models)) return walls;
+    for (const [id, row] of Object.entries(models)) {
+      if (!isUsableId(id)) continue;
+      const tokens = row?.servedTokens;
+      if (!usable(tokens)) continue;
+      const value = Math.floor(tokens / SNAPSHOT_STEP) * SNAPSHOT_STEP;
+      if (!usable(value)) continue;
+      const wall = typeof row?.wall === "string" ? row.wall : undefined;
+      const at = typeof row?.at === "string" ? row.at : undefined;
+      walls.set(id, { value, settles: wall === "bracketed", wall, at });
+    }
+  } catch {
+    // No measurement is not a failure: it is a build that declares what it says.
+  }
+  return walls;
+}
 
 // What this plugin declares for a model instead of what the catalogue says, as
 // a plain object to spread over the catalogue's own limit. Empty when there is
@@ -1153,6 +1255,7 @@ export function limitOverrides(
   observed = OBSERVED,
   observedOutput = OBSERVED_OUTPUT,
   brackets = BRACKETS,
+  walls = measuredWalls(),
 ) {
   const overrides = {};
   // A record has to be this table's own. `table[id]` otherwise answers out of
@@ -1160,6 +1263,30 @@ export function limitOverrides(
   // an object handed in as `table` carries — evidence for a model nobody
   // declared, from a table that never named it.
   const record = table && Object.hasOwn(table, id) ? table[id] : undefined;
+  // What the sweep measured for this id, once: it answers the context axis, and
+  // it answers the input axis through the window rather than beside it, so both
+  // readings have to be the same one.
+  const measuredWall = walls?.get?.(id);
+  // The window this id is published with before anything is observed live, and
+  // whether the sweep is what decided it. The input axis is the second half of
+  // the same answer: magpie answers `context_window` and `max_input_tokens` from
+  // `limit.input` when it is declared, and shows the smaller of the two axes, so
+  // an input left at a catalogue number the route has outgrown is not a second
+  // opinion — it is what the model's size appears to be. 160000 was on screen
+  // for a model serving 343000 exactly that way.
+  const contextEntry = record && Object.hasOwn(record, "context") ? record.context : undefined;
+  const contextDeclared = declared && Object.hasOwn(declared, "context") ? declared.context : undefined;
+  const contextApplies =
+    contextEntry !== undefined && contextDeclared !== undefined && contextEntry.declaredAt === contextDeclared;
+  const settledWindow = settledFor(contextApplies, contextEntry, contextDeclared, measuredWall);
+  // A window this process was told about is the strongest thing this axis has, and
+  // it is what the input axis follows like any other measured window: a route that
+  // names its window while the plugin runs must not have that answer shown as a
+  // smaller catalogue input instead. A window a refusal named is taken as it
+  // stands here as everywhere else, so the live value is not re-derived from the
+  // catalogue — it replaces the settled one for this purpose.
+  const liveWindow = observed?.get?.(id);
+  const window = usable(liveWindow) ? { value: liveWindow, source: "route" } : settledWindow;
   for (const axis of ["context", "input", "output"]) {
     // Own property, like the table lookup two lines up: `declared` is handed in
     // by a caller, and a `context` inherited from a custom prototype — or from a
@@ -1190,41 +1317,73 @@ export function limitOverrides(
     // after it: a record exists only because a request was served or refused,
     // which makes it evidence about the wall as it is enforced now, while the
     // table is a measurement of the same axis taken earlier. A record is seeded
-    // from the table's own number when it is created, so the table still has the
+    // from the settled value below when it is created, so the table still has the
     // first word — it just does not have the last one. A model nothing has been
-    // asked of has no record, and its axes are the table's and nothing else.
-    const seeded = seededFor(entry, declaredValue);
+    // asked of has no record, and its axes are the settled ones and nothing else.
+    const applies = entry !== undefined && declaredValue !== undefined && entry.declaredAt === declaredValue;
+    let settled = settledFor(applies, entry, declaredValue, axis === "context" ? measuredWall : undefined);
+    // The input axis has no measurement of its own to take: what the route served
+    // was a prompt, and the window is how this file states that. So where the
+    // window is a measured one — from the table, from the sweep, or named by a
+    // refusal while this process runs — an input the catalogue declares under it is
+    // raised to it. That is the precedent the table set by hand for
+    // space-bunny-free and big-pickle, and the only place those two axes can
+    // disagree in a way that shows: magpie reads `context_window` from the smaller
+    // of them, so an input left behind is a model drawn smaller than it is, and a
+    // window the route just named is drawn as the catalogue's input instead.
+    // 160000 was on screen for a model serving 343000 exactly that way.
+    //
+    // Raised and never lowered, and only where the catalogue declares one: with no
+    // input declared, magpie's own fallback already reads the window, and where
+    // the table names this axis the entry has its own samples. Both of those are
+    // answers this file would only be restating.
+    if (axis === "input" && settled.source === undefined && usable(declaredValue) && window.source !== undefined)
+      settled = {
+        value: Math.max(declaredValue, window.value),
+        source: window.source,
+        measured: window.measured,
+      };
+    const seeded = settled.value;
     const adopted = axis === "context" ? adoptedCeiling(id, seeded, brackets) : undefined;
     let value;
+    let source = settled.source;
     if (live !== undefined) {
       value = live;
+      // Live is the route answering about itself, so it stands whatever tier the
+      // axis was answered from a moment ago.
+      source = "route";
     } else if (adopted !== undefined) {
       value = adopted;
-    } else if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) {
-      value = entry.value;
-    } else if (entry) {
-      // Measured against a catalogue that has moved, or against an axis the
-      // catalogue no longer declares. Its value is void, and saying so is the
-      // whole point of the note: otherwise this is indistinguishable from a
-      // model nothing was ever measured for.
-      note({
-        kind: "catalogue-drift",
-        id,
-        axis,
-        value: entry.value,
-        measuredAgainst: entry.declaredAt,
-        declared: declaredValue,
-      });
+    } else {
+      value = settled.value;
+      if (entry && !applies) {
+        // Measured against a catalogue that has moved, or against an axis the
+        // catalogue no longer declares. Its value is void, and saying so is the
+        // whole point of the note: otherwise this is indistinguishable from a
+        // model nothing was ever measured for. The note says nothing about what
+        // replaced it, which is the sweep's own note below when that is what did.
+        note({
+          kind: "catalogue-drift",
+          id,
+          axis,
+          value: entry.value,
+          measuredAgainst: entry.declaredAt,
+          declared: declaredValue,
+        });
+      }
     }
     if (value === undefined || !Number.isSafeInteger(value) || value <= 0) continue;
     if (value === declaredValue) continue;
-    // Weaker evidence may only raise, and that holds for the table alone: a live
-    // refusal is the route itself and is taken as it stands, entry or no entry.
+    // Weaker evidence may only raise. Live is the route itself, a bracket was put
+    // under the declaration by the route answering, and a tier that is neither of
+    // those has to be on its own entry: this is what keeps a vendor's page, a
+    // watched generation, and a floor the sweep found but never hit from narrowing
+    // a window somebody else measured.
     if (
       live === undefined &&
       adopted === undefined &&
-      entry &&
-      !ROUTE_TIERS.has(entry.source) &&
+      source !== undefined &&
+      !ROUTE_TIERS.has(source) &&
       Number.isSafeInteger(declaredValue) &&
       value < declaredValue
     )
@@ -1232,18 +1391,36 @@ export function limitOverrides(
     overrides[axis] = value;
     // A live value is the one override taken past the staleness guard and past
     // the raise-only rule, so it is the one nobody can account for afterwards:
-    // say what was applied and what it stands in for.
+    // say what was applied and what it stands in for. A sweep value can be taken
+    // past both as well, so it says where it came from.
     if (live !== undefined) note({ kind: "route-statement", id, axis, value, declared: declaredValue });
+    else if (source === SWEEP_SOURCE && adopted === undefined)
+      note({
+        kind: "sweep-statement",
+        id,
+        axis,
+        value,
+        declared: declaredValue,
+        wall: settled.measured?.wall,
+        at: settled.measured?.at,
+      });
   }
   return overrides;
 }
 
 // What the caller would have declared for this axis with no bracket in play: the
-// shipped entry when it still applies, and the catalogue's own number when it
-// does not. It is the seed a record is created from, and the value a search that
-// has not moved yet derives from — never a second opinion about a record that
-// already has one.
-function seededFor(entry, declaredValue) {
-  if (entry && declaredValue !== undefined && entry.declaredAt === declaredValue) return entry.value;
-  return declaredValue;
+// shipped entry when it still applies, else what the sweep measured, and the
+// catalogue's own number when neither answers. It is the seed a record is created
+// from, and the value a search that has not moved yet derives from — never a
+// second opinion about a record that already has one.
+//
+// `applies` is decided by the caller rather than compared again here: the loop
+// that hands this the entry is the same loop that has to say whether an entry it
+// is not using was measured against a catalogue that moved, and one comparison
+// answering both questions is one comparison that cannot disagree with itself.
+function settledFor(applies, entry, declaredValue, measured) {
+  if (applies) return { value: entry.value, source: entry.source };
+  if (measured !== undefined && (measured.settles || !usable(declaredValue) || measured.value > declaredValue))
+    return { value: measured.value, source: SWEEP_SOURCE, measured };
+  return { value: declaredValue, source: undefined };
 }

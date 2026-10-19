@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.2.24",
+  "version": "0.2.25",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -21,6 +21,7 @@
     "core-tools.mjs",
     "fingerprint.json",
     "limits.mjs",
+    "limits-observed.json",
     "models.mjs",
     "stream.mjs",
     "tool-response.mjs",
