@@ -64,7 +64,7 @@ test("a void refusal is a served size, and the point it was voided by is not a s
 });
 
 test("a bracket is narrowed on its gap, not on how many refusals it collected", async () => {
-  const { nextAsk, tally } = await subject;
+  const { BUDGET, NARROW_TO, nextAsk, tally } = await subject;
   // The three ladder sizes produce two refusals whenever the wall is under the top
   // rung, and the narrowing loop used to stop on exactly that count. It therefore
   // stopped on entry, and no bracket was ever widened past its second rung: the
@@ -81,10 +81,8 @@ test("a bracket is narrowed on its gap, not on how many refusals it collected", 
   // The rule runs on the budget as well: with the budget spent nothing more is
   // asked, however wide the bracket still is.
   // The rule runs on the budget as well: with the budget spent nothing more is
-  // asked, however wide the bracket still is. Eleven is BUDGET: it is what the
-  // loop is actually given, so the case is about the real ceiling rather than a
-  // number chosen here.
-  assert.equal(nextAsk(ladder, 11), undefined, "a spent budget asks nothing");
+  // asked, however wide the bracket still is.
+  assert.equal(nextAsk(ladder, BUDGET), undefined, "a spent budget asks nothing");
   // And a bracket already inside the precision rule costs nothing: this is what
   // keeps a model that was asked once from being asked six times.
   const tight = tally([served(1600000, 343131), refused(1620000)]);
@@ -92,4 +90,45 @@ test("a bracket is narrowed on its gap, not on how many refusals it collected", 
   // A bracket with no refused size above the floor has no interval to halve.
   assert.equal(nextAsk(tally([served(2800000, 598923)]), 1), undefined, "no refusal, nothing to narrow");
   assert.equal(nextAsk(tally([refused(1000000)]), 1), undefined, "no served floor, nothing to narrow");
+});
+
+test("the budget is enough to narrow the widest bracket the ladder produces", async () => {
+  const { BUDGET, NARROW_TO, nextAsk, tally } = await subject;
+  // The budget and the loop are two halves of one rule: a repaired loop with too
+  // small a budget still stops short of the wall, which is exactly what happened
+  // when the loop was fixed at BUDGET 6 and the declared floor only reached 279,223
+  // of a 326,702-token wall. What the ladder leaves to narrow is its two lower
+  // rungs, 1,000,000 and 1,600,000, minus the three ladder asks and one refusal
+  // confirmation.
+  const LADDER = [1_000_000, 1_600_000, 2_800_000];
+  const spentOnLadder = LADDER.length + 1;
+  // Bisect the widest bracket the ladder can leave, with the wall just under the
+  // second rung, and count what it takes to satisfy the precision rule.
+  const wall = 1_522_400;
+  let asked = [
+    { chars: LADDER[0], kind: "served", tokens: 215178 },
+    { chars: LADDER[1], kind: "refused" },
+    { chars: LADDER[2], kind: "refused" },
+  ];
+  let spent = spentOnLadder;
+  let bracket = tally(asked);
+  while (true) {
+    const next = nextAsk(bracket, spent);
+    if (next === undefined) break;
+    spent += 1;
+    asked = [
+      ...[...new Set(bracket.refusedSizes)].map((chars) => ({ chars, kind: "refused" })),
+      { chars: bracket.servedChars, kind: "served", tokens: 1 },
+      { chars: next, kind: next <= wall ? "served" : "refused", tokens: next <= wall ? 1 : undefined },
+    ];
+    bracket = tally(asked);
+  }
+  assert.ok(
+    bracket.servedChars / wall > 1 - NARROW_TO * 2,
+    `the floor lands within the precision rule of the wall, got ${bracket.servedChars} against ${wall}`,
+  );
+  assert.ok(
+    spent <= BUDGET,
+    `and BUDGET (${BUDGET}) is enough to get there, which took ${spent} requests`,
+  );
 });

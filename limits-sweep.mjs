@@ -76,13 +76,13 @@ const PACE_MS = 5000;
 // what lets the repaired loop reach the wall rather than stop a third short of it.
 // Eleven leaves seven for bisection, which closes the widest bracket this ladder
 // produces with room for one refused midpoint along the way.
-const BUDGET = 11;
+export const BUDGET = 11;
 // How close a bracket is worth closing to, as a fraction of the refused size. The
 // declared floor is within this of the wall once the loop stops, and a host cannot
 // act on a difference this small: the margin the plugin declares under a measured
 // wall is the same order. Asking past it spends the shared free credential on a
 // number that would not change any declaration.
-const NARROW_TO = 0.02;
+export const NARROW_TO = 0.02;
 // A failure that is about the request being unanswerable rather than about its
 // size: retried, never counted.
 const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
