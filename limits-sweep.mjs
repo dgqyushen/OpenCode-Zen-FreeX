@@ -69,8 +69,14 @@ const READ_BUDGET = 256 * 1024;
 // Between requests, so a sweep is not the thing that gets the shared free
 // credential rate-limited for everyone.
 const PACE_MS = 5000;
-// Per model, first pass included.
-const BUDGET = 6;
+// Per model, first pass included. The ladder costs three and confirming a refusal
+// costs one, so what is left for narrowing is this minus those: six left two, and
+// a (1,000,000 .. 1,600,000) bracket needs five to close to `NARROW_TO`. The budget
+// was therefore the other half of why no bracket was ever narrowed — raising it is
+// what lets the repaired loop reach the wall rather than stop a third short of it.
+// Eleven leaves seven for bisection, which closes the widest bracket this ladder
+// produces with room for one refused midpoint along the way.
+const BUDGET = 11;
 // How close a bracket is worth closing to, as a fraction of the refused size. The
 // declared floor is within this of the wall once the loop stops, and a host cannot
 // act on a difference this small: the margin the plugin declares under a measured

@@ -80,7 +80,11 @@ test("a bracket is narrowed on its gap, not on how many refusals it collected", 
   assert.equal(nextAsk(raised, 4), 1450000, "the gap halves, so the asks converge on the wall");
   // The rule runs on the budget as well: with the budget spent nothing more is
   // asked, however wide the bracket still is.
-  assert.equal(nextAsk(ladder, 6), undefined, "a spent budget asks nothing");
+  // The rule runs on the budget as well: with the budget spent nothing more is
+  // asked, however wide the bracket still is. Eleven is BUDGET: it is what the
+  // loop is actually given, so the case is about the real ceiling rather than a
+  // number chosen here.
+  assert.equal(nextAsk(ladder, 11), undefined, "a spent budget asks nothing");
   // And a bracket already inside the precision rule costs nothing: this is what
   // keeps a model that was asked once from being asked six times.
   const tight = tally([served(1600000, 343131), refused(1620000)]);
