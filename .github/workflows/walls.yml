@@ -11,12 +11,24 @@ name: walls
 # a million tokens; the deciding stays with whoever merges the branch.
 on:
   schedule:
-    # Daily at 03:17 UTC. The minute is not :00 because every scheduled workflow
-    # in the world asks at :00, and this one spends somebody's shared free
+    # Hourly, at :17. The minute is not :00 because every scheduled workflow in
+    # the world asks at :00, and this one spends somebody's shared free
     # credential on megabyte-sized prompts.
-    - cron: "17 3 * * *"
-  # The way to find out whether this works without waiting for tomorrow, and the
-  # way to re-measure one model by hand: run it from the Actions page.
+    #
+    # Hourly is affordable because of what the default run does not do. Without
+    # `--all` it measures only the ids the listing offers and the snapshot does
+    # not name yet, so an hour in which Zen added nothing costs one listing read
+    # and thirteen seconds - that is the measured cost of a run that finds
+    # nothing to measure. The nine minutes are what a run that does measure
+    # something pays, and a model Zen makes free is then measured and published
+    # within the hour instead of within the day. What this frequency does not buy
+    # is a fresh reading of a wall that moved under an id already measured: that
+    # is `--all`, and it stays a person's dispatch because re-measuring nine ids
+    # every hour is nine minutes of megabyte prompts for an answer that rarely
+    # changes.
+    - cron: "17 * * * *"
+  # The way to find out whether this works without waiting for the next hour, and
+  # the way to re-measure one model by hand: run it from the Actions page.
   workflow_dispatch:
     inputs:
       sweep_all:

@@ -355,7 +355,7 @@ entry for this axis wins while that entry still applies, because the entry
 carries the samples behind it.
 
 **What the sweep leaves, and how it is read back.** The scheduled workflow
-(`.github/workflows/walls.yml`, once a day) runs `limits-watch.mjs --sweep`,
+(`.github/workflows/walls.yml`, hourly at :17) runs `limits-watch.mjs --sweep`,
 which measures the ids the listing offers and the snapshot does not name yet and
 folds each result into `limits-observed.json` beside `limits.mjs`: the file is
 pushed as a branch and opened as a pull request, with a compare link in the run
@@ -399,9 +399,10 @@ catalogue still prints.
 
 **What happens to a run.** A run that measured something new leaves one changed
 file on a branch, opens it as a pull request and merges it, so the measurement is
-on `main` before the run ends and an id Zen added yesterday has a measured window
-today instead of waiting for somebody to notice. The report travels in the pull
-request body and the diff beside it: a row per model, the sizes that were served,
+on `main` before the run ends and an id Zen made free an hour ago has a measured
+window this hour instead of waiting for somebody to notice. The report travels in
+the pull request body and the diff beside it: a row per model, the sizes that were
+served,
 the sizes that were refused and the two labels above.
 
 Merging unattended is defensible here for two reasons, and the workflow checks
