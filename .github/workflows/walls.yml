@@ -115,6 +115,18 @@ jobs:
       # and the link goes to the run summary. A repository that has allowed it
       # gets the pull request; one that has not gets a branch and a link, which is
       # a person's click rather than a red run.
+      #
+      # It then merges what it opened, which is what makes a timer worth having: a
+      # window that waits for somebody to click is a window a new model does not
+      # get, and the run that found it is the one that knows what it found. Two
+      # things make an unattended merge safe, and neither is a promise. The pull
+      # request is the snapshot and nothing else, checked against what GitHub says
+      # the pull request changes rather than assumed, and left for a person if that
+      # guard ever fails. And the numbers themselves are bounded by construction:
+      # a row's value is a size the route was watched to serve, floored, so it can
+      # never be above one, and the table still has the first word for every id it
+      # names. A repository that wants the click anyway sets the variable
+      # WALLS_AUTOMERGE to `off`; nothing else about the run changes.
       - name: Open a pull request with the measurement
         id: open
         if: steps.diff.outputs.changed == 'true'
@@ -152,21 +164,49 @@ jobs:
             echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
             echo "\`single-refusal\` rather than smoothed into a wall."
           } > pr-body.md
+          opened=false
           if gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"; then
-            echo "opened=true" >> "$GITHUB_OUTPUT"
+            opened=true
           else
-            echo "opened=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=Pull request not opened::This repository does not let GitHub Actions open pull requests, so the branch was pushed and no pull request was made. Open it from the link in the run summary, or allow it under Settings > Actions > General > Workflow permissions."
           fi
+          echo "opened=$opened" >> "$GITHUB_OUTPUT"
+          merged=false
+          if [ "${{ vars.WALLS_AUTOMERGE }}" = "off" ]; then
+            echo "::notice title=Merge left to a person::WALLS_AUTOMERGE is off for this repository, so the pull request was left open."
+          elif [ "$opened" = "true" ]; then
+            paths=$(gh pr view "$branch" --json files --jq '[.files[].path] | join(",")')
+            if [ "$paths" = "limits-observed.json" ]; then
+              # Mergeability is computed after the pull request exists, so the first
+              # ask can come back with nothing to merge yet.
+              for attempt in 1 2 3 4; do
+                if gh pr merge "$branch" --squash; then merged=true; break; fi
+                sleep 5
+              done
+              if [ "$merged" = "true" ]; then
+                git push origin --delete "$branch" >/dev/null 2>&1 || true
+              else
+                echo "::warning title=Not merged automatically::The pull request for $branch could not be merged by this run; it was left open. Merge it from the run summary."
+              fi
+            else
+              echo "::warning title=Not merged automatically::This pull request changes $paths, which is more than limits-observed.json, so the run left it for a person."
+            fi
+          fi
+          echo "merged=$merged" >> "$GITHUB_OUTPUT"
       - name: Where the measurement is
         if: steps.diff.outputs.changed == 'true'
         run: |
           {
             echo
-            echo "## The measurement is on a branch"
+            echo "## Where the measurement is"
             echo
-            if [ "${{ steps.open.outputs.opened }}" = "true" ]; then
-              echo "A pull request was opened for \`${{ steps.open.outputs.branch }}\`."
+            if [ "${{ steps.open.outputs.merged }}" = "true" ]; then
+              echo "This run measured something new and merged it to \`main\`: \`${{ steps.open.outputs.branch }}\`"
+              echo "was opened as a pull request, checked to be the snapshot and nothing else, squashed"
+              echo "and its branch deleted."
+            elif [ "${{ steps.open.outputs.opened }}" = "true" ]; then
+              echo "A pull request was opened for \`${{ steps.open.outputs.branch }}\` and left for a person to"
+              echo "merge, either because \`WALLS_AUTOMERGE\` is \`off\` or because the run could not merge it."
             else
               echo "This repository does not let GitHub Actions open pull requests, so the branch"
               echo "\`${{ steps.open.outputs.branch }}\` was pushed and the pull request is a click:"
@@ -175,8 +215,8 @@ jobs:
             fi
             echo
             echo "\`limits-observed.json\` is not only a report. The plugin reads it when it"
-            echo "starts, so a measurement merged to \`main\` is the window a host shows for an"
-            echo "id \`limits.mjs\` does not name - which is what a model Zen made free after this"
-            echo "table was written is. Until it is merged, the catalogue's own numbers are what"
+            echo "starts, so a measurement on \`main\` is the window a host shows for an id"
+            echo "\`limits.mjs\` does not name - which is what a model Zen made free after this"
+            echo "table was written is. Until it is there, the catalogue's own numbers are what"
             echo "is published for those ids."
           } >> "$GITHUB_STEP_SUMMARY"
