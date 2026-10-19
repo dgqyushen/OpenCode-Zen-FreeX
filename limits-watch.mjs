@@ -56,12 +56,17 @@ export async function readSnapshot(file = SNAPSHOT) {
 // What a sweep result is worth keeping. `asked` and `spent` are dropped: they are
 // the receipt for one run's budget, and a snapshot that grew by every request ever
 // made would stop being a thing a person can read.
-const kept = ({ servedTokens, servedChars, refusedChars, refusedSizes, wall }) => ({
+const kept = ({ servedTokens, servedChars, refusedChars, refusedSizes, wall, named }) => ({
   servedTokens,
   servedChars,
   refusedChars,
   refusedSizes,
   wall,
+  // A window the route named in its own words, when one of its refusals stated it.
+  // Kept because it outranks every bracket below it: `limits.mjs` reads this field
+  // to answer the axis as the route stated it rather than as the sweep narrowed it,
+  // and a named number dropped here would be a number the plugin never sees.
+  ...(Number.isSafeInteger(named) ? { named } : {}),
 });
 
 // The run. Everything it decides is returned rather than printed, so the same

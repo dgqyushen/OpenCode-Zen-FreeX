@@ -48,7 +48,7 @@
 
 import { profileFor } from "./core-tools.mjs";
 import { baseFrom } from "./limits-audit.mjs";
-import { readBoundedText } from "./limits.mjs";
+import { namedAxes, readBoundedText } from "./limits.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
@@ -143,7 +143,15 @@ async function once(model, chars) {
       : { chars, kind: "served", tokens: undefined, says: "served, but no usage count came back" };
   }
   const { text } = await readBoundedText(response, READ_BUDGET).catch(() => ({ text: "" }));
-  return { chars, kind: "refused", status: response.status, says: text.slice(0, 400) };
+  // A refusal that names the window states it, and a stated number is better than
+  // any bracket: no bisection needed, no margin guessed, nothing left to narrow.
+  // The reader is `limits.mjs`'s own, so the sweep and the running plugin agree on
+  // what a named window looks like — `nemotron-3.5-lightning-free` answers with
+  // "This endpoint's maximum context length is 1000000 tokens", which the sweep
+  // used to keep only as an opaque `says` string while it went on bisecting toward
+  // a number the route had already given it.
+  const named = namedAxes(text).context;
+  return { chars, kind: "refused", status: response.status, named, says: text.slice(0, 400) };
 }
 
 // `once` with the retry rule: a transient failure is asked again, because a 500
@@ -180,7 +188,15 @@ export function tally(asked) {
   // bigger than everything served is a candidate for the bound.
   const over = refused.filter((one) => servedChars === undefined || one.chars > servedChars);
   const refusedSizes = [...new Set(over.map((one) => one.chars))].sort((a, b) => a - b);
-  return { servedChars, servedTokens, refusedSizes, refused: over };
+  // The window a refusal named, if any of them did. This is the route stating its
+  // own limit, which outranks anything bracketed: a named number needs no bisection
+  // and carries no margin. Read from the refusals above the served size, so a
+  // refusal of something the route went on to serve cannot name the wall.
+  const named = over.reduce(
+    (best, one) => (Number.isSafeInteger(one.named) && one.named > 0 && (best === undefined || one.named < best) ? one.named : best),
+    undefined,
+  );
+  return { servedChars, servedTokens, refusedSizes, refused: over, named };
 }
 
 // The next size to ask, or undefined when the bracket is as tight as the budget
@@ -195,6 +211,9 @@ export function tally(asked) {
 // stops at once and costs nothing.
 export function nextAsk(bracket, spent) {
   if (spent >= BUDGET) return undefined;
+  // A named window leaves nothing to narrow: the route said what it is, and every
+  // further ask would be a request spent re-deriving a number already given.
+  if (Number.isSafeInteger(bracket?.named)) return undefined;
   const low = bracket?.servedChars;
   const high = bracket?.refusedSizes?.[0];
   if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)) return undefined;
@@ -297,11 +316,17 @@ async function sweep(model, log) {
     servedChars: now.servedChars ?? null,
     refusedChars: now.refusedSizes[0] ?? null,
     refusedSizes: now.refusedSizes,
+    // The window the route stated in its own words, when one of its refusals named
+    // it. A named number is the route's own answer and is reported beside the
+    // bracket rather than instead of it: a reader that only wants a floor still has
+    // one, and a reader that wants the wall gets the number the route gave instead
+    // of a bisection toward it.
+    named: now.named ?? null,
     // Two refused sizes behind a served one is the weakest evidence this file
     // accepts for a wall. One is a bracket with a hole in it and is reported as
     // such rather than smoothed into a wall, and none is a model whose wall is
     // above everything that was asked.
-    wall: now.refusedSizes.length >= 2 ? "bracketed" : now.refusedSizes.length === 1 ? "single-refusal" : "openEnded",
+    wall: now.named !== undefined ? "named" : now.refusedSizes.length >= 2 ? "bracketed" : now.refusedSizes.length === 1 ? "single-refusal" : "openEnded",
     says: [...new Set(now.refused.map((one) => one.says).filter((said) => said !== ""))].slice(0, 2),
     asked: asked.map((one) => ({
       chars: one.chars,

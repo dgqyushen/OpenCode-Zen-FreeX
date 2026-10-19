@@ -1361,12 +1361,21 @@ export function measuredWalls(file) {
     if (!models || typeof models !== "object" || Array.isArray(models)) return walls;
     for (const [id, row] of Object.entries(models)) {
       if (!isUsableId(id)) continue;
+      const wall = typeof row?.wall === "string" ? row.wall : undefined;
+      const at = typeof row?.at === "string" ? row.at : undefined;
+      // A window the route stated in its own words answers the axis outright: it is
+      // the route's own number, not a bracketed floor, so it settles the axis and
+      // needs no rounding down. This is the strongest evidence any tier here has,
+      // and the sweep keeps it beside the bracket it also measured.
+      const named = row?.named;
+      if (usable(named)) {
+        walls.set(id, { value: named, settles: true, wall: "named", at });
+        continue;
+      }
       const tokens = row?.servedTokens;
       if (!usable(tokens)) continue;
       const value = Math.floor(tokens / SNAPSHOT_STEP) * SNAPSHOT_STEP;
       if (!usable(value)) continue;
-      const wall = typeof row?.wall === "string" ? row.wall : undefined;
-      const at = typeof row?.at === "string" ? row.at : undefined;
       walls.set(id, { value, settles: wall === "bracketed", wall, at });
     }
   } catch {

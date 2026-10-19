@@ -165,3 +165,40 @@ test("the ladder reaches the largest window the catalogue declares", async () =>
     `the ladder (${spentOnLadder}) plus the bisections the widest rung leaves (${needed}) must fit BUDGET (${BUDGET})`,
   );
 });
+
+test("a window the route named is read from the refusal instead of bisected", async () => {
+  const { namedAxes } = await import("./limits.mjs");
+  const { nextAsk, tally } = await subject;
+  // `nemotron-3.5-lightning-free` answers a too-large prompt with its own number:
+  // "This endpoint's maximum context length is 1000000 tokens." The sweep used to
+  // keep that only as an opaque `says` string and go on bisecting toward a number
+  // the route had already given it.
+  const refusal =
+    '{"error":{"type":"server_error","message":"Upstream request failed: [400] This endpoint\'s ' +
+    'maximum context length is 1000000 tokens. However, you requested about 1052632 tokens ' +
+    '(1048576 of text input, 1444 of tool input, 16 in the output)."}}';
+  assert.equal(namedAxes(refusal).context, 1000000, "the reader takes the number the route stated");
+  // Read through the same reduction the sweep uses, it survives as `named` and is
+  // the smallest one stated above the served size.
+  const bracket = tally([
+    { chars: 2_800_000, kind: "served", tokens: 599561 },
+    { chars: 4_200_000, kind: "refused", status: 400, named: 1000000, says: refusal },
+  ]);
+  assert.equal(bracket.named, 1000000);
+  // And a named window ends the narrowing: there is nothing left to bisect toward.
+  assert.equal(nextAsk(bracket, 0), undefined, "a stated window needs no midpoint");
+  // A refusal that names nothing contributes nothing, so a generic 400 cannot
+  // become a window.
+  const generic = tally([
+    { chars: 1_000_000, kind: "served", tokens: 215178 },
+    { chars: 1_600_000, kind: "refused", status: 400, says: "context_length_exceeded" },
+  ]);
+  assert.equal(generic.named, undefined, "a refusal that names no number names no window");
+  // And a refusal below the served size cannot name the wall, by the same rule that
+  // keeps it out of the bracket.
+  const below = tally([
+    { chars: 1_600_000, kind: "served", tokens: 343131 },
+    { chars: 1_000_000, kind: "refused", status: 400, named: 999999 },
+  ]);
+  assert.equal(below.named, undefined, "a refusal the route went on to serve names nothing");
+});
