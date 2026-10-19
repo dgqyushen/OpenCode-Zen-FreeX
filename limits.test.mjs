@@ -122,8 +122,11 @@ const REFUSAL = JSON.stringify({
 test("a free id Zen under-reports is declared at what the route says", async () => {
   const { limitOverrides } = await subject;
   assert.equal(typeof limitOverrides, "function", "limit alignment must be implemented");
+  // The window is the last point this route is measured to serve, rounded down:
+  // its refusal names no number and refuses 326,750 itself, so the declared
+  // budget stops under it. The completion ceiling is the paid twin's declaration.
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
-    context: 1048576,
+    context: 326000,
     output: 384000,
   });
 });
@@ -220,11 +223,21 @@ test("evidence measured against another catalogue is void, and only on its own a
   // Zen moved the window it declares: the measured window is an answer to a
   // question nobody is asking any more, while the output axis was measured
   // against 32000 and still stands.
+  assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", { context: 250000, output: 32000 }), {
+    output: 131072,
+  });
+  assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 64000 }), {
+    context: 1048576,
+  });
+  assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", {}), {});
+  // The DeepSeek id obeys the same rule on both axes: its window was measured
+  // against the catalogue's 200000, so a catalogue that moves it voids that axis
+  // while the output stands, and a pair carrying both declarations keeps both.
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 250000, output: 32000 }), {
     output: 384000,
   });
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 64000 }), {
-    context: 1048576,
+    context: 326000,
   });
   assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", {}), {});
 });
@@ -333,7 +346,7 @@ test("an axis carried only by the record's prototype is not evidence", async () 
     Object.prototype.context = { value: 999999, source: "route", declaredAt: 200000 };
     assert.deepEqual(limitOverrides("nothing-measured-free", { context: 200000, output: 32000 }), {});
     assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }), {
-      context: 1048576,
+      context: 326000,
       output: 384000,
     });
   } finally {
@@ -406,9 +419,9 @@ test("a refusal naming a window while the process runs outranks the shipped tabl
     // ...and an id the shipped table carries is answered from the table, which is
     // the same answer the observation above would have given it, read from one
     // place: the entry's own declared pair.
-    assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", DECLARED), {
+    assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
       context: 1048576,
-      output: 384000,
+      output: 131072,
     });
   } finally {
     limitObservations(held);
@@ -741,7 +754,9 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
     {},
     "https://opencode.ai/inference/v1",
   );
-  assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
+  // the window is the wall this route enforces, with a margin; the output is the
+  // paid twin's declaration
+  assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 326000, output: 384000 });
   assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 1048576, output: 131072 });
   // one axis has evidence for this one and the other does not, so only its
   // output moves and the catalogue's own `input` survives untouched
@@ -893,20 +908,20 @@ test("an entry the catalogue has moved past says so, and one that applies says n
   const fresh = () => new Map(); // no live value: the table is what is being read
   try {
     assert.deepEqual(
-      limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }, undefined, fresh(), fresh()),
-      { context: 1048576, output: 384000 },
+      limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 32000 }, undefined, fresh(), fresh()),
+      { context: 1048576, output: 131072 },
     );
     assert.deepEqual(notes, [], "an entry that applies has nothing to explain");
     // the catalogue moved: the window was measured against a question nobody is
     // asking any more, while the output axis still stands
     assert.deepEqual(
-      limitOverrides("deepseek-v4.1-flash-free", { context: 250000, output: 32000 }, undefined, fresh(), fresh()),
-      { output: 384000 },
+      limitOverrides("mimo-v2.6-flash-free", { context: 250000, output: 32000 }, undefined, fresh(), fresh()),
+      { output: 131072 },
     );
     // the axis is not declared at all any more: the same rule, said the same way
     assert.deepEqual(
-      limitOverrides("deepseek-v4.1-flash-free", { output: 32000 }, undefined, fresh(), fresh()),
-      { output: 384000 },
+      limitOverrides("mimo-v2.6-flash-free", { output: 32000 }, undefined, fresh(), fresh()),
+      { output: 131072 },
     );
     // no entry is no evidence, which is a different thing and stays quiet
     assert.deepEqual(limitOverrides("never-measured-free", DECLARED, undefined, fresh(), fresh()), {});
@@ -916,7 +931,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
   assert.deepEqual(notes, [
     {
       kind: "catalogue-drift",
-      id: "deepseek-v4.1-flash-free",
+      id: "mimo-v2.6-flash-free",
       axis: "context",
       value: 1048576,
       measuredAgainst: 200000,
@@ -924,7 +939,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
     },
     {
       kind: "catalogue-drift",
-      id: "deepseek-v4.1-flash-free",
+      id: "mimo-v2.6-flash-free",
       axis: "context",
       value: 1048576,
       measuredAgainst: 200000,
@@ -946,7 +961,7 @@ test("the same notes reach stderr when the environment asks for them", async () 
     // and a `console.warn` left behind is a stub every later case writes into.
     console.warn = (line) => lines.push(line);
     process.env[LIMITS_DEBUG_ENV] = "1";
-    limitOverrides("deepseek-v4.1-flash-free", { context: 250000, output: 32000 }, undefined, new Map(), new Map());
+    limitOverrides("mimo-v2.6-flash-free", { context: 250000, output: 32000 }, undefined, new Map(), new Map());
   } finally {
     delete process.env[LIMITS_DEBUG_ENV];
     console.warn = warn;
@@ -954,7 +969,7 @@ test("the same notes reach stderr when the environment asks for them", async () 
   assert.equal(lines.length, 1, "one line for the one axis the catalogue voided");
   assert.match(
     lines[0],
-    /deepseek-v4\.1-flash-free context=1048576 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
+    /mimo-v2\.6-flash-free context=1048576 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
   );
 });
 

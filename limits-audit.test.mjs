@@ -153,12 +153,12 @@ test("a ceiling the route names is a candidate, and one it agrees with is not", 
 
 test("the line that names the catalogue prints the catalogue's own number, not the plugin's", async () => {
   const { findings, withEffective } = await subject();
-  // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue and
-  // 1048576/384000 by limits.mjs, so a row carrying both pairs is where the two
-  // numbers can be confused. The candidate lines say "the catalogue declares X",
-  // which is the catalogue's own pair; they used to read `judgement(row)`, the
-  // effective one, and so printed limits.mjs's override as the catalogue's
-  // number for every id the table does not already cover.
+  // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue, with
+  // its output raised to 384000 by limits.mjs, so a row carrying both pairs is
+  // where the two numbers can be confused. The candidate lines say "the
+  // catalogue declares X", which is the catalogue's own pair; they used to read
+  // `judgement(row)`, the effective one, and so printed limits.mjs's override as
+  // the catalogue's number for every id the table does not already cover.
   const rowFor = (extra) =>
     withEffective({
       id: "deepseek-v4.1-flash-free",
@@ -906,17 +906,16 @@ test("a case that queued fewer answers than it was asked for fails on the shortf
 
 test("the pair a row is judged by is the plugin's, not the catalogue's under it", async () => {
   const { withEffective } = await subject();
-  // `deepseek-v4.1-flash-free` is declared 200000/32000 in the catalogue and
-  // 1048576/384000 by limits.mjs. The row has to carry the second pair, or the
+  // `mimo-v2.6-flash-free` is declared 200000/32000 in the catalogue and
+  // 1048576/131072 by limits.mjs. The row has to carry the second pair, or the
   // table would print one number and the findings would compare another.
   const row = withEffective({
-    id: "deepseek-v4.1-flash-free",
+    id: "mimo-v2.6-flash-free",
     declared: { context: 200000, output: 32000 },
     status: 200,
   });
   assert.deepEqual(row.declared, { context: 200000, output: 32000 }, "the catalogue's own pair stays readable");
-  assert.equal(row.effective.context, 1048576);
-  assert.equal(row.effective.output, 384000);
+  assert.deepEqual(row.effective, { context: 1048576, output: 131072 });
   // An id with no evidence is judged by its catalogue pair unchanged.
   const plain = withEffective({ id: "nothing-measured-free", declared: { context: 1000, output: 100 }, status: 200 });
   assert.deepEqual(plain.effective, { context: 1000, output: 100 });
@@ -927,14 +926,14 @@ test("a sibling is measured against the pair the plugin declares, not the catalo
   // Both rows share an upstream and the catalogue lists both at 200000/32000, so
   // a comparison over `declared` sees one pair, skips the group, and never raises
   // the sibling. The plugin's own pair is what the table prints and what a
-  // sibling has to be measured against: 1048576/384000 against 200000/32000 is
+  // sibling has to be measured against: 1048576/131072 against 200000/32000 is
   // the under-declaration this list exists to find.
   const rows = [
-    withEffective({ id: "deepseek-v4.1-flash-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
+    withEffective({ id: "mimo-v2.6-flash-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
     withEffective({ id: "sibling-free", declared: { context: 200000, output: 32000 }, status: 200, upstream: "up" }),
   ];
   assert.deepEqual(findings(rows), [
-    "sibling-free: declared 200000/32000, and up is also served as deepseek-v4.1-flash-free (1048576/384000)",
+    "sibling-free: declared 200000/32000, and up is also served as mimo-v2.6-flash-free (1048576/131072)",
   ]);
   // and the pair printed beside it is the plugin's too, so the line cannot
   // contradict the table it sits under

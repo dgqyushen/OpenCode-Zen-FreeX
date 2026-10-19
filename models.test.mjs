@@ -681,7 +681,7 @@ test("a field the catalogue wrote in another shape does not end the call", async
     {},
     baseURL,
   );
-  assert.deepEqual(real["deepseek-v4.1-flash-free"].limit, { context: 1048576, output: 384000 });
+  assert.deepEqual(real["deepseek-v4.1-flash-free"].limit, { context: 326000, output: 384000 });
 });
 
 // The same rule for the two modality axes, which the case above does not reach:

@@ -44,7 +44,7 @@ magpie plugin login opencode-zen-free
 模型名 = `opencode-zen-free/<模型名>`，例如 `opencode-zen-free/big-pickle`。
 
 - **自动发现**：宿主列举模型时重新获取，但一分钟内（`RELIST_AFTER`）重复列举复用上一次结果——magpie 启动一次、其后每小时，所以它每次列举都落到新的一次读取。id 带 `-free`、Zen 的列表里有就提供，**不等**目录。判为下线：`status`/`lifecycle` 为 `retired`/`disabled`、布尔 `deprecated: true`、`deprecated_at`/`retirement_date` 写了日期（不看到期与否），以及 SystemOne 路由的模型；目录只把 `deprecated` 写成 `status`/`lifecycle`、而 Zen 仍在服务的，照常提供。
-- **上限按实测对齐**：目录会少报上下文 / 输出 / `input`，插件按实测与路由自述对齐——例如 `deepseek-v4.1-flash-free` 目录 20 万上下文 / 3.2 万输出，付费同源是 100 万 / 38.4 万。依据与复测方法见 [`MAINTAINING.md` 的 “Limits Zen under-reports”](MAINTAINING.md#limits-zen-under-reports)。
+- **上限按实测对齐**：目录会少报上下文 / 输出 / `input`，插件按实测与路由自述对齐——例如 `mimo-v2.6-flash-free` 目录 20 万上下文 / 3.2 万输出，厂商自述与实测都是 1048576 / 131072。路由自己否掉的数量也照认：`deepseek-v4.1-flash-free` 的 100 万上下文是 2026-10-15 测出来的，2026-10-19 起路由改用自己的校验，约 32.7 万 token 以上的提示被 `context_length_exceeded` 拒绝且不报数字，这条覆盖随之改成实测能过的最大点向下取整：32.6 万（326,750 实测 3/3 被拒，326,702 是能过的最大值）；输出仍按 38.4 万，路由现在明说自己接受 `max_tokens` 到 393216。依据与复测方法见 [`MAINTAINING.md` 的 “Limits Zen under-reports”](MAINTAINING.md#limits-zen-under-reports)。
 - **目录读不到 ≠ fallback**：Zen 的列表读到了它就是当前该提供的——目录或文档读不到，只影响它们各自描述的那部分。沿用上一次结果只有两种情形：**列表本身**读不到，或距上次读取不到一分钟（见上一条）。
 - 请求一个不再免费的模型 → 404，并列出当时免费的模型；刚转免费的模型会在重新获取列表后照常服务。可用性与限流归 Zen 管，插件看不到剩余额度。
 
@@ -81,6 +81,7 @@ bun run capture             # 确认差异后才写入
 | `Model is not an available free model for this protocol` | 请求发来时列表变了 | 让宿主刷新模型列表再试 |
 | `uses the public credential` | 存的密钥不是 `public` | 用 `public` 重新登录 |
 | 不带 `FreeTierError` 的 403 | 是别的 403：正文原样透传，只去掉描述旧字节的长度、编码与校验头 | 按 Zen 自己的错误来读，别当成这个插件的 |
+| `400 … context_length_exceeded`，或 `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]` | 路由按模型自己的上限校验请求：提示超出该模型当时执行的上下文，或 `max_tokens` 超出它的范围 | 让宿主压缩对话、把 `max_tokens` 调回范围内；这类拒绝不报窗口数字，别用插件的“模型多大”去推 |
 
 ## 鸣谢
 

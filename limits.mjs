@@ -38,14 +38,38 @@
 // refusal that names a different window while the plugin is running corrects it
 // for the rest of the process (see observeRouteStatement).
 export const LIMITS = {
+  // The window that used to be here was 1048576, measured on 2026-10-15 from a
+  // refusal that named it. On 2026-10-19 the route refused 1,050,000-token
+  // prompts and stopped naming anything: past a wall of about 326,700 tokens the
+  // answer is 400 `context_length_exceeded` — "Your request resulted in more
+  // tokens than this model's maximum context length allows. Please reduce the
+  // length of the messages or run compaction." — and there is no number in that
+  // sentence to read. What replaced it is a bracket, measured in characters
+  // because a refused request reports no `usage.prompt_tokens`: 1,522,400
+  // characters of filler were served and counted 326,702 tokens, 1,522,600 was
+  // refused three times out of three, and six sessions of 250,413-token prompts
+  // were all served. 326000 is the last served point rounded down rather than a
+  // figure the route stated — a host has to stop below a wall it can never quite
+  // touch, and the wall itself was just demonstrated: 326,750 is refused, so
+  // that number cannot be the budget. The margin is also about the endpoints:
+  // the same day, 254,196- and 279,095-token requests from a host were refused
+  // in the same words while a 331,989-token request was served, so an endpoint
+  // that says no sooner can be reached at any size above the catalogue's 200000.
+  // The catalogue remains the fallback if this entry is ever voided, and it is
+  // the one window Zen itself states.
+  //
+  // The output axis is untouched: it was measured from the paid twin, and the
+  // route now confirms the ceiling it enforces is above it — `max_tokens` over
+  // 393216 is refused with "Invalid max_tokens value, the valid range of
+  // max_tokens is [1, 393216]".
   "deepseek-v4.1-flash-free": {
     context: {
-      value: 1048576,
+      value: 326000,
       source: "route",
       declaredAt: 200000,
-      measured: "2026-10-15",
-      samples: "1,048,507 tokens served; 1,048,707 and 1,060,000 refused 4/4",
-      how: "a prompt sized just over the window; Zen's own 400 answers \"This model's maximum context length is 1048576 tokens. However, you requested 1422278 tokens (1038278 in the messages, 384000 in the completion).\"",
+      measured: "2026-10-19",
+      samples: "326,702 tokens served (1,522,400 characters); 1,522,600 characters (about 326,745 tokens) refused 3/3 with context_length_exceeded, as was 1,522,800 and 1,050,000 tokens; 250,413 served from six different sessions. The same day, 254,196- and 279,095-token requests were refused while a 331,989-token one was served, so not every endpoint behind this id draws the wall in the same place.",
+      how: "the route's own enforcement, found by bracketing because its refusal names no number; 326000 is the largest served sample (326,702) rounded down, with room for a host's count to differ from the route's, and not a figure the route ever stated. 326,750 was asked three times and refused three times, so the wall itself cannot be the declared budget. The 1048576 measured on 2026-10-15 is withdrawn: the route that stated it now refuses prompts a third that size.",
     },
     output: {
       value: 384000,

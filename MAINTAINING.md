@@ -18,11 +18,8 @@ sends people off to change headers.
 
 `models.mjs` declares each model's limits from Zen's catalogue, and for some free
 ids the catalogue is wrong in the one direction nothing complains about: too
-small. `deepseek-v4.1-flash-free` is declared 200000/32000 while
-`deepseek-v4.1-flash` — the paid id serving the same upstream model, which
-`x-opencode-upstream-model-id` confirms — is declared 1000000/384000 in that
-same catalogue, and `mimo-v2.6-flash-free` is declared 200000/32000 against a
-model whose own vendor publishes 1048576/131072. The ids the tier added on
+small. `mimo-v2.6-flash-free` is declared 200000/32000 against a model whose own
+vendor publishes 1048576/131072. The ids the tier added on
 2026-10-16 were under-reported the same way on the day they appeared:
 `ll-alpha-free` names a 262144-token completion ceiling in its own refusal
 against a declared 65536, and `glm-5.3-flash-free` is declared 200000/32000
@@ -47,7 +44,7 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 
 | id | axis | value | from |
 | --- | --- | --- | --- |
-| `deepseek-v4.1-flash-free` | context | 1048576 | the route's own refusal, in its own words |
+| `deepseek-v4.1-flash-free` | context | 326000 | the last point this route is measured to serve (326,702), rounded down on 2026-10-19 because its refusal names no number and refuses 326,750 itself |
 | `deepseek-v4.1-flash-free` | output | 384000 | what this route declares for the same upstream model |
 | `mimo-v2.6-flash-free` | context | 1048576 | the route's own refusal, in its own words |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
@@ -71,6 +68,12 @@ page. The output figure is the paid twin's declaration, so the route has already
 published what that model does; a single reply of 306,880 completion tokens
 (`finish_reason: stop`) was watched and is recorded as the witness.
 
+The DeepSeek id was the first entry measured this way and is no longer one: its
+1,048,576-token window was withdrawn on 2026-10-19, when the route began
+refusing prompts past a wall it no longer names. The paragraph below is for a
+route that still names its window; what to do when it stops is the subsection
+after it.
+
 **Re-measuring.** The window: send a prompt of about 1.05M tokens and read the
 number out of the refusal, three times, interleaved, per the rule below. The
 filler measured 4.887 characters per token with about 1700 tokens of fixed
@@ -80,6 +83,48 @@ wall is — it is what the calibration is checked against, since
 figure is a rough one (characters, not tokens) and must not be read as a count.
 A second upstream words the same fact as "This endpoint's maximum context length
 is …" and breaks the request into text input, tool input and output.
+
+**When the refusal stops naming the number.** Measured 2026-10-19 on
+`deepseek-v4.1-flash-free`, and the shape to expect on any id this route starts
+validating: a prompt past the window came back 400 with a body that names no
+number at all —
+
+```
+{"error":{"message":"Your request resulted in more tokens than this model's
+maximum context length allows. Please reduce the length of the messages or run
+compaction.","type":"invalid_request_error","code":"context_length_exceeded"}}
+```
+
+— while the same run's `max_tokens` over the ceiling was refused *with* its
+range: `Invalid max_tokens value, the valid range of max_tokens is [1, 393216]`.
+Nothing in `limits.mjs` reads the first wording, and it should not be made to:
+it states no number, so any value taken from it would be the reader's guess.
+What is left is a bracket, and it has to be measured in characters rather than
+tokens, because a refused request reports no `usage.prompt_tokens`: 1,522,400
+characters of this file's filler were served and counted 326,702 tokens, while
+1,522,800 was refused — putting the wall within roughly a hundred tokens of
+326,750, at 4.66 characters per token measured on that run. Two further probes
+placed it there: 1,522,000 characters (326,617 tokens) served, 1,524,000
+refused, and `max_tokens: 100000` alongside a 300,573-token prompt served, so
+the two limits are enforced independently of each other. Six more sessions were
+asked 250,413-token prompts and all six were served, which says the wall is not
+somewhere below the biggest served sample.
+
+The axis is set from that bracket, not from a statement: `limits.mjs` carries
+**326000** for this id — the largest point the route is measured to serve
+(326,702), rounded down, because a host has to stop below the wall and the wall
+itself refuses the exact figure too: 1,522,600 characters, about 326,745
+tokens, was asked three times and refused three times, so 326,750 cannot be the
+declared budget. It is deliberately not the catalogue's 200000: the route
+serves more than that from every session tried, and a window set there is the
+quiet under-use this file exists to remove. It is not the old 1,048,576 either —
+the refusal that named that figure has been replaced by one that refuses a third
+of it. The remaining margin is also about the endpoints: on the same day, a
+host's 254,196- and 279,095-token requests were refused in the same words while
+a 331,989-token request was served, so an endpoint that says no sooner can be
+reached at any size above 200000. Re-measuring means bracketing on fresh
+samples, not reading a number: this refusal will not name one, and the wall
+behind it moves.
 
 **The input**, the third axis: nothing cheap names it — the refusals on this
 route name the window, and this id's own refusal names nothing at all — so it is
