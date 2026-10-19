@@ -358,18 +358,20 @@ carries the samples behind it.
 (`.github/workflows/walls.yml`, once a day) runs `limits-watch.mjs --sweep`,
 which measures the ids the listing offers and the snapshot does not name yet and
 folds each result into `limits-observed.json` beside `limits.mjs`: the file is
-pushed as a branch, with a pull request opened where the repository lets Actions
-open one and a compare link in the run summary where it does not, and never a
-commit to `main`. A wall that moves under an id already measured is not
-re-measured on that timer, and `--all` is a person asking for a fresh reading of
-everything. That file is an input at run time now rather than only a workflow
-artifact: `measuredWalls()` reads it once per path and keeps the answer, taking
-the path from its argument, else `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the
-file beside the module, with an empty value of that variable meaning no snapshot
-at all. A missing file, an unreadable one, one that is not JSON, one whose
-`models` is not an object and one past 256 KiB answer the same way - no
-measurement - because a build that cannot read a measurement declares what its
-table and its catalogue say, and nothing here may fail a request.
+pushed as a branch and opened as a pull request, with a compare link in the run
+summary where the repository does not let Actions open one, and it never reaches
+`main` as a push - what reaches `main` is a merged pull request, which in a
+repository that allows it is what the run does itself (below). A wall that moves
+under an id already measured is not re-measured on that timer, and `--all` is a
+person asking for a fresh reading of everything. That file is an input at run time
+now rather than only a workflow artifact: `measuredWalls()` reads it once per path
+and keeps the answer, taking the path from its argument, else
+`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the file beside the module, with an empty
+value of that variable meaning no snapshot at all. A missing file, an unreadable
+one, one that is not JSON, one whose `models` is not an object and one past 256
+KiB answer the same way - no measurement - because a build that cannot read a
+measurement declares what its table and its catalogue say, and nothing here may
+fail a request.
 
 Each row contributes two facts and no more: the largest prompt the route was
 watched to serve, floored to a whole thousand, the same rounding and for the same
@@ -395,16 +397,30 @@ is also what a record is seeded from, so a wall that moved and was measured agai
 is the number the runtime bracket searches around rather than the one the
 catalogue still prints.
 
-**What a maintainer does with a run.** A run that measured something new leaves one
-changed file on a branch, so the review is the report in the pull request body and
-the diff beside it: a row per model, the sizes that were served, the sizes that
-were refused and the two labels above. Merging is what publishes it — for an id
-`limits.mjs` does not name, or one whose catalogue value has moved since its entry
-was written, the merged row is the window a host is told — and that is the whole
-reason the result is a pull request rather than a push to `main`: a measurement can
-be wrong in a way a person can see (an endpoint that answered a size it should not
-have, a model measured on the wrong protocol), and nothing here is in a hurry. A
-host picks the file up when it next starts, because it is read once per process;
+**What happens to a run.** A run that measured something new leaves one changed
+file on a branch, opens it as a pull request and merges it, so the measurement is
+on `main` before the run ends and an id Zen added yesterday has a measured window
+today instead of waiting for somebody to notice. The report travels in the pull
+request body and the diff beside it: a row per model, the sizes that were served,
+the sizes that were refused and the two labels above.
+
+Merging unattended is defensible here for two reasons, and the workflow checks
+both rather than assuming them. The pull request is `limits-observed.json` and
+nothing else, compared against the file list GitHub reports for it - a pull request
+that turns out to carry anything else is left open with a warning instead. And the
+numbers are bounded by construction: a row's value is the largest prompt the route
+was watched to serve, floored, and the table keeps the first word for every id it
+names, so an automatic merge can only move an id the table does not answer, and
+only to a size something was actually served at. A measurement can still be wrong
+in a way a person could have seen - an endpoint that answered a size it should not
+have, a model measured on the wrong protocol - and that is what the pull request
+record is for afterwards, since a merged commit is reverted as easily as it was
+merged.
+
+A repository that wants the click back sets the variable `WALLS_AUTOMERGE` to
+`off`: the pull request is then left open, and the run summary says so.
+
+A host picks the file up when it next starts, because it is read once per process;
 an id that appeared on Zen is offered whether or not this file mentions it, at
 whatever the catalogue declares, until that happens.
 
