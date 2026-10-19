@@ -10,6 +10,7 @@ import {
   entryDecision,
   fingerprintTarget,
   invokedDirectly,
+  neutralise,
   report,
 } from "./capture.mjs";
 
@@ -800,4 +801,59 @@ test("a failed write with nothing to clean up says nothing about cleanup", async
     scratch.remove();
   }
   assert.equal(stored, wording.slice(0, 1200), "the capture landed over the stale temporary");
+});
+
+// The capture host's shell is put back to the shell the tool actually runs,
+// because these bytes are the description the model reads. A tool named `bash`
+// described as executing PowerShell is a tool the model calls `PowerShell`, and
+// the host answers `unknown tool "PowerShell"` — measured 2026-10-20, nine such
+// calls in one session, each one a lost turn.
+//
+// The wording this pins is the one opencode 1.19.0 produced, version and all,
+// because that is what was shipped: dropping only the version left "PowerShell"
+// standing, and the assumption that a Linux capture carries no such clause was
+// wrong. Both hosts' spellings are pinned here so neither can come back.
+test("the shell's wording is put back to the shell the tool runs, not the host's", () => {
+  const windows = "Executes a given Windows PowerShell (5.1) command with optional timeout, ensuring proper handling and security measures.";
+  const versioned = "Executes a given PowerShell (7+) command with optional timeout, ensuring proper handling and security measures.";
+  const bare = "Executes a given PowerShell command with optional timeout, ensuring proper handling and security measures.";
+  for (const wording of [windows, versioned, bare]) {
+    const neutral = neutralise(wording);
+    assert.equal(
+      neutral,
+      "Executes a given bash command with optional timeout, ensuring proper handling and security measures.",
+      `no shell but bash survives: ${neutral}`,
+    );
+  }
+
+  // The section heading and the cmdlet advice move with it: `Get-ChildItem` is
+  // not a command that runs on the host this is sent from.
+  const notes = neutralise("# Windows PowerShell (5.1) shell notes\n- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases.");
+  assert.match(notes, /^# bash shell notes$/m);
+  assert.equal(notes.includes("Get-ChildItem"), false, "the cmdlet advice is not advice here");
+
+  // The 2.x `shell` wording says it a different way, and `Windows` is the word
+  // the version-dropping rule never touched.
+  const shell = neutralise("Execute a shell command and return its output. Commands run on Windows using PowerShell (5.1). Quote file paths.");
+  assert.equal(shell.includes("Windows"), false, `no Windows survives: ${shell}`);
+  assert.equal(shell.includes("PowerShell"), false, `no PowerShell survives: ${shell}`);
+});
+
+// The wording that is actually shipped, through the same rules: this is the half
+// a live session caught and a unit test should have. `fingerprint.json` is only
+// as neutral as the run that wrote it, so the file is checked rather than trusted.
+test("the shipped capture carries no shell but the one it runs", () => {
+  const shipped = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8"));
+  for (const [generation, profile] of Object.entries(shipped.profiles)) {
+    for (const [name, tool] of Object.entries(profile.tools)) {
+      const description = tool.description;
+      for (const wrong of ["PowerShell", "Windows", "Get-ChildItem", "Set-Content", "cmdlet"]) {
+        assert.equal(
+          description.includes(wrong),
+          false,
+          `${generation} ${name} is sent upstream describing ${wrong}: ${description.slice(0, 120)}`,
+        );
+      }
+    }
+  }
 });

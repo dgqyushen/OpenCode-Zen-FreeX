@@ -92,22 +92,53 @@ for (const [generation, names] of Object.entries(REQUIRED)) {
 // machine the capture ran on, not to the tool. These are put back to something
 // neutral so the capture is not tied to one machine.
 //
-// The shell's version is the one these can get wrong: opencode 1.19.0 words
-// `bash`'s description after the host it runs on — "Executes a given Windows
-// PowerShell (5.1) command…" on one machine, "PowerShell (7+)…" on another —
-// and every one of those bytes is sent upstream, because Zen reads the wording
-// out of the request. Measured 2026-10-16 on the same pinned release, both
-// versions answered, so the difference was never Zen's to insist on; it was two
-// machines disagreeing about a description that belongs to neither. The version
-// is dropped, which is also the wording a run on any host converges to — a
-// capture on Linux says "Shell: bash" and carries no such clause at all. What
-// the neutral wording is worth is settled by `bun run check:gate`, not here.
+// The shell is the one these can get wrong, and it is worse than untidy: these
+// bytes are the description the model reads, so a tool named `bash` described as
+// executing PowerShell is a tool the model calls `PowerShell`. Measured
+// 2026-10-20 through a local magpie pointed at this tree, `bash` declared with
+// this profile's wording: the model answered `PowerShell` and the host answered
+// `unknown tool "PowerShell"` — the whole turn lost, and again on the retry,
+// because the wording never changes between them. Nine such calls in one
+// session (`session-94316913`), each one a turn.
+//
+// opencode 1.19.0 words that tool after the host it runs on — "Executes a given
+// Windows PowerShell (5.1) command…" on one machine, "PowerShell (7+)…" on
+// another. The previous rule dropped only the version, on the assumption that a
+// Linux capture carries no such clause at all; it does, which is how the
+// PowerShell wording came to be shipped as the neutral one. A shell is a
+// property of the tool, not of the machine that captured it, so the name is put
+// back to the shell this tool actually runs — and the cmdlet advice with it,
+// since `Get-ChildItem` is not a command that runs here.
+//
+// This is the neutral wording, so it is what any host converges to; what it is
+// worth is settled by `bun run check:gate`, which answered both shapes of 1.x on
+// 2026-10-20 with this wording in place.
 const NEUTRALISE = [
   [/Be aware: OS: [^\n]*/g, "Be aware: OS: linux, Shell: bash"],
   [/Use `[^`]*` for temporary work outside the workspace\./g, "Use `/tmp` for temporary work outside the workspace."],
   [/Use `[A-Za-z]:\\[^`]*`/g, "Use `/tmp`"],
-  [/\b(?:Windows )?PowerShell \(\d[^)]*\)/g, "PowerShell"],
+  // The sentence that names the shell, with or without a version and with or
+  // without the Windows qualifier, in the `bash` and `shell` wordings alike.
+  [/\b(?:Windows )?PowerShell(?: \(\d[^)]*\))? command\b/g, "bash command"],
+  // The section heading over the shell's own notes.
+  [/# (?:Windows )?PowerShell(?: \(\d[^)]*\))? shell notes/g, "# bash shell notes"],
+  // The shell notes themselves: the two that only make sense in PowerShell are
+  // dropped, and the cmdlet advice becomes the POSIX advice that is true here.
+  // Written as whole lines so nothing is left half-rewritten.
+  [/^- Prefer full cmdlet names like `Get-ChildItem`, `Set-Content`, `Remove-Item`, and `New-Item` over aliases\.$/gm,
+   "- Prefer standard utilities over shell builtins where one exists."],
+  [/^- Use `cmd1; if \(\$\?\) \{ cmd2 \}` to chain dependent commands\.\n/gm, ""],
+  // "Commands run on Windows using PowerShell" is the 2.x `shell` wording's way
+  // of saying the same thing, and the one `Windows` word the old rules missed.
+  [/Commands run on Windows using PowerShell(?: \(\d[^)]*\))?\./g, "Commands run in the current shell."],
 ];
+// The rules above, applied. Exported so the one thing they exist to prevent — a
+// tool named `bash` whose description says PowerShell, which the model then calls
+// as `PowerShell` — is pinned by a test rather than by a live session.
+export function neutralise(description) {
+  return NEUTRALISE.reduce((text, [find, to]) => text.replace(find, to), description);
+}
+
 // Zen compares roughly the first 700 characters and ignores the rest; 1200
 // leaves margin, and the tail is where a note to the model goes.
 const KEEP = 1200;
@@ -294,7 +325,7 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     if (!tool?.name || !read.includes(tool.name) || !tool.description) continue;
     tools[tool.name] = {
       name: tool.name,
-      description: NEUTRALISE.reduce((text, [find, to]) => text.replace(find, to), tool.description).slice(0, KEEP),
+      description: neutralise(tool.description).slice(0, KEEP),
       parameters: tool.parameters,
     };
   }
