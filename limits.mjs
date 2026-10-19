@@ -357,13 +357,20 @@ const CJK_TOKENS_PER_CHAR = 0.7;
 // `usage.prompt_tokens` on the bodies a host actually sends — 3.938, 4.015 and
 // 4.034 on conversations of 12,546, 60,796 and 292,396 tokens, so 3.996.
 //
-// The 4.66 this used to be was calibrated on repeated filler text, which tokenises
-// far better than a coding conversation: same words, no JSON, no tool-call ids, no
-// punctuation between fragments. Against real traffic it read the prompt about 14%
-// short — the three points above came back at 0.845, 0.862 and 0.866 of the route's
-// count — and a floor read 14% short is a window declared 14% short, which is the
-// one direction this file exists to stop. 4.66 is kept named below as what it was,
-// because the difference between the two is the evidence for the change.
+// The 4.66 this replaces was not wrong, it was answering a different question.
+// Measured against the sweep's repeated filler text it is exact: the nine models
+// in `limits-observed.json` come back at 4.65 to 4.68 characters per token,
+// averaging 4.666. That is the ratio for `The quick brown fox` repeated, which
+// tokenises far better than a coding conversation — same words, no JSON, no
+// tool-call ids, no punctuation between fragments. Applied to real traffic it read
+// the prompt about 14% short: the three points above came back at 0.845, 0.862 and
+// 0.866 of the route's count, and a floor read 14% short is a window declared 14%
+// short, which is the one direction this file exists to stop.
+//
+// The sweep itself never calls `estimateTokens` — it asks the route and reads
+// `prompt_tokens` — so the two ratios cannot be confused again: this one belongs to
+// a bracket learned while a host is running, and the table's numbers are the
+// route's own count.
 const LATIN_CHARS_PER_TOKEN = 3.996;
 
 // The tokens a request's own text holds. An estimate, and used as one: the route
