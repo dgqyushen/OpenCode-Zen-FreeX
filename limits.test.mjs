@@ -1479,7 +1479,7 @@ test("a body of many strings is read to its end, not to a count of strings", asy
 });
 
 test("a refusal never declares a window below a size the route has served", async () => {
-  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const { observeServedRequest, observeRefusedRequest, limitBracket, limitOverrides } = await subject;
   const brackets = new Map();
   const seeded = 326000;
   // The VPS on 2026-10-19, replayed: a prompt estimated at 228286 tokens is
@@ -1507,20 +1507,69 @@ test("a refusal never declares a window below a size the route has served", asyn
     assert.ok(raised.ceiling >= raised.floor, `raise ${attempt + 1} kept the declaration above the floor`);
   }
   // A record read back from a state file that already holds the inversion is
-  // repaired by the same clamp rather than republished: `adoptedCeiling` derives
-  // only when the ceiling is unusable, so the clamp is what a persisted 223942
-  // meets on its way out.
-  const persisted = new Map([
-    [
+  // repaired rather than republished. The clamp in `derivedCeiling` is not enough
+  // on its own: a record arrives with a usable `ceiling`, and the two paths that
+  // answer with it without deriving anything are the ones a host is in before it
+  // sends its first request and once the refusal budget is spent. Both are asked
+  // here, because both published 223942 while only the raise path was repaired.
+  //
+  // What is asserted is what the model list is told, not what the record holds:
+  // `limitBracket` reads the stored value, and the boundary that answers magpie is
+  // `limitOverrides`. A record is repaired on its way out of that boundary, which
+  // is also what the next save writes.
+  const stale = (refusals) => ({
+    floor: 228286,
+    ceil: 228513,
+    ceiling: 223942,
+    step: 27992,
+    refusals,
+    seen: 228286,
+    seededFrom: 326000,
+  });
+  const published = (brackets) =>
+    limitOverrides(
       "persisted-free",
-      { floor: 228286, ceil: 228513, ceiling: 223942, step: 27992, refusals: 3, seen: 228286 },
-    ],
-  ]);
-  observeServedRequest("persisted-free", { tokens: 228286 }, 326000, persisted, 5_000_000);
-  assert.ok(
-    limitBracket("persisted-free", persisted).ceiling >= 228286,
-    "a state file holding the inversion does not keep publishing it",
-  );
+      { context: 326000, output: 384000 },
+      undefined,
+      undefined,
+      undefined,
+      brackets,
+      new Map(),
+    );
+  // 4 is MAX_REFUSALS, the point at which the raise path closes. It is not
+  // exported, and the boundary has to hold there rather than anywhere this test
+  // chooses.
+  for (const refusals of [3, 4]) {
+    // Cold: nothing has been served in this process, so nothing derives a ceiling
+    // and `adoptedCeiling` is what the model list reads.
+    const cold = new Map([["persisted-free", stale(refusals)]]);
+    assert.equal(
+      published(cold).context,
+      228286,
+      `a persisted inversion (refusals=${refusals}) is not republished before the first request`,
+    );
+    assert.equal(
+      limitBracket("persisted-free", cold).ceiling,
+      228286,
+      `and the record itself is repaired as it is answered (refusals=${refusals})`,
+    );
+    // Warm: the host filled the declaration, and the cooldown has long passed.
+    // With the budget spent the raise is closed, so this is the other path that
+    // used to answer 223942 for as long as the file was kept.
+    const warm = new Map([["persisted-free", stale(refusals)]]);
+    observeServedRequest("persisted-free", { tokens: 223942 }, 326000, warm, 9_999_999_999);
+    assert.equal(
+      published(warm).context,
+      228286,
+      `a persisted inversion (refusals=${refusals}) is not republished after a raise`,
+    );
+    // The output axis is not the context axis and is not clamped with it: a
+    // completion ceiling larger than the window is what this route serves, and
+    // magpie's own clamp is a rule about a declaration this file should not be
+    // making. 384000 is left alone here so that the pair the table states is the
+    // pair that is published.
+    assert.equal(published(warm).output, undefined, "the output declaration is left as the table states it");
+  }
 });
 
 test("a served request proves a floor, and a declaration moves only when the host fills it", async () => {

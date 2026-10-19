@@ -469,6 +469,19 @@ function adoptedCeiling(id, seeded, brackets) {
   const record = brackets && typeof brackets.get === "function" ? brackets.get(id) : undefined;
   if (!record || typeof record !== "object") return undefined;
   if (!usable(record.ceiling)) record.ceiling = derivedCeiling(record, seeded);
+  // The floor binds a ceiling that was never derived here as well. A record is
+  // not always born in this process: it is read back from a state file, or handed
+  // in by a caller, and one written by a version whose bound was not clamped
+  // carries the inversion in the field this function answers with. Deriving only
+  // when the ceiling is unusable means such a record is republished as it stands,
+  // for as long as nothing raises it — which is exactly the case a host is in
+  // before it sends its first request, and the case it stays in once the refusal
+  // budget is spent and the raise path is closed. Clamping on the way out is what
+  // makes the invariant hold for a record this process did not compute, and it
+  // repairs the record as it goes, so the next save writes the corrected number
+  // rather than the one that was read.
+  const floor = usable(record.floor) ? record.floor : 0;
+  if (usable(record.ceiling) && record.ceiling < floor) record.ceiling = floor;
   return record.ceiling;
 }
 
