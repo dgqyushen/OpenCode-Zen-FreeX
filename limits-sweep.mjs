@@ -244,12 +244,24 @@ async function sweep(model, log) {
     return first;
   };
 
-  // The first pass: three sizes, widely spaced, asking only downward when a wall
-  // has already been found below.
+  // The first pass: the rungs in order, asking only downward once a wall has been
+  // found below. A rung above a confirmed refusal is a request whose answer is
+  // already known — the wall is under the size that was just refused, so every
+  // larger rung is refused too, and asking it spends the shared credential on a
+  // foregone conclusion. Widening the ladder to reach a million made that waste
+  // grow with it: a model walled at 1,600,000 would also have been asked 2,800,000
+  // and 4,200,000, four more requests for an answer already in hand.
+  //
+  // A refusal at the smallest size keeps its own rule: there is nothing served
+  // underneath it and so no interval to narrow, which is a different situation from
+  // a wall found above a served rung.
+  let walled = false;
   for (const chars of SIZES) {
+    if (walled) break;
     const result = await believe(chars);
     if (result === undefined) break;
     const now = tally(asked);
+    if (now.refusedSizes.length > 0 && now.servedChars !== undefined) walled = true;
     // A refusal at the smallest size, believed twice, puts the wall below
     // everything this sweep would ask next: nothing is learned by asking bigger.
     if (chars === SIZES[0] && now.servedChars === undefined && now.refusedSizes.length > 0) break;
