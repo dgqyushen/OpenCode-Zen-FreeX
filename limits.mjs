@@ -524,12 +524,30 @@ function derivedCeiling(record, seeded) {
   // its own number and may be declared as it stands; one this file estimated is
   // a character count, so it is stepped under rather than sat on — declaring the
   // exact size that was just refused is how a search turns into a loop.
+  const margin = ceil === undefined || record?.exact === true ? undefined : Math.floor(ceil * (1 - REFUSAL_MARGIN));
   const bound =
     ceil === undefined
       ? cap
       : record?.exact === true
         ? Math.min(ceil, cap)
-        : Math.min(Math.floor(ceil * (1 - REFUSAL_MARGIN)), cap);
+        : Math.min(margin, cap);
+  // A margin that is a fraction of `ceil` is not a margin at all when the bracket
+  // is narrow: 2% of a refused size 4000 tokens above the floor is 80 tokens below
+  // it, so the bound is on the wrong side of the floor and the clamp below pins the
+  // declaration AT the floor for good. The search then reports no progress however
+  // many times the host fills it — the VPS bracket of floor 326000 / ceil 330000
+  // never moved, while a 60,000-token bracket climbed 91% of its own span. That is
+  // a capability cap with no evidence behind it: the route refused 330000, not
+  // 326001, and nothing was ever asked between them.
+  //
+  // So where the margin lands at or under the floor and the bracket is still open,
+  // the next size is the midpoint of the interval instead. Every served midpoint
+  // raises the floor without spending a refusal, and every refused one halves what
+  // is left, so the declaration climbs to within a sixteenth of the span inside the
+  // refusal budget — which is what `ceil` is for. The margin rule keeps every case
+  // it already answered: it is only displaced where it produced no movement at all.
+  const wedge = floor > 0 && ceil !== undefined && ceil > floor + 1 && (bound ?? 0) <= floor;
+  if (wedge) return Math.min(Math.max(floor + 1, floor + Math.ceil((ceil - floor) / 2)), cap);
   // The declaration may never sit below the largest size the route is known to
   // have SERVED. That is not a preference about margins: `floor` is a request the
   // route answered, so a declaration under it is a number contradicted by the

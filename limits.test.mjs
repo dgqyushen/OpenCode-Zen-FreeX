@@ -1614,10 +1614,17 @@ test("a refusal never declares a window below a size the route has served", asyn
     // used to answer 223942 for as long as the file was kept.
     const warm = new Map([["persisted-free", stale(refusals)]]);
     observeServedRequest("persisted-free", { tokens: 223942 }, 326000, warm, 9_999_999_999);
-    assert.equal(
-      published(warm).context,
-      228286,
-      `a persisted inversion (refusals=${refusals}) is not republished after a raise`,
+    // The invariant, not a fixed number: the window never sits below the floor, and
+    // it may climb past it — a raise that moves is the search working, and pinning
+    // this to 228286 would forbid the very progress `derivedCeiling` exists to make.
+    const warmPublished = published(warm).context;
+    assert.ok(
+      warmPublished >= 228286,
+      `a persisted inversion (refusals=${refusals}) is not republished after a raise: got ${warmPublished}`,
+    );
+    assert.ok(
+      warmPublished <= 228513,
+      `and it stays under the size the route refused: got ${warmPublished}`,
     );
     // The output axis is not the context axis and is not clamped with it: a
     // completion ceiling larger than the window is what this route serves, and
@@ -1652,6 +1659,42 @@ test("a served request proves a floor, and a declaration moves only when the hos
   // ...and a second raise waits for the cooldown again.
   observeServedRequest("small-free", { tokens: 215000 }, seeded, brackets, 900002);
   assert.equal(limitBracket("small-free", brackets).ceiling, raised.ceiling);
+});
+
+test("a narrow bracket climbs to its own ceiling instead of stopping at the floor", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const brackets = new Map();
+  // A margin that is a fraction of the refused size is no margin when the bracket
+  // is narrow. 2% of 330000 is 6600, which is below a floor of 326000, so the
+  // bound sits on the wrong side of the evidence and the declaration was pinned at
+  // 326000 for good: six raises moved it nowhere, on a route that had refused
+  // 330000 and been asked nothing in between.
+  const seed = 330000;
+  observeServedRequest("narrow-free", { tokens: 326000 }, seed, brackets, 0);
+  observeRefusedRequest("narrow-free", { tokens: 330000 }, seed, brackets, 1000);
+  assert.equal(limitBracket("narrow-free", brackets).ceiling, 326000);
+  // The host fills the declaration, the cooldown passes, and the search moves into
+  // the interval it has evidence for rather than sitting on its lower edge.
+  let now = 1000 + 900001;
+  const trail = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const held = limitBracket("narrow-free", brackets);
+    observeServedRequest("narrow-free", { tokens: held.ceiling }, seed, brackets, now);
+    trail.push(limitBracket("narrow-free", brackets).ceiling);
+    now += 900001;
+  }
+  assert.ok(trail[0] > 326000, `the first raise moves into the bracket, got ${trail[0]}`);
+  // Never past the size the route refused, and never back under the floor.
+  for (const value of trail) {
+    assert.ok(value > 326000 && value < 330000, `${value} stays inside (326000, 330000)`);
+  }
+  // It converges on the wall rather than approaching it by 2% of itself: six
+  // bisections put it within a sixteenth of the span, which a 2%-margin climb
+  // cannot do because the margin is larger than the span.
+  assert.ok(
+    trail[trail.length - 1] >= 330000 - (330000 - 326000) / 4,
+    `the declaration reaches the top quarter of the bracket, got ${trail[trail.length - 1]}`,
+  );
 });
 
 test("a refusal halves the step, puts the declaration under the wall, and is never crossed", async () => {
