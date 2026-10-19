@@ -21,10 +21,11 @@
       "at": "2026-10-19"
     },
     "deepseek-v4.1-flash-free": {
-      "servedTokens": 215178,
-      "servedChars": 1000000,
-      "refusedChars": 1600000,
+      "servedTokens": 323254,
+      "servedChars": 1506250,
+      "refusedChars": 1525000,
       "refusedSizes": [
+        1525000,
         1600000,
         2800000
       ],
