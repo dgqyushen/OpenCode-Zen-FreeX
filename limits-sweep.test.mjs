@@ -3,9 +3,11 @@
 //
 // `limits-sweep.mjs` asks the route questions that cost megabytes and, when it
 // overshoots, a refused turn that somebody pays for. That makes the rules it
-// applies — what counts as a bound, when a refusal is void — the part most worth
-// pinning, and the part a live run cannot check cheaply or repeatably. `tally` is
-// the reduction all of them pass through, so it is where the cases are.
+// applies — what counts as a bound, when a refusal is void, which failures are
+// asked again — the part most worth pinning, and the part a live run cannot
+// check cheaply or repeatably. `tally` is the reduction most of them pass
+// through, and `sweep`/`ask` take an injected request, so the rules that spend
+// the budget and confirm a refusal can be run without a route at all.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -51,13 +53,19 @@ test("a served size with no usage count is a floor, and carries no number to dec
   assert.equal(bracket.servedChars, 1600000, "the size that fitted is the floor of the bracket");
   assert.equal(bracket.servedTokens, undefined, "and there is no count to declare from it");
   assert.deepEqual(bracket.refusedSizes, [2200000, 2800000], "both refusals are above everything served");
-  // A count that did come back is still the number a declaration is made of,
-  // and it is read from the size it belongs to: the two are separate answers
-  // about separate asks, and the count is the smaller of the two here — a
-  // floor under the size, never over it.
+  // A count that did come back is only a declaration if it belongs to the floor.
+  // Here it does not: 215,178 belongs to the 1,000,000-character ask, while the
+  // 1,600,000-character ask — the size that is actually reported as served — came
+  // back without one. Declaring the smaller count as the window is the "window
+  // too small, quietly never used" failure this file exists to prevent, so the
+  // pair is not mixed and no count is declared.
   const counted = tally([served(1000000, 215178), served(1600000, undefined)]);
   assert.equal(counted.servedChars, 1600000, "the largest size served is the floor");
-  assert.equal(counted.servedTokens, 215178, "and the count is the largest one that came back");
+  assert.equal(counted.servedTokens, undefined, "a count from a smaller prompt is not the floor's count");
+  // The count that belongs to the floor is the one declared.
+  const atFloor = tally([served(1000000, undefined), served(1600000, 343131)]);
+  assert.equal(atFloor.servedChars, 1600000);
+  assert.equal(atFloor.servedTokens, 343131, "the count read at the reported floor is the number to declare");
 });
 
 test("the same size refused twice is one refused size, not two", async () => {
@@ -70,17 +78,35 @@ test("the same size refused twice is one refused size, not two", async () => {
 });
 
 test("a void refusal is a served size, and the point it was voided by is not a second one", async () => {
-  const { tally } = await subject;
+  const { LADDER, sweep } = await subject;
   // What the sweep does when the identical request that was refused is then
   // served: the first answer becomes `served`, and the second answer — the same
-  // request twice — is dropped rather than counted again.
-  const bracket = tally([served(1600000, 343131), served(1900000, 407000)]);
-  assert.equal(bracket.servedTokens, 407000);
-  assert.deepEqual(bracket.refusedSizes, []);
+  // request twice — is dropped rather than counted again. Driving `sweep` rather
+  // than `tally` is the point: the voiding happens inside the loop, and a
+  // reduction that only ever sees the loop's output cannot check it.
+  let calls = 0;
+  const request = (model, chars) => {
+    calls += 1;
+    // The bottom rung is the route's flip-flop: refused once, served on the
+    // identical ask. Every other rung is served, so the run has a floor and no
+    // wall at all.
+    if (chars === LADDER[0] && calls === 1)
+      return { chars, kind: "refused", status: 400, says: "context_length_exceeded" };
+    return { chars, kind: "served", tokens: Math.round(chars / 4) };
+  };
+  const result = await sweep("void-free", () => {}, { request, pause: async () => {} });
+  const atBottom = result.asked.filter((one) => one.chars === LADDER[0]);
+  assert.equal(calls, LADDER.length + 1, "the voided refusal was asked twice and every other rung once");
+  assert.equal(atBottom.length, 1, "the answer the refusal was voided by is not a second point");
+  assert.equal(atBottom[0].kind, "served", "the voided refusal is the serve that replaced it");
+  assert.equal(atBottom[0].tokens, Math.round(LADDER[0] / 4), "and it carries the second answer's count");
+  assert.ok(!result.asked.some((one) => one.kind === "refused"), "no refusal survives the run");
+  assert.deepEqual(result.refusedSizes, []);
+  assert.equal(result.wall, "openEnded");
 });
 
 test("a bracket is narrowed on its gap, not on how many refusals it collected", async () => {
-  const { BUDGET, NARROW_TO, nextAsk, tally } = await subject;
+  const { BUDGET, nextAsk, tally } = await subject;
   // The three ladder sizes produce two refusals whenever the wall is under the top
   // rung, and the narrowing loop used to stop on exactly that count. It therefore
   // stopped on entry, and no bracket was ever widened past its second rung: the
@@ -94,8 +120,6 @@ test("a bracket is narrowed on its gap, not on how many refusals it collected", 
   // itself, and the next ask lands between it and the refusal.
   const raised = tally([served(1300000, 279223), refused(1600000), refused(2800000)]);
   assert.equal(nextAsk(raised, 4), 1450000, "the gap halves, so the asks converge on the wall");
-  // The rule runs on the budget as well: with the budget spent nothing more is
-  // asked, however wide the bracket still is.
   // The rule runs on the budget as well: with the budget spent nothing more is
   // asked, however wide the bracket still is.
   assert.equal(nextAsk(ladder, BUDGET), undefined, "a spent budget asks nothing");
@@ -183,7 +207,7 @@ test("the ladder reaches the largest window the catalogue declares", async () =>
 });
 
 test("a window the route named is read from the refusal instead of bisected", async () => {
-  const { namedAxes } = await import("./limits.mjs");
+  const { namedWindow } = await subject;
   const { nextAsk, tally } = await subject;
   // `nemotron-3.5-lightning-free` answers a too-large prompt with its own number:
   // "This endpoint's maximum context length is 1000000 tokens." The sweep used to
@@ -193,7 +217,9 @@ test("a window the route named is read from the refusal instead of bisected", as
     '{"error":{"type":"server_error","message":"Upstream request failed: [400] This endpoint\'s ' +
     'maximum context length is 1000000 tokens. However, you requested about 1052632 tokens ' +
     '(1048576 of text input, 1444 of tool input, 16 in the output)."}}';
-  assert.equal(namedAxes(refusal).context, 1000000, "the reader takes the number the route stated");
+  // Read through the sweep's own reader, the one that decides at run time, so
+  // the case pins the budget and the cut flag as the sweep uses them.
+  assert.equal(namedWindow(refusal, false), 1000000, "the reader takes the number the route stated");
   // Read through the same reduction the sweep uses, it survives as `named` and is
   // the smallest one stated above the served size.
   const bracket = tally([
@@ -246,6 +272,184 @@ test("a refusal about the window is still a bound", async () => {
   const counted = tally(asked);
   assert.deepEqual(counted.refusedSizes, [1_600_000], "a refusal about a size is a bound");
   assert.equal(counted.refused.length, 1);
+});
+
+// Only a 400 or a 413 is about the size of the prompt. The refusal reader reads
+// a named window before it looks at the status, so without a gate a 429 or a 500
+// whose body happens to quote "maximum context length is N tokens" is classified
+// as a size refusal — and the number rides along as a wall the route "stated",
+// which is the route's own number and outranks any bracket.
+test("a failure that is not a 400 or 413 is never a size refusal, even when its body names a window", async () => {
+  const { classifyFailure } = await subject;
+  const body = '{"error":{"message":"This endpoint\'s maximum context length is 1000000 tokens"}}';
+  const limited = classifyFailure(1_000_000, 429, body, false);
+  assert.equal(limited.kind, "error", "a rate limit is not a wall");
+  assert.equal(limited.named, undefined, "and it does not carry the number as a stated window");
+  // The same sentence on a 400 is exactly the refusal the route means.
+  const refusal = classifyFailure(1_000_000, 400, body, false);
+  assert.equal(refusal.kind, "refused");
+  assert.equal(refusal.named, 1_000_000, "the number the route stated is still read from a size status");
+  // A 500 that talks about context length but names no number is about no axis
+  // at all, and a 413 is the other size status.
+  assert.equal(classifyFailure(1_000_000, 500, "context length exceeded", false).kind, "error");
+  assert.equal(classifyFailure(1_000_000, 413, "prompt is too long", false).kind, "refused");
+});
+
+// The retry rule, which is the other half of "a failure is never a verdict".
+// Retrying a permanent 400 spends two more requests on an answer that will not
+// change; keeping a transient refusal after its retries lets `tally` count a
+// rate limit as a wall.
+test("a permanent error is asked once, and only a transient one is asked again", async () => {
+  const { RETRIES, ask } = await subject;
+  const wait = async () => {};
+  let calls = 0;
+  const permanent = () => {
+    calls += 1;
+    return { chars: 1_000_000, kind: "error", status: 400, says: "invalid request: bad parameter" };
+  };
+  const onceOnly = await ask("m", 1_000_000, () => {}, { request: permanent, wait });
+  assert.equal(calls, 1, "a permanent 400 answers the same however often it is asked, so it is asked once");
+  assert.equal(onceOnly.kind, "error");
+  assert.equal(onceOnly.requests, 1, "and the ask reports the one request it sent");
+  // A transport failure carries no status at all, so it may be the network
+  // rather than the route and is asked again until the last attempt.
+  calls = 0;
+  const transport = () => {
+    calls += 1;
+    return calls < RETRIES + 1
+      ? { chars: 1_000_000, kind: "error", says: "fetch failed" }
+      : { chars: 1_000_000, kind: "served", tokens: 250_000 };
+  };
+  const recovered = await ask("m", 1_000_000, () => {}, { request: transport, wait });
+  assert.equal(calls, RETRIES + 1, "a transport failure is asked again");
+  assert.equal(recovered.kind, "served");
+  assert.equal(recovered.requests, RETRIES + 1, "and the requests it took are reported");
+});
+
+test("a transient refusal is retried and then reported as an error, never a wall", async () => {
+  const { RETRIES, ask, tally } = await subject;
+  let calls = 0;
+  const request = () => {
+    calls += 1;
+    return { chars: 1_600_000, kind: "refused", status: 429, says: "rate limited" };
+  };
+  const out = await ask("m", 1_600_000, () => {}, { request, wait: async () => {} });
+  assert.equal(calls, RETRIES + 1, "a rate limit says nothing about the request, so it is asked again");
+  assert.equal(out.kind, "error", "the last answer is an error rather than the refusal that survived its retries");
+  assert.equal(out.requests, RETRIES + 1);
+  assert.deepEqual(tally([out]).refusedSizes, [], "so the reduction cannot turn a rate limit into a wall");
+  // A refusal that is about the size is not retried: the identical second ask is
+  // the confirmation `believe` makes, not this rule's.
+  calls = 0;
+  const size = () => {
+    calls += 1;
+    return { chars: 1_600_000, kind: "refused", status: 400, says: "context_length_exceeded" };
+  };
+  const kept = await ask("m", 1_600_000, () => {}, { request: size, wait: async () => {} });
+  assert.equal(calls, 1, "a 400 refusal is asked once");
+  assert.equal(kept.kind, "refused");
+});
+
+// A refusal is confirmed by asking the same size again. A confirmation that was
+// never made (the budget ran out between the two asks) or that failed (the
+// second ask was a 5xx) is not a second refusal, so the first one is not a wall.
+test("a confirmation the budget never paid for is not a confirmation", async () => {
+  const { BUDGET, LADDER, RETRIES, sweep } = await subject;
+  // Spend all but one request on the rungs before the refusal: the first answers
+  // cost the three requests a retried answer can cost, and the last of them is
+  // whatever the budget has left. The refusal itself costs one, taking the run to
+  // the ceiling, so the identical second ask is never made.
+  const perAnswer = [];
+  for (let left = BUDGET - 1; left > 0; ) {
+    const requests = Math.min(RETRIES + 1, left);
+    perAnswer.push(requests);
+    left -= requests;
+  }
+  assert.ok(perAnswer.length <= LADDER.length - 1, "the fixture leaves the refused rung last in the ladder");
+  let calls = 0;
+  let answered = 0;
+  const request = (model, chars) => {
+    calls += 1;
+    if (answered < perAnswer.length) {
+      const requests = perAnswer[answered];
+      answered += 1;
+      return { chars, kind: "served", tokens: Math.round(chars / 4), requests };
+    }
+    return { chars, kind: "refused", status: 400, says: "context_length_exceeded", requests: 1 };
+  };
+  const result = await sweep("spent-free", () => {}, { request, pause: async () => {} });
+  assert.equal(result.spent, BUDGET, "the serves plus the refusal spent the whole budget");
+  assert.equal(calls, perAnswer.length + 1, "the confirmation at the last rung was never asked for");
+  const last = result.asked[result.asked.length - 1];
+  assert.equal(last.chars, LADDER[perAnswer.length]);
+  assert.equal(last.kind, "unconfirmed", "a refusal nobody could ask again is not counted");
+  assert.deepEqual(result.refusedSizes, []);
+  assert.equal(result.wall, "openEnded", "and it cannot become a wall");
+});
+
+test("a confirmation that failed is not a confirmation", async () => {
+  const { LADDER, RETRIES, sweep } = await subject;
+  let calls = 0;
+  const request = (model, chars) => {
+    calls += 1;
+    if (chars === LADDER[0] && calls === 1)
+      return { chars, kind: "refused", status: 400, says: "context_length_exceeded", requests: 1 };
+    if (chars === LADDER[0])
+      // What `ask` returns for a 500 that survived its retries: an error, and
+      // the three requests it cost.
+      return { chars, kind: "error", status: 500, says: "upstream failed", requests: RETRIES + 1 };
+    return { chars, kind: "served", tokens: Math.round(chars / 4), requests: 1 };
+  };
+  const result = await sweep("flaky-free", () => {}, { request, pause: async () => {} });
+  assert.equal(calls, 2 + (LADDER.length - 1), "the bottom rung was asked twice and every other rung once");
+  const bottom = result.asked.filter((one) => one.chars === LADDER[0]);
+  assert.equal(bottom.length, 2);
+  assert.equal(bottom[0].kind, "unconfirmed", "the refusal whose confirmation failed is not counted");
+  assert.equal(bottom[1].kind, "error");
+  assert.deepEqual(result.refusedSizes, [], "one failed confirmation is not one refusal, let alone a wall");
+  assert.equal(result.wall, "openEnded");
+  assert.equal(
+    result.spent,
+    1 + (RETRIES + 1) + (LADDER.length - 1),
+    "and the failed confirmation is charged every request it sent",
+  );
+});
+
+// The budget is what the shared free credential sees, which is requests rather
+// than questions: an answer that needed a retry spent two of them for one step.
+test("the budget is charged the requests a step sent, not the question it asked", async () => {
+  const { BUDGET, LADDER, ask, sweep } = await subject;
+  let calls = 0;
+  const inner = (model, chars) => {
+    calls += 1;
+    // The first ask needs one retry: a 500, then a serve.
+    if (calls === 1) return { chars, kind: "error", status: 500, says: "upstream failed" };
+    return { chars, kind: "served", tokens: Math.round(chars / 4) };
+  };
+  const request = (model, chars, options) =>
+    ask(model, chars, () => {}, { ...options, request: inner, wait: async () => {} });
+  const result = await sweep("retried-free", () => {}, { request, pause: async () => {} });
+  // One retried answer (two requests) plus one request for each of the other five
+  // rungs: seven requests for six questions.
+  assert.equal(calls, LADDER.length + 1, "the retry is a real request");
+  assert.equal(result.spent, LADDER.length + 1, "and it is what the run reports it spent");
+  assert.ok(result.spent <= BUDGET, "which is still inside the ceiling");
+});
+
+test("a run of transient failures cannot spend past the budget", async () => {
+  const { BUDGET, LADDER, ask, sweep } = await subject;
+  let calls = 0;
+  const inner = (model, chars) => {
+    calls += 1;
+    return { chars, kind: "error", status: 503, says: "upstream failed" };
+  };
+  const request = (model, chars, options) =>
+    ask(model, chars, () => {}, { ...options, request: inner, wait: async () => {} });
+  const result = await sweep("down-free", () => {}, { request, pause: async () => {} });
+  assert.ok(calls <= BUDGET, `a run cannot send more than the budget in requests, sent ${calls}`);
+  assert.equal(result.spent, calls, "and it reports every request it sent");
+  assert.ok(calls > LADDER.length, "the retries were charged, not counted as one per question");
+  assert.equal(result.wall, "openEnded");
 });
 
 // The rule, enforced where the requests are made: an id the catalogue declares
@@ -360,6 +564,12 @@ test("a run that learned nothing is a failure of the run, and the exit code says
   assert.equal(learnedAbout(nothingLearned), false, "a model the route never answered is not learned about");
   assert.equal(learnedAbout({ ...nothingLearned, servedChars: 5200000 }), true, "a model it served is");
   assert.equal(learnedAbout({ ...nothingLearned, refusedChars: 1600000 }), true, "and a model it refused is too");
+  // The refusal also arrives as the head of `refusedSizes` when the caller holds
+  // a `tally` result rather than a `sweep` result. Reading only the scalar would
+  // report a run that measured a wall as a run that learned nothing, and
+  // `exitCodeFor` would exit 1 for it.
+  assert.equal(learnedAbout({ servedChars: undefined, refusedSizes: [1600000] }), true, "a tally-shaped refusal is learned about");
+  assert.equal(exitCodeFor([{ servedChars: undefined, refusedSizes: [1600000] }]), 0, "and the run's exit code says so");
   // A model the route served without a count is learned about as well: the
   // size that fitted is the measurement, and the count is what is missing.
   assert.equal(
@@ -372,14 +582,31 @@ test("a run that learned nothing is a failure of the run, and the exit code says
 // A window the route states is the strongest answer this sweep gets, so a
 // number the read cut in half must not become one. The read's own `over` is
 // what says the body went on past what was read.
-test("a refusal body cut mid-number names no window", async () => {
+test("a number the read cut mid-digits is not a window the route stated", async () => {
   const { namedWindow } = await subject;
-  // The read stopped before the body did, so the digits may have continued:
-  // `104857` may be `1048576`. A stated window outranks every bracket and
-  // carries no margin, so a truncated number would become the declared wall.
-  const cut = "This endpoint's maximum context length is 104857";
-  assert.equal(namedWindow(cut, true), undefined, "a number the read cut is not a window the route stated");
-  assert.equal(namedWindow(`${cut}6 tokens`, false), 1048576, "the same body read whole is the route's own number");
+  const { namedAxes } = await import("./limits.mjs");
+  // A stated window outranks every bracket and carries no margin, so a number
+  // the read cut in half (`104857` cut from `1048576`) would become the declared
+  // wall. `namedWindow` is the sweep's reader, and it returns only the context
+  // axis — whose patterns all have " tokens" after the digits, so a context
+  // number can never end at the read head and the cut rule cannot be shown
+  // there. The output axis is the one that can end on its own number, and the
+  // rule is shared, so the case is pinned where it can fire.
+  const output = "max_tokens: 1000000 is not less or equal to 262144";
+  assert.equal(
+    namedAxes(output, output.length, true).output,
+    undefined,
+    "the digits reach the read head, so they may have continued: no stated ceiling",
+  );
+  assert.equal(namedAxes(output, output.length, false).output, 262144, "the same body read whole is the route's own number");
+  // A character after the digits inside the head proves they ended, even when
+  // the read stopped before the body did: `262144.` is not a prefix of a longer
+  // number.
+  const withText = `${output}.`;
+  assert.equal(namedAxes(withText, withText.length, true).output, 262144, "text after the digits proves the number whole");
+  // And the sweep's own context reader still takes a whole body's number.
+  const context = "This endpoint's maximum context length is 1048576 tokens";
+  assert.equal(namedWindow(context, false), 1048576);
 });
 
 // The count is in the route's own bytes, and the route's own bytes are not

@@ -734,9 +734,16 @@ async function readCutAt(observe, id, limit, shape, size) {
 }
 
 test("a body cut inside the ceiling it names is not read as a smaller ceiling", async () => {
-  const { observeRouteStatement, limitOverrides, namedOutputCap, LIMITS } = await subject;
+  const { observeRouteStatement, limitOverrides, namedOutputCap, LIMITS, limitObservations } = await subject;
   const at = CEILING_WORDING.indexOf("262144");
-  // whole, and cut after the number is complete: the ceiling is read
+  // The whole body below is observed through the module's live output map, and
+  // that map outlives the case: an entry left in it answers a later read of this
+  // id from this refusal instead of from the shipped entry — which is exactly
+  // the confusion the assertions at the end exist to rule out — so the pair is
+  // held and put back in a `finally`, as the observation cases above do.
+  const held = limitObservations();
+  try {
+    // whole, and cut after the number is complete: the ceiling is read
   assert.equal(namedOutputCap(CEILING_WORDING), 262144);
   assert.deepEqual(
     await observeRouteStatement("longcat-2.5-preview-free", new Response(CEILING_WORDING, { status: 400 })),
@@ -790,6 +797,9 @@ test("a body cut inside the ceiling it names is not read as a smaller ceiling", 
   assert.deepEqual(limitOverrides("longcat-2.5-preview-free", { context: 1000000, output: 131072 }), {
     output: 262144,
   });
+  } finally {
+    limitObservations(held);
+  }
 });
 
 test("a chunked body cut inside a number stores nothing, and the same body whole is read", async () => {
@@ -1779,6 +1789,59 @@ test("a refusal halves the step, puts the declaration under the wall, and is nev
     climbed.ceiling <= Math.floor(230000 * 0.98),
     "and never at or above the size the route refused",
   );
+});
+
+test("a refusal that puts the declaration back at the floor leaves demand to raise again", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const brackets = new Map();
+  const seeded = 200000;
+  // The shape the raise gate could not survive: the host fills the declaration,
+  // the declaration is raised, the host builds to the raised number and is
+  // refused, and the declaration falls back to what had already been served.
+  observeServedRequest("pinned-free", { tokens: 190000 }, seeded, brackets, 0);
+  observeServedRequest("pinned-free", { tokens: 190000 }, seeded, brackets, 900001);
+  const raised = limitBracket("pinned-free", brackets);
+  assert.ok(raised.ceiling > 190000, `the first raise happened, got ${raised.ceiling}`);
+  assert.equal(raised.raisedAtSeen, 190000, "and it was paid for by the served request");
+  observeRefusedRequest("pinned-free", { tokens: 215000 }, seeded, brackets, 900002);
+  const lowered = limitBracket("pinned-free", brackets);
+  assert.equal(lowered.ceiling, 190000, "a refusal puts the declaration back at the floor");
+  assert.equal(lowered.raisedAt, 900002, "the cooldown is kept");
+  // `seen` is still 190000, and leaving the baseline at it would compare the
+  // largest request ever carried with itself for the rest of the process: the
+  // host can only rebuild to 190000, so no second raise could ever fire.
+  assert.equal(lowered.raisedAtSeen, 0, "the demand baseline is reset, so re-filling the floor counts");
+  // The host rebuilds to the lowered declaration and the cooldown passes.
+  observeServedRequest("pinned-free", { tokens: 190000 }, seeded, brackets, 900002 + 900001);
+  const again = limitBracket("pinned-free", brackets);
+  assert.ok(
+    again.ceiling > lowered.ceiling,
+    `re-filling the lowered declaration buys another raise, got ${again.ceiling}`,
+  );
+});
+
+test("a configured maximum below a served size never declares under the floor", async () => {
+  const { MAX_WINDOW_ENV, observeServedRequest, observeRefusedRequest, limitBracket } = await subject;
+  const previous = process.env[MAX_WINDOW_ENV];
+  // An operator sets the search's ceiling below a size the route has already
+  // served. The wedge path leaves `derivedCeiling` before its floor clamp, so
+  // the global cap became the declaration — lower than the request the route
+  // answered, which is the inversion this file has a rule about.
+  process.env[MAX_WINDOW_ENV] = "1048576";
+  try {
+    const brackets = new Map();
+    observeServedRequest("oversized-free", { tokens: 2_000_000 }, 200000, brackets, 0);
+    observeRefusedRequest("oversized-free", { tokens: 2_000_100 }, 200000, brackets, 1000);
+    const held = limitBracket("oversized-free", brackets);
+    assert.equal(held.floor, 2_000_000, "the served request is the floor");
+    assert.ok(
+      held.ceiling >= held.floor,
+      `the declaration (${held.ceiling}) may not sit below the served floor (${held.floor})`,
+    );
+  } finally {
+    if (previous === undefined) delete process.env[MAX_WINDOW_ENV];
+    else process.env[MAX_WINDOW_ENV] = previous;
+  }
 });
 
 test("a size the route served at or above a refused one drops that refusal", async () => {

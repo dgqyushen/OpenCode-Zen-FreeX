@@ -7,8 +7,9 @@
 // found the right ids would be testing Zen.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,7 +58,7 @@ test("without --sweep a run plans and asks nothing", async () => {
   });
   assert.deepEqual(state.added, ["fresh-free"]);
   assert.equal(swept, false, "a report is not a measurement");
-  assert.deepEqual(state.snapshot.models, {}, "and it moves nothing");
+  assert.deepEqual(Object.keys(state.snapshot.models), [], "and it moves nothing");
 });
 
 test("--all re-measures what is already measured", async () => {
@@ -697,7 +698,7 @@ test("a snapshot that cannot be read and one that is not JSON are told apart", a
   }
 });
 
-test("--check reads the file, writes nothing, and asks nothing", async () => {
+test("--check reads the file, writes nothing, and asks nothing", { skip: needsBun }, async () => {
   const { writeSnapshot } = await subject;
   const file = join(tmpdir(), `zen-observed-${process.pid}-check-${Date.now()}.json`);
   try {
@@ -715,22 +716,39 @@ test("--check reads the file, writes nothing, and asks nothing", async () => {
         ZEN_CATALOG_URL: "http://127.0.0.1:1/api.json",
       },
     });
-    assert.equal(run.status, 0, `a snapshot the plugin can read passes: ${run.stdout ?? ""}${run.stderr ?? ""}`);
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 0, `a snapshot the plugin can read passes: ${said}`);
+    assert.ok(
+      said.includes("is a snapshot the plugin can read"),
+      `the child says the file passed, rather than saying nothing and happening to exit 0: ${said}`,
+    );
     assert.equal(readFileSync(file, "utf8"), before, "and the file it read is the file it left");
   } finally {
     rmSync(file, { force: true });
   }
 });
 
-test("--check says which row is wrong, and exits with the code the workflow reads", async () => {
+test("--check says which row is wrong, and exits with the code the workflow reads", { skip: needsBun }, async () => {
   const { writeSnapshot } = await subject;
   const file = join(tmpdir(), `zen-observed-${process.pid}-bad-${Date.now()}.json`);
   try {
     await writeSnapshot({ models: { "a-free": { ...goodRow, wall: "nonsense" } } }, file);
     const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
-    const run = spawnSync(process.execPath, [script, "--check", file], { encoding: "utf8", timeout: 60000 });
+    const run = spawnSync(process.execPath, [script, "--check", file], {
+      encoding: "utf8",
+      timeout: 60000,
+      env: {
+        ...process.env,
+        // The same closed port as the passing case: `--check` asks nothing, and a
+        // run that did reach for the route fails at once here instead of talking
+        // to the live route and answering a question this case is not asking.
+        ZEN_BASE_URL: "http://127.0.0.1:1/v1",
+        ZEN_CATALOG_URL: "http://127.0.0.1:1/api.json",
+      },
+    });
     const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
     assert.equal(run.status, 1, "a snapshot the plugin cannot read does not pass");
+    assert.ok(said.includes("is not what the plugin will read"), `the child's own sentence is said: ${said}`);
     assert.ok(said.includes("a-free:"), "the row is named: " + said);
     assert.ok(said.includes("nonsense"), "and what is wrong with it is said: " + said);
   } finally {
@@ -819,3 +837,255 @@ test("a result the route served without a count is a measurement, and is kept", 
   assert.deepEqual(state.unlearned, [], "the route served a size, so the run learned something");
   assert.equal(state.snapshot.models["small-free"].servedChars, 200_000, "and the row is written");
 });
+
+// A wall label is what decides whether a row is a measurement, and the label
+// used to be accepted as any string while `--check` enforced this file's own
+// list. A row a person mistyped into `"bracketedt"` was then read as a
+// measurement: `added` is decided by the id being in the table, so that id was
+// never swept again and the bad row was written straight back out.
+test("a row whose wall is not one this file knows is not a measurement", async () => {
+  const { readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-wall-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(
+      file,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "good-free": { wall: "openEnded", servedTokens: 10 },
+          "typo-free": { wall: "bracketedt" },
+          "spaced-free": { wall: " bracketed" },
+        },
+      }),
+      "utf8",
+    );
+    const read = await readSnapshot(file);
+    assert.deepEqual(Object.keys(read.models), ["good-free"], "only a wall this file knows is a measurement");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// An id is a key, and an id named `__proto__` is exactly the key a plain object
+// cannot hold: assigning it walks the prototype setter. The row is lost, the id
+// stays "new" and is swept on every run, and the map's prototype becomes a
+// row-shaped object that later lookups read through.
+test("an id named __proto__ is a row and never a prototype", async () => {
+  const { readSnapshot, watch } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-proto-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(
+      file,
+      '{"version":1,"models":{"__proto__":{"wall":"openEnded","servedTokens":100}}}',
+      "utf8",
+    );
+    const read = await readSnapshot(file);
+    assert.equal(Object.getPrototypeOf(read.models), null, "the snapshot map has no prototype to reach");
+    assert.ok(Object.hasOwn(read.models, "__proto__"), "and the id is an own property, not the prototype");
+    assert.equal(read.models.__proto__.servedTokens, 100, "the row is what it says it is");
+    // ...and a measurement for that id is written as a row too.
+    const state = await watch({
+      sweep: true,
+      fetchJSON: async (url) =>
+        url.endsWith("/models")
+          ? { data: [{ id: "__proto__" }] }
+          : { opencode: { models: { ["__proto__"]: { name: "__proto__", cost: { input: 0, output: 0 } } } } },
+      read: async () => ({ models: Object.create(null) }),
+      sweepModels: async () => [
+        {
+          model: "__proto__",
+          servedTokens: 100,
+          servedChars: 400,
+          refusedChars: null,
+          refusedSizes: [],
+          wall: "openEnded",
+          says: [],
+        },
+      ],
+    });
+    assert.equal(Object.getPrototypeOf(state.snapshot.models), null, "the map it writes has no prototype either");
+    assert.ok(Object.hasOwn(state.snapshot.models, "__proto__"), "the id is a row, not a prototype");
+    assert.equal(state.snapshot.models.__proto__.servedTokens, 100);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// A run that learned nothing still has to move the day it is asked about, or
+// the seven-day bound reads the unchanged measurement day for ever: an
+// `openEnded` row that fell past the week was re-swept every hour.
+test("an attempt that learned nothing dates the row without rewriting the measurement", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-13" } }),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+      },
+    ],
+  });
+  assert.deepEqual(state.unlearned, ["small-free"], "the run learned nothing about it");
+  const row = state.snapshot.models["small-free"];
+  assert.equal(row.at, "2026-10-13", "the measurement's own day is not rewritten");
+  assert.equal(row.servedTokens, 100_000, "and the measurement stands");
+  assert.equal(row.tried, "2026-10-20", "but the attempt is dated, so the week starts again");
+  // The next tick reads the row this run wrote, and does not pay for the same
+  // question again — which is the whole cost this field is for.
+  const again = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: async () => ({ models: state.snapshot.models }),
+    sweepModels: async () => {
+      throw new Error("a row asked about today must not be measured again");
+    },
+  });
+  assert.deepEqual(again.suspicion, [], "the later of `at` and `tried` is the day the age is counted from");
+});
+
+test("a row asked about after it was measured is not suspected again", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-01", tried: "2026-10-19" } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, [], "the attempt is a day later than the measurement");
+  assert.deepEqual(swept, [], "so the same question is not paid for again");
+});
+
+test("a row that carries the day it was tried passes the check, and a bad one does not", async () => {
+  const { checkSnapshot } = await subject;
+  const units = {
+    servedTokens: "tokens",
+    servedChars: "characters",
+    refusedChars: "characters",
+    refusedSizes: "characters",
+    named: "tokens",
+    at: "date, YYYY-MM-DD",
+  };
+  assert.deepEqual(
+    checkSnapshot({ version: 1, _units: units, models: { "a-free": { ...goodRow, tried: "2026-10-20" } } }),
+    [],
+    "the optional attempt day is part of the shape rather than a problem",
+  );
+  const bad = checkSnapshot({
+    version: 1,
+    _units: units,
+    models: { "a-free": { ...goodRow, tried: "2026-13-40" } },
+  });
+  assert.ok(bad.some((problem) => problem.includes("tried")), "a day that is not a day is refused: " + bad.join("\n"));
+});
+
+// `--check` is the gate on the unattended merge, and a positive safe integer is
+// not a plausible measurement: 9,000,000,000 tokens passed the shape check and
+// was merged into main, where `limits.mjs` would read it as a window.
+test("a measurement too large to be one is refused, and the units have to agree", async () => {
+  const { checkSnapshot } = await subject;
+  const units = {
+    servedTokens: "tokens",
+    servedChars: "characters",
+    refusedChars: "characters",
+    refusedSizes: "characters",
+    named: "tokens",
+    at: "date, YYYY-MM-DD",
+  };
+  const over = (patch) =>
+    checkSnapshot({ version: 1, _units: units, models: { "a-free": { ...goodRow, ...patch } } });
+  const giant = over({ servedTokens: 9_000_000_000 });
+  assert.ok(giant.some((problem) => problem.includes("servedTokens")), "the token count is named: " + giant.join("\n"));
+  assert.ok(giant.some((problem) => problem.includes("4000000")), "and so is the bound it crossed");
+  const wide = over({ servedChars: 33_000_000 });
+  assert.ok(wide.some((problem) => problem.includes("servedChars")), "the character count is named: " + wide.join("\n"));
+  const named = over({ wall: "named", named: 9_000_000_000 });
+  assert.ok(named.some((problem) => problem.includes("named")), "and a named window is bounded: " + named.join("\n"));
+  const crossed = over({ servedTokens: 4_000_000, servedChars: 400_000 });
+  assert.ok(
+    crossed.some((problem) => problem.includes("servedTokens") && problem.includes("servedChars")),
+    "a token count that outruns the characters it was read from is two different runs: " + crossed.join("\n"),
+  );
+});
+
+// The exit codes are the workflow's only way to tell "could not ask" from
+// "asked, and there was nothing": 1 was both, so an empty listing looked like
+// an outage. Run as a program, because the entry point is Bun's.
+function runWatchInChild(script, env = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script], { env: { ...process.env, ...env } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+function watchServer({ listing, catalog }) {
+  return new Promise((resolve) => {
+    const server = createServer((request, response) => {
+      const url = new URL(request.url, "http://127.0.0.1");
+      const body = url.pathname.endsWith("/models") ? { data: listing.map((id) => ({ id })) } : catalog;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(body));
+    });
+    server.listen(0, "127.0.0.1", () => resolve(server));
+  });
+}
+
+function closeServer(server) {
+  return new Promise((resolve) => server.close(resolve));
+}
+
+test(
+  "a route that answered with ids exits 0, and one that answered with none exits 2",
+  { skip: needsBun },
+  async () => {
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const offered = await watchServer({
+      listing: ["a-free"],
+      catalog: { opencode: { models: { "a-free": { name: "a-free" } } } },
+    });
+    try {
+      const { port } = offered.address();
+      const run = await runWatchInChild(script, {
+        ZEN_BASE_URL: `http://127.0.0.1:${port}/v1`,
+        ZEN_CATALOG_URL: `http://127.0.0.1:${port}/api.json`,
+      });
+      assert.equal(run.status, 0, `a route that offered an id was reached: ${run.stdout}${run.stderr}`);
+      assert.ok(run.stdout.includes("1 free ids offered"), "and the report says what it saw");
+    } finally {
+      await closeServer(offered);
+    }
+    // The route answers, and the answer is an empty listing: reached, and
+    // nothing to publish. That is exit 2, not the exit 1 of a dead route.
+    const empty = await watchServer({ listing: [], catalog: { opencode: { models: {} } } });
+    try {
+      const { port } = empty.address();
+      const run = await runWatchInChild(script, {
+        ZEN_BASE_URL: `http://127.0.0.1:${port}/v1`,
+        ZEN_CATALOG_URL: `http://127.0.0.1:${port}/api.json`,
+      });
+      assert.equal(run.status, 2, `a route that offered nothing was still reached: ${run.stdout}${run.stderr}`);
+      assert.ok(run.stdout.includes("0 free ids offered"), "and the report says so, rather than reporting an outage");
+    } finally {
+      await closeServer(empty);
+    }
+  },
+);

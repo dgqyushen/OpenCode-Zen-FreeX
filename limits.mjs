@@ -109,8 +109,8 @@ export const LIMITS = {
       source: "route",
       declaredAt: 200000,
       measured: "2026-10-20",
-      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
-      how: "the route's own enforcement, found by bracketing, and 375,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: what the route used to serve it refuses now, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 1,750,000 characters (served, 375,142 tokens) and the 2,800,000 characters the route refused is not known - the sweep stopped at the first refusal it could reproduce, and the refusal of 1,750,000 characters that the route then served again was voided - and the figure declared sits under both.",
+      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000, 1,825,000 and 1,787,500: 1,787,500 is the nearest refused size and the top of the bracket, while the earlier 2,800,000 probe is a higher refusal and not the bracket's edge.",
+      how: "the route's own enforcement, found by bracketing, and 375,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: what the route used to serve it refuses now, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 1,750,000 characters (served, 375,142 tokens) and the 1,787,500 characters the route refused is not known - the sweep stopped at the first refusal it could reproduce, and the earlier 2,800,000 probe was refused too, so that number is an upper bound rather than the bracket's edge - and the figure declared sits under both.",
     },
     output: {
       value: 131072,
@@ -127,7 +127,7 @@ export const LIMITS = {
       source: "route",
       declaredAt: 200000,
       measured: "2026-10-20",
-      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
+      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000, 1,825,000 and 1,787,500: 1,787,500 is the nearest refused size and the top of the bracket, while the earlier 2,800,000 probe is a higher refusal and not the bracket's edge.",
       how: "the route's own enforcement, found by bracketing; 375,000 is the largest served sample rounded down so that a host's count may differ from the route's. This entry used to say the axis was left to the catalogue because the one attempt to measure it answered 200 with an empty body, which is not an answer: a 2026-10-19 sweep did measure it, and the catalogue's 200000 is a third of what the route serves.",
     },
     output: {
@@ -195,8 +195,8 @@ export const LIMITS = {
       source: "route",
       declaredAt: 200000,
       measured: "2026-10-20",
-      samples: "323,107 tokens served (1,787,500 characters, counted by the route) on 2026-10-20, where an earlier sweep the same day had served 311,109 (1,450,000 characters). The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000. This id's upstream was failing intermittently earlier the same day - a request of 547,384 characters was answered and one of 540,983 was refused, which no wall does - and a failure that is not about a size is not counted as one.",
-      how: "the route's own enforcement, found by bracketing, and 323,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: the paid id's window is not one this endpoint serves, and the refusal that withdrew it was answered by a serve of the same size the next day, which is this id's instability rather than a wall. The wall's exact position between 323,107 tokens (1,787,500 characters) and the size the route refused is not known - the sweep stopped at the first refusal it could reproduce. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
+      samples: "323,107 tokens served (1,506,250 characters, counted by the route) on 2026-10-20, where an earlier sweep the same day had served 311,109 (1,450,000 characters). The 2026-10-20 run refused 1,525,000 characters, and 1,600,000 before it: 1,525,000 is the nearest refusal and the top of the bracket this entry sits under. This id's upstream was failing intermittently earlier the same day - a request of 547,384 characters was answered and one of 540,983 was refused, which no wall does - and a failure that is not about a size is not counted as one.",
+      how: "the route's own enforcement, found by bracketing, and 323,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: the paid id's window is not one this endpoint serves, and the refusal that withdrew it was answered by a serve of the same size the next day, which is this id's instability rather than a wall. The wall's exact position between 323,107 tokens (1,506,250 characters) and the 1,525,000 characters the route refused is not known - the sweep stopped at the first refusal it could reproduce. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
     },
     output: {
       value: 131072,
@@ -659,7 +659,16 @@ function derivedCeiling(record, seeded) {
   // refusal budget — which is what `ceil` is for. The margin rule keeps every case
   // it already answered: it is only displaced where it produced no movement at all.
   const wedge = floor > 0 && ceil !== undefined && ceil > floor + 1 && (bound ?? 0) <= floor;
-  if (wedge) return Math.min(Math.max(floor + 1, floor + Math.ceil((ceil - floor) / 2)), cap);
+  if (wedge)
+    // The floor clamp of the return below applies here too: the wedge branch
+    // leaves before that return, and `cap` is the global default maximum window
+    // (1,048,576) unless an operator configured one, so a record whose floor is
+    // above it would otherwise be published below the size the route is known to
+    // have served — the inverted bracket this file has a rule about. That is
+    // exactly the case `OPENCODE_ZEN_FREE_MAX_WINDOW` makes reachable by hand, and
+    // it is not a preference: a declaration under the floor is contradicted by
+    // the request that produced the floor.
+    return Math.max(floor, Math.min(Math.max(floor + 1, floor + Math.ceil((ceil - floor) / 2)), cap));
   // The declaration may never sit below the largest size the route is known to
   // have SERVED. That is not a preference about margins: `floor` is a request the
   // route answered, so a declaration under it is a number contradicted by the
@@ -872,6 +881,18 @@ export function observeRefusedRequest(
   record.refusals += 1;
   record.refusedAt = now;
   record.raisedAt = now;
+  // The declaration is about to fall back to the floor, and the host's requests
+  // are capped at that floor from then on — so the demand the next raise is paid
+  // for has to be measured from here. `record.seen` is the largest request ever
+  // carried and `raisedAtSeen` was set to it at the last raise, so leaving it
+  // alone compares the maximum with itself and pins the bracket at the floor: the
+  // route serves 255,000, the declaration is raised, the host builds to the raised
+  // number and is refused, the declaration falls back to 255,000, and every
+  // request after it is the same 255,000 that already paid for the first raise —
+  // so no second raise ever happens and the remaining refusals are never spent.
+  // Resetting the baseline makes re-filling the lowered declaration demand again;
+  // the cooldown above is untouched, so the probe is still spaced.
+  record.raisedAtSeen = 0;
   record.step = Math.max(Math.floor(record.step / 2), MIN_STEP);
   if (ceil > 0 && (record.ceil === undefined || ceil < record.ceil)) record.ceil = ceil;
   if (usable(named)) {
@@ -1255,12 +1276,12 @@ const READ_DEADLINE_MS = 3000;
 
 // The two ways a wait may end, as one signal.
 //
-// `AbortSignal.any` landed in Node 20.3 and this package declares Node 18.17,
-// where the call is a TypeError. It sat outside the try that swallows errors on
-// an error path, so on Node 18 every refusal body went unread: no route-stated
-// window was ever learned and no completion cap either, and the failure was
-// silent — the diagnostic sink was never told. So the combination is made by
-// hand where the runtime cannot make it.
+// `AbortSignal.any` was added in Node 20.3 and backported to 18.17, so the
+// package's declared floor has it. The helper below still keeps a hand-made
+// combination for a runtime that does not (an older 18.x a host might run, or a
+// non-Node runtime): a discovery or refusal read that cannot combine its waits
+// must not lose the abort on the error path. The native call is preferred when
+// it exists; the fallback is the same rule, not a different one.
 //
 // Exported because the same call is made elsewhere in this plugin for the same
 // reason, and one implementation of it is one thing to get right.

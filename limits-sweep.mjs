@@ -22,6 +22,26 @@
 //     two asks with a 500 before serving all three sizes. So every refusal is
 //     asked again, once, and one that is followed by a served answer is void.
 //
+//   * A refusal that could not be asked again is not a wall either. The second
+//     ask costs budget, and a run whose budget ran out between the two answers,
+//     or whose confirmation failed outright, has one refusal and no proof it
+//     reproduces — so that refusal is recorded as `unconfirmed` and the
+//     reduction below does not count it.
+//
+//   * Only a 400 or a 413 can be a size refusal. Those are the statuses this
+//     route uses to say the prompt is too long; a 429, a 5xx or a transport
+//     error says nothing about the request that was sent, even when its body
+//     quotes a context length. Reading one as a wall is how a rate limit
+//     becomes a smaller window, so such an answer is an error and never a
+//     verdict.
+//
+//   * An error is retried only when it is transient: 408, 429, 500, 502, 503 and
+//     504, or a transport failure that carries no status at all. Retrying a 400
+//     about an invalid parameter spends two more requests on an answer that will
+//     not change, and a refusal carrying a transient status is retried and then
+//     downgraded to an error — an endpoint that never stopped failing has not
+//     confirmed anything.
+//
 //   * A wall needs two refused sizes behind it. One refusal proves one endpoint
 //     said no; two prove the prompt is past something this model enforces. A
 //     bracket that could not get a second refused size is not a wall and is
@@ -31,15 +51,14 @@
 //     it, so a reader treats both the same way — only `bracketed` settles an
 //     axis.
 //
-//   * A request that failed for a reason that is not about size — a 5xx, a rate
-//     limit, a transport error — is retried twice and is never a verdict. Being
-//     unable to ask is not a finding about a model.
-//
-//   * The budget is six requests per model, three of them the first pass. What is
-//     left narrows the boundary once, with two points; a boundary that is still
-//     not narrow is reported as it stands rather than chased. This is somebody's
-//     quota and somebody's refused turn, and a sweep that runs unattended must
-//     not be able to spend without a ceiling.
+//   * The budget is fourteen requests per model, first pass included. It is
+//     counted in REQUESTS rather than in questions: an answer that had to be
+//     retried twice spent three of them, and the budget is what the shared free
+//     credential sees. The budget check and the reported `spent` are therefore
+//     charged what `ask` says it sent, and the asks left in the budget cap the
+//     last answer's retries so the run cannot cross the ceiling. This is
+//     somebody's quota and somebody's refused turn, and a sweep that runs
+//     unattended must not be able to spend without a ceiling.
 //
 // What this does not do: write `limits.mjs`. A measurement becomes a table entry
 // through a person reading the output, because a bracket produced by a scheduled
@@ -135,9 +154,10 @@ export const BUDGET = 14;
 // number that would not change any declaration.
 export const NARROW_TO = 0.02;
 // A failure that is about the request being unanswerable rather than about its
-// size: retried, never counted.
+// size: retried, never counted. Exported so the tests count the attempts the rule
+// actually makes rather than restating them.
 const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
-const RETRIES = 2;
+export const RETRIES = 2;
 const RETRY_WAIT_MS = 10000;
 
 const SENTENCE = "The quick brown fox jumps over the lazy dog while the calm river runs past the old mill. ";
@@ -184,6 +204,34 @@ export function namedWindow(text, over) {
   return namedAxes(text, READ_BUDGET, over).context;
 }
 
+// What one non-2xx answer says about the size of the prompt.
+//
+// Only a 400 or a 413 is about the size. `refusalAxis` reads a named window
+// before it looks at the status, so a 429 or a 500 whose body happens to name a
+// context length would be classified as a size refusal — and `named` would ride
+// along, so `tally` would publish the number as a wall the route "stated". The
+// file's own rule is the opposite: a failure that is not about size — a rate
+// limit, a 5xx, a transport error — is never a verdict. `limits.mjs` restricts
+// size refusals to 400/413 for the same reason, and the sweep and the running
+// plugin have to agree about what a refusal is.
+//
+// Exported so the status gate can be pinned without a live refusal.
+export function classifyFailure(chars, status, text, over) {
+  const sizeStatus = status === 400 || status === 413;
+  // `namedWindow` is only asked under a status that can be about size. The reader
+  // does not know about statuses, so handing it a 429 body is what let a stated
+  // number outrank the status rule in the first place.
+  const named = sizeStatus ? namedWindow(text, over) : undefined;
+  // The reader is the plugin's own `refusalAxis`, so the sweep and the running
+  // plugin agree about what a refusal is: a numbered sentence first, then the
+  // wording, and a failure about no axis at all moves nothing.
+  const axis = refusalAxis(status, text, named ? { context: named } : {});
+  if (axis !== "context") {
+    return { chars, kind: "error", status, says: text.slice(0, 400) };
+  }
+  return { chars, kind: "refused", status, named, says: text.slice(0, 400) };
+}
+
 // One request. The answer is reduced to what a bracket needs: whether the prompt
 // was served, the route's own count when it was, and the words it used when it
 // was not.
@@ -226,40 +274,45 @@ async function once(model, chars) {
       : { chars, kind: "served", tokens };
   }
   const { text, over } = await readBoundedText(response, READ_BUDGET).catch(() => ({ text: "", over: true }));
-  // A refusal that names the window states it, and a stated number is better than
-  // any bracket: no bisection needed, no margin guessed, nothing left to narrow.
-  // The read's own `over` goes with the text, so a number the read cut in half
-  // is not read as a window the route stated — `namedWindow` says why.
-  const named = namedWindow(text, over);
-  // A failure is a refusal only when it is about the SIZE. A 400 that says
-  // nothing about a length is the endpoint failing, and reading it as a wall
-  // is how a flaky upstream becomes a small window: measured 2026-10-20 on
-  // `glm-5.3-flash-free`, whose upstream answered "Upstream request failed:
-  // [400] Provider returned error" to prompts it had served minutes earlier,
-  // and the sweep — which called every 400 a bound — narrowed toward a wall
-  // that was not there.
-  //
-  // The reader is the plugin's own `refusalAxis`, so the sweep and the running
-  // plugin agree about what a refusal is: a numbered sentence first, then the
-  // wording, and a failure about no axis at all moves nothing.
-  const axis = refusalAxis(response.status, text, named ? { context: named } : {});
-  if (axis !== "context") {
-    return { chars, kind: "error", status: response.status, says: text.slice(0, 400) };
-  }
-  return { chars, kind: "refused", status: response.status, named, says: text.slice(0, 400) };
+  // A non-2xx answer is classified in one place, `classifyFailure`, which is
+  // where the status rule is written. The read's own `over` goes with the text,
+  // so a number the read cut in half is not read as a window the route stated —
+  // `namedWindow` says why.
+  return classifyFailure(chars, response.status, text, over);
 }
 
-// `once` with the retry rule: a transient failure is asked again, because a 500
-// says nothing about the size of the prompt, and the sweep must not turn one into
-// a wall. Answered twice with the same fault and the request is reported as one.
-async function ask(model, chars, log) {
-  for (let attempt = 0; attempt <= RETRIES; attempt += 1) {
-    const result = await once(model, chars);
-    if (result.kind !== "error" && !TRANSIENT.has(result.status)) return result;
+// `once` with the retry rule. The result carries the number of HTTP requests the
+// answer cost, which is what the budget is charged: one step can send up to
+// `RETRIES + 1` requests, and a sweep that reported asks would under-report what
+// the shared free credential actually saw.
+//
+// Only a transient answer is retried: a 408, 429, 500, 502, 503 or 504, or a
+// transport failure that carries no status at all. A permanent 400 about an
+// invalid parameter answers the same way however many times it is asked, so it
+// is asked once. A refusal that carries a transient status is retried with the
+// rest and then downgraded to an error: an endpoint that never stopped failing
+// has confirmed nothing, and `tally` cannot count what is not a refusal.
+//
+// `maxRequests` is what was left of the budget when the ask began. The sweep caps
+// the last answer's retries with it, so a run whose ceiling is one request away
+// cannot spend two more on a retry. `request` and `wait` are injected by the
+// tests, which have no route to ask and no ten seconds to wait.
+export async function ask(model, chars, log = () => {}, { request = once, wait = sleep, maxRequests = RETRIES + 1 } = {}) {
+  const tries = Math.max(1, Math.min(maxRequests, RETRIES + 1));
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    const result = await request(model, chars);
+    const requests = attempt + 1;
+    const transient = result.kind === "error" && result.status === undefined ? true : TRANSIENT.has(result.status);
+    if (!transient) return { ...result, requests };
     const why = result.kind === "error" ? result.says : `HTTP ${result.status}`;
-    if (attempt === RETRIES) return result;
+    if (attempt === tries - 1) {
+      // A failure that is not about the size of the prompt is never a verdict: a
+      // refusal carrying a transient status comes back as an error, so `tally`
+      // cannot count it as a wall.
+      return result.kind === "refused" ? { ...result, kind: "error", requests } : { ...result, requests };
+    }
     log(`    ${chars} chars: ${why} — asking again in ${RETRY_WAIT_MS / 1000}s`);
-    await sleep(RETRY_WAIT_MS);
+    await wait(RETRY_WAIT_MS);
   }
   return undefined;
 }
@@ -282,16 +335,16 @@ export function tally(asked) {
   // then read as a ceiling with nothing under it, and the ladder went on
   // asking sizes above a refusal whose answer was already known.
   const servedChars = served.reduce((best, one) => (best === undefined || one.chars > best ? one.chars : best), undefined);
-  // The count is a different answer, and it comes from the sizes that carried
-  // one: it is what a declaration is made of, so it is the largest count that
-  // came back — a floor under the size, never over it. A size served without
-  // a count carries no number to declare, and declaring nothing is better than
-  // declaring the count of a smaller prompt.
-  const counted = served.filter((one) => Number.isSafeInteger(one.tokens));
-  const servedTokens = counted.reduce(
-    (best, one) => (best === undefined || one.tokens > best ? one.tokens : best),
-    undefined,
-  );
+  // The count is a different answer, and it is what a declaration is made of, so
+  // it has to belong to the size reported as the floor. It is read from the asks
+  // at that floor: a count the route gave for a SMALLER prompt proves the smaller
+  // prompt fitted, not this one, and publishing it as the window is the "window
+  // too small, quietly never used" failure this file exists to prevent. A floor
+  // whose serve carried no count carries no number to declare — declaring
+  // nothing is better than declaring the count of a smaller prompt.
+  const servedTokens = served
+    .filter((one) => one.chars === servedChars && Number.isSafeInteger(one.tokens))
+    .reduce((best, one) => (best === undefined || one.tokens > best ? one.tokens : best), undefined);
   // A refusal below the largest served size says nothing about the wall above it:
   // this route refuses prompts it then serves, so only a refusal of something
   // bigger than everything served is a candidate for the bound.
@@ -384,9 +437,17 @@ export function climbGoesOn(result) {
 // survey writes a row per measured id, and a row for a model the route never
 // answered says "no wall in reach" about a run that got no answer at all — and
 // marks the id as measured, so it is never asked again.
+//
+// The refusal is read from `refusedChars` or from `refusedSizes[0]`: a `sweep`
+// result carries the first refused size as a scalar, while the exported
+// `tally` reduction carries only the list. A caller that hands this a
+// tally-shaped result must not be told the run learned nothing when a size was
+// in fact refused — that would make `exitCodeFor` exit 1 for a run that
+// measured a wall.
 export function learnedAbout(result) {
   const present = (value) => value !== undefined && value !== null;
-  return present(result?.servedChars) || present(result?.refusedChars);
+  const refused = present(result?.refusedChars) ? result.refusedChars : result?.refusedSizes?.[0];
+  return present(result?.servedChars) || present(refused);
 }
 
 // The exit code of a run, which says what the run learned and nothing else.
@@ -407,15 +468,30 @@ export function exitCodeFor(results) {
 
 // The bracket for one model. `spent` and `asked` are reported so a reader can see
 // how much of the budget a result cost, and what it was spent on.
-async function sweep(model, log) {
+//
+// Exported, with the request and the pacing injectable, because the loop is where
+// the rules that spend the shared credential are decided — a refusal is confirmed
+// once, and a step is charged every request it sent — and neither can be checked
+// through live requests. The default request is `ask`; a test that has no route
+// and no five seconds to wait names its own.
+export async function sweep(
+  model,
+  log = () => {},
+  { request = (id, chars, options) => ask(id, chars, log, options), pause = sleep } = {},
+) {
   let spent = 0;
   const asked = [];
   const step = async (chars) => {
     if (spent >= BUDGET) return undefined;
-    spent += 1;
-    if (spent > 1) await sleep(PACE_MS);
-    const result = await ask(model, chars, log);
+    if (spent > 0) await pause(PACE_MS);
+    // The budget is charged the requests the ask actually sent: an answer that
+    // needed two retries spent three of them, and counting the question would
+    // report a third of what the shared free credential saw. What is left of the
+    // budget also caps this ask's retries, so the last answer cannot cross the
+    // ceiling by retrying.
+    const result = await request(model, chars, { maxRequests: BUDGET - spent });
     if (result === undefined) return undefined;
+    spent += result.requests ?? 1;
     asked.push(result);
     log(
       `    ${String(chars).padStart(9)} chars: ${
@@ -436,7 +512,15 @@ async function sweep(model, log) {
     const first = await step(chars);
     if (first === undefined || first.kind !== "refused") return first;
     const again = await step(chars);
-    if (again === undefined) return first;
+    // A confirmation that was never made — the budget ran out between the two
+    // asks — or that failed is not a confirmation. One refusal is not a wall, so
+    // it is kept as `unconfirmed` rather than `refused`: the reduction below
+    // cannot count it, and the result says plainly that the route answered once.
+    if (again === undefined || again.kind === "error") {
+      log(`    ${chars} chars: the refusal could not be confirmed, so it is not counted`);
+      first.kind = "unconfirmed";
+      return first;
+    }
     if (again.kind !== "served") return first;
     log(`    ${chars} chars: the refusal did not reproduce, so it is void`);
     first.kind = "served";

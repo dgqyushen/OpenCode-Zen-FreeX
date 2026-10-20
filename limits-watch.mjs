@@ -6,6 +6,16 @@
 //   bun limits-watch.mjs --write    fold what was measured into the snapshot
 //   bun limits-watch.mjs --check    say whether a snapshot is one the plugin can read
 //
+// Exit codes, which are how the workflow tells the three answers apart:
+//   0  the route was reached and offered at least one free id
+//   1  the route, the catalogue or the snapshot could not be read or written
+//   2  the route was reached and offered no free id at all
+//
+// 1 is "could not ask" and 2 is "asked, and the answer was nothing": an empty
+// listing is not an outage, so 2 may be reported as reached with nothing to
+// publish rather than as a dead route. `--check` keeps its own 0/1 — it asks
+// nothing, so "not reached" is not one of its answers.
+//
 // This is the scheduled half of the survey `limits-sweep.mjs` performs. The
 // sweep answers "how big is this model's prompt wall"; this answers the questions
 // a calendar can ask: is anything being offered that nobody has measured, has
@@ -114,6 +124,27 @@ const EXPECTED_UNITS = {
 // says another label is a row nothing can be read out of.
 const WALLS = ["bracketed", "single-refusal", "openEnded", "named"];
 
+// The bounds a measurement has to sit inside to be one this file may publish.
+//
+// `--check` is the gate on an unattended merge, and until these existed it asked
+// only that a number be a positive safe integer: a `servedTokens` of
+// 9,000,000,000 passed the shape check and was merged into main, where
+// `limits.mjs` reads it as a window and publishes it to every host. The bounds
+// are deliberately generous — the largest window this route is known to serve is
+// 1,048,576 tokens, and the character ladder that measures it stops around 4.2
+// million characters — so they exist to catch a unit error or a runaway probe,
+// not to second-guess a measurement.
+const MAX_SERVED_TOKENS = 4_000_000;
+const MAX_MEASURED_CHARS = 32_000_000;
+// A token is at least one character for every script this route takes, so a row
+// whose token count is more than twice its character count is a row about two
+// different things. The slack is the message envelope: a `usage.prompt_tokens`
+// count covers the body a character count may not. This is the cross-unit bound
+// the shape check lacked, and it is what a servedTokens/servedChars row from two
+// runs fails.
+const MAX_TOKENS_PER_CHAR = 2;
+const TOKEN_CHAR_SLACK = 4096;
+
 // How old a row has to be before the suspicion rule may ask about it again.
 //
 // The rule has no other bound, and a row whose wall was never found is asked
@@ -129,19 +160,35 @@ const WALLS = ["bracketed", "single-refusal", "openEnded", "named"];
 // is still noticed inside the same month.
 export const SUSPECT_AFTER_DAYS = 7;
 
-// How old a row is, in whole days, from the day it was measured to the day of
-// this run. Both are the run's own dates — the row carries the day it was
+// How old a row is, in whole days, from the last day it was asked about to the
+// day of this run. Both are the run's own dates — the row carries the day it was
 // written and the run carries the day it is writing — so the age is a whole
 // number of days rather than "some time yesterday", and a test can drive it.
 //
-// A row with no day on it has no age: the answer is undefined rather than
-// zero, because a row nobody dated is not a row measured today.
+// There are two such days on a row. `at` is the day the measurement was taken,
+// and `tried` is the day the id was last asked about when the attempt learned
+// nothing new. The later of the two is the one the age is counted from: a row
+// whose sweep came back empty is still a row with a measurement in it, and
+// without `tried` the seven-day bound would read `at` and the id would be swept
+// again on every hourly tick — up to fourteen requests and several megabytes of
+// prompt each — for a question whose answer has not changed.
+//
+// A row with neither day has no age: the answer is undefined rather than zero,
+// because a row nobody dated is not a row measured today.
+function dayNumber(value) {
+  if (typeof value !== "string") return undefined;
+  const day = Date.parse(`${value}T00:00:00Z`);
+  return Number.isNaN(day) ? undefined : day;
+}
+
 function ageInDays(row, today) {
-  const day = typeof row?.at === "string" ? row.at : undefined;
-  if (day === undefined || today === undefined) return undefined;
-  const then = Date.parse(`${day}T00:00:00Z`);
-  if (Number.isNaN(then)) return undefined;
-  return Math.floor((today - then) / DAY);
+  if (today === undefined) return undefined;
+  const measured = dayNumber(row?.at);
+  const tried = dayNumber(row?.tried);
+  const day =
+    measured === undefined ? tried : tried === undefined ? measured : Math.max(measured, tried);
+  if (day === undefined) return undefined;
+  return Math.floor((today - day) / DAY);
 }
 
 async function getJSON(url) {
@@ -172,10 +219,23 @@ export async function readSnapshot(file = SNAPSHOT) {
     if (parsed?.version !== SNAPSHOT_VERSION) return { models: {} };
     const models = parsed?.models;
     if (!models || typeof models !== "object" || Array.isArray(models)) return { models: {} };
-    const rows = {};
+    // A null-prototype map, because an id comes out of a file a person may edit
+    // by hand: assigning a row under the key `__proto__` on a plain object walks
+    // `Object.prototype`'s setter and sets the map's prototype instead of adding
+    // a row. The row would then be lost — `Object.hasOwn(measured, "__proto__")`
+    // false, so the id stays "new" and is re-swept every run — and the prototype
+    // would be a row-shaped object every later lookup reads through.
+    const rows = Object.create(null);
     for (const [id, row] of Object.entries(models)) {
       if (!row || typeof row !== "object" || Array.isArray(row)) continue;
-      if (typeof row.wall !== "string") continue;
+      // The label decides whether the row is a measurement, and the label itself
+      // has to be one this file — and `limits.mjs` — knows. A row whose wall is
+      // `"bracketedt"` (a typo, or a label a newer sweep adds) is kept by the
+      // shape check but is not a measurement: `added` is decided by the id being
+      // in the table, so that id would never be swept again, and the bad row
+      // would be written straight back out. `checkSnapshot` is the other reader
+      // of these labels, and the two lists are the same one held here.
+      if (typeof row.wall !== "string" || !WALLS.includes(row.wall)) continue;
       rows[id] = row;
     }
     return { models: rows };
@@ -288,11 +348,12 @@ export async function watch({
     // it is paid for on every scheduled tick — up to fourteen requests and
     // several megabytes of prompt for a question whose answer does not change,
     // because the ladder is the same on every run. The row carries the day it
-    // was measured, and it is the only thing here that says when the id was
-    // last asked about.
+    // was measured, and `tried` when a later run asked and learned nothing; the
+    // later of the two is when the id was last asked about.
     const age = ageInDays(entry, today);
     // A row with no day on it is asked once: its age is unknown, and the
-    // measurement writes the day, so the bound holds from then on.
+    // measurement — or the empty attempt, which writes `tried` — dates it, so
+    // the bound holds from then on.
     if (age !== undefined && age < SUSPECT_AFTER_DAYS) return false;
     return true;
   });
@@ -310,7 +371,12 @@ export async function watch({
   if (gone.length > 0) log(`  no longer offered: ${gone.join(", ")}`);
   if (all && sweep) log(`  --all: re-measuring all ${targets.length} that may be measured`);
   const results = targets.length > 0 ? await sweepModels(targets, log) : [];
-  const next = { ...measured };
+  // The rows this run will write, as a null-prototype map: an id comes from the
+  // route and from a file a person may edit by hand, and `next["__proto__"]` on a
+  // plain object would set the map's prototype instead of adding a row. JSON
+  // output is unchanged — a null-prototype object serialises exactly like a
+  // plain one — and the snapshot keeps being an object in the file.
+  const next = Object.assign(Object.create(null), measured);
   // A result the run learned nothing about is not a measurement, and it must
   // not become a row.
   //
@@ -326,16 +392,27 @@ export async function watch({
   // failed is a model the route could not be asked about. `learnedAbout` is
   // where the sweep says it, and it is asked here rather than the rule being
   // copied — the same rule the sweep's own exit code is built on.
+  //
+  // Such an attempt still has to leave a trace, or the age bound cannot see it:
+  // a row left with its old `at` is a row that has been "measured" seven days
+  // ago for ever, so an `openEnded` id the route will not answer is swept again
+  // on every hourly tick. The measurement is not rewritten — that is the rule
+  // above — but the day the id was last asked about is, in `tried`, which
+  // `ageInDays` prefers over `at`. A new id with no row cannot carry one without
+  // also being marked as measured for ever, so it gets none: it is retried every
+  // run until the route answers it, which is what `added` means.
   const unlearned = [];
   for (const result of results) {
     if (!learnedAbout(result)) {
       unlearned.push(result.model);
+      const held = next[result.model];
+      if (held) next[result.model] = { ...held, tried: at };
       continue;
     }
     next[result.model] = { ...kept(result), at };
   }
   if (unlearned.length > 0)
-    log(`  learned nothing, so no row was written: ${unlearned.join(", ")}`);
+    log(`  learned nothing, so no measurement was written: ${unlearned.join(", ")}`);
   // A row for an id that is answered from models.dev is a row about a window
   // nobody asked about, and it is the row that makes the next run think the
   // model is still a candidate: `openEnded` is what the suspicion rule reads.
@@ -435,17 +512,43 @@ function rowProblems(id, row) {
   }
   // The numbers. A number in a row is a whole number of tokens or of
   // characters, and a row that has none of a thing says so with a null rather
-  // than with a zero: a zero is a measurement of nothing.
-  for (const key of ["servedTokens", "servedChars", "refusedChars"]) {
+  // than with a zero: a zero is a measurement of nothing. Each number also has
+  // an upper bound, because this check is the gate on an unattended merge and a
+  // runaway probe is otherwise a shape the gate accepts.
+  const bounds = {
+    servedTokens: MAX_SERVED_TOKENS,
+    servedChars: MAX_MEASURED_CHARS,
+    refusedChars: MAX_MEASURED_CHARS,
+  };
+  for (const [key, bound] of Object.entries(bounds)) {
     const value = row[key];
     if (value === undefined || value === null) continue;
     if (!Number.isSafeInteger(value) || value <= 0) {
       say(`\`${key}\` is ${JSON.stringify(value)}, and a number in a row is a whole number of tokens or characters`);
+      continue;
     }
+    if (value > bound) {
+      say(`\`${key}\` is ${value}, and no measurement here is above ${bound}`);
+    }
+  }
+  // The two units are about the same request, so they have to agree: a body of
+  // 400,000 characters does not carry a million tokens. A row that says it does
+  // was built from two different runs — or two different units — and neither
+  // number can be trusted as a window.
+  if (
+    Number.isSafeInteger(row.servedTokens) &&
+    row.servedTokens > 0 &&
+    Number.isSafeInteger(row.servedChars) &&
+    row.servedChars > 0 &&
+    row.servedTokens > row.servedChars * MAX_TOKENS_PER_CHAR + TOKEN_CHAR_SLACK
+  ) {
+    say(`\`servedTokens\` is ${row.servedTokens} against \`servedChars\` ${row.servedChars}, and a prompt of that many characters does not hold that many tokens`);
   }
   if (row.named !== undefined) {
     if (!Number.isSafeInteger(row.named) || row.named <= 0) {
       say(`\`named\` is ${JSON.stringify(row.named)}, and a window the route named is a whole number of tokens`);
+    } else if (row.named > MAX_SERVED_TOKENS) {
+      say(`\`named\` is ${row.named}, and no window the route names here is above ${MAX_SERVED_TOKENS} tokens`);
     }
   }
   // The sizes that were refused, in the order they were refused.
@@ -457,6 +560,8 @@ function rowProblems(id, row) {
       for (const size of sizes) {
         if (!Number.isSafeInteger(size) || size <= 0) {
           say(`\`refusedSizes\` holds ${JSON.stringify(size)}, and a size is a whole number of characters`);
+        } else if (size > MAX_MEASURED_CHARS) {
+          say(`\`refusedSizes\` holds ${size}, and no measurement here is above ${MAX_MEASURED_CHARS} characters`);
         }
       }
       for (let index = 1; index < sizes.length; index += 1) {
@@ -506,6 +611,20 @@ function rowProblems(id, row) {
     say(`the date is ${JSON.stringify(day)}, and it is the day the row was measured, as YYYY-MM-DD`);
   } else if (new Date(read).toISOString().slice(0, 10) !== day) {
     say(`the date is ${JSON.stringify(day)}, and there is no such day`);
+  }
+  // The day the id was last asked about and learned nothing, when a later run
+  // has tried. It is optional — a row written before the field existed has none,
+  // and a row whose sweep answered has no reason for one — but a value the file
+  // does carry is a day of the same shape as `at`: `ageInDays` reads it to hold
+  // the seven-day bound on a measurement that could not be renewed.
+  if (row.tried !== undefined) {
+    const tried = row.tried;
+    const triedRead = typeof tried === "string" ? Date.parse(`${tried}T00:00:00Z`) : Number.NaN;
+    if (typeof tried !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(tried) || Number.isNaN(triedRead)) {
+      say(`\`tried\` is ${JSON.stringify(tried)}, and it is the day the id was last asked, as YYYY-MM-DD`);
+    } else if (new Date(triedRead).toISOString().slice(0, 10) !== tried) {
+      say(`\`tried\` is ${JSON.stringify(tried)}, and there is no such day`);
+    }
   }
   return problems;
 }
@@ -620,10 +739,15 @@ if (import.meta.main) {
         await writeSnapshot(state.snapshot);
         console.log(`\nwrote ${Object.keys(state.snapshot.models).length} ids to limits-observed.json`);
       } else console.log("\nnothing written; --write folds what was measured into the snapshot");
-      // A run that reached the route has answered its question even when it found
-      // nothing to do. One that could not reach it has not, and the workflow has to
-      // be able to tell those apart.
-      process.exit(state.offered.length > 0 ? 0 : 1);
+      // Three answers, three codes (documented at the top of this file). A run
+      // that reached the route and was offered ids answered its question, and so
+      // did one that was offered none: the second is not an outage, and giving
+      // it the code of a route that could not be asked hides the one fact the
+      // workflow needs — 2 means "asked, and there is nothing to publish". The
+      // code is set rather than exited on, because stdout to a pipe is written
+      // asynchronously and `process.exit` can cut the report off before it is out
+      // — and the report is the pull request body.
+      process.exitCode = state.offered.length > 0 ? 0 : 2;
     } catch (error) {
       // Being unable to ask is not a finding about limits, so it is a sentence
       // and an exit code rather than a stack trace about a fetch that failed: a
