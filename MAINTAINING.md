@@ -49,15 +49,20 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | --- | --- | --- | --- |
 | `deepseek-v4.1-flash-free` | context | 326000 | the last point this route is measured to serve (326,702), rounded down on 2026-10-19 because its refusal names no number and refuses 326,750 itself |
 | `deepseek-v4.1-flash-free` | output | 384000 | the paid twin's figure, and nothing on this route confirms it today: the `[1, 393216]` sentence did not reproduce on a 2026-10-19 re-ask, which was answered 200 |
-| `mimo-v2.6-flash-free` | context | 343000 | the route's own enforcement, found by bracketing on 2026-10-19 (343,131 tokens served, a prompt of about 407,725 refused), not the 1048576 the route used to state |
+| `mimo-v2.6-flash-free` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 tokens served, 1,750,000 characters; refused at 2,800,000 characters), not the 1048576 the route used to state |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
-| `big-pickle` | context | 343000 | the route's own enforcement, found by bracketing on 2026-10-19 (343,131 served, about 407,725 refused), an axis an earlier sweep had left to the catalogue |
+| `big-pickle` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 served, 1,750,000 characters; refused at 2,800,000 characters), an axis an earlier sweep had left to the catalogue |
 | `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much, named again on a 2026-10-19 re-ask |
+| `big-pickle` | input | 375000 | the window, not the sample: the catalogue's 160000 was falsified by a served prompt of 343,131 tokens, and this route names no input cap of its own, so the axis is declared at the window |
 | `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
 | `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
 | `ll-alpha-free` | output | 262144 | the ceiling the route's own refusal names, against a declared 65536 |
-| `glm-5.3-flash-free` | context | 311000 | the route's own enforcement, found by bracketing on 2026-10-19 (311,109 served, about 343,348 refused), not the paid twin's 1000000 |
-| `glm-5.3-flash-free` | output | 131072 | what this route declares for the same upstream model |
+| `glm-5.3-flash-free` | context | 323000 | the route's own enforcement, found by bracketing on 2026-10-20 (323,107 tokens served, 1,787,500 characters; a prompt of about 343,000 tokens is refused), not the paid twin's 1000000 |
+| `glm-5.3-flash-free` | output | 131072 | the paid twin's figure for the same upstream model |
+| `minimax-m3.1-flash-free` | context | 1048576 | the wall behind the catalogue's round million: models.dev declares 1048576 for this canonical model - two of nineteen provider entries say so, against seventeen that repeat 1000000 - and the bisection agrees with those two, 1,048,092 tokens served and 1,082,359 refused |
+| `minimax-m3.1-flash-free` | output | 512000 | the catalogue's own declaration for this id, left as declared: nothing above 32000 was watched on it, and lowering a ceiling on no evidence cuts replies off |
+| `beam-free` | context | 1048576 | the route's own enforcement, found by bisection: 1,048,361 tokens served, 1,071,887 refused - the binary wall, which is the scale the catalogue's 1048576 already names |
+| `beam-free` | output | 131072 | the catalogue's declaration for this id; nothing here measured it, and the axis is left as declared |
 | `space-bunny-free` | input | 1048576 | the window this route declares for the same id, with prompts of up to nearly twice the declared input served |
 
 A prompt sized just over the window is refused with
@@ -178,8 +183,10 @@ under a short prompt answers 200 and writes nothing like it, and `mimo`'s refusa
 came back with the 200000 it was asked for rather than with a ceiling — and
 neither is a generation nobody watched finish.
 
-The evidence tiers are `route`, `route-twin`, `route-sweep`, `vendor` and
-`witnessed`, in that order. The table here draws on `route`, `route-twin` and
+The evidence tiers are `route`, `route-twin`, `route-sweep`, `models.dev` (the
+same records republished across providers, which says what scale a round million
+was meant in), `vendor` and `witnessed`, in that order. The table here draws on
+`route`, `route-twin`, `models.dev` and
 `vendor` only: `route-sweep` is a measurement on this same route taken by a
 machine rather than by hand, read at run time from the file the scheduled sweep
 writes rather than written into this file, and it answers where the table has
@@ -243,14 +250,24 @@ catalogue's own number when it does not, and the value already declared. It is
 then held under the bound a refusal puts on it and under the cap, and never below
 1. `step` is how far above the proven floor the declaration is willing to go:
 seeded at 5% of the seed and at least 1024, doubled each time a raise is taken
-(by at least 1024, and capped at a quarter of the seed, with 4096 as the smallest
-that cap may be) and halved on every refusal (never below 1024). The bound is the
+that really moved the declaration (by at least 1024, and capped at a quarter of
+the seed, with 4096 as the smallest that cap may be) and halved on every refusal
+(never below 1024). A raise that does not raise doubles nothing: the step is
+part of what a raise moves, so it is written down only when the declaration
+moved with it.
+
+The bound is the
 size the route refused, once it has refused one: a declaration may not sit on a
 size the route turned down, and where the refusal named no number the bound is 2%
-under it, while a window the route named is exact and may be declared as it
-stands. The cap is `OPENCODE_ZEN_FREE_MAX_WINDOW`, 1048576 by default, and it is
-read as at least the seed, so it only ever holds back a value the search raised
-and never cuts down a number the table or the catalogue declared.
+under it — unless that margin lands at or under the floor, where it is a margin
+of nothing, and the next size is the midpoint of the bracket instead of a bound
+the route has already contradicted — while a window the route named is exact and
+may be declared as it stands. The cap is `OPENCODE_ZEN_FREE_MAX_WINDOW`, 1048576
+by default, and it is read as at least the seed, so it only ever holds back a
+value the search raised and never cuts down a number the table or the catalogue
+declared. It does not cut down a window the route named in its own words either:
+that number is the route's own and is published as it stands, so a route that
+named 2,000,000 tokens is not brought back to this file's 1,048,576.
 
 **Not every refusal is about the window.** An answer that is not 200 is not
 evidence about size by itself: the route's failures wear the same clothes, and a
@@ -286,8 +303,11 @@ A raise is demand-driven, and that is the whole of the search. The host filling
 the declaration, which is the largest request the route has served reaching 90%
 of what was declared, is the only evidence there is that it wants more room: a
 model whose traffic sits well under its window is left alone rather than given a
-bigger one to not use, and when the host does fill it the step doubles and the
-declaration moves above the floor. A raise also waits out a cooldown
+bigger one to not use, and when the host does fill it the declaration moves above
+the floor and the step doubles with it. A raise that moves nothing is not a
+raise: it spends none of the demand that pays for the next one — the host
+cannot send a larger request than the window it was given, and that window did
+not grow — and it starts no cooldown. A raise also waits out a cooldown
 (`OPENCODE_ZEN_FREE_LIMITS_COOLDOWN_MS`, 900000 by default, which is fifteen
 minutes), and a refusal stamps the same clock, so probes are spaced whichever way
 the last one went. The cost is the part worth being plain about: a probe that
@@ -309,7 +329,10 @@ state in memory only; unset, it is `limits.json` under `opencode-zen-freex` in
 the cache directory the platform uses — `%LOCALAPPDATA%` on Windows, else
 `$XDG_CACHE_HOME`, else `~/.cache`. The write is atomic, a temporary file beside
 the target and a rename over it, because a half-written state file would be read
-as a bracket somebody measured; it happens at most once per
+as a bracket somebody measured; the temporary file is named per write and the
+writes are serialised behind each other, because two of them inside one process
+landing on one path is the same half-written file arriving by another road. It
+happens at most once per
 `OPENCODE_ZEN_FREE_LIMITS_STATE_DEBOUNCE_MS` (5000 by default, and 0 writes
 straight away) and never delays a request. The read is tolerant in the same
 direction: a missing file, an unreadable one, one holding another shape or a
@@ -328,7 +351,8 @@ catalogue still declares what it was measured against, so the table has the firs
 word for an id it names; then what the scheduled sweep measured on this same
 route, which is the tier that answers for an id the table never named and for an
 axis whose catalogue value has moved since, and which may lower a declaration
-only when the wall behind it was bracketed; and last the catalogue's own number.
+only when the wall behind it was bracketed or when the row carries a window the
+route named in its own words; and last the catalogue's own number.
 Whichever of them settles an axis is also what a fresh record is seeded from, so
 the search starts from the table's number where the table answers and from the
 sweep's where it does not, while the bracket the route teaches keeps the last
@@ -356,30 +380,51 @@ carries the samples behind it.
 
 **What the sweep leaves, and how it is read back.** The scheduled workflow
 (`.github/workflows/walls.yml`, hourly at :17) runs `limits-watch.mjs --sweep`,
-which measures the ids the listing offers and the snapshot does not name yet and
-folds each result into `limits-observed.json` beside `limits.mjs`: the file is
-pushed as a branch and opened as a pull request, with a compare link in the run
-summary where the repository does not let Actions open one, and it never reaches
-`main` as a push - what reaches `main` is a merged pull request, which in a
-repository that allows it is what the run does itself (below). A wall that moves
-under an id already measured is not re-measured on that timer, and `--all` is a
-person asking for a fresh reading of everything. That file is an input at run time
+which measures the ids the listing offers and the snapshot does not name yet,
+plus the ids whose wall was never found - a snapshot row that says `openEnded`
+while the catalogue declares more than the snapshot ever served is an id whose
+wall is one rung up - and measures those at most once a week, because the ladder
+is the same on every run and only the catalogue's number and the route's own
+build change, and neither of those is an hourly event. It does not measure the
+ids the catalogue declares at a million or more at all: those are answered from
+models.dev, the largest entry any provider declares for the same canonical
+model, and an id answered from there is never measured, so it is never "new"
+either. The rows of those ids are dropped from the snapshot as well - they are
+rows about a window nobody asked about - and the run names the ones it dropped.
+Each result is folded into `limits-observed.json` beside `limits.mjs`: the file
+is pushed as a branch and opened as a pull request, with a compare link in the
+run summary where the repository does not let Actions open one, and it never
+reaches `main` as a push - what reaches `main` is a merged pull request, which
+in a repository that allows it is what the run does itself (below). A wall that
+moves under an id already measured is not re-measured on that timer, and `--all`
+is a person asking for a fresh reading of everything that may be measured - the
+ids models.dev answers are not among them. That file is an input at run time
 now rather than only a workflow artifact: `measuredWalls()` reads it once per path
 and keeps the answer, taking the path from its argument, else
 `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the file beside the module, with an empty
 value of that variable meaning no snapshot at all. A missing file, an unreadable
-one, one that is not JSON, one whose `models` is not an object and one past 256
-KiB answer the same way - no measurement - because a build that cannot read a
-measurement declares what its table and its catalogue say, and nothing here may
-fail a request.
+one, one that is not JSON, one whose `models` is not an object, one whose
+`version` this build does not know and one past 256 KiB answer the same way - no
+measurement - because a build that cannot read a measurement declares what its
+table and its catalogue say, and nothing here may fail a request.
 
-Each row contributes two facts and no more: the largest prompt the route was
-watched to serve, floored to a whole thousand, the same rounding and for the same
-reason as the numbers in the table above; and whether the sweep hit a wall at
-all, which is whether its `wall` is `bracketed`. A bracketed wall had two refused
+`limits:sweep` says what a run learned in its exit code: a run that asked about
+models and learned nothing about any of them exits 1, and a run that asked
+nothing at all - every id was answered from models.dev - exits 0, because
+nothing failed and nothing was learned.
+
+Each row contributes what it measured and no more: the largest prompt the route
+was watched to serve, floored to a whole thousand, the same rounding and for the same
+reason as the numbers in the table above; whether the sweep hit a wall at
+all, which is whether its `wall` is `bracketed`; and, when one of the refusals
+stated the window, the window it stated. A bracketed wall had two refused
 sizes behind it, so the served sample is a point the wall is known to sit above
 and the axis may be answered with it either way, which is what lets a sweep value
-lower a declaration as well as raise one. A wall the sweep never hit is a floor -
+lower a declaration as well as raise one. A window the route named in its own
+words is the route's own number and settles the axis outright, as it stands -
+and such a row survives the rule that drops the rows models.dev answers, because
+a vendor raising a declaration over a million does not un-state what the route
+said about itself. A wall the sweep never hit is a floor -
 the route served this much and said nothing about the rest - and a floor under
 the declaration says nothing about the declaration, so it may only raise one. The
 sweep's other two labels, `openEnded` and `single-refusal`, are that same floor
@@ -389,6 +434,24 @@ for sixteen completion tokens and measures a prompt, so it answers the context
 axis only: the output axis is still the table and the catalogue, and `input` is
 still measured by nothing here, though the window that axis follows may be the
 one the sweep settled rather than the table's (above).
+
+A row that counts characters and no tokens is invisible to the plugin, and that
+is a decision rather than an oversight: the route served the prompt but sent back
+no count of its own, and the only way to turn characters into tokens here is the
+estimator's own ratio, which exists to guess how big a *request* is so that a
+request may be sent. The same ratio turned into a declaration would publish an
+estimate as the wall the route enforces, which is the one thing a declaration is
+not allowed to be. The sweep keeps such a row - a route that served without
+counting is evidence that it serves - and the table's own number still stands
+for that model.
+
+The file says what its numbers are, because the names cannot change: a
+top-level `_units` names the unit of every field - `servedTokens` and `named`
+are tokens, `servedChars`, `refusedChars` and `refusedSizes` are characters,
+`at` is the day it was measured - and a reader who takes one for the other is
+wrong by a factor of four. `bun limits-watch.mjs --check` reads the file the
+plugin will read and says, line by line, what is wrong with it; it asks nothing
+and writes nothing, so it can be a gate on the file a run is about to publish.
 
 Applying one is reported as it happens: `OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` gets a
 `sweep-statement` line naming the model, the axis, the value, the wall behind it
@@ -400,10 +463,15 @@ catalogue still prints.
 **What happens to a run.** A run that measured something new leaves one changed
 file on a branch, opens it as a pull request and merges it, so the measurement is
 on `main` before the run ends and an id Zen made free an hour ago has a measured
-window this hour instead of waiting for somebody to notice. The report travels in
+window this hour instead of waiting for somebody to notice. The file is checked
+and the suite is run over it before that happens: a workflow started with
+`GITHUB_TOKEN` starts no workflow of its own, so the pull request this run opens
+runs no `ci.yml` of its own and the squash merge produces no `push` run either -
+this job checks what it is about to publish and runs the tests over it. The
+report travels in
 the pull request body and the diff beside it: a row per model, the sizes that were
 served,
-the sizes that were refused and the two labels above.
+the sizes that were refused and the labels above.
 
 Merging unattended is defensible here for two reasons, and the workflow checks
 both rather than assuming them. The pull request is `limits-observed.json` and
@@ -472,9 +540,10 @@ output).
 which is the route naming its own window, on an upstream that words it
 differently from the DeepSeek ids. That figure was overtaken on 2026-10-19, when
 a prompt of about 408,000 tokens was refused — less than half of it — so the axis
-is the route's own enforcement found by bracketing (343,131 tokens served,
-1,900,000 characters refused) rather than the number the route stated, the same
-way the DeepSeek id's stated million went. Its output is the first figure in this
+is the route's own enforcement found by bracketing (375,142 tokens served on
+2026-10-20, refused at 2,800,000 characters) rather than the number the route
+stated, the same way the DeepSeek id's stated million went. Its output is the
+first figure in this
 file resting on a vendor page: that same refusal came back with the 200000 it was
 asked for, unclamped, so this route states no completion ceiling of its own, and
 131072 is Xiaomi's entry for `mimo-v2.6-flash` (`api.xiaomimimo.com`, and its
@@ -533,6 +602,7 @@ It reports each request as:
 | `failed` | Zen answered with something other than a 403, so it never judged the fingerprint |
 | `malformed` | the request could not be built: a name in `required` has no tool behind it in `fingerprint.json`. Zen was never asked, and the line names the generation, the shape and the name |
 | `unreachable` | Zen could not be asked at all |
+| `timed-out` | the request was still in flight when the deadline passed: the route did not say no about the wording, and it did not say nothing because it could not be reached - it did not answer at all, which is neither a refusal nor an outage |
 
 A `malformed` row is a `fingerprint.json` problem, not a network one, and the
 summary says so rather than sending the reader to `capture`. It is deliberately
@@ -555,6 +625,25 @@ part of a run answered and part of it did not.
 `capture` needs `opencode` on PATH. It points a real OpenCode at a server running
 locally and reads the request it makes, so nothing is sent to Zen and no key is
 involved.
+
+It compares against the file it is about to write, not the copy this repository
+keeps, so `--fingerprint <path>` is the baseline and the tools it does not
+observe are carried over from that file. A capture that is missing, that is not
+JSON, or that is not a table of profiles is written from scratch rather than
+refused: refusing would name a remedy - "run `bun run capture`" - that the broken
+file would have killed at its import, and the command that repairs it has to be
+able to start. A file that holds no `profiles` object keeps the rest of it and
+has its profiles written afresh. What the file held is said out loud, because a
+file replaced without a word is a file nobody knows was there. The script reaches
+for no Bun-only API - its own directory comes from the module's URL - so it runs
+on the Node the package declares as well.
+
+The `anthropic` provider-utils in `fingerprint.json` is the one entry a capture
+cannot take: no free model speaks that protocol, so the anthropic request shape
+is refused and the value in the file is one a human has to keep. It is
+maintained by hand and has to be checked when `@ai-sdk/anthropic` is bumped, and
+every capture that writes the file says so - it cannot tell whether that value
+is current, and it must not let the file look as current as the rest of it.
 
 The wording it reads is the host's, so the host's own details are put back to
 something neutral before the capture is written: the OS banner, the scratch
@@ -600,6 +689,13 @@ non-zero, and the summary says the same thing in one sentence.
 repeated refusals from this address have put it in a cooldown — they can, and
 the cooldown answers like a refusal.
 
+**`timed-out`.** The request was still in flight when the gate's deadline
+passed. The route did not say no about the wording, and it did not say nothing
+because it could not be reached either — it did not answer at all. Ask again,
+or look at the route's load: a request that is still in flight is not a
+refusal, and the summary says so rather than sending the reader to the network
+or to `capture`.
+
 **`failed`.** Zen answered, but not with 403: a 5xx or a 429, or a 401 if the
 request was not authorized. Not a fingerprint problem either, and the gate says
 so rather than naming the wording. A 429 is the one to read twice: repeated
@@ -638,6 +734,16 @@ x-opencode-request with x-session-affinity is refused. A header cannot be judged
 by adding it on its own, so add it in `outboundHeaders` and let the pinned test
 and a live `check:gate` say what it did.
 
+**Reading the protocol table by its columns.** The console docs are read as a
+table whose rows name an id and the endpoint that id is asked at, and the
+endpoint is found by the cell that holds one — not by a column number — so a
+table that gains a column, loses one or renames one still says which id it is
+talking about. A table that holds no endpoint this plugin asks about is not the
+same as a document that says nothing, and the two are told apart: a model left
+on the snapshot's own protocol is asked at the wrong one and fails upstream in a
+way a host cannot explain, so `OPENCODE_ZEN_FREE_MODELS_DEBUG=1` says how many
+rows the document had and that none of them names an endpoint.
+
 **Rewriting the tool wording.** The wording sent upstream is OpenCode's, because
 Zen reads it. What replaces it is only the wording: the host's tool and its
 parameters are kept, so the call the model makes still fits the tool that runs
@@ -669,20 +775,26 @@ by the id — dsh writes `tool/result` records keyed by it — fails its turn on
 an empty one and cannot reload the session afterwards ("tool call id requires
 a nonempty string"). Merging frames must read the id as a name that only
 replaces itself, and a call the route never names has to leave with an
-invented one. Both live in `tool-response.mjs` — the merge's keep, and
-`ensureCallIDs` at the two places a call is published — and `stream.mjs`'s
-collapse reads the same rule.
+invented one - one that misses every id the whole reply already carries, not
+only the ones of the choice it sits in, because the reply's calls are read
+together rather than one choice at a time. Both live in `tool-response.mjs` — the
+merge's keep, and `ensureCallIDs` at the two places a call is published — and
+`stream.mjs`'s collapse reads the same rule.
 
-Both of those places publish the **chat** shape only. A Responses or Messages
-reply whose call carries no id of its own is handed on as it stands — no id, no
-`call_id` — and both protocols require the field. Measured 2026-10-18, no free
-model is served on either route: the tier's own `/models` listed none,
-`muse-spark-1.3-contributor-free` answered 410 `ModelDeprecated` and the four
-Messages models answered "Model is unavailable". So the gap is real but not
-reachable today, and the sentence above — every published call leaves with a
-non-empty id — is chat's. A free model on either route puts it back in scope,
-and then the id has to be minted once per call across its added, done and
-terminal copies, the way the dropped ones already are.
+Both of those places publish the **chat** shape. A Responses or Messages reply
+whose call carries no id of its own used to be handed on as it stands — no id, no
+`call_id` — and both protocols require the field; the id a client answers the
+call by is minted for it now (Responses' `call_id`, the Messages block's `id`),
+once for the call, so its added, done and terminal copies answer one id. The
+Responses item's own `id` is still not filled in: on the stream path the
+upstream may name it later, and a name given before the upstream's would make
+one call two ids. Measured 2026-10-18, no free model is served on either route:
+the tier's own `/models` listed none, `muse-spark-1.3-contributor-free` answered
+410 `ModelDeprecated` and the four Messages models answered "Model is
+unavailable". So the gap is real but not reachable today, and the sentence above
+— every published call leaves with a non-empty id — is chat's. A free model on
+either route puts the rest of it back in scope, and then the item id has to be
+minted across the same copies, the way the dropped ones already are.
 
 **Trusting one observation.** The gate is not steady: it moved more than once in
 a day while this was being worked out, and identical requests were answered both
@@ -706,17 +818,21 @@ that passes under the stricter of them, since the looser one will not last.
 | `limits-observed.json` | what the last scheduled run measured: read at run time as the `route-sweep` tier |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
+| `assert-bun-version.mjs` | checks that the Bun on PATH is the one `package.json` declares (CI only) |
 
-`capture.mjs`, `limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs` and
-`tools-smoke.mjs` are maintenance tools for this repository, not part of what a
-host loads: they are not in `package.json`'s `files`, so a published tarball
+`capture.mjs`, `limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs`,
+`tools-smoke.mjs` and `assert-bun-version.mjs` are maintenance tools for this
+repository, not part of what a host loads: they are not in `package.json`'s
+`files`, so a published tarball
 carries the modules a host imports, `fingerprint.json`, `limits-observed.json`
 (which `limits.mjs` does read at run time) and the four documents beside them
 (`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - fourteen files in all, the
 last being `package.json`, which npm packs whatever `files` says. The same list
 is why `npm run` has nothing to run in an installed package: `check:gate`,
 `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are entry points for
-a checkout, and the tools they name stay here. `package.json`'s `exports` names
+a checkout, and the tools they name stay here - each of them now says in one
+line that it runs from a repository checkout, and exits, rather than failing
+with a module it cannot find. `package.json`'s `exports` names
 those public modules one by one rather than mapping `./*`, so a file that was
 never meant to be imported cannot
 be reached as a subpath — `capture.mjs` in particular starts a server and
@@ -742,14 +858,21 @@ Every script in `package.json` names `bun`: `bun test` is the suite, and
 `check:gate`, `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are
 the tools. `bun test` is what CI runs, at the version pinned in
 `.github/workflows/ci.yml` so a run says something about the commit rather than
-about whatever Bun was newest that morning.
+about whatever Bun was newest that morning, and `assert-bun-version.mjs` is
+what compares that pin with the `packageManager` field in `package.json` and
+with the Bun that is actually on PATH: three places name the version and
+nothing else compares them, so an upgrade on one side alone would leave the
+suite and the gate running on a Bun the project no longer declares, and nothing
+would fail.
 
 Nothing here is installed with Bun — there are no dependencies — so Bun is the
 tools only, and the floor a host's runtime has to clear is the newest API the
-modules a host imports reach for. That is `AbortSignal.any` (`provider.mjs`,
-`limits.mjs`), which Node added in 20.3.0 and backported to 18.17.0 — so
-`engines.node` says `>=18.17.0` and not `>=20.3.0`, which would have warned
-hosts that work. Everything else those modules use is older: `AbortSignal.timeout`
+modules a host imports reach for. That was `AbortSignal.any` (`provider.mjs`,
+`limits.mjs`), which Node added in 20.3.0 and backported to 18.17.0: it is
+feature-detected now — the runtime's own where it has one, a hand-made
+combination of the signals where it does not — so `engines.node` says
+`>=18.17.0` and not `>=20.3.0`, which would have warned hosts that work.
+Everything else those modules use is older: `AbortSignal.timeout`
 and `throwIfAborted` (17.3), `findLast` (18.0), `Object.hasOwn` (16.9), and the
 fetch globals (18.0 unflagged).
 
@@ -783,8 +906,9 @@ built from are one thing. `magpie plugin add opencode-zen-freex` installs it by
 that name.
 
 What ships is `package.json`'s `files` list, and it is deliberately narrower than
-the repository: the five maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
-`limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs`) stay here, because a
+the repository: the maintenance scripts (`capture.mjs`, `tools-smoke.mjs`,
+`limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs`) and the CI-only
+`assert-bun-version.mjs` stay here, because a
 host never loads them and one of them rewrites the shipped `fingerprint.json`
 when it is run, while `limits-observed.json` does ship, because `limits.mjs`
 reads it at run time. `LICENSE` is
