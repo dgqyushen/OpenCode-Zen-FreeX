@@ -154,7 +154,7 @@ export async function watch({
   if (suspicion.length > 0 && sweep && !all)
     log(`  open-ended but under-declared, so measured again: ${suspicion.join(", ")}`);
   if (gone.length > 0) log(`  no longer offered: ${gone.join(", ")}`);
-  if (all && sweep) log(`  --all: re-measuring all ${offered.length}`);
+  if (all && sweep) log(`  --all: re-measuring all ${targets.length} that may be measured`);
   const results = targets.length > 0 ? await sweepModels(targets, log) : [];
   const next = { ...measured };
   for (const result of results) next[result.model] = { ...kept(result), at };

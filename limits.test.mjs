@@ -155,7 +155,7 @@ test("a second id on another upstream, whose axes rest on different tiers, is de
   // window it used to state was contradicted; its output is the vendor's
   // catalogue entry, because this upstream names no completion ceiling
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
-    context: 343000,
+    context: 375000,
     output: 131072,
   });
 });
@@ -174,7 +174,7 @@ test("the ids the tier added last do not keep the ceilings the catalogue gave th
   // 2026-10-19 after the paid twin's 1000000 was contradicted by a refusal; its
   // output is still the twin's, which nothing has contradicted.
   assert.deepEqual(limitOverrides("glm-5.3-flash-free", { context: 200000, output: 32000 }), {
-    context: 311000,
+    context: 323000,
     output: 131072,
   });
   // and the catalogue moving voids the axis it moved, as it does for every entry
@@ -248,7 +248,7 @@ test("evidence measured against another catalogue is void, and only on its own a
     output: 131072,
   });
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 64000 }), {
-    context: 343000,
+    context: 375000,
   });
   assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", {}), {});
   // The DeepSeek id obeys the same rule on both axes: its window was measured
@@ -444,7 +444,7 @@ test("a refusal naming a window while the process runs outranks the shipped tabl
     // the same answer the observation above would have given it, read from one
     // place: the entry's own declared pair.
     assert.deepEqual(limitOverrides("mimo-v2.6-flash-free", DECLARED), {
-      context: 343000,
+      context: 375000,
       output: 131072,
     });
   } finally {
@@ -924,11 +924,11 @@ test("discovery declares the aligned limits for the ids with evidence, and leave
   // the window is the wall this route enforces, with a margin; the output is the
   // paid twin's declaration
   assert.deepEqual(models["deepseek-v4.1-flash-free"].limit, { context: 326000, output: 384000 });
-  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 343000, output: 131072 });
+  assert.deepEqual(models["mimo-v2.6-flash-free"].limit, { context: 375000, output: 131072 });
   // all three axes have evidence for this one: the catalogue's `input` of 160000
   // was falsified by the same served prompt that set the window, at more than
   // twice the declaration
-  assert.deepEqual(models["big-pickle"].limit, { context: 343000, input: 343000, output: 131072 });
+  assert.deepEqual(models["big-pickle"].limit, { context: 375000, input: 375000, output: 131072 });
   // the input axis is one of the axes now: this one's declared input is its own
   // context − output, falsified by prompts of up to nearly twice it served, so
   // the input moves to the window while the window and the ceiling stay as
@@ -1077,7 +1077,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
   try {
     assert.deepEqual(
       limitOverrides("mimo-v2.6-flash-free", { context: 200000, output: 32000 }, undefined, fresh(), fresh()),
-      { context: 343000, output: 131072 },
+      { context: 375000, output: 131072 },
     );
     assert.deepEqual(notes, [], "an entry that applies has nothing to explain");
     // the catalogue moved: the window was measured against a question nobody is
@@ -1101,7 +1101,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
       kind: "catalogue-drift",
       id: "mimo-v2.6-flash-free",
       axis: "context",
-      value: 343000,
+      value: 375000,
       measuredAgainst: 200000,
       declared: 250000,
     },
@@ -1109,7 +1109,7 @@ test("an entry the catalogue has moved past says so, and one that applies says n
       kind: "catalogue-drift",
       id: "mimo-v2.6-flash-free",
       axis: "context",
-      value: 343000,
+      value: 375000,
       measuredAgainst: 200000,
       declared: undefined,
     },
@@ -1137,7 +1137,7 @@ test("the same notes reach stderr when the environment asks for them", async () 
   assert.equal(lines.length, 1, "one line for the one axis the catalogue voided");
   assert.match(
     lines[0],
-    /mimo-v2\.6-flash-free context=343000 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
+    /mimo-v2\.6-flash-free context=375000 was measured against a catalogue that declared 200000, and this one declares 250000: not applied/,
   );
 });
 
@@ -2249,7 +2249,15 @@ test("the shipped snapshot holds whole thousands and nothing else", async () => 
     assert.ok(id.length > 0);
     assert.ok(Number.isSafeInteger(wall.value) && wall.value >= 1000 && wall.value % 1000 === 0, `${id}: ${wall.value}`);
     assert.equal(typeof wall.settles, "boolean");
-    assert.ok(wall.wall === "bracketed" || wall.wall === "openEnded", `${id}: ${wall.wall}`);
+    // Three kinds, and the third is the strongest: a window the route stated in
+    // its own words settles the axis as it stands and is not rounded down, which
+    // is how `nemotron-3.5-lightning-free` is read — the route answered with
+    // 1000000 and the file keeps that number rather than a floor.
+    assert.ok(
+      wall.wall === "bracketed" || wall.wall === "openEnded" || wall.wall === "named",
+      `${id}: ${wall.wall}`,
+    );
+    if (wall.wall === "named") assert.equal(wall.settles, true, `${id}: a named wall settles`);
   }
 });
 
@@ -2303,7 +2311,7 @@ test("an input the catalogue declares under a measured window is raised to it, a
       new Map(),
       NO_WALLS,
     ),
-    { context: 343000, input: 343000, output: 131072 },
+    { context: 375000, input: 375000, output: 131072 },
   );
 });
 

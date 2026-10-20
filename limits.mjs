@@ -105,11 +105,11 @@ export const LIMITS = {
   },
   "mimo-v2.6-flash-free": {
     context: {
-      value: 343000,
+      value: 375000,
       source: "route",
       declaredAt: 200000,
-      measured: "2026-10-19",
-      samples: "343,131 tokens served (1,600,000 characters, counted by the route); 1,900,000 characters (about 407,725 tokens) refused with context_length_exceeded, as were 2,200,000 and 2,800,000 characters. The window the route stated on 2026-10-15 — 1048576, in a refusal that named it — was not reached then either: an 850,249-token prompt was served that day and a prompt of about 1,496,523 tokens was refused.",
+      measured: "2026-10-20",
+      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
       how: "the route's own enforcement, found by bracketing, and 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: a prompt of about 408,000 tokens is refused now, less than half of it, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 343,131 and about 407,725 tokens is not known — the sweep stopped at the first refusal — and the figure declared sits under both.",
     },
     output: {
@@ -123,11 +123,11 @@ export const LIMITS = {
   },
   "big-pickle": {
     context: {
-      value: 343000,
+      value: 375000,
       source: "route",
       declaredAt: 200000,
-      measured: "2026-10-19",
-      samples: "343,131 tokens served (1,600,000 characters, counted by the route, and identical to mimo-v2.6-flash-free at every shared size); 1,900,000, 2,200,000 and 2,800,000 characters all refused with context_length_exceeded. The first ask at 1,600,000 characters answered 400 with no code field at all, and that same request was then served — one endpoint declining a prompt the next one took.",
+      measured: "2026-10-20",
+      samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
       how: "the route's own enforcement, found by bracketing; 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. This entry used to say the axis was left to the catalogue because the one attempt to measure it answered 200 with an empty body, which is not an answer: a 2026-10-19 sweep did measure it, and the catalogue's 200000 is a third of what the route serves.",
     },
     output: {
@@ -147,7 +147,7 @@ export const LIMITS = {
     // a 160000-token window to every host behind it no matter what `context`
     // said. Measured the same way as the window above and from the same sweep.
     input: {
-      value: 343000,
+      value: 375000,
       source: "route",
       declaredAt: 160000,
       measured: "2026-10-19",
@@ -191,11 +191,11 @@ export const LIMITS = {
   },
   "glm-5.3-flash-free": {
     context: {
-      value: 311000,
+      value: 323000,
       source: "route",
       declaredAt: 200000,
       measured: "2026-10-20",
-      samples: "311,109 tokens served (1,450,000 characters, counted by the route) and 279,086 before it (1,300,000 characters), both answered from; 1,600,000 characters (about 343,348 tokens) refused with context_length_exceeded, as was 2,800,000 characters. The 232,685-token prompt served on 2026-10-16 still fits inside what is declared here. On 2026-10-20 this id's UPSTREAM was failing intermittently, and the measurement of that afternoon is not to be read as a wall: a request of 547,384 characters was answered while one of 540,983 was refused, which no wall can do, and the bracket that made of it (floor 136973 over ceiling 135381) pinned the declaration at a third of this entry. Asked again the same day it behaved like a wall: 60,000 words (211,050 tokens) served, and 90,000 words (about 318,000 tokens) refused six times out of six with 'Your request resulted in more tokens than this model's maximum context length allows'.",
+      samples: "323,107 tokens served (1,787,500 characters, counted by the route) on 2026-10-20, where an earlier sweep the same day had served 311,109 (1,450,000 characters). The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000. This id's upstream was failing intermittently earlier the same day - a request of 547,384 characters was answered and one of 540,983 was refused, which no wall does - and a failure that is not about a size is not counted as one.",
       how: "the route's own enforcement, found by bracketing, and 311,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: a prompt of about 343,000 tokens is refused, so the paid id's window is not one this endpoint serves. The wall's exact position between 311,109 and about 343,348 tokens is not known — the sweep stopped at the first refusal. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
     },
     output: {
