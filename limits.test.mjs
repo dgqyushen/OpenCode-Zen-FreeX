@@ -2488,3 +2488,52 @@ test("a claim below a measurement never pulls the measurement down", async () =>
   );
   assert.equal(over.context, 1_048_092, "a bisection outranks a provider's claim");
 });
+
+// A bracket is seeded FROM the catalogue's number, so before the route has said
+// anything about a million-token id the bracket IS 1000000 — and the second
+// opinion, which exists to correct exactly that number, was required to wait for
+// `adopted === undefined`. It therefore waited for ever: the deployment kept
+// answering 1000000 with the claim map full and a 1048576 claim in it.
+test("a bracket seeded at the catalogue number does not pin the second opinion", async () => {
+  const { limitOverrides, modelsDevClaims, limitAdaptivity } = await import("./limits.mjs");
+  modelsDevClaims({
+    providers: { a: { models: { m: { canonical_model_id: "v/seeded", limit: { context: 1_048_576 } } } } },
+  });
+  const previous = limitAdaptivity(
+    new Map([["id", {
+      floor: 0, ceil: undefined, exact: false, refusals: 0,
+      step: 50_000, seededFrom: 1_000_000, ceiling: 1_000_000,
+    }]]),
+  );
+  try {
+    const over = limitOverrides(
+      "id", { context: 1_000_000 }, undefined, undefined, undefined, undefined, undefined, "v/seeded",
+    );
+    assert.equal(over.context, 1_048_576, "the claim corrects the number the bracket was seeded from");
+  } finally {
+    limitAdaptivity(previous);
+  }
+});
+
+// And a bracket the ROUTE grew past the claim still wins: that is a size this
+// route served, which no provider's page can contradict.
+test("a bracket the route raised above the claim is not lowered", async () => {
+  const { limitOverrides, modelsDevClaims, limitAdaptivity } = await import("./limits.mjs");
+  modelsDevClaims({
+    providers: { a: { models: { m: { canonical_model_id: "v/high", limit: { context: 1_048_576 } } } } },
+  });
+  const previous = limitAdaptivity(
+    new Map([["id", {
+      floor: 1_100_000, ceil: undefined, exact: false, refusals: 0,
+      step: 50_000, seededFrom: 1_000_000, ceiling: 1_100_000,
+    }]]),
+  );
+  try {
+    const over = limitOverrides(
+      "id", { context: 1_000_000 }, undefined, undefined, undefined, undefined, undefined, "v/high",
+    );
+    assert.equal(over.context, 1_100_000);
+  } finally {
+    limitAdaptivity(previous);
+  }
+});

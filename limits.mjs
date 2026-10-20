@@ -1632,16 +1632,22 @@ export function limitOverrides(
     // written in — the two are not rivals, and the entry `minimax` now carries
     // says `models.dev` for exactly that reason. What still outranks it is
     // evidence about this route: a live refusal, or a bracket the route drew.
+    // What a claim may still be beaten by is evidence about THIS route: a live
+    // refusal, or a size the route is known to have refused. `adopted` is
+    // neither — it is the bracket this process learned, seeded from the
+    // catalogue's own number, so before the route has said anything about a
+    // million-token id it IS that number (1000000 here) and would pin the answer
+    // there for ever. It is taken as a floor for the claim instead.
     let secondOpinion;
     if (
       axis === "context" &&
       live === undefined &&
-      adopted === undefined &&
       Number.isSafeInteger(declaredValue) &&
       declaredValue >= MODELS_DEV_MIN
     ) {
       const claimed = modelsDevLimit(canonical);
-      if (usable(claimed) && claimed > declaredValue) {
+      const floor = usable(adopted) ? adopted : 0;
+      if (usable(claimed) && claimed > Math.max(declaredValue, floor)) {
         secondOpinion = { value: claimed, source: "models.dev" };
       }
     }
@@ -1653,7 +1659,10 @@ export function limitOverrides(
       // axis was answered from a moment ago.
       source = "route";
     } else if (adopted !== undefined) {
-      value = adopted;
+      // A claim that beat the adopted bracket is the value; the bracket only
+      // wins when it is the larger of the two.
+      value = secondOpinion && secondOpinion.value > adopted ? secondOpinion.value : adopted;
+      if (secondOpinion && secondOpinion.value > adopted) source = secondOpinion.source;
     } else {
       // The second opinion raises the settled value rather than replacing it: a
       // table entry that measured 1,048,092 and a claim of 1,048,576 agree, and
