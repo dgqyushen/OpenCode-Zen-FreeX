@@ -67,7 +67,15 @@ import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
 // is reached only where `limits-audit.mjs` is not loaded. Moving `baseFrom` to a
 // module both can import without a cycle is the fix if a third caller appears.
 const BASE = (process.env.ZEN_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
-const MODEL = process.env.ZEN_CHECK_MODEL ?? "space-bunny-free";
+// The model the gate probes with. It has to be a model the route still serves,
+// and it stopped being one: `space-bunny-free` was retired by the route on
+// 2026-10-19 and every request with it is answered 410, so every run of this
+// gate said "this says nothing about it" and every CI job that ran it learned
+// nothing — a green report that is not a report. The probe model is a piece of
+// equipment like any other and it expires; what changed here is that the
+// failure is now NAMED rather than being one more line of a run that says
+// nothing, so the next expiry is a sentence about the probe and not a silence.
+const MODEL = process.env.ZEN_CHECK_MODEL ?? "minimax-m3.1-flash-free";
 
 // A session id of the shape OpenCode makes, since that is part of what is asked.
 // It is provider.mjs's own `opencodeID` rather than a copy of it: the id is one
@@ -199,6 +207,20 @@ export async function check(generation, profile, shape, namesOf) {
     // the reader to `capture` over a problem capturing cannot fix.
     if (response.status === 403)
       return { generation, shape, verdict: "refused", detail: `HTTP 403${says(text)}` };
+    // A probe model the route no longer serves is a fact about the PROBE, and
+    // this gate is about the fingerprint. 410 is the route retiring an id and
+    // 404 is the route not knowing it, and both answer a question about the
+    // model this run chose to ask with — a question ZEN_CHECK_MODEL answers.
+    // They are not the fingerprint being stale, and reporting them as "failed"
+    // put them in the same column as an outage, which is where a reader stops
+    // looking.
+    if (response.status === 410 || response.status === 404)
+      return {
+        generation,
+        shape,
+        verdict: "probe-gone",
+        detail: `HTTP ${response.status}${says(text)} — the probe model is gone; set ZEN_CHECK_MODEL to one the route serves`,
+      };
     return { generation, shape, verdict: "failed", detail: `HTTP ${response.status}${says(text)}` };
   } catch (error) {
     return { generation, shape, verdict: "unreachable", detail: error.message };
@@ -354,6 +376,16 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
       // network applies to it: the name in `required` with no tool behind it is
       // in fingerprint.json, and so is the fix.
       return `${unbuilt.length}/${total} floor requests were never asked: a name in \`required\` has no entry in that profile's \`tools\`, and the malformed lines above name them. Fix fingerprint.json before reading anything else here — a request that could not be built is not a network problem.`;
+    }
+    // A probe model the route no longer serves is said so FIRST, because it is
+    // the one verdict that makes every other verdict in this run meaningless:
+    // the run asked a model that is gone, so nothing it learned was about the
+    // fingerprint. `space-bunny-free` was retired on 2026-10-19 and every run
+    // since then ended here — with a green CI job and a report that said the
+    // service should be checked, when what needed changing was one line of
+    // configuration.
+    if (verdicts.includes("probe-gone")) {
+      return "None of them, and not about the fingerprint: the model this gate probes with is no longer served, so nothing in this run was an answer about the wording. Set ZEN_CHECK_MODEL to a model the route serves and ask again.";
     }
     if (verdicts.every(fingerprint)) {
       return "None of them. Zen has moved past every generation this plugin knows; the tool wording in fingerprint.json needs capturing again from a current OpenCode.";

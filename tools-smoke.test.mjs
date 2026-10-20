@@ -322,7 +322,10 @@ test("the gate asks with the body the plugin sends, not a shape of its own", () 
     "the gate must send each named tool once, wrapped and in order",
   );
   assert.equal(body.stream, true, "the gate asks for a stream, as the plugin does");
-  assert.equal(body.model, process.env.ZEN_CHECK_MODEL ?? "space-bunny-free");
+  // The default is a model the route still serves: `space-bunny-free` was
+  // retired on 2026-10-19, and a gate that probes with a retired model reports
+  // nothing about the fingerprint on every run.
+  assert.equal(body.model, process.env.ZEN_CHECK_MODEL ?? "minimax-m3.1-flash-free");
   // And the headers are the plugin's own, which is the other half of the claim.
   assert.equal(headers.get("user-agent"), agentFor("2.x"));
   assert.equal(headers.get("accept"), "*/*");
@@ -393,6 +396,18 @@ test("every answer the gate reads is let go of, not left dangling", async () => 
     { cancels: 1, reads: 0 },
     "a superseded body is released without being read",
   );
+
+  // A probe model the route no longer serves is a fact about the PROBE. It was
+  // reported as `failed`, which put it in the same column as an outage, and the
+  // run it produced said the service should be checked when what needed
+  // changing was one line of configuration: `space-bunny-free` was retired on
+  // 2026-10-19 and every gate run since then learned nothing.
+  for (const status of [404, 410]) {
+    const gone = box(new Response("Model space-bunny-free has been deprecated.", { status }));
+    const result = await ask({ box: gone });
+    assert.equal(result.result.verdict, "probe-gone", `HTTP ${status} is about the probe model`);
+    assert.match(result.result.detail, /ZEN_CHECK_MODEL/, "and it says what to change");
+  }
 
   for (const [status, verdict] of [[403, "refused"], [500, "failed"]]) {
     const released = box(new Response("", { status }));
@@ -550,4 +565,14 @@ test("a floor that was never asked is named once, not as a refusal as well", () 
   // that reaches for the phrase anyway names a floor no row reported.
   const clean = refusedSummary({ served: 1, unserved: ["unreachable"] });
   assert.equal(/never asked/.test(clean), false, clean);
+});
+
+// A run whose probe model is gone says so, and says it is not about the
+// fingerprint — the one verdict that makes every other verdict in the run
+// meaningless, and the one that has to come first in the summary.
+test("a run that probed with a retired model says so", () => {
+  const summary = refusedSummary({ served: 0, unbuilt: [], unserved: ["probe-gone", "probe-gone"] });
+  assert.match(summary, /not about the fingerprint/);
+  assert.match(summary, /ZEN_CHECK_MODEL/);
+  assert.doesNotMatch(summary, /capturing again/, "and it does not send the reader to capture");
 });

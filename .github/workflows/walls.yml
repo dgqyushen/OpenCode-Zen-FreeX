@@ -16,16 +16,17 @@ on:
     # credential on megabyte-sized prompts.
     #
     # Hourly is affordable because of what the default run does not do. Without
-    # `--all` it measures only the ids the listing offers and the snapshot does
-    # not name yet, so an hour in which Zen added nothing costs one listing read
-    # and thirteen seconds - that is the measured cost of a run that finds
-    # nothing to measure. The nine minutes are what a run that does measure
-    # something pays, and a model Zen makes free is then measured and published
-    # within the hour instead of within the day. What this frequency does not buy
-    # is a fresh reading of a wall that moved under an id already measured: that
-    # is `--all`, and it stays a person's dispatch because re-measuring nine ids
-    # every hour is nine minutes of megabyte prompts for an answer that rarely
-    # changes.
+    # `--all` it measures the ids the listing offers and the snapshot does not
+    # name yet, PLUS the ids whose wall was never found: a snapshot row that says
+    # `openEnded` while the catalogue declares more than the snapshot ever
+    # served is an id whose wall is one rung up, and the ladder now reaches past
+    # the binary million, so those are measured again rather than left open.
+    # An hour in which Zen added nothing and nothing is open costs one listing
+    # read and thirteen seconds - that is the measured cost of a run that finds
+    # nothing to measure. What this frequency does not buy is a fresh reading of
+    # a wall that moved under an id already measured: that is `--all`, and it
+    # stays a person's dispatch because re-measuring ten ids every hour is an
+    # hour of megabyte prompts for an answer that rarely changes.
     - cron: "17 * * * *"
   # The way to find out whether this works without waiting for the next hour, and
   # the way to re-measure one model by hand: run it from the Actions page.
@@ -64,9 +65,16 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    # Nine models, six requests each, five seconds apart, and a 180-second abort
-    # per request: the arithmetic is why this is not ten minutes.
-    timeout-minutes: 45
+    # Ten models, up to fourteen requests each, five seconds apart, and a
+    # 180-second abort per request — and the requests are not all quick: a
+    # million-token prompt takes the route 40 to 110 seconds to count, so the
+    # arithmetic is not requests times five seconds but requests times (pace
+    # plus the time the route takes to read the prompt). Measured 2026-10-20, a
+    # full re-measurement of ten ids ran past twenty-seven minutes and was still
+    # going; forty-five was what the old ladder's arithmetic asked for, and the
+    # new ladder asks for more. A job killed by its own timeout reports nothing
+    # at all, which is the one outcome worse than a partial one.
+    timeout-minutes: 120
     steps:
       # Pinned to the commit its version names, as in `ci.yml`: a tag can be moved
       # under a workflow that holds a token.
@@ -171,10 +179,12 @@ jobs:
             cat watch-report.txt
             echo '```'
             echo
-            echo "The rules the sweep applies — a refusal is asked twice before it counts, a wall"
-            echo "needs two refused sizes behind a served one, six requests per model — are in"
+            echo "The rules the sweep applies — a failure that is not about a size is not a"
+            echo "refusal, a refusal is asked twice before it counts, a wall needs two refused"
+            echo "sizes behind a served one, fourteen requests per model — are in"
             echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
-            echo "\`single-refusal\` rather than smoothed into a wall."
+            echo "\`single-refusal\` rather than smoothed into a wall, and an upstream that is"
+            echo "failing shows up as \`openEnded\` rather than as a small window."
           } > pr-body.md
           opened=false
           if gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"; then
