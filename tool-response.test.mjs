@@ -4307,3 +4307,135 @@ test("every protocol's failure carries the code that says which failure it was",
     assertError(protocol, await broken.json(), false, "upstream_error");
   }
 });
+
+// The chat arm has read two calls of one reply under one word since
+// ensureCallIDs ("Two calls of one reply under one word: the client keys the
+// result by it, and reads one call's result as the other's"). The
+// Responses/Messages arm held every word with `ids.hold` and never asked
+// whether it was already held, so two kept calls carrying one upstream
+// `call_id` both kept it: a client that answers a call by its call_id could not
+// tell the two results apart. The first call to claim a word keeps it; the
+// second is answered by an id of its own.
+test("Responses: two kept calls of one reply under one upstream call_id do not share it", async () => {
+  const reply = {
+    output: [
+      { id: "fc_1", type: "function_call", call_id: "shared", name: "bash", arguments: "{}" },
+      { id: "fc_2", type: "function_call", call_id: "shared", name: "bash", arguments: "{}" },
+    ],
+  };
+  const response = await guardToolResponse(Response.json(reply), "responses", policy);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const words = body.output.filter((item) => item.type === "function_call").map((item) => item.call_id);
+  assert.equal(words.length, 2);
+  // The walk reads the reply's items in its own order, so which of the two
+  // keeps the upstream word is not this assertion's business: exactly one does,
+  // and the other is answered by an id of the guard's.
+  assert.equal(words.filter((word) => word === "shared").length, 1, "two calls answered one call_id");
+  const other = words.find((word) => word !== "shared");
+  assert.match(other, /^call_\d+$/, "the duplicate was not given an id of the guard's");
+});
+
+// The terminal response of a stream can carry both calls of one word in one
+// snapshot. Each copy is answered by the id its own frames already answered at
+// that place: reading the snapshot's own claim before the reply's would hand the
+// second copy a fresh id, so one call would change its word between the frames
+// the client already read and the terminal that ends them.
+test("Responses: a terminal holding two same-word calls keeps each place's own answer", async () => {
+  const one = { type: "function_call", id: "fc_1", call_id: "shared", name: "bash", arguments: "{}" };
+  const two = { type: "function_call", id: "fc_2", call_id: "shared", name: "bash", arguments: "{}" };
+  const text =
+    event({ type: "response.output_item.added", output_index: 0, item: { ...one, status: "in_progress" } }) +
+    event({ type: "response.output_item.added", output_index: 1, item: { ...two, status: "in_progress" } }) +
+    event({ type: "response.output_item.done", output_index: 0, item: { ...one, status: "completed" } }) +
+    event({ type: "response.output_item.done", output_index: 1, item: { ...two, status: "completed" } }) +
+    event(
+      {
+        type: "response.completed",
+        response: {
+          id: "r2",
+          status: "completed",
+          output: [
+            { ...one, status: "completed" },
+            { ...two, status: "completed" },
+          ],
+        },
+      },
+      "response.completed",
+    );
+  const guarded = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(guarded.status, 200);
+  const data = frameData(await guarded.text());
+  const seen = [new Set(), new Set()];
+  for (const value of data) {
+    if (value.item && callShaped(value.item.type)) {
+      const place = value.item.id === "fc_1" ? 0 : 1;
+      seen[place].add(value.item.call_id);
+    } else if (value.type === "response.completed") {
+      for (const item of value.response.output) {
+        seen[item.id === "fc_1" ? 0 : 1].add(item.call_id);
+      }
+    }
+  }
+  assert.equal(seen[0].size, 1, `place 0 answered more than one id: ${[...seen[0]].join(", ")}`);
+  assert.equal(seen[1].size, 1, `place 1 answered more than one id: ${[...seen[1]].join(", ")}`);
+  assert.equal([...seen[0]][0], "shared", "the first call kept the upstream word");
+  assert.notEqual([...seen[1]][0], "shared", "the second call did not take it");
+});
+
+// A word the guard itself invented is not one an upstream call may take. A call
+// left out is answered by a note whose id is `msg_<the call_id it carried>`;
+// an upstream that then names a kept call `msg_<that word>` would hand the
+// client two items under one id — the note and the call — and the chat arm
+// already re-mints such a call (`ids.holds`). This arm kept it as it was. The
+// call's added, done and terminal copies must also keep one id between them,
+// which is what the claimed state is for.
+test("Responses: a kept call whose call_id is an invented word is re-minted, once for its copies", async () => {
+  const dropped = { type: "function_call", id: "fc_1", call_id: "x", name: "", arguments: "" };
+  const kept = { type: "function_call", id: "fc_2", call_id: "msg_x", name: "bash", arguments: "{}" };
+  const text =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { ...dropped, status: "in_progress" },
+    }) +
+    event({
+      type: "response.output_item.added",
+      output_index: 1,
+      item: { ...kept, status: "in_progress" },
+    }) +
+    event({
+      type: "response.output_item.done",
+      output_index: 1,
+      item: { ...kept, status: "completed" },
+    }) +
+    event(
+      {
+        type: "response.completed",
+        response: {
+          id: "r1",
+          status: "completed",
+          // The terminal repeats the whole output, the dropped call included:
+          // the kept call sits at the place its frames stated only if the item
+          // before it is there too.
+          output: [{ ...dropped, status: "completed" }, { ...kept, status: "completed" }],
+        },
+      },
+      "response.completed",
+    );
+  const guarded = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(guarded.status, 200);
+  const data = frameData(await guarded.text());
+  const note = data.find((value) => value.item?.type === "message");
+  assert.equal(note.item.id, "msg_x", "the note's id is the word the dropped call's call_id made");
+  const words = [
+    ...data.filter((value) => value.item && callShaped(value.item.type)).map((value) => value.item.call_id),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? [])
+      .filter((item) => callShaped(item.type))
+      .map((item) => item.call_id),
+  ];
+  assert.equal(words.length, 3, "the added frame, the done frame and the terminal's copy");
+  assert.equal(new Set(words).size, 1, `one call answered more than one id: ${words.join(", ")}`);
+  assert.notEqual(words[0], "msg_x", "the kept call took the id of the note in the dropped call's place");
+  assert.match(words[0], /^call_\d+$/, "the colliding call was not given an id of the guard's");
+});

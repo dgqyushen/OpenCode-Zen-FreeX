@@ -142,7 +142,7 @@ test("the plugin guard reads own properties only, and refuses a blank id", async
       writeFileSync(
         script,
         `import(${JSON.stringify(pathToFileURL(join(dir, "index.mjs")).href)}).then(
-  () => console.log("THE MODULE LOADED"),
+  (module) => console.log("THE MODULE LOADED", JSON.stringify(module.id), JSON.stringify(module.default.id)),
   (error) => console.error(String(error && error.message)),
 );
 `,
@@ -164,6 +164,30 @@ test("the plugin guard reads own properties only, and refuses a blank id", async
     `);
     assert.doesNotMatch(blank, /THE MODULE LOADED/, "a plugin with a blank id must not load");
     assert.match(blank, /server.*factory.*id/);
+    // An id is a name, and the name that goes out is exactly the one that was
+    // checked. A padded id is refused rather than trimmed: silently publishing
+    // `opencode-zen-free` for a plugin that named itself `"  opencode-zen-free  "`
+    // would key the plugin by a name the provider never wrote.
+    const padded = load(`
+      export default { server: () => {}, id: "  opencode-zen-free  " };
+    `);
+    assert.doesNotMatch(padded, /THE MODULE LOADED/, "a padded id is not the name that was written");
+    assert.match(padded, /surrounding whitespace/, "and the refusal says why");
+    // The value the guard reads is the value it exports. The getter below
+    // answers a differently padded name on every read; the guard reads it once,
+    // and a padded first read is refused rather than published under either
+    // spelling.
+    const changing = load(`
+      let reads = 0;
+      const plugin = { server: () => {} };
+      Object.defineProperty(plugin, "id", {
+        enumerable: false,
+        get() { reads += 1; return reads === 1 ? "  first-name  " : "later-name"; },
+      });
+      export default plugin;
+    `);
+    assert.doesNotMatch(changing, /THE MODULE LOADED/, "the id the guard read is the id it refuses");
+    assert.match(changing, /surrounding whitespace/, "and the first read is what was judged");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1038,11 +1062,40 @@ test("a prototype member name is an id like any other in the preservation path",
 
 test("partial catalog failure retains previously verified models rather than dropping them", async (t) => {
   const { plugin, state } = await fixture(t);
-  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
-  state.catalogStatus = 503;
+  // The model this case is about is one only the catalogue describes as free,
+  // and one the snapshot does not know: a `-free` id (like the fixture's own
+  // three) is resolved without the catalogue, so keeping it through a partial
+  // read proves nothing about the preservation branch. `verified` is in the
+  // listing, was made free by its catalogue row, and is not in the bootstrap
+  // snapshot — with the branch gone it is not in the second answer at all.
+  state.ids = ["verified", "chat-free"];
+  state.catalogRows = {
+    verified: { cost: { input: 0, output: 0 }, provider: { npm: "@ai-sdk/openai-compatible" } },
+  };
+  const models = await plugin.refresh();
+  assert.ok(models["verified"], "the catalogue's own free row is what makes this id known");
+  assert.ok(models["chat-free"]);
+  // The second round is partial: the docs are out of reach, and the catalogue
+  // answers but no longer describes `verified` — the row that made it free is
+  // gone, which is the shape the preservation branch is for (a catalogue row
+  // that cannot be read says nothing about the model, so the model verified
+  // last round must not silently disappear). The catalogue staying reachable
+  // matters: with it unreachable, `metadata` keeps the row the first round
+  // read and `buildModels` would produce `verified` without the branch, which
+  // is how this case passed while the branch was dead.
+  state.catalogRows = {};
   state.docsStatus = 503;
-  const partial = await plugin.provider.models({ models }, { auth: await publicAuth() });
-  assert.deepEqual(Object.keys(partial).sort(), ["chat-free", "messages-free", "responses-free"]);
+  // `refresh()`, not a second `models()`: the hook spends the RELIST_AFTER
+  // budget now, so a second call inside that minute is answered from the cache
+  // — the 503 below would never be read, and the whole preserve-on-a-partial-
+  // read branch this case exists for would not run. A case that asks through
+  // the hook therefore pins the cached list, not the branch.
+  const partial = await plugin.refresh();
+  assert.deepEqual(Object.keys(partial).sort(), ["chat-free", "verified"]);
+  // The second round really read the failing catalogue and docs: two discovery
+  // rounds, one per ask. Read from the cache this count is 1, which is the bug
+  // the second `models()` call used to hide in.
+  assert.deepEqual(reads(state), { rounds: 2, discovery: 6, inference: 0 });
   // and it is not said as fallen back: Zen's own list was read, and a host that
   // cannot reach the catalogue or the docs must still see what that list says
   assert.equal(partial[Symbol.for("magpie.fellBack")], undefined);

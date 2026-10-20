@@ -765,6 +765,88 @@ test("a terminal response that carries no output keeps what was streamed", async
   }
 });
 
+// The terminal response is a snapshot like any other, and it was the one place
+// in this file where a snapshot could overwrite a fully accumulated item on
+// the strength of the item count and ids alone. A gateway that re-emits the
+// final response with empty or truncated content passed that test — `names()`
+// matched, the count matched — so `return { ...body, ...terminal }` answered
+// 200 with the text the deltas had already delivered silently dropped. The
+// terminal gets the same per-item weight comparison as every other snapshot:
+// an item it carries in a shorter form than the accumulation is a partial view
+// of it, and the accumulation stands.
+test("a terminal response whose named items carry less text than the stream did keeps the stream", async () => {
+  const terminal = {
+    id: "resp_1",
+    status: "completed",
+    output: [
+      {
+        id: "m",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "", annotations: [] }],
+      },
+    ],
+  };
+  const body = await json(
+    event({ type: "response.created", response: { id: "resp_1", output: [] } }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { id: "m", type: "message", role: "assistant", content: [] },
+      }) +
+      event({
+        type: "response.output_text.delta",
+        output_index: 0,
+        content_index: 0,
+        delta: "hello",
+      }) +
+      event({ type: "response.completed", response: terminal }, "response.completed"),
+    "responses",
+  );
+  assert.equal(body.id, "resp_1");
+  assert.equal(body.output[0].content[0].text, "hello", "the terminal's empty copy dropped the text");
+});
+
+test("a terminal that repeats no ids is still weighed against the stream by place", async () => {
+  // The same empty copy, in the two shapes where the ids cannot pair the
+  // items: the terminal names nothing, or the stream never named its item.
+  // The place in the list is the correspondence left, and it is the same
+  // place the accumulation holds; an unchecked terminal would drop "hello".
+  for (const shape of ["no-ids-anywhere", "terminal-named-only"]) {
+    const terminalItem = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "", annotations: [] }],
+    };
+    if (shape === "terminal-named-only") terminalItem.id = "m";
+    const addedItem = { type: "message", role: "assistant", content: [] };
+    if (shape === "no-ids-anywhere") addedItem.id = undefined;
+    const body = await json(
+      event({ type: "response.created", response: { id: "resp_n", output: [] } }) +
+        event({ type: "response.output_item.added", output_index: 0, item: addedItem }) +
+        event({
+          type: "response.output_text.delta",
+          output_index: 0,
+          content_index: 0,
+          delta: "hello",
+        }) +
+        event(
+          {
+            type: "response.completed",
+            response: { id: "resp_n", status: "completed", output: [terminalItem] },
+          },
+          "response.completed",
+        ),
+      "responses",
+    );
+    assert.equal(
+      body.output[0].content[0].text,
+      "hello",
+      `the terminal's empty copy dropped the text (${shape})`,
+    );
+  }
+});
+
 test("a partial snapshot does not overwrite the content already accumulated", async () => {
   // A response.created that repeats beside the deltas it opened, carrying a
   // message that is still empty, and a message_start whose block has not been
@@ -2646,6 +2728,24 @@ test("protocol-specific finish reasons without terminal events remain truncated"
 // fragment of the request or a credential in a URL, and the 502 body is read
 // by whoever asked for the reply. The bound is a length and not a
 // redaction: what the upstream said about its own failure stays readable.
+// An upstream error whose text is a bare string under a nested `error` —
+// `{ "error": "rate limited" }` inside the event — lost that text: the reader
+// looked only for `value.error.message`, so the client was told the generic
+// "Upstream stream failed" instead of the one thing it can act on. The same
+// shape at the top level was read; this is the same reading one level in.
+test("an upstream error whose text is a string under `error` is relayed", async () => {
+  const response = await collapseResponse(
+    sse(event({ error: { type: "upstream_error", error: "rate limited" } })),
+    "chat",
+  );
+  assert.equal(response.status, 502);
+  assert.equal(
+    (await response.json()).error.message,
+    "rate limited",
+    "the upstream's own words were replaced",
+  );
+});
+
 test("an upstream error longer than the bound is cut short", async () => {
   const long = "x".repeat(4096);
   for (const [shape, text] of [
@@ -2986,6 +3086,71 @@ test("a reply larger than the limit is refused, though the stream that produced 
     "chat",
   );
   assert.equal(response.status, 502, "a reply over the limit is not answered");
+  await assertProtocolError(
+    await response.json(),
+    "chat",
+    new RegExp(`${MAX_BYTES / (1024 * 1024)} MiB`),
+  );
+});
+
+// The reply-size guard is a byte limit, and it was measured with `text.length`
+// — UTF-16 code units, not bytes. ASCII made the two agree, so every case above
+// passed, while a body of CJK text (three UTF-8 bytes per code unit) could leave
+// at more than twice the limit. The reply must be over the limit while the
+// stream that produced it is not, so the content is sized at run time from the
+// two overheads measured below: the reply is 47 bytes larger than the stream
+// that answers it (117 against 70 in the measurement this was written from),
+// and the difference is what the test rides — a body just over the limit as
+// bytes and well inside it as characters.
+test("a reply inside the limit as characters but outside it as UTF-8 bytes is refused", { timeout: 60_000 }, async () => {
+  const chat = (content) => event({ choices: [{ index: 0, delta: { content } }] }) + event("[DONE]");
+  const raw = async (text) =>
+    (
+      await collapseResponse(
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.enqueue(encoder.encode(text));
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+        "chat",
+      )
+    ).text();
+  const emptyStream = chat("");
+  const replyOverhead = encoder.encode(await (async () => {
+    const response = await collapseResponse(sse(emptyStream), "chat");
+    assert.equal(response.status, 200);
+    return response.text();
+  })()).byteLength;
+  const streamOverhead = encoder.encode(emptyStream).byteLength;
+  assert.ok(
+    streamOverhead < replyOverhead,
+    `the reply is not the larger body (${replyOverhead} against ${streamOverhead})`,
+  );
+  // As many CJK characters as fit the reply below the limit, plus one: the
+  // reply is over it by a byte, and the stream under it by more than the
+  // overhead difference (three bytes per character keeps the rounding close).
+  const content = "中".repeat(Math.floor((MAX_BYTES - replyOverhead) / 3) + 1);
+  const text = chat(content);
+  assert.ok(text.length < MAX_BYTES, `the reply is ${text.length} code units`);
+  assert.ok(encoder.encode(text).byteLength < MAX_BYTES, "the stream itself is over the limit");
+  assert.ok(Buffer.byteLength(text, "utf8") < MAX_BYTES, "the stream's bytes are over the limit");
+  const response = await collapseResponse(
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.enqueue(encoder.encode(text));
+          controller.close();
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+    "chat",
+  );
+  assert.equal(response.status, 502, "a reply over the byte limit is not answered");
   await assertProtocolError(
     await response.json(),
     "chat",

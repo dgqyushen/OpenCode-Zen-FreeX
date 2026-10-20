@@ -303,3 +303,63 @@ test("a name with nothing in it is no name, and no such request is shared", () =
     "an empty name names nothing, so it changes nothing about the key",
   );
 });
+
+// The other half of a body being the host's to fill in: a body that is not a
+// body at all. `sessionID` read `body.metadata` and `message.role` with no null
+// check, so `sessionID(headers)` with no body, `{ metadata: null }`, and a
+// history holding a null entry each threw a TypeError — a request that never
+// reached upstream, answered as an internal error. The shapes that are not a
+// body are the host's to send too, and none of them may throw; the ones that
+// carry a usable opening still key it, past the entries that are not messages.
+test("a body that is not a body does not throw, and its opening is still read", () => {
+  const headers = new Headers();
+  for (const [what, body] of [
+    ["no body at all", undefined],
+    ["a null body", null],
+    ["a null metadata", { metadata: null }],
+    ["a null message in the history", { messages: [null] }],
+    ["a null entry in input", { input: [null] }],
+  ])
+    assert.doesNotThrow(() => sessionID(headers, body), what);
+  // A null entry beside the opening is skipped rather than standing for it: the
+  // first user message is still what names the conversation, exactly as if the
+  // null had not been sent.
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  assert.equal(
+    sessionID(headers, { messages: [null, { role: "user", content: "hi" }] }),
+    sessionID(headers, opening),
+    "a null entry before the opening hid the opening from the key",
+  );
+  // Nothing named this one, so it gets an id of its own rather than throwing —
+  // and an OpenCode-shaped one, because the tier checks the shape.
+  const unnamed = sessionID(headers, undefined);
+  assert.ok(realSessionID(unnamed), unnamed);
+});
+
+// A signal and an opening are different kinds of name, and they used to share
+// one hashed key space (`ses\0`). A host that sends the header value `"hi"` —
+// the quote characters are part of the value — and a host whose first user
+// message is the string `hi` hashed the same bytes, because JSON.stringify
+// writes the opening as `"hi"` too: two unrelated conversations landed on one
+// Zen session, with its affinity and its quota. The domains have their own
+// prefixes now, so no value of one can spell a value of the other.
+test("a signal that spells a JSON opening is not that opening's conversation", () => {
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  const bySignal = sessionID(new Headers({ "x-opencode-session": '"hi"' }), opening);
+  const byOpening = sessionID(new Headers(), opening);
+  assert.ok(realSessionID(bySignal), bySignal);
+  assert.notEqual(
+    bySignal,
+    byOpening,
+    "a header value equal to the quoted opening named the opening's conversation",
+  );
+  // Each still keys itself: the same signal is one conversation, and the same
+  // opening is one conversation — the separation is between the two domains,
+  // not a break of either.
+  assert.equal(
+    sessionID(new Headers({ "x-opencode-session": '"hi"' }), opening),
+    bySignal,
+    "the signal stopped naming its own conversation",
+  );
+  assert.equal(sessionID(new Headers(), opening), byOpening, "the opening stopped naming its own");
+});

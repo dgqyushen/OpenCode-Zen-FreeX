@@ -486,23 +486,140 @@ function chatCalls(value) {
 // of them: the upstream's own call_id is the word the client answers the call
 // by, and a call that carries none is given one of the guard's.
 //
+// A word is claimed, not copied. The chat arm reads two calls of one reply
+// under one word in `ensureCallIDs` — the client keys its result by the word
+// and reads one call's result as the other's — and this arm read the same
+// thing without checking, so two kept calls carrying one upstream call_id
+// reached the client unchanged, and so did a call whose upstream word happened
+// to be one the reply already held (an id the guard invented for a call with
+// none, or the `msg_*` id of a note it put in a call's place). The first call
+// to claim a word of this snapshot keeps it; a later call under the same word
+// — or one under a word the reply already holds — is answered by an id of its
+// own below.
+//
+// `claims` keeps the streaming path stable while it does that. A stream shows
+// one call in several frames, and the frames are checked one snapshot at a
+// time: a per-snapshot set alone would give the second frame of a call a new
+// id, making one call two to the client. So the state is the reply's, not the
+// snapshot's: it records each word a kept call claimed and the place the
+// snapshot stated for it, and a later frame carrying the same word at that
+// place — or carrying no place at all, when only one call claimed the word —
+// is the same call and answers the id it was already given. A later frame
+// carrying the word at a different stated place is a different call and is
+// given an id of its own, which its own copies then answer the same way. A
+// whole reply is one snapshot and has no such state; the default Map is
+// discarded with the call.
+//
 // `answered` is the stream's own answer for a call it has already named (the
 // frames of one call are one call, and the id they answer has to be one id);
 // a whole reply has no such state — every call of it appears once.
-function answerCalls(calls, protocol, ids, answered) {
+function answerCalls(calls, protocol, ids, answered, claims = new Map()) {
   if (protocol === "chat" || !calls.length) return false;
   const field = protocol === "responses" ? "call_id" : "id";
-  for (const [call] of calls) {
-    const id = identity(call[field]);
-    if (id !== undefined) ids.hold(id);
-  }
+  // The words this snapshot's own calls have spoken for, by place: two calls
+  // in one snapshot under one word are two calls however they are placed, and
+  // the second must not answer the first's word. The place is part of the
+  // record because a word an earlier frame answered at one place may name two
+  // calls of this snapshot at two places, and each must answer the id it was
+  // given then.
+  const claimed = new Map(); // word -> Set of places
+  // The calls this snapshot took a word from, and the word and place it was
+  // taken at. The answer they are given below is recorded against both, so the
+  // copies of that call in later frames answer the same id.
+  const renamed = new Map(); // call -> { word, at }
   let changed = false;
+  const placeKey = (at) => (at === undefined ? "" : String(at));
+  for (const [call, at] of calls) {
+    const id = identity(call[field]);
+    if (id === undefined) continue;
+    // The reply's own answer comes first. A terminal response can carry two
+    // calls of one word that an earlier frame already answered at their two
+    // places; reading the snapshot's set before the reply's claims would give
+    // the second copy a fresh id even though the reply had one for it.
+    const known = claimedID(claims, id, at);
+    if (known !== undefined) {
+      if (call[field] !== known) {
+        call[field] = known;
+        changed = true;
+      }
+      continue;
+    }
+    const key = placeKey(at);
+    const places = claimed.get(id);
+    if (places?.has(key)) {
+      // The same word at the same place twice in one snapshot is two calls
+      // the reply cannot tell apart: the second gets an id of its own.
+      call[field] = undefined;
+      renamed.set(call, { word: id, at });
+      changed = true;
+      continue;
+    }
+    if (places === undefined) claimed.set(id, new Set([key]));
+    else places.add(key);
+    // A word the reply already holds is not this call's to take: it names
+    // another item, and a second item under it is one item to the client.
+    if (ids.holds(id)) {
+      call[field] = undefined;
+      renamed.set(call, { word: id, at });
+      changed = true;
+      continue;
+    }
+    ids.hold(id);
+    claimWord(claims, id, at, id);
+  }
   for (const [call, at] of calls) {
     if (identity(call[field]) !== undefined) continue;
-    call[field] = answered?.(call, at) ?? ids.mint("call_");
+    const taken = renamed.get(call);
+    if (taken !== undefined) {
+      // A call the snapshot took a word from is answered by an id of its own,
+      // and the word it carried is recorded as answering that id: the frames of
+      // this call that follow answer it, not a fresh one each time.
+      const minted = ids.mint("call_");
+      call[field] = minted;
+      claimWord(claims, taken.word, taken.at, minted);
+    } else {
+      // A call that carried no word at all: the stream's own answer for it (by
+      // its item id or its place) keeps its copies one id, and a whole reply
+      // has no such answer and mints one.
+      call[field] = answered?.(call, at) ?? ids.mint("call_");
+    }
     changed = true;
   }
   return changed;
+}
+
+// The id a kept call of a reply was answered by for the word it carried at the
+// place this snapshot states, or undefined when the word has not been claimed
+// or names a different call. A copy that states no place belongs to the call
+// that claimed the word when that call is the only one which did; with two
+// calls under the word, a frame stating no place cannot be told apart, and is
+// given an id of its own rather than a word it must not share.
+function claimedID(claims, word, at) {
+  const held = claims.get(word);
+  if (held === undefined) return undefined;
+  if (at !== undefined) {
+    const exact = held.find((entry) => entry.at === at);
+    if (exact !== undefined) return exact.answer;
+  }
+  if (held.length === 1 && (at === undefined || held[0].at === undefined))
+    return held[0].answer;
+  return undefined;
+}
+
+// Records that a call of the reply answers `answer` under `word`, at the place
+// this snapshot stated for it. A word can name more than one kept call of an
+// upstream at odds with itself, so the entries are a list rather than one id.
+// A copy that answers the same entry again adds nothing: the frames of one call
+// are many, and a list that grew once per frame would make every later lookup
+// scan the history of the stream.
+function claimWord(claims, word, at, answer) {
+  const held = claims.get(word);
+  if (held === undefined) {
+    claims.set(word, [{ at, answer }]);
+    return;
+  }
+  if (held.some((entry) => entry.at === at && entry.answer === answer)) return;
+  held.push({ at, answer });
 }
 
 // checkSnapshots checks every call in a reply or event: renamed to the
@@ -1001,6 +1118,11 @@ function snapshotStream(protocol, checkName) {
   // holds the place the frame that opened it held.
   const answeredWords = new Map(); // a word the call is named by → the id it answers
   const answeredPlaces = new Map(); // the place it holds → the id it answers
+  // The words the kept calls of this reply were answered by (answerCalls): a
+  // stream shows one call in several frames, and a frame that carries the word
+  // again is the same call and must answer the same id. One Map for the whole
+  // reply, because the frames of one call are not adjacent.
+  const claims = new Map();
   function answeredFor(call, at) {
     const word = identity(call.id) ?? identity(call.call_id);
     if (word !== undefined) {
@@ -1359,7 +1481,7 @@ function snapshotStream(protocol, checkName) {
       // leaves the client with nothing to answer it with, and the frames of
       // one call are one call: the id is invented once for it and every copy
       // answers that one id (answeredFor).
-      const answered = answerCalls(checked.calls, protocol, ids, answeredFor);
+      const answered = answerCalls(checked.calls, protocol, ids, answeredFor, claims);
       return { changed: checked.changed || answered, data };
     },
   };

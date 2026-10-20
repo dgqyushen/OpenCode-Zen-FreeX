@@ -53,10 +53,14 @@ function jsonResponse(source, protocol, value, error) {
   // The reply is held in memory, and the limit that bounds the bytes read
   // bounds the reply held: a body larger than the limit is not a reply this
   // file can answer with, however small the stream that produced it was. The
-  // limit is on bytes and the body is measured in the characters of the text
-  // that is written — a character is at least one byte of it.
+  // limit is on bytes, so the body is measured in the bytes it will be written
+  // as: `text.length` counts UTF-16 code units, and a code unit carries up to
+  // three UTF-8 bytes (four per surrogate pair), so a body of CJK or astral
+  // text passed a character count and left as several times the limit. The
+  // how-far-over number the reply is refused with is the limit's, not the
+  // measurement's, so both readings name the same MiB.
   const text = JSON.stringify(value);
-  if (text.length > MAX_BYTES) {
+  if (Buffer.byteLength(text, "utf8") > MAX_BYTES) {
     return new Response(
       JSON.stringify(
         errorBody(protocol, `Upstream reply exceeds the ${MAX_BYTES / (1024 * 1024)} MiB limit`),
@@ -71,7 +75,9 @@ function errorMessage(value, fallback = "Upstream stream failed") {
   const text =
     typeof value === "string" && value
       ? value
-      : value?.message || value?.error?.message || fallback;
+      : value?.message ||
+        (typeof value?.error === "string" ? value.error : value?.error?.message) ||
+        fallback;
   if (typeof text !== "string" || !text) return fallback;
   return text.length > MAX_ERROR_TEXT ? `${text.slice(0, MAX_ERROR_TEXT)}…` : text;
 }
@@ -809,10 +815,44 @@ function responsesAccumulator() {
       // reply, and it stands in for the collection it lost — a gateway that
       // reports the last item only answered 200 with one item where the
       // stream carried two, and the earlier one was gone with no word.
+      //
+      // The terminal is the last snapshot of a reply whose items were filled
+      // in by deltas, and it gets the same weight comparison every other
+      // snapshot gets: a list equal to the accumulation in count and ids but
+      // carrying shorter content is a partial view of it, not a newer one.
+      // Read by count and ids alone, a gateway re-emitting the final response
+      // with `content: [{type:"output_text", text:""}]` passed the test and
+      // `return { ...body, ...terminal }` answered 200 with the streamed text
+      // silently dropped — the one place in this file where a snapshot could
+      // overwrite a fully accumulated item without being weighed against it.
+      //
+      // An id is not the only correspondence: a gateway may repeat the list
+      // without ids, or the stream may have opened items it never named. The
+      // place in the list is what is left then, and it is the same place the
+      // item was accumulated at. Both readings are weighed, so a terminal that
+      // names nothing still cannot replace a filled item with an empty one.
+      const keptByID = new Map();
+      for (const item of kept) {
+        const id = identity(item.id);
+        if (id !== undefined) keptByID.set(id, item);
+      }
       const whole = Array.isArray(final.output)
         ? final.output.length > 0 &&
           final.output.length >= kept.length &&
-          names(final.output, kept)
+          names(final.output, kept) &&
+          // A terminal that carries MORE items than the stream was seen to
+          // accumulate is a superset of the reply, not a shorter view of it:
+          // the missing items are the reason it exists, and it wins. A terminal
+          // of the same length is the shape a re-emitting gateway uses, and each
+          // item is weighed against the one in the same place before it may
+          // replace it. A longer terminal's first items are not weighed because
+          // a partial gateway does not add items, it truncates them.
+          (final.output.length > kept.length ||
+            final.output.every((item, at) => {
+              const id = identity(item.id);
+              const held = id === undefined ? kept[at] : (keptByID.get(id) ?? kept[at]);
+              return held === undefined || carries(item, held, fields);
+            }))
         : final.output !== null && final.output !== undefined;
       // The terminal is spread whole onto the answer, so the report it carries
       // is read by shape like every other (keepUsage, above): one that is not a

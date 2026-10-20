@@ -277,11 +277,11 @@ function requirePublic(auth) {
 
 async function readRemote(url, json, headers, callerSignal) {
   const timeout = AbortSignal.timeout(15000);
-  // `AbortSignal.any` landed in Node 20.3 and this package declares Node
-  // 18.17, where the call is a TypeError — and it was outside the try that
-  // swallows what a read throws, so on Node 18 every discovery read failed and
-  // no model list was ever read. The two waits are combined by the one helper
-  // that makes the combination where the runtime cannot (limits.mjs).
+  // `AbortSignal.any` was added in Node 20.3 and backported to 18.17, which is
+  // the floor this package declares; the helper in limits.mjs still makes the
+  // combination where the runtime cannot (an older 18.x or a non-Node runtime),
+  // so a discovery read never loses its abort on the error path. The two waits
+  // are combined by that one helper rather than at each call site.
   //
   // The listener it leaves on the caller's own signal is let go of below: that
   // signal outlives the read, and a listener left on it outlives the wait that
@@ -569,12 +569,19 @@ export function sessionID(headers, body) {
   // key every host that sends an empty name shares. The name is taken whole,
   // not trimmed: a host that spells its conversations differently is naming
   // them differently, and only a name with nothing in it is no name.
-  if (typeof body.metadata?.session_id === "string" && body.metadata.session_id !== "")
+  //
+  // The body is the host's to fill in, and the rest of this file reads every
+  // value it takes from the host through an optional chain. These two did not:
+  // `body` itself can be absent or null, and a history can hold an entry that
+  // is not a message, so both threw a TypeError before a request was sent —
+  // an opaque internal error where a request keyed by no signal belongs. The
+  // same reading as every other host value in the file.
+  if (typeof body?.metadata?.session_id === "string" && body.metadata.session_id !== "")
     signal ??= body.metadata.session_id;
   if (realSessionID(signal)) return signal;
-  const messages = body.messages ?? body.input;
+  const messages = body?.messages ?? body?.input;
   const first = Array.isArray(messages)
-    ? messages.find((message) => message.role === "user")?.content
+    ? messages.find((message) => message?.role === "user")?.content
     : messages;
   // A host signal is the conversation's own name for itself, so it is the key
   // on its own and nothing else is folded in beside it: a host that carries a
@@ -591,8 +598,17 @@ export function sessionID(headers, body) {
   // names, while no user message at all is a body with nothing to key by. Read
   // by truthiness — as `!first` read both — the two are one branch, and the
   // signal is spent before either can be told from the other.
+  //
+  // The two key spaces below are separate domains, not two spellings of one:
+  // a signal and an opening carry different kinds of fact, and hashing them
+  // under one prefix let a signal be read as an opening's key. A host that
+  // sends the header value `"hi"` — quotes included — and a host whose first
+  // user message is the string `hi` both hashed `ses\0"hi"` (JSON.stringify
+  // writes the quotes), so two unrelated conversations shared one Zen session
+  // with its affinity and its quota. The prefixes name the domain each key is
+  // read from, so no value of one can spell a value of the other.
   if (signal !== undefined) {
-    const named = createHash("sha256").update(`ses\0${signal}`).digest("hex");
+    const named = createHash("sha256").update(`sig\0${signal}`).digest("hex");
     return kept(named);
   }
   // An empty opening has nothing to key a conversation by, and one cannot be
@@ -609,7 +625,7 @@ export function sessionID(headers, body) {
     // of OpenCode's shape, because that shape is what the tier checks.
     return opencodeID("ses", true);
   }
-  return kept(createHash("sha256").update(`ses\0${JSON.stringify(first)}`).digest("hex"));
+  return kept(createHash("sha256").update(`open\0${JSON.stringify(first)}`).digest("hex"));
 }
 
 // The id kept for a key, minted on first sight and reused while the key stays

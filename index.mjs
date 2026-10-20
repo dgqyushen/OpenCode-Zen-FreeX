@@ -26,19 +26,46 @@ import plugin from "./provider.mjs"
 // something the provider never wrote — the one case this guard exists to
 // catch. And an id is a name: one of nothing but spaces is no name at all, so
 // it is refused here rather than registered under it.
+//
+// The two own properties are checked before either is read, and each is read
+// exactly once. A value inherited from a prototype is not something provider.mjs
+// exported; a getter on the object is read once, so the value checked and the
+// value exported are the same read. The id is a name, and one of nothing but
+// spaces is no name at all.
 if (
   !Object.hasOwn(plugin ?? {}, "server") ||
-  typeof plugin.server !== "function" ||
-  !Object.hasOwn(plugin ?? {}, "id") ||
-  typeof plugin.id !== "string" ||
-  !plugin.id.trim()
+  !Object.hasOwn(plugin ?? {}, "id")
 ) {
   throw new TypeError(
     "provider.mjs must default-export a plugin with a `server` factory and an `id`",
   )
 }
+const factory = plugin.server
+const name = plugin.id
+if (typeof factory !== "function" || typeof name !== "string" || !name.trim()) {
+  throw new TypeError(
+    "provider.mjs must default-export a plugin with a `server` factory and an `id`",
+  )
+}
+// An id is a name, and the name that leaves is exactly the one that was
+// checked. Trimming it here would publish a different name than the provider
+// registers (the provider's own `id` constant is what `server()` reports), and
+// exporting the raw value with the padding is the drift this guard exists to
+// stop. So a padded id is refused rather than silently normalised: the author
+// named the plugin with spaces and has to decide against which spelling a host
+// will key it.
+if (name !== name.trim()) {
+  throw new TypeError(
+    "provider.mjs's plugin id is a name and must not carry surrounding whitespace",
+  )
+}
 
-export const ZenFreePlugin = plugin.server
-export const server = plugin.server
-export const id = plugin.id
+export const ZenFreePlugin = factory
+export const server = factory
+export const id = name
+// The provider's object is forwarded as it is. A copy would be a second object
+// with its own getters and prototype, and a host that compares the import with
+// the provider's export would be comparing two things; the two values the guard
+// read are the object's own own-property reads, so forwarding the original
+// cannot publish a value the guard did not see.
 export default plugin
