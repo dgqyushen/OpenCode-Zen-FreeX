@@ -745,7 +745,13 @@ async function server(_input, options = {}) {
       // catalogue's own numbers, which is what it had before this read existed.
       // It is asked in the same breath so it costs no turn of its own, and it is
       // allowed to fail quietly for the same reason.
-      opinionURL === undefined ? Promise.reject(new Error("no second opinion")) : readRemote(opinionURL, false, undefined, signal),
+      // `true` for JSON: the document is an object and `modelsDevClaims` reads
+      // it as one. Asked as text it would parse into a string, which the claim
+      // reader skips over entry by entry — a silent no-op that looks exactly
+      // like "models.dev had nothing to say".
+      opinionURL === undefined
+        ? Promise.reject(new Error("no second opinion"))
+        : readRemote(opinionURL, true, undefined, signal),
     ]);
     signal?.throwIfAborted();
     if (opinion.status === "fulfilled") {

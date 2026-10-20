@@ -2434,3 +2434,23 @@ test("the second opinion only answers an axis the catalogue declares at a millio
   // Never lowered either way.
   assert.deepEqual(limitOverrides(...args({ context: 2_000_000 }, "v/big")), {});
 });
+
+// The read has to be a JSON read. `readRemote` returns text when asked for it,
+// and `modelsDevClaims` walked a string entry by entry and found nothing: the
+// deployment answered the catalogue's 1000000 for a model models.dev puts at
+// 1048576, with no error anywhere — the worst shape a bug can take.
+test("a models.dev document reaches the claim reader as an object", async () => {
+  const { modelsDevClaims, modelsDevLimit } = await import("./limits.mjs");
+  // The failure this pins: text in, a full map out of nothing.
+  const info = modelsDevClaims(JSON.stringify({
+    providers: { a: { models: { one: { canonical_model_id: "x/m", limit: { context: 1_048_576 } } } } },
+  }));
+  assert.equal(info.models, 0, "a string is not a document, and must not be read as one");
+  assert.equal(modelsDevLimit("x/m"), undefined);
+  // And the shape that does work.
+  const good = modelsDevClaims({
+    providers: { a: { models: { one: { canonical_model_id: "x/m", limit: { context: 1_048_576 } } } } },
+  });
+  assert.equal(good.models, 1);
+  assert.equal(modelsDevLimit("x/m"), 1_048_576);
+});
