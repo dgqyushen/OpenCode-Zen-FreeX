@@ -54,13 +54,6 @@
   "engines": {
     "node": ">=18.17.0"
   },
-  "devEngines": {
-    "runtime": {
-      "name": "bun",
-      "version": "1.4.3",
-      "onFail": "warn"
-    }
-  },
   "scripts": {
     "test": "bun test",
     "check:gate": "test -f tools-smoke.mjs || { echo \"check:gate runs from a repository checkout; the published package does not ship tools-smoke.mjs.\" >&2; exit 1; }; bun tools-smoke.mjs",
