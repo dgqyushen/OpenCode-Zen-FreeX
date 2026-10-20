@@ -2454,3 +2454,37 @@ test("a models.dev document reaches the claim reader as an object", async () => 
   assert.equal(good.models, 1);
   assert.equal(modelsDevLimit("x/m"), 1_048_576);
 });
+
+// A table entry and a second opinion are not rivals: the entry measures the
+// WALL, the opinion says what scale the catalogue's round number was written in.
+// The arm used to require `settled.source === undefined`, which is "no table
+// entry and no sweep" — so it was unreachable for every id the table names,
+// which is every id it exists for. The deployment answered 1000000 for
+// `minimax-m3.1-flash-free` with the claim map full.
+test("a table entry does not lock the second opinion out", async () => {
+  const { limitOverrides, modelsDevClaims } = await import("./limits.mjs");
+  modelsDevClaims({
+    providers: { a: { models: { m: { canonical_model_id: "v/m", limit: { context: 1_048_576 } } } } },
+  });
+  const table = {
+    id: { context: { value: 1_000_000, source: "models.dev", declaredAt: 1_000_000, measured: "2026-10-20" } },
+  };
+  const over = limitOverrides(
+    "id", { context: 1_000_000 }, table, new Map(), new Map(), new Map(), new Map(), "v/m",
+  );
+  assert.deepEqual(over, { context: 1_048_576 }, "the entry's number and the claim's agree, and the claim is higher");
+});
+
+test("a claim below a measurement never pulls the measurement down", async () => {
+  const { limitOverrides, modelsDevClaims } = await import("./limits.mjs");
+  modelsDevClaims({
+    providers: { a: { models: { m: { canonical_model_id: "v/m2", limit: { context: 1_000_000 } } } } },
+  });
+  const table = {
+    id: { context: { value: 1_048_092, source: "route", declaredAt: 1_000_000, measured: "2026-10-20" } },
+  };
+  const over = limitOverrides(
+    "id", { context: 1_000_000 }, table, new Map(), new Map(), new Map(), new Map(), "v/m2",
+  );
+  assert.equal(over.context, 1_048_092, "a bisection outranks a provider's claim");
+});

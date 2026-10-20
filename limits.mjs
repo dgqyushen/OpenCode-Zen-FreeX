@@ -1625,12 +1625,18 @@ export function limitOverrides(
     // it — and every id under the line is measured instead, which is what the
     // sweep is for. It never lowers anything: `value < declaredValue` falls to
     // the raise-only rule below like any other weak tier.
+    // `settled.source === undefined` was in this guard and is not any more: it
+    // meant "no table entry and no sweep", which excluded the very ids this
+    // half is for. A table entry for a million-token id is a MEASUREMENT of the
+    // wall, and the second opinion is about the SCALE its round number was
+    // written in — the two are not rivals, and the entry `minimax` now carries
+    // says `models.dev` for exactly that reason. What still outranks it is
+    // evidence about this route: a live refusal, or a bracket the route drew.
     let secondOpinion;
     if (
       axis === "context" &&
       live === undefined &&
       adopted === undefined &&
-      settled.source === undefined &&
       Number.isSafeInteger(declaredValue) &&
       declaredValue >= MODELS_DEV_MIN
     ) {
@@ -1649,8 +1655,11 @@ export function limitOverrides(
     } else if (adopted !== undefined) {
       value = adopted;
     } else {
-      value = secondOpinion ? secondOpinion.value : settled.value;
-      if (secondOpinion) source = secondOpinion.source;
+      // The second opinion raises the settled value rather than replacing it: a
+      // table entry that measured 1,048,092 and a claim of 1,048,576 agree, and
+      // a claim BELOW a measurement must not pull the measurement down.
+      value = secondOpinion ? Math.max(settled.value, secondOpinion.value) : settled.value;
+      if (secondOpinion && secondOpinion.value > settled.value) source = secondOpinion.source;
       if (entry && !applies) {
         // Measured against a catalogue that has moved, or against an axis the
         // catalogue no longer declares. Its value is void, and saying so is the
