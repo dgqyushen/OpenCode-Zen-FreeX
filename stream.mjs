@@ -21,31 +21,74 @@ export const STALE_BODY_HEADERS = [
   "last-modified",
 ];
 
+// How much of an upstream error is answered to the caller. The upstream's own
+// error text is relayed as it arrived — the reason a reply failed is the one
+// thing the client can act on, and the suite pins the wording — but it is
+// bounded: an upstream error may carry a provider's internals, a fragment of
+// the request or a credential in a URL, and the 502 body is read by whoever
+// asked for the reply. The bound is a length and not a redaction: what the
+// upstream said about its own failure stays readable.
+//
+// The same bound the route keeps for the prefix of an upstream body it
+// relays (provider.mjs's KEPT_PREFIX, and the same "…" at the end of it):
+// one rule for what is read out of an upstream's own words.
+const MAX_ERROR_TEXT = 512;
+
+// The body a failed reply is answered with: the same shape on every protocol,
+// and the upstream's own error text in it.
+function errorBody(protocol, message) {
+  const detail = { type: "upstream_error", message };
+  return protocol === "anthropic"
+    ? { type: "error", error: detail }
+    : { error: { ...detail, param: null, code: null } };
+}
+
 function jsonResponse(source, protocol, value, error) {
   const headers = new Headers(source.headers);
   for (const name of STALE_BODY_HEADERS) headers.delete(name);
   headers.set("content-type", "application/json");
   if (error) {
-    const detail = { type: "upstream_error", message: error };
-    value =
-      protocol === "anthropic"
-        ? { type: "error", error: detail }
-        : { error: { ...detail, param: null, code: null } };
+    return new Response(JSON.stringify(errorBody(protocol, error)), { status: 502, headers });
   }
-  return new Response(JSON.stringify(value), {
-    status: error ? 502 : source.status,
-    headers,
-  });
+  // The reply is held in memory, and the limit that bounds the bytes read
+  // bounds the reply held: a body larger than the limit is not a reply this
+  // file can answer with, however small the stream that produced it was. The
+  // limit is on bytes and the body is measured in the characters of the text
+  // that is written — a character is at least one byte of it.
+  const text = JSON.stringify(value);
+  if (text.length > MAX_BYTES) {
+    return new Response(
+      JSON.stringify(
+        errorBody(protocol, `Upstream reply exceeds the ${MAX_BYTES / (1024 * 1024)} MiB limit`),
+      ),
+      { status: 502, headers },
+    );
+  }
+  return new Response(text, { status: source.status, headers });
 }
 
 function errorMessage(value, fallback = "Upstream stream failed") {
-  if (typeof value === "string" && value) return value;
-  return value?.message || value?.error?.message || fallback;
+  const text =
+    typeof value === "string" && value
+      ? value
+      : value?.message || value?.error?.message || fallback;
+  if (typeof text !== "string" || !text) return fallback;
+  return text.length > MAX_ERROR_TEXT ? `${text.slice(0, MAX_ERROR_TEXT)}…` : text;
 }
+
+// The largest index an upstream may state for an item, a part or a summary.
+//
+// It is the range of a number the upstream says, not a length this package
+// allocates: the accumulator holds the parts by the place the upstream gave
+// them and writes them out dense, so a far-off index is a part in a list, not
+// a hole-filled array. It is exported because the guard in `tool-response.mjs`
+// reads the same number and the two paths have to refuse the same indices —
+// the same reply, the same answer.
+export const MAX_STREAM_INDEX = 65535;
 
 function index(value) {
   const result = value ?? 0;
-  if (!Number.isInteger(result) || result < 0 || result > 65535) {
+  if (!Number.isInteger(result) || result < 0 || result > MAX_STREAM_INDEX) {
     throw new Error("Invalid stream item index");
   }
   return result;
@@ -58,6 +101,25 @@ function index(value) {
 // reply share a name.
 function identity(value) {
   return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+// Whether a terminal's own list of items names every item the stream
+// accumulated. The items of a reply are named by their ids, and one the
+// terminal leaves out is an item the reply would lose: the accumulation
+// stands in for it. A terminal that names none of them says nothing about
+// which items it left out — it may be a gateway that does not repeat the ids
+// — and the count of the two lists is what is read then.
+function names(terminal, kept) {
+  const named = new Set();
+  for (const item of terminal) {
+    const id = identity(item.id);
+    if (id !== undefined) named.add(id);
+  }
+  if (!named.size) return true;
+  return kept.every((item) => {
+    const id = identity(item.id);
+    return id === undefined || named.has(id);
+  });
 }
 
 function sorted(map) {
@@ -78,17 +140,44 @@ function applyText(target, field, value, isDelta) {
   else if (value !== undefined) target[field] = value;
 }
 
-// How much of a streamed reply a snapshot carries, counted over the fields a
-// stream fills in.
-function weight(snapshot, fields) {
-  let total = 0;
-  for (const field of fields) {
-    const value = snapshot?.[field];
-    if (typeof value === "string") total += value.length;
-    else if (Array.isArray(value)) total += value.length;
-    else if (value && typeof value === "object") total += Object.keys(value).length;
+// Whether a value can be read as a snapshot of something the stream
+// accumulated. A snapshot is the upstream's own view of an item, a block or a
+// part; a null, a string or a list is not one, and stands in for nothing.
+function isSnapshotObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// How much a value carries, counted in the fields that matter. A string is
+// its length; a list is what its entries carry and not how many entries it
+// has; an object is the fields it names.
+//
+// The collection is weighed by what it holds because the reply is read for
+// what it holds: `{content: [{}]}` is a part with no text in it, and weighing
+// it by its length (one entry) made a snapshot that carries nothing look like
+// a whole view of the content the deltas had already delivered — so it stood
+// in for it, and the text was dropped without a word.
+function weight(value, fields) {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) {
+    let total = 0;
+    for (const entry of value) total += weight(entry, fields);
+    return total;
   }
-  return total;
+  // The parts of an item are held by the place the upstream gave them (the
+  // Responses accumulator below), and the same weighing reads them there.
+  if (value instanceof Map) {
+    let total = 0;
+    for (const entry of value.values()) total += weight(entry, fields);
+    return total;
+  }
+  if (isSnapshotObject(value)) {
+    let total = 0;
+    for (const field of fields) {
+      if (value[field] !== undefined) total += weight(value[field], fields);
+    }
+    return total;
+  }
+  return 0;
 }
 
 // Whether a snapshot may stand in for what was accumulated. An upstream puts
@@ -96,18 +185,26 @@ function weight(snapshot, fields) {
 // message_start whose block has not been filled in, a terminal response — and
 // one that carries nothing where the accumulation has content is a partial
 // view of it rather than a newer one: taking it would discard what the stream
-// already delivered. One that does carry the collection settles it, which is
-// how response.output_item.done and a whole terminal response replace
-// accumulated arguments with the complete ones.
+// already delivered.
+//
+// A snapshot stands in only where it is a whole view of the accumulation: a
+// field it carries in a shorter form than the accumulation held is a partial
+// view of it, and the accumulation stands. The comparison is field by field,
+// because a snapshot may carry more of one field and less of another, and the
+// field it carries less of is the one that would be lost. A snapshot holding
+// one character where the accumulation holds a sentence is the same view.
+//
+// One that does carry the collection settles it, which is how
+// response.output_item.done and a whole terminal response replace accumulated
+// arguments with the complete ones.
 function carries(snapshot, accumulated, fields) {
-  return weight(snapshot, fields) > 0 || weight(accumulated, fields) === 0;
-}
-
-// Whether a value can be read as a snapshot of something the stream
-// accumulated. A snapshot is the upstream's own view of an item, a block or a
-// part; a null, a string or a list is not one, and stands in for nothing.
-function isSnapshotObject(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (weight(accumulated, fields) === 0) return true;
+  for (const field of fields) {
+    const before = accumulated?.[field];
+    if (before === undefined) continue;
+    if (weight(snapshot?.[field], fields) < weight(before, fields)) return false;
+  }
+  return true;
 }
 
 // The usage report a body holds after a snapshot has been spread whole onto it.
@@ -296,7 +393,7 @@ function responsesAccumulator() {
   const idMap = new Map(); // item id -> arrival order
   // The fields a streamed item fills in: a message its content, a call its
   // arguments, a reasoning item its summary.
-  const fields = ["content", "arguments", "summary", "text"];
+  const fields = ["content", "arguments", "summary", "text", "refusal"];
   // The newest item this stream opened without an id, by kind: a reply whose
   // frames name nothing at all is one the upstream never indexed, and every
   // frame after its item — the ones that say `added` and the ones that only
@@ -460,6 +557,40 @@ function responsesAccumulator() {
     }
     return record.value;
   }
+  // The parts of one item, held by the place the upstream gave each of them.
+  // A Map and not an array: the place is the upstream's own number and may be
+  // far ahead of the ones before it, and an array written at that number holds
+  // a hole for every place between — one frame of a hundred bytes answered a
+  // reply of 327 821 bytes, every hole written as a null, and the limit that
+  // bounds the bytes read says nothing about a reply that is a thousand times
+  // the stream that described it (measured: 304 bytes of SSE, 327 821 bytes of
+  // reply). The Map holds what was written and the reply is written dense:
+  // the parts in the order the upstream placed them, and no null among them.
+  //
+  // A collection that arrived as an array — a snapshot's own content — is
+  // taken hold of in the same shape, and the parts that are not parts are
+  // left out of it, as they are everywhere else in this file.
+  function parts(value, field) {
+    let collection = value[field];
+    if (collection instanceof Map) return collection;
+    const map = new Map();
+    if (Array.isArray(collection))
+      for (const [at, part] of collection.entries()) {
+        if (isSnapshotObject(part)) map.set(at, part);
+      }
+    value[field] = map;
+    return map;
+  }
+  // The reply is written dense: the parts of an item are the ones the stream
+  // placed, in the order it placed them, and a place nothing was written to
+  // is not a null among them.
+  function dense(value) {
+    for (const field of ["content", "summary"]) {
+      const collection = value[field];
+      if (collection instanceof Map) value[field] = sorted(collection);
+    }
+    return value;
+  }
   return {
     apply(data, type) {
       if (type === "response.created" || type === "response.in_progress") {
@@ -531,7 +662,7 @@ function responsesAccumulator() {
           );
       } else if (type === "response.content_part.added" || type === "response.content_part.done") {
         const value = item(data);
-        value.content ??= [];
+        const content = parts(value, "content");
         // A re-emitted opening part carries an empty text where the deltas
         // have already filled the slot — the partial-snapshot hazard the item
         // guard above and content_block_start exist for, so the same test.
@@ -543,11 +674,8 @@ function responsesAccumulator() {
         // of it threw ("Attempted to assign to readonly property"). Nothing to
         // place places nothing, and the item's own frames stand.
         const at = index(data.content_index);
-        if (
-          isSnapshotObject(data.part) &&
-          carries(data.part, value.content[at], ["text", "refusal"])
-        )
-          value.content[at] = data.part;
+        if (isSnapshotObject(data.part) && carries(data.part, content.get(at), ["text", "refusal"]))
+          content.set(at, data.part);
       } else if (
         type === "response.output_text.delta" ||
         type === "response.output_text.done" ||
@@ -555,12 +683,17 @@ function responsesAccumulator() {
         type === "response.refusal.done"
       ) {
         const value = item(data);
-        value.content ??= [];
+        const content = parts(value, "content");
         const refusal = type.startsWith("response.refusal.");
         const field = refusal ? "refusal" : "text";
-        const part = (value.content[index(data.content_index)] ??= refusal
-          ? { type: "refusal", refusal: "" }
-          : { type: "output_text", text: "", annotations: [] });
+        const at = index(data.content_index);
+        let part = content.get(at);
+        if (part === undefined) {
+          part = refusal
+            ? { type: "refusal", refusal: "" }
+            : { type: "output_text", text: "", annotations: [] };
+          content.set(at, part);
+        }
         const isDelta = type.endsWith(".delta");
         applyText(part, field, isDelta ? data.delta : data[field], isDelta);
       } else if (
@@ -575,22 +708,22 @@ function responsesAccumulator() {
         type === "response.reasoning_summary_part.done"
       ) {
         const value = item(data, "reasoning");
-        value.summary ??= [];
+        const summary = parts(value, "summary");
         // The same re-emitted-opening-frame hazard as content_part above, and
         // the same refusal of a part that is not a part.
         const at = index(data.summary_index);
-        if (isSnapshotObject(data.part) && carries(data.part, value.summary[at], ["text"]))
-          value.summary[at] = data.part;
+        if (isSnapshotObject(data.part) && carries(data.part, summary.get(at), ["text"]))
+          summary.set(at, data.part);
       } else if (/^response\.reasoning_(summary_)?text\.(delta|done)$/.test(type)) {
         const value = item(data, "reasoning");
         const summary = type.includes("summary");
-        const collection = summary ? "summary" : "content";
-        value[collection] ??= [];
+        const collection = parts(value, summary ? "summary" : "content");
         const at = index(summary ? data.summary_index : data.content_index);
-        const part = (value[collection][at] ??= {
-          type: summary ? "summary_text" : "reasoning_text",
-          text: "",
-        });
+        let part = collection.get(at);
+        if (part === undefined) {
+          part = { type: summary ? "summary_text" : "reasoning_text", text: "" };
+          collection.set(at, part);
+        }
         // A summary's whole text arrives in `summary` and a reasoning text's
         // in `text`. Reading `text` for a summary lost a done event that had
         // no delta before it (measured: the summary came back empty).
@@ -599,7 +732,13 @@ function responsesAccumulator() {
       } else if (type === "response.reasoning_content.delta") {
         body.reasoning_content = (body.reasoning_content ?? "") + (data.delta ?? "");
       } else if (type === "response.completed" || type === "response.incomplete") {
-        if (data.response && typeof data.response === "object") {
+        // A terminal whose `response` is not a reply object — a null, a string,
+        // a list — is not a terminal reply at all, and stands in for nothing:
+        // the same reading every snapshot in this file gets (isSnapshotObject,
+        // above). Read as one, a list became the whole body of the reply — the
+        // accumulated items were gone and the client read a list where a
+        // response belongs.
+        if (isSnapshotObject(data.response)) {
           // The output a terminal carries is a list of items like any other
           // snapshot's, and an entry that is not an item is not one to answer
           // with: it was returned verbatim, so the reply ended with a null or a
@@ -648,7 +787,7 @@ function responsesAccumulator() {
           while (stated.has(free)) free++;
           placed.push([free++, record.value]);
         }
-        return placed.sort(([a], [b]) => a - b).map(([, value]) => value);
+        return placed.sort(([a], [b]) => a - b).map(([, value]) => dense(value));
       };
       if (!final) {
         body.output = items();
@@ -662,11 +801,19 @@ function responsesAccumulator() {
       // accumulation stands in for the collection it lost; everything else
       // about the terminal is what the upstream said last, and comes back
       // exactly as it arrived.
+      //
+      // A terminal that carries a list of its own is read against the items
+      // the stream delivered before that list wins. It is a whole view of the
+      // reply only where it holds as many of those items as the stream
+      // delivered: a list that names fewer of them is a partial view of the
+      // reply, and it stands in for the collection it lost — a gateway that
+      // reports the last item only answered 200 with one item where the
+      // stream carried two, and the earlier one was gone with no word.
       const whole = Array.isArray(final.output)
-        ? final.output.length > 0
+        ? final.output.length > 0 &&
+          final.output.length >= kept.length &&
+          names(final.output, kept)
         : final.output !== null && final.output !== undefined;
-      // An array is not a reply object at all, and is returned as it came.
-      if (Array.isArray(final)) return final;
       // The terminal is spread whole onto the answer, so the report it carries
       // is read by shape like every other (keepUsage, above): one that is not a
       // report states none, and the report the stream accumulated stands.
@@ -718,9 +865,17 @@ function anthropicAccumulator() {
         // The message is spread whole, and its own `usage` comes with it: read
         // by shape, so a report that is not one leaves the body holding the
         // report it already had (keepUsage, above).
+        //
+        // A message that is not an object stands in for nothing — the same
+        // reading the Responses accumulator gives its own snapshot
+        // (isSnapshotObject, above): spread as it stood, a string's characters
+        // became the reply's own keys, and the reply answered 200 carrying keys
+        // the upstream never named and no id at all.
         const reported = body.usage;
-        body = { ...body, ...data.message };
-        keepUsage(body, reported);
+        if (isSnapshotObject(data.message)) {
+          body = { ...body, ...data.message };
+          keepUsage(body, reported);
+        }
         // `content` is the one key of a message_start that `apply` fills in
         // itself, and a value that is not a list of blocks — a string, a
         // number, an object — is not a view of the reply to take it from: the
@@ -938,6 +1093,34 @@ export async function collapseResponse(response, protocol) {
         }
       }
       feed(decoder.decode());
+      // The event-stream format discards the pending data at the end of the
+      // stream, and this file does not. The framing dispatches an event on an
+      // empty line, so a stream whose last event is not followed by one —
+      // `data: [DONE]\n`, or a last line with no newline at all — left that
+      // event undispatched: the completion marker among it was never read,
+      // the reply was answered with a 502 that threw away the text the stream
+      // had already delivered (measured on the same bytes: two newlines
+      // answered 200 with the reply, one newline answered 502 with nothing).
+      //
+      // The marker is the upstream's own end of the reply, and a reply that
+      // carries it is a whole one whatever the framing did after it. So the
+      // pending event is dispatched at the end of the stream.
+      //
+      // What this does not make is half an event acceptable: the pending bytes
+      // are dispatched as they stand, and bytes that are not a whole event
+      // fail as they always have. A stream cut short in the middle of one
+      // still answers 502, and a stream cut short before its marker still
+      // answers 502 with the completion it never reported — the distinction
+      // this file has always drawn between a reply that ended and one that
+      // was cut short (provider.mjs and tool-response.mjs read the same two
+      // cases apart).
+      if (!failure) {
+        if (lineParts.length) {
+          line(lineParts.join(""));
+          lineParts = [];
+        }
+        if (dataLines.length) dispatch();
+      }
     } finally {
       reader.releaseLock();
     }

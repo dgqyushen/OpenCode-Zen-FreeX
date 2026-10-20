@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
@@ -110,6 +115,58 @@ test("the plugin is reached by every name this module offers, and the id comes w
   assert.equal(module.server, module.ZenFreePlugin);
   assert.equal(module.server, module.default.server);
   assert.equal(typeof module.default.id, "string");
+  // The id travels with the named exports as well, so a host that resolves
+  // the plugin by one of them has something to key it by — the provider's own
+  // id, read from the module rather than written out here.
+  assert.equal(module.id, module.default.id);
+});
+
+// The guard that reads provider.mjs's export runs when this module is loaded,
+// and what it has to catch is a provider.mjs that lost one of the two things
+// the plugin has to carry. The real one carries both, so there is nothing for
+// the guard to catch in it — the guard is read in a child process with a
+// provider.mjs of its own.
+//
+// The two cases are the two ways it used to wave a plugin through: a value
+// inherited from a prototype, which is not something provider.mjs exported at
+// all, and an id of nothing but spaces, which is no name to key a plugin by.
+test("the plugin guard reads own properties only, and refuses a blank id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zenfree-plugin-guard-"));
+  try {
+    // This module as it is, so what is under test is the guard and not a copy
+    // of it, and a provider.mjs beside it that the copy imports.
+    writeFileSync(join(dir, "index.mjs"), readFileSync(new URL("./index.mjs", import.meta.url)));
+    const load = (source) => {
+      writeFileSync(join(dir, "provider.mjs"), source);
+      const script = join(dir, "load.mjs");
+      writeFileSync(
+        script,
+        `import(${JSON.stringify(pathToFileURL(join(dir, "index.mjs")).href)}).then(
+  () => console.log("THE MODULE LOADED"),
+  (error) => console.error(String(error && error.message)),
+);
+`,
+      );
+      const run = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 60000 });
+      return `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    };
+    // A provider that exports neither half: the factory and the id are
+    // inherited, and the export carries nothing of its own.
+    const inherited = load(`
+      const inherited = { server: () => {}, id: "inherited" };
+      export default Object.create(inherited);
+    `);
+    assert.doesNotMatch(inherited, /THE MODULE LOADED/, "a plugin that carries neither half must not load");
+    assert.match(inherited, /server.*factory.*id/, "and the refusal says what is missing");
+    // And one that exports a factory and a name of nothing but spaces.
+    const blank = load(`
+      export default { server: () => {}, id: "   " };
+    `);
+    assert.doesNotMatch(blank, /THE MODULE LOADED/, "a plugin with a blank id must not load");
+    assert.match(blank, /server.*factory.*id/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // The watchdog is the one branch that can end a wait without what it waited
@@ -1212,6 +1269,13 @@ test("reads a tool's name out of either shape, so nothing is filled twice", asyn
 // A chat host may still declare its tools the legacy way, in the top-level
 // `functions` array. Those tools are declared — the host has them — so none of
 // them may be stood in for, and the same tool must not go out twice (#131).
+//
+// The declaration goes out in `tools` as well, because `tools` is the array
+// Zen reads: a host that declared its tools only the old way sent `tools: []`
+// with its real declarations in an array Zen may not read, while the filling
+// only ever pushed into `tools`. And the legacy array is dropped, because a
+// declaration left in it is a tool sent twice — once with OpenCode's wording
+// and once with the host's.
 test("a tool declared through the legacy functions array is not filled in again", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
@@ -1224,24 +1288,86 @@ test("a tool declared through the legacy functions array is not filled in again"
       functions: [{ name: "bash", description: "the host's own", parameters: { type: "object", properties: {} } }],
     }),
   });
-  const names = lastCall(state).body.tools.map((tool) => tool.function.name);
+  const sent = lastCall(state).body;
+  const names = sent.tools.map((tool) => tool.function.name);
   assert.deepEqual(
     names.filter((name) => name === "bash"),
-    [],
-    "the legacy declaration is a declaration: nothing is stood in for this name",
+    ["bash"],
+    "the legacy declaration is a declaration: it is not stood in for a second time",
   );
   // The names the host did not declare are still filled, as they are for any
-  // host that is not OpenCode.
-  assert.deepEqual(names, ["glob", "grep", "read"]);
-  // And the wording is Zen's wherever the tool was declared. An entry carried by
-  // `functions` is read by Zen the same way one in `tools` is, so leaving the
-  // host's own words there is a refusal this plugin could have prevented — and
-  // it is the entry `explain()` would otherwise describe as rewritten.
+  // host that is not OpenCode — and the declaration the host did make comes
+  // first, in the place it was made.
+  assert.deepEqual(names, ["bash", "glob", "grep", "read"]);
+  // And the wording is Zen's wherever the tool was declared: the declaration
+  // went out in `tools`, wearing OpenCode's wording and keeping the host's own
+  // parameters, so the call the model makes still fits the tool that runs it.
   assert.equal(
-    lastCall(state).body.functions[0].description,
+    sent.tools[0].function.description,
     PROFILES["1.x"].tools.bash.description,
     "the legacy entry is reworded too",
   );
+  assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} });
+  // The legacy array is gone: a declaration left in it is one Zen may not read,
+  // and one left in both arrays is a tool sent twice.
+  assert.equal(sent.functions, undefined, "the legacy array does not go out beside `tools`");
+});
+
+// The names a request carries are the names Zen reads, whichever array they
+// arrived in. A host that declares `shell` the legacy way is the 2.x host it
+// says it is: reading the generation from `tools` alone answered the 1.x
+// floor — the 1.x stand-in names and the 1.x User-Agent — for a request that
+// named a 2.x tool.
+test("a legacy declaration counts towards the generation the request is sent as", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      messages: [{ role: "user", content: "hi" }],
+      functions: [{ name: "shell", description: "the host's own", parameters: { type: "object", properties: {} } }],
+    }),
+  });
+  const sent = lastCall(state);
+  assert.equal(sent.headers["user-agent"], agentOf("2.x"), "the tools say 2.x, so the request is 2.x");
+  assert.deepEqual(
+    sent.body.tools.map((tool) => tool.function.name),
+    ["shell", "read"],
+    "the 1.x stand-in names are not added to a 2.x request",
+  );
+});
+
+// One tool, declared twice: in `tools` and in the legacy array. It is one
+// declaration under two spellings, so it goes out once — in the array Zen
+// reads, and with the wording Zen reads.
+test("a tool declared in both arrays goes out once", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          type: "function",
+          function: { name: "bash", description: "the host's own", parameters: { type: "object", properties: {} } },
+        },
+      ],
+      functions: [{ name: "bash", description: "the host's own", parameters: { type: "object", properties: {} } }],
+    }),
+  });
+  const sent = lastCall(state).body;
+  assert.deepEqual(
+    sent.tools.map((tool) => tool.function.name),
+    ["bash", "glob", "grep", "read"],
+    "the tool is sent once, not once per array it was declared in",
+  );
+  assert.equal(sent.functions, undefined);
+  assert.equal(sent.tools[0].function.description, PROFILES["1.x"].tools.bash.description);
 });
 // A host that is not OpenCode describes its tools in its own words, and Zen
 // reads the wording of the tools it knows by name. The tool itself is the
@@ -1382,21 +1508,27 @@ test("a refusal names the wording to update rather than the headers", async (t) 
 // reads when the free tier stops answering, and a body re-served under the
 // upstream's `content-encoding` cannot be read at all — the caller that honours
 // the header fails to decompress it.
+//
+// The body here is one the reader can read to its end, because a refusal that
+// was read whole is the one that gets replaced: a body that never ends is
+// relayed as it was read, and that is the case below.
 test("a rewritten refusal carries headers for the body it actually returns", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
   state.status = 403;
-  state.responseHeaders = {
-    "content-encoding": "identity",
-    "content-length": "999",
-    etag: '"stale-validator"',
-    "last-modified": "Wed, 01 Oct 2026 00:00:00 GMT",
-  };
   state.body = JSON.stringify({
     type: "error",
     error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." },
   });
+  state.responseHeaders = {
+    "content-encoding": "identity",
+    // The upstream's own length, for the upstream's own bytes: they describe
+    // what arrived, and the reply below carries different bytes.
+    "content-length": String(state.body.length),
+    etag: '"stale-validator"',
+    "last-modified": "Wed, 01 Oct 2026 00:00:00 GMT",
+  };
   const response = await loader.fetch(`${origin}/v1/chat/completions`, {
     method: "POST",
     body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
@@ -1410,6 +1542,40 @@ test("a rewritten refusal carries headers for the body it actually returns", asy
   // the headers it was given.
   const { error } = await response.json();
   assert.match(error.message, /wording/i);
+});
+
+// A refusal whose body was not read to its end is not a refusal this package
+// has read: what it has is an opening, and the opening may or may not say the
+// whole story. Here it does say `FreeTierError` — inside the part that was
+// read — so the diagnosis would have been built from it, and the caller would
+// have been told a refusal was complete when the read never reached the end of
+// it. The one rule this package keeps for a body that was not read to its end
+// is the refusal that says so: it carries the upstream's own words, and it does
+// not claim to be more than it read.
+test("a refusal whose body was cut short keeps the refusal that says so", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 403;
+  // Past the reader's budget, so the read stops short of the end of it — and
+  // the words that name the free tier are inside the part that was read.
+  const long = `{"error":{"type":"FreeTierError","message":"${"x".repeat(5000)}"}}`;
+  state.body = long;
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 403, "the upstream's status is the answer's status");
+  const { error } = await response.json();
+  assert.match(error.message, /was not read to the end/);
+  assert.match(error.message, /the \d+ characters read before the read stopped/);
+  // The upstream's own words are carried along, so nothing about the refusal
+  // is lost — including the one that names the free tier.
+  assert.equal(error.upstream, long.slice(0, 512) + "…");
+  assert.match(error.upstream, /FreeTierError/);
+  // And the diagnosis is not substituted for it: it says the refusal was about
+  // the wording of the tools, and this one was never read to its end.
+  assert.doesNotMatch(error.message, /wording/i);
 });
 
 // A 403 that is not the free tier's is somebody else's answer, and nothing here

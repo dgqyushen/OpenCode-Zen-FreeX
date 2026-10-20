@@ -146,6 +146,74 @@ test("a host signal still names a conversation whose first user message is empty
   assert.equal(byMetadata, first, "where the name came from does not change what it names");
 });
 
+// The same contract with a first user message that has words in it: a host
+// signal is the conversation's own name for itself, so it is the key on its own
+// and nothing else is folded in beside it. A host that carries a signal may
+// open a later turn with a shortened history, and keyed by the opening too, the
+// same conversation would answer a new id the moment its first message moved.
+//
+// The empty opening above cannot hold this line on its own: a regression that
+// folded the opening into the signal — hashing the name and the first message
+// together — answers one id for an empty opening and two for a spoken one, and
+// every assertion above still passes.
+test("a host signal names a conversation whatever its first user message says", () => {
+  const named = new Headers({ "x-opencode-session": "conversation-i" });
+  const opened = { messages: [{ role: "user", content: "hi" }] };
+  const shortened = { messages: [{ role: "user", content: "hi again" }] };
+  // The signal alone is the key: the same name answers one id whatever the
+  // opening says, so a turn that opens differently keeps the conversation.
+  assert.equal(
+    sessionID(named, opened),
+    sessionID(named, shortened),
+    "one name, one conversation: the opening is not folded in beside the signal",
+  );
+  // ...and two names answer two ids, whatever the opening says.
+  assert.notEqual(
+    sessionID(named, opened),
+    sessionID(new Headers({ "x-opencode-session": "conversation-j" }), opened),
+    "two names, two conversations: one opening does not make them one",
+  );
+  // The id is still OpenCode's own shape, and not the name passed on.
+  const id = sessionID(named, opened);
+  assert.ok(realSessionID(id), id);
+  assert.notEqual(id, "conversation-i", "a name that is not OpenCode's is hashed, not passed on");
+});
+
+// The id is the one OpenCode itself would mint, and that is what Zen reads.
+// OpenCode's own identifier.ts (packages/schema/src/identifier.ts) takes six
+// bytes out of `Date.now() * 0x1000 + counter` — the low 48 of it and no more
+// — writes them as hex, and adds 14 random base62 characters; a session's
+// value is the one inverted, so that a newer id sorts first.
+//
+// The 48 bits are OpenCode's own field and not a truncation of a wider one, so
+// what the field holds of the time is the time modulo 2^36 ms — 795.4 days —
+// and OpenCode's ids start over at the same period. The mask is not a defect
+// to be repaired here: an id that carried more of the time than OpenCode's
+// does is not one Zen reads as OpenCode's.
+function opencodeTime(timestamp, counter, descending) {
+  const current = BigInt(timestamp) * 0x1000n + BigInt(counter);
+  const value = descending ? ~current : current;
+  return Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0"),
+  ).join("");
+}
+
+test("the id is the one OpenCode itself would mint, bit for bit", () => {
+  // A millisecond no other case in this file uses, so the counter this module
+  // keeps for it is the first one it hands out: 1.
+  const now = 1_790_000_777_000;
+  const id = opencodeID("ses", true, now);
+  assert.equal(id.slice(4, 16), opencodeTime(now, 1, true));
+  assert.equal(id.length, 4 + FIELD_HEX + TAIL_CHARS);
+  // The time the field carries is the time modulo 2^36 ms, inverted for a
+  // session — and that is what OpenCode's own ids carry, so the two cannot
+  // drift into being different kinds of id.
+  const value = BigInt(`0x${id.slice(4, 16)}`);
+  assert.equal(value >> 12n, (1n << 36n) - 1n - (BigInt(now) % (1n << 36n)));
+});
+
 // An empty opening with NO signal is the one shape that cannot be keyed: two
 // conversations that opened empty are indistinguishable from one, so any key
 // derived here would either be shared by unrelated conversations — one Zen
@@ -196,4 +264,42 @@ test("a session id is never minted from a signal that is not a string", () => {
   const text = sessionID(new Headers(), { metadata: { session_id: "42" } });
   assert.notEqual(first, text, "42 is not \"42\"");
   assert.notEqual(first, second, "a number is not a session to key a conversation by");
+});
+
+// An empty string is a string, and the guard that reads the metadata admits
+// one: taken as the conversation's name, it became the key every such request
+// shared — `sha256("ses\0")` — so every host that sent an empty name landed on
+// one Zen session, with its affinity and its quota. Measured on 2026-10-20:
+// two conversations opening differently answered the same id
+// (ses_ea7d502a1ffe9szowdKaA6Qa5p), which is the one thing the module's own
+// comments say must not happen.
+//
+// The case above proves the type guard was considered and stops one case short
+// of the empty string — which is where this hid.
+test("a name with nothing in it is no name, and no such request is shared", () => {
+  const blank = sessionID(new Headers(), { metadata: { session_id: "" } });
+  const blankAgain = sessionID(new Headers(), { metadata: { session_id: "" } });
+  assert.ok(realSessionID(blank), blank);
+  // Nothing named those two conversations, so nothing may be shared between
+  // them: an id of its own each, not the one key every empty name shares.
+  assert.notEqual(blank, blankAgain, "an empty name is no name: it may not be shared");
+  // And two conversations that each carry an empty name are two
+  // conversations, however differently they open.
+  const one = sessionID(new Headers(), {
+    metadata: { session_id: "" },
+    messages: [{ role: "user", content: "one" }],
+  });
+  const other = sessionID(new Headers(), {
+    metadata: { session_id: "" },
+    messages: [{ role: "user", content: "two" }],
+  });
+  assert.notEqual(one, other, "an empty name may not fold two conversations into one");
+  // An empty name changes nothing about how the request is keyed: it is keyed
+  // the way any unnamed request is, by its opening.
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  assert.equal(
+    sessionID(new Headers(), { ...opening, metadata: { session_id: "" } }),
+    sessionID(new Headers(), opening),
+    "an empty name names nothing, so it changes nothing about the key",
+  );
 });

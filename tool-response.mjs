@@ -1,4 +1,4 @@
-import { MAX_BYTES, STALE_BODY_HEADERS } from "./stream.mjs";
+import { MAX_BYTES, MAX_STREAM_INDEX, STALE_BODY_HEADERS } from "./stream.mjs";
 
 // The limit as a failure's message names it, from the one place it is set:
 // stream.mjs owns the number, and this guard reads the same bytes through it.
@@ -18,18 +18,36 @@ function headersFor(response) {
   return headers;
 }
 
-// failure answers the error a client reads. `code` says what went wrong
-// where the shape has room for it: only a call the guard cannot name at all
-// is an undeclared one, and a limit, a truncation or a malformed upstream is
-// not.
+// failure answers the error a client reads. `code` says what went wrong: only
+// a call the guard cannot name at all is an undeclared one, and a limit, a
+// truncation or a malformed upstream is not. Every shape this guard answers
+// with has room for the code, so it goes in all of them: the code was
+// computed for two of the three protocols and dropped, and a client on the
+// chat or the Messages arm could not tell an undeclared tool from a size
+// limit or a transport failure.
 function failure(protocol, message, stream = false, code = "upstream_error") {
-  if (protocol === "anthropic") return { type: "error", error: { type: "api_error", message } };
+  if (protocol === "anthropic")
+    return { type: "error", error: { type: "api_error", code, message } };
   if (protocol === "responses") {
     return stream
       ? { type: "error", code, message }
       : { error: { type: "upstream_error", code, message } };
   }
-  return { error: { message, type: "upstream_error" } };
+  return { error: { message, type: "upstream_error", code } };
+}
+
+// A failure the client is not told in full: the text of an internal failure —
+// a transport error, a TypeError from the guard's own code — is the server's
+// business, and the server's own log is where it goes. A log line is not
+// worth a failed request, so a sink that refuses it is swallowed.
+function logFailure(error) {
+  try {
+    console.error(
+      `[opencode-zen-freex] upstream stream failed: ${error?.stack ?? error?.message ?? error}`,
+    );
+  } catch {
+    /* a log line is not worth a failed request */
+  }
 }
 
 function object(value) {
@@ -290,6 +308,43 @@ function identity(value) {
 // apart (see inPlaceOf).
 let synthesized = 0;
 
+// The ids one reply publishes. An id is the word a client keys an item by, so
+// it has to name one item of the reply and no other: the reply is one answer,
+// and a client that reads two items under one word reads one of them twice —
+// the result of one call is taken for the other's.
+//
+// The set is the reply's, not a container's. A reply holds several
+// containers — a chat body with two choices has two lists of calls, a
+// Responses body has an `output` and the `content` of every item in it — and
+// the id invented for a call of one of them has to miss the names the others
+// carry. The ids the calls already carry are read first, and an invented one
+// missed all of them but the ones in its own list: a reply whose upstream
+// names its calls `call_1`, `call_2` handed two calls of two choices the one
+// id, and a client that keys its results by the id could not tell them apart.
+function replyIDs() {
+  const used = new Set();
+  return {
+    // The word the reply already uses.
+    holds: (word) => used.has(word),
+    // The word the reply uses from now on.
+    hold(word) {
+      used.add(word);
+      return word;
+    },
+    // A word no item of the reply carries. The number is the process's own,
+    // so the invented ids of two replies are never one another's, and the
+    // reply's own names are missed: an upstream that names its calls `call_1`
+    // and `call_2` is not handed one of them.
+    mint(prefix) {
+      let word;
+      do word = `${prefix}${++synthesized}`;
+      while (used.has(word));
+      used.add(word);
+      return word;
+    },
+  };
+}
+
 // What a call left out of a Responses or Messages reply becomes: text
 // saying so, in the call's place, so no later index moves. `at` is where the
 // call sits in the reply as far as the caller can tell — a frame's
@@ -297,7 +352,7 @@ let synthesized = 0;
 // caller that follows the whole stream has already answered for this call
 // (see snapshotStream): without it every rewrite of that call invented a new
 // id.
-function inPlaceOf(protocol, call, note, at, placed) {
+function inPlaceOf(protocol, call, note, at, placed, ids) {
   if (protocol === "anthropic") return { type: "text", text: note };
   // An item id is what a Responses client keys the item by, and what the
   // streaming path suppresses arguments by. One call is replaced more than
@@ -320,9 +375,14 @@ function inPlaceOf(protocol, call, note, at, placed) {
   // the other end. Behind the prefix the word cannot collide with an item of
   // the reply, and a call_id the reply used is still named in the id it
   // answers, as it was.
-  const id =
-    placed ??
-    `msg_${identity(call.call_id) ?? (at === undefined ? `anon_${++synthesized}` : `dropped_${at}`)}`;
+  //
+  // The place a call holds is the index inside one container, so a call in
+  // `output[0]` and a call in `output[1].content[0]` are both at 0 and both
+  // became `msg_dropped_0`: one item to the client, which keys its items by
+  // the id it was handed, and the second note was never read. A word the reply
+  // already holds is therefore missed, and the call is given one of the
+  // guard's own instead (droppedID).
+  const id = placed ?? droppedID(call, at, ids);
   return {
     type: "message",
     id,
@@ -330,6 +390,24 @@ function inPlaceOf(protocol, call, note, at, placed) {
     status: call.status ?? "completed",
     content: [{ type: "output_text", text: note, annotations: [] }],
   };
+}
+
+// The id a call left out is answered by, when the stream has not answered one
+// for it already: the word the call carries behind the `msg_`, or the place
+// it holds. A word the reply already holds is missed — the reply is one
+// answer, and two items under one word are one item to the client — and the
+// call is given one of the guard's own, which no other item of the reply
+// holds.
+function droppedID(call, at, ids) {
+  const word = identity(call.call_id);
+  if (word !== undefined) {
+    const named = `msg_${word}`;
+    if (!ids.holds(named)) return ids.hold(named);
+  } else if (at !== undefined) {
+    const placed = `msg_dropped_${at}`;
+    if (!ids.holds(placed)) return ids.hold(placed);
+  }
+  return ids.mint("msg_anon_");
 }
 
 // A tool call needs an id its host can key the result by, and this route has
@@ -352,30 +430,93 @@ function inPlaceOf(protocol, call, note, at, placed) {
 // them — two calls of one reply under one id, which is the same failure the
 // counter exists to prevent, one step further out. The ids the calls being
 // flushed already carry are read first, and an invented id misses all of them.
-function ensureCallIDs(calls) {
-  const held = new Set();
+//
+// Which ids "all of them" are is the reply's, not one list's. Both places a
+// call is published hand this one choice's tool_calls at a time, and the set
+// the ids were read into held that list alone: a reply whose upstream names
+// its calls `call_1`, `call_2` in one choice and leaves a call of another
+// unnamed handed that call the id of the first, and a client keys its results
+// by the id and reads one call's result as the other's. The set is the
+// reply's now (replyIDs), the reply's calls are read together rather than one
+// choice at a time, and a call whose word another call of the reply already
+// holds is given an id of its own — the first call to claim a word keeps it,
+// and a word is not handed out twice.
+function ensureCallIDs(calls, ids) {
+  const claimed = new Set();
   for (const call of calls) {
     const id = identity(call.id);
-    if (id !== undefined) held.add(id);
+    if (id === undefined) continue;
+    if (claimed.has(id) || ids.holds(id)) {
+      // Two calls of one reply under one word: the client keys the result by
+      // it, and reads one call's result as the other's. The upstream's own id
+      // is not the guard's to change for the call that claimed it first, so
+      // this one is given an id of its own below.
+      call.id = undefined;
+      continue;
+    }
+    claimed.add(id);
+    ids.hold(id);
   }
   for (const call of calls) {
     if (identity(call.id) !== undefined) continue;
-    let id;
-    do id = `call_${++synthesized}`;
-    while (held.has(id));
-    held.add(id);
-    call.id = id;
+    call.id = ids.mint("call_");
   }
+}
+
+// The calls of one reply, in the order the reply holds them: every choice's,
+// because the id a call is published under has to be unique in the whole
+// reply and not only in the choice that carried it.
+function chatCalls(value) {
+  const calls = [];
+  for (const choice of list(value.choices)) {
+    const message = object(choice) ? choice.message : undefined;
+    if (object(message)) calls.push(...list(message.tool_calls));
+  }
+  return calls;
+}
+
+// The id a client answers a call by. A Responses item is answered by its
+// call_id, a Messages block by its id, and a call that carries neither leaves
+// the client with nothing to answer it with: the id has to be invented — and
+// invented once for the call, because the frame that opens it, the frame that
+// closes it and the copy inside the terminal response are one call to the
+// client, and two ids for it are two calls.
+//
+// The names the calls carry are read first, so an invented id misses every one
+// of them: the upstream's own call_id is the word the client answers the call
+// by, and a call that carries none is given one of the guard's.
+//
+// `answered` is the stream's own answer for a call it has already named (the
+// frames of one call are one call, and the id they answer has to be one id);
+// a whole reply has no such state — every call of it appears once.
+function answerCalls(calls, protocol, ids, answered) {
+  if (protocol === "chat" || !calls.length) return false;
+  const field = protocol === "responses" ? "call_id" : "id";
+  for (const [call] of calls) {
+    const id = identity(call[field]);
+    if (id !== undefined) ids.hold(id);
+  }
+  let changed = false;
+  for (const [call, at] of calls) {
+    if (identity(call[field]) !== undefined) continue;
+    call[field] = answered?.(call, at) ?? ids.mint("call_");
+    changed = true;
+  }
+  return changed;
 }
 
 // checkSnapshots checks every call in a reply or event: renamed to the
 // agent's tool, or (Responses, Messages) put in place of by a note. It
 // answers whether data changed, how many calls it kept and how many it
-// left out. `placeOf` is the stream's own answer for a call whose frames
-// carry no output_index and no item id — a token already invented for it, so
-// all of its rewrites answer one item id (snapshotStream); a caller reading a
-// whole reply has no such state and leaves it out.
-function checkSnapshots(data, protocol, checkName, placeOf) {
+// left out, and which calls it kept — the ones a client has to be able to
+// answer (answerCalls). `ids` is the reply's own set of the ids it
+// publishes: two items of one reply under one word are one item to the
+// client, so a word the reply holds is not handed out twice. `placeOf` is
+// the stream's own answer for a call whose frames carry no output_index and
+// no item id — a token already invented for it, so all of its rewrites
+// answer one item id (snapshotStream); a caller reading a whole reply has no
+// such state and leaves it out.
+function checkSnapshots(data, protocol, checkName, ids, placeOf) {
   let changed = false;
   if (protocol === "chat") {
     // A `choices` that is not a list is not one a client can read as the shape
@@ -420,10 +561,14 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
           choice.finish_reason = "stop";
       }
     }
-    return { changed, kept: 0, left: 0 };
+    return { changed, kept: 0, left: 0, calls: [] };
   }
   let kept = 0;
   let left = 0;
+  // The calls the reply kept, and the place each of them holds: the ones a
+  // client is asked to answer, and the ones the ids it answers them with are
+  // invented for (answerCalls).
+  const calls = [];
   if (!object(data)) throw new GuardError("Invalid upstream tool snapshot");
   // Each entry is a value, where it sits, the place it holds in the reply as
   // far as the walk knows, and whether the walk reached it as an item of a
@@ -431,7 +576,14 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
   // which keeps the output_index the frame carries). A call left out is
   // replaced by an item whose invented id names that place, so the added,
   // done and terminal copies of one call are one item (inPlaceOf).
-  const stack = [[data, null, null, object(data) ? data.output_index : undefined, false]];
+  //
+  // The place a frame names is the reply's own numbering — a Responses frame
+  // states the output_index of its item, a Messages frame the index of its
+  // block — so it is where the call holds in the whole reply, not in one
+  // container of it.
+  const stack = [
+    [data, null, null, object(data) ? (data.output_index ?? data.index) : undefined, false],
+  ];
   while (stack.length) {
     const [value, holder, key, at, listed] = stack.pop();
     // A value that is not an object is not a snapshot to walk — an entry of a
@@ -461,6 +613,7 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
           droppedNote(value.name),
           at,
           placeOf?.(value, at, listed),
+          ids,
         );
         changed = true;
         left++;
@@ -471,6 +624,7 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
         changed = true;
       }
       kept++;
+      calls.push([value, at]);
     }
     const arrays = protocol === "responses" ? ["output", "content"] : ["content"];
     const objects =
@@ -492,7 +646,7 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
   ) {
     data.stop_reason = "end_turn";
   }
-  return { changed, kept, left };
+  return { changed, kept, left, calls };
 }
 
 // The slot a choice, or a fragment that states one, sits in. A frame that
@@ -502,9 +656,16 @@ function checkSnapshots(data, protocol, checkName, placeOf) {
 // by the chat test "a fragment that names no index is read the same by both
 // paths"). A fragmented call that names no index is placed by the id it
 // carries where it has one (slotFor, in chatBuffer).
+//
+// The bound is the one stream.mjs's `index` reads, and it is imported rather
+// than written here, so the guard and the collapse path over one stream accept
+// and refuse the same indexes: this path took any safe integer and refused
+// only the negative ones, and a chat frame whose choice or tool call sat at
+// 70000 was published by the guard and refused by the collapse path — one
+// upstream, two answers, and the two failures shaped differently.
 function position(value) {
   const result = value ?? 0;
-  if (!Number.isSafeInteger(result) || result < 0)
+  if (!Number.isSafeInteger(result) || result < 0 || result > MAX_STREAM_INDEX)
     throw new GuardError("Invalid upstream tool index");
   return result;
 }
@@ -534,6 +695,10 @@ function appendFunction(target, fragment) {
 
 function chatBuffer(checkName) {
   const pending = new Map();
+  // The ids this reply has published. The buffer holds one reply — one
+  // stream, every choice of it — so the id a call is published under has to
+  // be unique in all of it, not only in the choice that carried the call.
+  const ids = replyIDs();
   let bytes = 0;
   function charge(state, value) {
     const size = encoder.encode(JSON.stringify(value)).byteLength;
@@ -601,7 +766,7 @@ function chatBuffer(checkName) {
     }
     if (state.legacy) delta.function_call = state.legacy;
     const { notes } = checkChatMessage(delta, checkName);
-    if (Array.isArray(delta.tool_calls)) ensureCallIDs(delta.tool_calls);
+    if (Array.isArray(delta.tool_calls)) ensureCallIDs(delta.tool_calls, ids);
     if (notes.length) {
       delta.tool_calls?.forEach((call, i) => {
         call.index = i;
@@ -637,7 +802,7 @@ function chatBuffer(checkName) {
       bytes = 0;
     },
     apply(data) {
-      let { changed } = checkSnapshots(data, "chat", checkName);
+      let { changed } = checkSnapshots(data, "chat", checkName, ids);
       const choices = list(data.choices);
       for (const choice of choices) {
         // A choice that is not an object holds no delta to read: skipped, as
@@ -778,6 +943,10 @@ function chatBuffer(checkName) {
 // as text carrying the note, and its arguments are never sent. A message
 // whose every call was left out stops as a turn's end, not as tool use.
 function snapshotStream(protocol, checkName) {
+  // The ids this reply has published. One stream is one reply, and a client
+  // keys an item by the id it was handed: two items of one reply under one
+  // word are one item to it.
+  const ids = replyIDs();
   // Where a call left out was replaced, by its output_index (or a Messages
   // block's index, which stores true: the id it answers is the text's, not an
   // item's). A copy of the call that lands on the same place answers the id
@@ -823,6 +992,30 @@ function snapshotStream(protocol, checkName) {
   // arrives after the replacement, and answering it then would make one call
   // two items (inPlaceOf).
   const minted = new Map(); // a word the call is named by → the id it answers
+  // The id a kept call is answered by, invented once for the call: the frame
+  // that opens it, the frame that closes it and the copy inside the terminal
+  // response are one call to the client, and two ids for it are two calls. A
+  // call the reply names by its own id is found by that id, and a call it
+  // names by nothing is found by the place it holds — the frames of one call
+  // carry the same output_index, and the copy inside the terminal response
+  // holds the place the frame that opened it held.
+  const answeredWords = new Map(); // a word the call is named by → the id it answers
+  const answeredPlaces = new Map(); // the place it holds → the id it answers
+  function answeredFor(call, at) {
+    const word = identity(call.id) ?? identity(call.call_id);
+    if (word !== undefined) {
+      const known = answeredWords.get(word);
+      if (known !== undefined) return known;
+    }
+    if (at !== undefined) {
+      const known = answeredPlaces.get(at);
+      if (known !== undefined) return known;
+    }
+    const minted = ids.mint("call_");
+    if (word !== undefined) answeredWords.set(word, minted);
+    if (at !== undefined) answeredPlaces.set(at, minted);
+    return minted;
+  }
   // The item ids the reply has named on an item of its own, and the words of
   // the item the stream is inside. A frame that names one of the latter is that
   // item's — the reply naming the same word elsewhere says nothing about it —
@@ -952,7 +1145,7 @@ function snapshotStream(protocol, checkName) {
     // A done frame whose added frame was never seen. It is a call of its own,
     // and the terminal's copy of it still answers this id by name.
     const opened = entering(call.name, true);
-    opened.id = `msg_anon_${++synthesized}`;
+    opened.id = ids.mint("msg_anon_");
     return mintedFor(call, opened.id);
   }
   return {
@@ -1021,7 +1214,7 @@ function snapshotStream(protocol, checkName) {
           // that closes the call can carry none (measured: the call_id the
           // added frame named is gone from the done frame).
           const entry = data.output_index === undefined ? entering(item.name) : undefined;
-          const message = inPlaceOf(protocol, item, note, data.output_index, entry?.id);
+          const message = inPlaceOf(protocol, item, note, data.output_index, entry?.id, ids);
           if (entry) entry.id = message.id;
           // Every word this call can be named by later is recorded, whichever
           // shape its frames have: the id the guard answered for it (with the
@@ -1158,10 +1351,16 @@ function snapshotStream(protocol, checkName) {
           return { changed: true, data };
         }
       }
-      const checked = checkSnapshots(data, protocol, checkName, placeOf);
+      const checked = checkSnapshots(data, protocol, checkName, ids, placeOf);
       kept += checked.kept;
       dropped += checked.left;
-      return { changed: checked.changed, data };
+      // The id a client answers a kept call by: a Responses item by its
+      // call_id, a Messages block by its id. A call that carries neither
+      // leaves the client with nothing to answer it with, and the frames of
+      // one call are one call: the id is invented once for it and every copy
+      // answers that one id (answeredFor).
+      const answered = answerCalls(checked.calls, protocol, ids, answeredFor);
+      return { changed: checked.changed || answered, data };
     },
   };
 }
@@ -1239,6 +1438,23 @@ function rewrite(frame, data) {
   return `${lines.join("\n")}\n\n`;
 }
 
+// Whether the data an event carries is a whole event's worth: the completion
+// marker the chat protocol ends on, a JSON document, or nothing at all. A line
+// the stream cut in the middle of is none of them, and the event it belongs to
+// is not a whole one — which is the difference between a reply the upstream
+// finished and one it stopped writing.
+function wholeEvent(text) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (!trimmed) return true;
+  if (trimmed === "[DONE]") return true;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function* framesFrom(reader) {
   let parts = [];
   let lineBytes = 0;
@@ -1258,6 +1474,22 @@ async function* framesFrom(reader) {
       lineBytes += value.byteLength;
     }
   }
+  // The event the lines state: its name, the data it carries, and the bytes
+  // it came in (the guard forwards a frame it leaves as it came as its own
+  // bytes).
+  function frameOf(frameLines, raw) {
+    let name = "";
+    const data = [];
+    for (const item of frameLines) {
+      const colon = item.indexOf(":");
+      const key = colon < 0 ? item : item.slice(0, colon);
+      let content = colon < 0 ? "" : item.slice(colon + 1);
+      if (content.startsWith(" ")) content = content.slice(1);
+      if (key === "event") name = content;
+      if (key === "data") data.push(content);
+    }
+    return { lines: frameLines, name, text: data.join("\n"), raw: raw.join("") };
+  }
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
@@ -1266,8 +1498,55 @@ async function* framesFrom(reader) {
         pendingFrame = null;
         eventBytes = 0;
       }
-      if (eventBytes || lineBytes || lines.length)
-        throw new GuardError("Upstream SSE ended inside an event");
+      // A line the stream ended in the middle of: the bytes arrived without the
+      // terminator that would have ended the line. Whether the event that line
+      // states is whole is a question about its content, not about the framing:
+      // a reply that ends `data: [DONE]` with no newline at all is a whole
+      // event — the completion marker is the upstream's own end of the reply,
+      // and a reply that carries it is a whole one whatever the framing did
+      // after it — while `data: {"unfinished":` is half a JSON, and the event
+      // it belongs to is not a whole one. Refusing the first threw away the
+      // text the stream had already delivered (measured on the same bytes: two
+      // newlines answered 200 with the reply, one newline answered 502 with
+      // nothing).
+      //
+      // This is the same rule `stream.mjs`'s collapse path reads, so the two
+      // paths answer one stream with one reply: a whole last event is read
+      // there and read here, and a cut one fails in both.
+      if (lineBytes) {
+        const bytes = new Uint8Array(lineBytes);
+        let cursor = 0;
+        for (const part of parts) {
+          bytes.set(part, cursor);
+          cursor += part.length;
+        }
+        let line;
+        try {
+          line = decoder.decode(bytes);
+        } catch {
+          throw new GuardError("Invalid UTF-8 in upstream SSE event");
+        }
+        const frame = frameOf([...lines, line], [...rawLines, line]);
+        if (!wholeEvent(frame.text)) throw new GuardError("Upstream SSE ended inside an event");
+        yield frame;
+        return;
+      }
+      // The event's lines are whole and the empty line that dispatches it
+      // never came: `data: [DONE]\n` at the end of a stream is an event, and
+      // it is read as one. The event-stream format would discard it and this
+      // does not, the same way stream.mjs's collapse path does not: the
+      // completion marker among it is the upstream's own end of the reply,
+      // and a reply that carries it is a whole one whatever the framing did
+      // after it. Refusing it threw away the text the stream had already
+      // delivered (measured on the same bytes: two newlines answered 200
+      // with the reply, one newline answered 502 with nothing).
+      if (lines.length) {
+        const frame = frameOf(lines, rawLines);
+        lines = [];
+        rawLines = [];
+        eventBytes = 0;
+        yield frame;
+      }
       return;
     }
     let start = 0;
@@ -1327,22 +1606,7 @@ async function* framesFrom(reader) {
       } else {
         const frameLines = lines;
         lines = [];
-        let name = "";
-        const data = [];
-        for (const item of frameLines) {
-          const colon = item.indexOf(":");
-          const key = colon < 0 ? item : item.slice(0, colon);
-          let content = colon < 0 ? "" : item.slice(colon + 1);
-          if (content.startsWith(" ")) content = content.slice(1);
-          if (key === "event") name = content;
-          if (key === "data") data.push(content);
-        }
-        const frame = {
-          lines: frameLines,
-          name,
-          text: data.join("\n"),
-          raw: rawLines.join(""),
-        };
+        const frame = frameOf(frameLines, rawLines);
         rawLines = [];
         if (skipLF) {
           // Preserve a trailing CRLF even when its LF arrives in the next chunk.
@@ -1446,6 +1710,10 @@ function guardedStream(response, protocol, checkName, endCutShort) {
   let frames = reader ? framesFrom(reader) : null;
   let completed = false;
   let stopped = false;
+  // Whether the client has been told how the reply ended. A failure that
+  // arrives after that has nothing left to tell it, and one that arrives
+  // before it is told like every other failure.
+  let closed = false;
   let released = false;
   let cancellation;
   function release() {
@@ -1480,6 +1748,7 @@ function guardedStream(response, protocol, checkName, endCutShort) {
                 release();
                 controller.enqueue(encoder.encode(ending));
                 controller.close();
+                closed = true;
                 return;
               }
               if (!completed || chat?.size) {
@@ -1496,6 +1765,7 @@ function guardedStream(response, protocol, checkName, endCutShort) {
               stopped = true;
               release();
               controller.close();
+              closed = true;
               return;
             }
             const frame = next.value;
@@ -1534,10 +1804,12 @@ function guardedStream(response, protocol, checkName, endCutShort) {
                 await cancel();
               } catch (cause) {
                 controller.error(cause);
+                closed = true;
                 return;
               }
               controller.enqueue(encoder.encode(frame.raw));
               controller.close();
+              closed = true;
               return;
             }
             // An event after the terminal marker is not part of the reply: the
@@ -1574,13 +1846,19 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             }
           }
         } catch (error) {
-          if (stopped) return;
+          // The client was already told how the reply ended: there is nothing
+          // left to tell it, and writing into a closed stream throws. A
+          // failure that races the stop — the guard stopped reading and had
+          // not written the ending yet — is told below, like every other
+          // failure.
+          if (closed) return;
           stopped = true;
           if (error instanceof GuardError) {
             try {
               await cancel(error);
             } catch (cause) {
               controller.error(cause);
+              closed = true;
               return;
             }
             controller.enqueue(
@@ -1592,24 +1870,51 @@ function guardedStream(response, protocol, checkName, endCutShort) {
               ),
             );
             controller.close();
+            closed = true;
           } else {
             // A failure that is not the guard's own is a transport one: the
             // stream is over either way, and what is left of the body is not
             // something to keep writing into a socket nobody reads — the
             // same rule readBounded follows. Cancel's own failure is not
-            // allowed to replace the error the client has to see, which is
-            // the one that got here.
+            // allowed to replace the error that got here.
             try {
               await cancel(error);
             } catch {
-              /* the original error is the one the client must see */
+              /* the original error is the one that got here */
             }
-            controller.error(error);
+            // An abort is the client's own: it asked for the request to stop,
+            // and the reason it stopped by is a reason it already knows. It is
+            // handed over as it came, and it is not the failure the rule below
+            // is about.
+            if (error?.name === "AbortError") {
+              controller.error(error);
+              closed = true;
+              return;
+            }
+            // The client is told in the shape every other failure is told in,
+            // and what it is told says nothing about the failure: the text of
+            // an internal one (a transport error, a TypeError from the guard's
+            // own code) is the server's business, and a client that reads it
+            // learns the inside of this package for nothing. The raw failure
+            // goes to the server's own log, where it belongs.
+            logFailure(error);
+            controller.enqueue(
+              encoder.encode(
+                encodeEvent(
+                  failure(protocol, "Upstream stream failed", true, "upstream_error"),
+                  protocol === "chat" ? "" : "error",
+                ),
+              ),
+            );
+            controller.close();
+            closed = true;
           }
         }
       },
       async cancel(reason) {
         stopped = true;
+        // The client is gone: it has been told, by leaving.
+        closed = true;
         await cancel(reason);
       },
     },
@@ -1645,12 +1950,20 @@ export async function guardToolResponse(response, protocol, policy, options = {}
   let status = response.status;
   try {
     value = parseJSON(await readBounded(response));
-    checkSnapshots(value, protocol, checkName);
+    // The ids this reply has published. One body is one reply, and a client
+    // keys an item by the id it was handed: two items of one reply under one
+    // word are one item to it.
+    const ids = replyIDs();
+    const checked = checkSnapshots(value, protocol, checkName, ids);
     if (protocol === "chat") {
-      for (const choice of list(value.choices)) {
-        const message = object(choice) ? choice.message : undefined;
-        if (object(message)) ensureCallIDs(list(message.tool_calls));
-      }
+      // Every choice's calls are read together: the id a call is published
+      // under has to be unique in the whole reply, and the names the reply
+      // carries are the ones an invented id has to miss.
+      ensureCallIDs(chatCalls(value), ids);
+    } else {
+      // The id a client answers a kept call by. A whole reply holds every
+      // call of it once, so there are no copies to keep one id for.
+      answerCalls(checked.calls, protocol, ids);
     }
   } catch (error) {
     if (!(error instanceof GuardError)) throw error;

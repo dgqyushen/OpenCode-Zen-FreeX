@@ -10,6 +10,7 @@ import {
   parseProtocolDocs,
 } from "./models.mjs";
 import {
+  anyAbortSignals,
   loadLimitState,
   modelsDevClaims,
   observeRefusedRequest,
@@ -276,13 +277,29 @@ function requirePublic(auth) {
 
 async function readRemote(url, json, headers, callerSignal) {
   const timeout = AbortSignal.timeout(15000);
-  const signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;
-  const response = await fetch(url, { headers, signal });
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new Error(`Model discovery returned HTTP ${response.status}`);
+  // `AbortSignal.any` landed in Node 20.3 and this package declares Node
+  // 18.17, where the call is a TypeError — and it was outside the try that
+  // swallows what a read throws, so on Node 18 every discovery read failed and
+  // no model list was ever read. The two waits are combined by the one helper
+  // that makes the combination where the runtime cannot (limits.mjs).
+  //
+  // The listener it leaves on the caller's own signal is let go of below: that
+  // signal outlives the read, and a listener left on it outlives the wait that
+  // asked for it.
+  const combined = callerSignal ? anyAbortSignals([callerSignal, timeout]) : undefined;
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: combined ? combined.signal : timeout,
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Model discovery returned HTTP ${response.status}`);
+    }
+    return json ? response.json() : response.text();
+  } finally {
+    combined?.dispose();
   }
-  return json ? response.json() : response.text();
 }
 
 function normalizeTools(body, protocol) {
@@ -299,13 +316,36 @@ function normalizeTools(body, protocol) {
   const declared = new Set([...present].filter((value) => typeof value === "string"));
   // The legacy top-level `functions` array is the older way of declaring the
   // same tools, and one a chat host may still use. Its names are declarations,
-  // so they count as declared, and the fill loop below finds them by name: a
-  // name that only arrived through `functions` has no index in `body.tools`, so
-  // it is looked up in the array itself and reworded where it sits rather than
-  // being stood in for. Without that the same tool would go out twice, which is
-  // what the note on `nameOf` says must not happen.
-  const legacy = Array.isArray(body.functions) && protocol === "chat" ? body.functions : [];
+  // so they count as declared.
+  const legacyChat = protocol === "chat" && Array.isArray(body.functions);
+  const legacy = legacyChat ? body.functions : [];
   for (const tool of legacy) if (typeof tool?.name === "string") declared.add(tool.name);
+  // Every declaration goes out in `tools`, which is the array Zen reads, and the
+  // legacy array is dropped. Left where it was, a declaration is one Zen may
+  // not read — a host that declares its tools the old way sent `tools: []` with
+  // its real declarations in an array of its own, while the filling below only
+  // ever pushed into `tools` — and a declaration in both arrays is a tool sent
+  // twice, once with OpenCode's wording and once with the host's.
+  //
+  // The legacy shape is the chat one: `{name, description, parameters}` at the
+  // top level, and `shapeOf` writes it into `tools` as the chat shape every
+  // other declaration there is written in.
+  // A name already in `tools` is not folded in again — it is one declaration
+  // under two spellings, and it goes out once.
+  const at = new Map();
+  body.tools.forEach((tool, index) => {
+    const name = nameOf(tool);
+    if (name && !at.has(name)) at.set(name, index);
+  });
+  for (const tool of legacy) {
+    const name = tool?.name;
+    if (typeof name !== "string" || at.has(name)) continue;
+    at.set(name, body.tools.length);
+    body.tools.push(
+      shapeOf({ name, description: tool.description, parameters: tool.parameters }, protocol),
+    );
+  }
+  if (legacyChat) delete body.functions;
   // Zen takes a request for one generation of OpenCode or the other, and the tools
   // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
   // often than descriptions do, so this survives a rewording that a pinned
@@ -314,6 +354,12 @@ function normalizeTools(body, protocol) {
   // Neither name being there is not the same as 1.x being there: the fallback
   // is the floor described on DEFAULT_GENERATION, and it decides the names this
   // loop then fills in as well as the User-Agent `agentForRequest` composes.
+  //
+  // The generation is read after the legacy declarations are folded in, because
+  // the names a request carries are the names Zen reads and it does not care
+  // which array they arrived in: a host that declares `shell` the old way is
+  // the 2.x host it says it is, and reading the generation from `tools` alone
+  // answered the floor and the 1.x stand-in names for a 2.x request.
   const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
   // Through `profileFor`, not `PROFILES[generation]`: a capture that holds one
   // generation leaves the other key absent, and the direct read fails below on
@@ -321,11 +367,6 @@ function normalizeTools(body, protocol) {
   // has to change, and it is the one thing that error does not say.
   const profile = profileFor(generation);
   const filled = [];
-  const at = new Map();
-  body.tools.forEach((tool, index) => {
-    const name = nameOf(tool);
-    if (name && !at.has(name)) at.set(name, index);
-  });
   for (const [name, spoken] of Object.entries(profile.tools)) {
     const index = at.get(name);
     if (index !== undefined) {
@@ -347,18 +388,6 @@ function normalizeTools(body, protocol) {
     // tokens of a tool it will not call, and they are the first thing a
     // tightened check would otherwise find missing.
     if (!profile.required.includes(name)) continue;
-    // Declared through `functions` rather than `tools`: this host does have the
-    // tool, so it is not one to stand in for. Its wording is still the host's,
-    // though, and Zen reads the wording of a tool it knows by name whichever
-    // array carried it — leaving that one entry as the host wrote it is the
-    // refusal this loop exists to prevent, and it is the entry `explain()`
-    // would then describe wrongly. The legacy shape carries `description` at
-    // the top level, which `setDescription` already handles.
-    const throughFunctions = legacy.find((tool) => tool?.name === name);
-    if (throughFunctions) {
-      setDescription(throughFunctions, spoken.description);
-      continue;
-    }
     filled.push(name);
     // A tool added here has nothing behind it: the agent has no such tool, so a
     // call to it goes to the agent as called and comes back as the agent's own
@@ -400,18 +429,31 @@ function shapeOf(definition, protocol) {
 //
 // The body arrives already read: on this path the refusal has to be read for
 // the window it may name before the message that replaces it is built (see
-// limits.mjs), and a response body can only be read once. So the text is passed
-// in rather than read here, and every reply this function rebuilds is built
-// under headers that describe the bytes it returns. A refusal that is not this
-// route's — or one whose body could not be read at all — is handed on as it
-// arrived.
-function explain(text, source, toolPolicy) {
+// limits.mjs), and a response body can only be read once. So what the reader
+// took is passed in rather than read here — the text and the reader's own
+// answer to "is this the whole body?" — and every reply this function rebuilds
+// is built under headers that describe the bytes it returns. A refusal that is
+// not this route's — or one whose body could not be read at all — is handed on
+// as it arrived.
+function explain(observed, source, toolPolicy) {
   if (source.status !== 403 && source.status !== 426) return source;
   // Zen's free tier names itself in the body. Without the body there is no way
   // to tell its refusal from anybody else's 403, and this is an error path on a
   // request whose caller is waiting, so the answer is passed on rather than
   // guessed at.
+  const text = typeof observed?.text === "string" ? observed.text : null;
   if (text === null) return source;
+  // A body that was not read to its end is a prefix, not the refusal: the
+  // relayed answer says so and carries what was read under `upstream`, and
+  // replacing it here would drop both the fact and the upstream's own words —
+  // and would tell the caller the refusal was complete when it was not.
+  //
+  // The prefix may well name the free tier, and the check below would then
+  // pass; that is not the question. The question is whether what was read is
+  // the whole refusal, and a read that stopped short cannot say so. It is also
+  // the only thing here that decides between two answers: the same 403 read to
+  // its end is explained, and the same 403 read to half of it is relayed.
+  if (observed.ended === false) return source;
   // A 403 that is not Zen's free tier is somebody else's; it is left as sent —
   // its bytes are what arrived, and so are the headers describing them.
   if (source.status === 403 && !text.includes("FreeTierError")) return source;
@@ -452,6 +494,20 @@ let counter = 0;
 // for a session, so newer sorts first), then 14 random base62 characters.
 // Zen's free tier checks a session id has this shape, a small counter
 // included, and answers 403 FreeTierError to one that doesn't (#100).
+//
+// The 48 bits are OpenCode's own field and not a truncation of a wider one.
+// OpenCode's identifier.ts takes six bytes out of the same value — the low 48
+// of it and no more — so the mask below drops the top five bits of
+// `Date.now() * 0x1000` (53 bits today) exactly where OpenCode drops them
+// too, and an id that carried more of the time than OpenCode's does is not one
+// Zen would read as OpenCode's. What the field holds is therefore the time
+// modulo 2^36 ms — 795.4 days — and the counter in its low 12, which is why
+// "newer sorts first" holds inside an epoch and not across one: OpenCode's own
+// ids wrap at the same period, so there is nothing here to make different.
+//
+// Uniqueness is the tail, not the field: 14 random base62 characters are some
+// 83 bits, and two ids of one millisecond and one counter differ there. The
+// field is what Zen reads, and it is what the counter has to stay small for.
 //
 // The counter is the low 12 bits of the id and realSessionID reads it back as
 // a counter, so it is kept inside the 4 bits OpenCode's own counter lives in
@@ -498,7 +554,23 @@ export function sessionID(headers, body) {
       break;
     }
   }
-  if (typeof body.metadata?.session_id === "string") signal ??= body.metadata.session_id;
+  // A name in the body's metadata is a name only when it is not empty.
+  // The guard used to be about the type alone, and an empty string is a string:
+  // it was taken as the conversation's name, and every request carrying
+  // `metadata: { session_id: "" }` was then keyed by `sha256("ses\0")` — one Zen
+  // session for all of them, with its affinity and its quota shared by
+  // conversations that have nothing to do with each other. Measured on
+  // 2026-10-20: two conversations opening differently answered the same id
+  // (ses_ea7d502a1ffe9szowdKaA6Qa5p), which is the one thing the note above
+  // this function says must not happen.
+  //
+  // An empty name is no name, so the request is keyed the way any unnamed one
+  // is — by its opening, or by an id of its own when it has none — and not by a
+  // key every host that sends an empty name shares. The name is taken whole,
+  // not trimmed: a host that spells its conversations differently is naming
+  // them differently, and only a name with nothing in it is no name.
+  if (typeof body.metadata?.session_id === "string" && body.metadata.session_id !== "")
+    signal ??= body.metadata.session_id;
   if (realSessionID(signal)) return signal;
   const messages = body.messages ?? body.input;
   const first = Array.isArray(messages)
@@ -997,7 +1069,7 @@ async function server(_input, options = {}) {
             else if (response.ok) observeServedRequest(body.model, size, declared);
             const answered = relayed(response, observed);
             const guarded = await guardToolResponse(
-              explain(observed?.text ?? null, answered, toolPolicy),
+              explain(observed, answered, toolPolicy),
               protocol,
               toolPolicy,
               { endCutShort: streaming },

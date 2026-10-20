@@ -10,6 +10,11 @@
 //   bun run capture            # writes fingerprint.json
 //   bun run capture -- --dry   # reports what changed, writes nothing
 //
+// A capture that is missing, or that is there and cannot be read as one, is
+// written afresh rather than refused: this is the tool that writes the file,
+// and the command every failure in `core-tools.mjs` names is this one, so a
+// refusal here would leave the reader with a remedy that refuses in turn.
+//
 // Needs opencode on PATH (https://opencode.ai) and bun. Nothing goes to Zen: the
 // OpenCode under test is pointed at a server running here, and the request it
 // makes is the thing being read.
@@ -22,10 +27,19 @@ import { mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROFILES } from "./core-tools.mjs";
 
-const PORT = Number(process.env.CAPTURE_PORT ?? 8791);
-const HERE = import.meta.dir;
+// This module does not import `core-tools.mjs`, and that is the whole of why
+// the remedy in that module's messages can be run: `core-tools` reads the
+// capture at import and throws when it is missing or invalid, so a capture that
+// imported it died before its own body ran — on the very file it is here to
+// repair. It used to import it, for the profile the comparison was made
+// against, and the import was the whole of the failure: `bun run capture` was
+// the answer every message in that module gave, and it could not run.
+//
+// So the capture is read here, from the file that is written, and from nowhere
+// else. One source of truth, and it is the file this script owns.
+
+const PORT = numberFromEnv("CAPTURE_PORT", 8791, process.env, 65535);
 // Where the capture is written, which is this directory unless something else
 // says so: `--fingerprint <path>`, `--fingerprint=<path>` and
 // `CAPTURE_FINGERPRINT` exist so a test can point the write at a scratch file,
@@ -35,6 +49,13 @@ const HERE = import.meta.dir;
 // usually is. Exported, with the argv and environment it reads as parameters, so
 // the one decision that can send a write somewhere unexpected is a test's to pin
 // rather than a reader's to trust.
+//
+// The directory comes from the module's own URL and not from `import.meta.dir`,
+// which is Bun's own: under Node it is `undefined`, and `join(undefined, ...)`
+// throws while this module is still being evaluated — so a Node could not
+// import it at all, and the `import.meta.main` fallback below (the one that
+// exists for the Node older than 22.18) could never be reached.
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const FINGERPRINT = resolve(fingerprintTarget());
 export function fingerprintTarget(argv = process.argv, env = process.env) {
   // Both spellings a command line accepts for an option with a value. Reading
@@ -56,6 +77,33 @@ export function fingerprintTarget(argv = process.argv, env = process.env) {
   // at a directory fails, but a knob that reads as set while naming nothing is
   // worse than one that reads as unset.
   return env.CAPTURE_FINGERPRINT || join(HERE, "fingerprint.json");
+}
+
+// A number from the environment that is not a number is a mistake, and a
+// mistake must not decide how long the child is given: `NaN` as a timeout
+// fires at once, the child is killed before it has made a request, and the run
+// then reports "no request was captured" — a mistyped knob reported as an
+// OpenCode problem. A port outside the range a port can be in fails the same
+// way, inside `Bun.serve`, as an error that says nothing about the variable
+// that was wrong.
+//
+// So the default stands for a value that is not a number, and the variable that
+// was refused is named: a knob that reads as set while it was not is worse than
+// one that is unset, because the run would answer for the default and the
+// reader would be looking at the wrong number.
+//
+// The environment is a parameter and the maximum a second one, so the rule is
+// a test's to pin rather than a reader's to trust — the same reason
+// `fingerprintTarget` takes its argv and its environment.
+export function numberFromEnv(name, fallback, env = process.env, max = Number.POSITIVE_INFINITY) {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || value > max) {
+    console.error(`${name} is not a number this run can use (${JSON.stringify(raw)}); using ${fallback}`);
+    return fallback;
+  }
+  return value;
 }
 
 // The names Zen reads, by generation: 2.x sends `shell` where 1.x sends `bash`
@@ -147,7 +195,12 @@ const KEEP = 1200;
 // prompt or a stalled connection, and this script would then hold the mock
 // server and the temporary config open until somebody noticed: an instrument
 // that waits for ever reads as one that is working.
-const CHILD_TIMEOUT_MS = Number(process.env.CAPTURE_TIMEOUT_MS ?? 120_000);
+//
+// Read through the rule `numberFromEnv` states, so a mistyped value cannot
+// decide it: `NaN` as a timeout fires the watchdog at once, which kills the
+// child before it has made a request and leaves the run to report "no request
+// was captured" — the mistyped knob reported as an OpenCode problem.
+const CHILD_TIMEOUT_MS = numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000);
 
 // Whether this module is the file that was run rather than one the tests
 // import. `import.meta.main` is the direct answer and the one Bun gives, but it
@@ -377,10 +430,41 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   console.log(`tools:  ${Object.keys(tools).join(", ")}  (${generation}, ${protocol})`);
   if (code !== 0) console.log(`(opencode exited ${code}; its request was still captured)`);
 
-  const agent = parseAgent(request.agent, generation);
-  if (agent.providerUtils) agent.providerUtils = { ...PROFILES[generation]?.agent?.providerUtils, [protocol]: agent.providerUtils[protocol] };
+  const agent = parseAgent(request.agent, generation, fingerprint);
+  // The generation comes from the tool names and the agent's shape from the
+  // User-Agent, and nothing said that the two belong together. They come from
+  // the same OpenCode, so they do — unless what was captured is a host that
+  // says one thing and sends another, which is the disagreement Zen refuses
+  // (a 403 FreeTierError) and which is then reported as a wording problem.
+  // Refused here rather than written: a capture that pairs them is a file
+  // every consumer of would carry the disagreement, and the capture is the
+  // one place it can still be seen.
+  const release = !("providerUtils" in agent);
+  if (release !== (generation === "2.x")) {
+    console.error(
+      `the captured User-Agent is a ${release ? "2.x" : "1.x"} one but the tools are ${generation}; not writing`,
+    );
+    process.exit(1);
+  }
 
-  const before = PROFILES[generation];
+  // The baseline is the file that is written, not the copy this process
+  // imported: `--fingerprint` exists so a run can write another file, and a
+  // comparison against the repository's copy describes a file nobody is
+  // writing — a target that holds no such profile was reported as "nothing
+  // changed" and nothing was written, and a target that does differ could be
+  // reported as unchanged. It is also the only place the provider-utils this
+  // capture did not observe can come from: they belong to the target, and the
+  // write replaces the whole profile, so they have to be carried over from
+  // there rather than from anywhere else.
+  //
+  // And the target is read now, at the comparison, rather than when the process
+  // started: a capture takes minutes, and a file edited while it ran is
+  // compared as it is now rather than as it was.
+  const target = readTarget(fingerprint);
+  const before = target.profiles[generation];
+  if (agent.providerUtils) {
+    agent.providerUtils = { ...before?.agent?.providerUtils, [protocol]: agent.providerUtils[protocol] };
+  }
   // The whole profile is compared, not only the tools the new capture happens to
   // carry: the write below replaces `{ agent, required, tools }` entire, so a tool
   // that is no longer captured — or a `required` list that moved — is a change,
@@ -402,6 +486,18 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     console.log(`  required  CHANGED  ${(before?.required ?? []).join(", ")} -> ${required.join(", ")}`);
   if (agent.providerUtils)
     console.log(`  agent  ${agentChanged ? "CHANGED" : "unchanged"}  ${protocol} provider-utils kept separate from the others`);
+  // The anthropic entry is the one a capture cannot take: the anthropic request
+  // shape is refused above, and no free model speaks that protocol, so the
+  // value in the file is one a human has to check when @ai-sdk/anthropic is
+  // bumped. It is said here, after the comparison, because it is about the file
+  // rather than about this run: a capture that cannot check it must not let
+  // the file look as current as the rest of it.
+  if (agent.providerUtils) {
+    const anthropic = agent.providerUtils.anthropic;
+    console.error(
+      `the anthropic provider-utils is the one entry a capture cannot take; no free model speaks that protocol, so ${fingerprint} ${anthropic ? `carries "${anthropic}" as it was` : "carries none, and the value has to be written by hand"} and nothing here can tell whether it is current. It is maintained by hand, and has to be checked when @ai-sdk/anthropic is bumped.`,
+    );
+  }
 
   if (dry) {
     // The agent is named whenever it moved, not only when it is the whole of
@@ -420,19 +516,18 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
     process.exit(0);
   }
 
-  // Read and written after a full capture run, so a failure here is late: it says
-  // what to fix rather than throwing a raw SyntaxError out of the last line.
-  let next;
-  try {
-    next = JSON.parse(readFileSync(fingerprint, "utf8"));
-  } catch (cause) {
-    console.error(`could not read ${fingerprint}: ${cause?.message ?? cause}`);
-    process.exit(1);
-  }
-  if (!next || typeof next !== "object" || Array.isArray(next) || typeof next.profiles !== "object" || next.profiles === null) {
-    console.error(`${fingerprint} has no profiles object; not writing`);
-    process.exit(1);
-  }
+  // The file that is written: the target's own content, with this generation's
+  // profile replaced. The target was read above — it is the baseline — so what
+  // is written is what the target held, with one profile in it replaced.
+  //
+  // What the target held and could not be used — a file that is not JSON, one
+  // with no profiles object — was said out loud when it was read, and the file
+  // is written from scratch in that case. Refusing to write it would leave the
+  // reader with the advice every failure in this repository gives — run `bun
+  // run capture` to write a new one — and that command would refuse in turn,
+  // which is how a broken capture came to be unfixable: the remedy died of the
+  // disease it was the cure for.
+  const next = target.file;
   next.profiles[generation] = nextProfile;
   // Written beside the target and renamed over it: a rename within one directory
   // is atomic, so the window in which an interruption can leave a half-written
@@ -472,6 +567,73 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   );
 }
 
+// The file that is written, read as the baseline it is: the profile this
+// generation had in it, and the file itself, to be written back with that
+// profile replaced.
+//
+// Three shapes come out of a target, and all three have to be usable, because
+// writing a capture is what this script is for and the file it repairs may be
+// the very one every other tool here reads:
+//
+//   a file that holds a capture   - extended; the other profiles are kept
+//   a file that holds no profiles - the profiles written afresh; the rest kept
+//   a file that cannot be read     - written from scratch, and said out loud
+//
+// The last two are not refusals. A refusal would leave the reader with the
+// advice every failure in this repository gives — "run `bun run capture` to
+// write a new one" — and that command would refuse in turn, so a capture that
+// was broken could not be repaired by the tool whose job is to repair it. The
+// file is written either way, and what it held is said out loud, because a
+// file that is replaced without a word is a file nobody knows was there.
+//
+// The predicate is the one `core-tools.mjs` reads a table with, written out
+// again rather than imported: importing that module would take this script
+// down with the very capture it is here to repair, which is the whole of what
+// the missing import above is about. The rule is the same one, so the two
+// files cannot end up disagreeing about what a table is.
+const isTable = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+
+function readTarget(fingerprint) {
+  let text;
+  try {
+    text = readFileSync(fingerprint, "utf8");
+  } catch {
+    // Not there is the ordinary first run; unreadable is a permission problem
+    // or a directory standing where the file belongs, and the write below has
+    // its own say about that.
+    console.log(`no capture at ${fingerprint} to compare against; one will be written from scratch`);
+    return { file: { profiles: {} }, profiles: {} };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    console.error(
+      `the capture at ${fingerprint} is not JSON (${cause?.message ?? cause}); it will be replaced by this capture`,
+    );
+    return { file: { profiles: {} }, profiles: {} };
+  }
+  if (!isTable(parsed)) {
+    console.error(`the capture at ${fingerprint} is not a table of profiles; it will be replaced by this capture`);
+    return { file: { profiles: {} }, profiles: {} };
+  }
+  if (!isTable(parsed.profiles)) {
+    // The file is kept — the note in it, and whatever else it holds — and only
+    // the profiles are written afresh. The old shape of `profiles` is lost: it
+    // was not a table of profiles, so there was nothing in it to keep. A list
+    // is the shape that used to get through: `JSON.stringify` drops a named
+    // property set on an array, so the profile was written and then dropped
+    // again, and the run said it had written a capture.
+    console.error(
+      `the capture at ${fingerprint} holds no profiles object; its profiles will be written afresh and the rest of the file kept`,
+    );
+    const file = { ...parsed, profiles: {} };
+    return { file, profiles: file.profiles };
+  }
+  const file = { ...parsed, profiles: { ...parsed.profiles } };
+  return { file, profiles: file.profiles };
+}
+
 // The parts of the --dry sentence, in the order they are said: the change count
 // when there is one, and "the agent" whenever the agent moved. The two are
 // independent because `changed` never counts the agent — it is the tools and the
@@ -479,18 +641,15 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
 // only the agent moved has a count of zero to say nothing about.
 //
 // `requiredChanged` is deliberately not a parameter, and the reason is worth
-// stating because it looks like an omission. The summary used to be built inline
-// under a guard reading `agentChanged && !requiredChanged`, and that guard cannot
-// be reached from a run: `report` compares against the capture this process
-// imported (`PROFILES`, above) while the list it captures and writes back is the
-// `REQUIRED` literal in this file, so the two are the same list by construction
-// and `requiredChanged` is false for every run that is not a hand-edited
-// fingerprint changing under an already-loaded module. Re-injecting that guard is
-// therefore a behaviour-equivalent mutation of `report`, not a hole in this
-// file's coverage — no fixture can kill it, because the branch does not exist to
-// be taken. What the guard decided is decided here instead, from the two booleans
-// that do vary, and the pair that matters — a count *and* a moved agent — is
-// pinned directly in capture.test.mjs rather than argued about through a run.
+// stating because it looks like an omission: the required list is already in
+// the count. `changed` is the tools that moved, the tools that are gone, and
+// the required list that moved, so a run where the list moved on its own says
+// "1 change(s) would change" and the summary has nothing else to add about it.
+// The guard the summary used to be built under (`agentChanged &&
+// !requiredChanged`) is not re-injected, because what it decided is decided
+// here instead: the summary is built from the two booleans that vary, and the
+// pair that matters — a count *and* a moved agent — is pinned directly in
+// capture.test.mjs rather than argued about through a run.
 export function drySummary({ changed, agentChanged }) {
   return [changed ? `${changed} change(s)` : null, agentChanged ? "the agent" : null].filter(Boolean);
 }
@@ -605,8 +764,11 @@ if (entry) {
 }
 
 // The User-Agent is stored the way agentFor() reads it back, which is not
-// necessarily the same split the raw header used.
-function parseAgent(agent, generation) {
+// necessarily the same split the raw header used. The file is passed in so that
+// the refusal below can name the file to fix: the agent is written by hand into
+// the capture, and a message that named the generation alone would leave the
+// reader to work out which file that was.
+function parseAgent(agent, generation, fingerprint) {
   const twoPart = /^opencode\/(\d[^ ]*) ai-sdk\/provider-utils\/(\S+) (\S+)$/.exec(agent ?? "");
   if (twoPart) {
     const [, opencode, providerUtils, runtime] = twoPart;
@@ -621,6 +783,8 @@ function parseAgent(agent, generation) {
     const [, channel, opencode, client] = threePart;
     return { channel, opencode, client };
   }
-  console.error(`\ncould not read \`${agent}\` as an OpenCode User-Agent; write PROFILES[${generation}].agent by hand`);
+  console.error(
+    `\ncould not read \`${agent}\` as an OpenCode User-Agent; write the ${generation} profile's agent in ${fingerprint} by hand`,
+  );
   process.exit(1);
 }

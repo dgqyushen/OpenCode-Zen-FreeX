@@ -1,5 +1,5 @@
 {
-  "_note": "Captured from a real OpenCode by capture.mjs. Refresh with: bun run capture",
+  "_note": "Captured from a real OpenCode by capture.mjs. Refresh with: bun run capture. The `anthropic` provider-utils is the one entry a capture cannot take, because no free model speaks the anthropic protocol, so that value is maintained by hand and has to be checked when @ai-sdk/anthropic is bumped.",
   "profiles": {
     "1.x": {
       "agent": {

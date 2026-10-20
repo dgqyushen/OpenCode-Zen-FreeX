@@ -198,6 +198,81 @@ test("a capture that carries no profile at all fails at import", async (t) => {
   }
 });
 
+// The cause of that failure is an Error and not the capture it read. A `cause`
+// is what reporters read — `error.cause.stack`, `util.inspect` of it, Bun's
+// own error formatting — and the capture holds every tool description in the
+// file, so handing it over would put all of that into an error log for a
+// failure whose diagnosis is one word long.
+test("the cause of a capture that holds no profiles is an Error, not the capture", async (t) => {
+  const failure = await scratch(t, '{"profiles":{}}')().then(
+    () => assert.fail("importing a copy whose capture holds no profiles must fail"),
+    (error) => error,
+  );
+  assertCaptureFailure(failure);
+  assert.ok(failure.cause instanceof Error, "the cause is an Error");
+  assert.equal(
+    failure.cause?.profiles,
+    undefined,
+    "the cause is not the parsed capture: a reporter reading it would log every description in the file",
+  );
+});
+
+// The two fields every consumer of a profile reads are checked where the
+// profile is handed out, so that a capture that lost them is named instead of
+// failing at the consumer with a TypeError that says nothing — "Cannot convert
+// undefined or null to object" — which is what the capture is here to prevent.
+test("a profile that lost the fields every consumer reads is named", async (t) => {
+  const agent = { channel: "latest", opencode: "2.0.29", client: "cli" };
+  for (const [what, profile, field] of [
+    ["no tools", { required: [], agent }, /tools/],
+    ["a tools list", { tools: [], required: [], agent }, /tools/],
+    ["no required list", { tools: {}, agent }, /required/],
+    ["a required that is not a list", { tools: {}, required: "bash", agent }, /required/],
+  ]) {
+    const { profileFor } = await scratch(
+      t,
+      JSON.stringify({ profiles: { "9.x": profile } }),
+    )();
+    const failure = thrown(() => profileFor("9.x"));
+    assert.ok(failure.message.includes("9.x"), `${what}: names the generation`);
+    assert.match(failure.message, field, `${what}: names the field that is missing`);
+    assertNamesRemedy(failure, what);
+  }
+});
+
+// The release shape is selected by the *absence* of provider-utils, so a
+// present-but-empty one is not a release agent: it is a per-protocol one whose
+// value is malformed, and the release branch used to take it — reporting a
+// capture as "not a release agent", which sends the reader after a `channel` and
+// a `client` the capture never had.
+test("a provider-utils that is there but is not a version is not a release agent", async (t) => {
+  for (const value of ["", false, 0, null]) {
+    const { agentFor: copied } = await scratch(
+      t,
+      JSON.stringify({
+        profiles: {
+          "9.x": {
+            tools: {},
+            required: [],
+            agent: { channel: "latest", opencode: "2.0.29", client: "cli", providerUtils: value },
+          },
+        },
+      }),
+    )();
+    const failure = thrown(() => copied("9.x"));
+    assert.match(
+      failure.message,
+      /per-protocol provider-utils/,
+      `the message names the field: ${JSON.stringify(value)}: ${failure.message}`,
+    );
+    assert.doesNotMatch(
+      failure.message,
+      /not a release agent/,
+      `a present provider-utils is not a release agent: ${JSON.stringify(value)}`,
+    );
+  }
+});
+
 // A caller can genuinely ask for a generation that was never captured, and
 // `undefined` is what `generationOf` returns for a body whose tools name
 // neither, which provider.mjs defaults itself. What has to be named is the
@@ -277,8 +352,15 @@ test("a captured protocol still composes its own User-Agent", () => {
 // check asks only that a profile map is there. A profile that is empty is then
 // named where it is used — the `.agent` of it used to be a TypeError about
 // undefined, exactly like the miss above.
+//
+// The profile carries the two fields every consumer of a profile reads, so
+// that the failure here is the one this case is about — a profile with no
+// `agent` — and not the refusal of a profile that lost its `tools`.
 test("a differently named generation loads, and an empty profile is named", async (t) => {
-  const { agentFor: copied } = await scratch(t, '{"profiles":{"9.x":{}}}')();
+  const { agentFor: copied } = await scratch(
+    t,
+    '{"profiles":{"9.x":{"tools":{},"required":[]}}}',
+  )();
   const failure = thrown(() => copied("9.x"));
   assert.match(failure.message, /9\.x/);
   assertNamesRemedy(failure);
@@ -307,7 +389,10 @@ test("a release profile that does not fill in its User-Agent is named", async (t
     ["no client", { channel: "latest", opencode: "2.0.29" }],
     ["no opencode version", { channel: "latest", client: "cli" }],
   ]) {
-    const { agentFor: copied } = await scratch(t, JSON.stringify({ profiles: { "9.x": { agent } } }))();
+    const { agentFor: copied } = await scratch(
+      t,
+      JSON.stringify({ profiles: { "9.x": { tools: {}, required: [], agent } } }),
+    )();
     const failure = thrown(() => copied("9.x"));
     assert.ok(failure.message.includes("9.x"), `${what}: names the generation`);
     assert.doesNotMatch(failure.message, /opencode\/(undefined|null|5)\//, what);
@@ -337,7 +422,10 @@ test("a per-protocol profile with a field that is not a string is named", async 
       { opencode: "1.19.0", providerUtils: "4.0.23", runtime: "runtime/bun/1.3.14" },
     ],
   ]) {
-    const { agentFor: copied } = await scratch(t, JSON.stringify({ profiles: { "9.x": { agent } } }))();
+    const { agentFor: copied } = await scratch(
+      t,
+      JSON.stringify({ profiles: { "9.x": { tools: {}, required: [], agent } } }),
+    )();
     const failure = thrown(() => copied("9.x", "chat"));
     assert.ok(failure.message.includes("9.x"), `${what}: names the generation`);
     assert.doesNotMatch(failure.message, /provider-utils\/(null|undefined)/, what);
@@ -358,6 +446,8 @@ test("a provider-utils that is a list is refused where it is read", async (t) =>
     JSON.stringify({
       profiles: {
         "9.x": {
+          tools: {},
+          required: [],
           agent: { opencode: "1.19.0", providerUtils: [], runtime: "runtime/bun/1.3.14" },
         },
       },

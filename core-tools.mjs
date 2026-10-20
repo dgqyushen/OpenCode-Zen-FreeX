@@ -25,6 +25,14 @@ const CAPTURE = new URL("./fingerprint.json", import.meta.url);
 // The one remedy every failure below points at, written once: only a capture
 // writes this file, so a message that names a command instead of the file to fix
 // would have to be edited in three places the day that command is renamed.
+//
+// It is a command that still runs when this file is broken, and that is the
+// only thing that makes it a remedy rather than a sentence: `capture.mjs` reads
+// the file it writes and nothing else — it does not import this module — so a
+// capture that is missing or invalid does not stop the command that repairs it
+// from starting. It used to stop it: this module read the capture at import
+// and the capture imported this module, so the remedy died of the disease it
+// was the cure for, and every message below named a command that could not run.
 const REMEDY = "run `bun run capture` to write a new one";
 
 // Every failure in this module is the same shape — what could not be read or
@@ -42,13 +50,17 @@ function captureError(what) {
 // list half of the check.
 const isTable = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 
-// Read once, here, because every answer in this module comes out of it. Guarded
-// because the failure this replaces is a bare ENOENT or SyntaxError thrown out of
-// whichever module imported this one, which reads as *that* module being broken
-// and never names the file to fix. The remedy is the same whatever went wrong,
-// but the diagnosis is not: an unreadable file (EACCES, EISDIR, a directory
-// where a file should be) is neither missing nor invalid JSON, and saying it is
-// sends the reader to a command that cannot fix a permission problem.
+// Read once, here, because every answer in this module comes out of it. Read at
+// import and not on first use, so a capture that is broken is visible before
+// the first request rather than during it: the failure is deterministic and
+// says what to fix, instead of arriving at whichever caller happened to read a
+// profile first. Guarded because the failure this replaces is a bare ENOENT or
+// SyntaxError thrown out of whichever module imported this one, which reads as
+// *that* module being broken and never names the file to fix. The remedy is the
+// same whatever went wrong, but the diagnosis is not: an unreadable file
+// (EACCES, EISDIR, a directory where a file should be) is neither missing nor
+// invalid JSON, and saying it is sends the reader to a command that cannot fix
+// a permission problem.
 function readProfiles() {
   let captured;
   try {
@@ -80,7 +92,13 @@ function readProfiles() {
   if (!isTable(profiles) || !Object.keys(profiles).length) {
     throw new Error(
       captureError(`the capture at ${fileURLToPath(CAPTURE)} has no profiles`),
-      { cause: captured },
+      // The cause is an Error and not the parsed capture. A `cause` is what
+      // reporters read — `error.cause.stack`, `util.inspect` of it, Bun's own
+      // error formatting — and handing it the capture would put every tool
+      // description in the file into an error log, for a failure whose
+      // diagnosis is one word long. The capture is named in the message above;
+      // the cause says what was found rather than what was wanted.
+      { cause: new Error("the capture parsed, but holds no profiles") },
     );
   }
   return profiles;
@@ -144,6 +162,26 @@ export function profileFor(generation) {
       ),
     );
   }
+  // The two fields every consumer of a profile reads: `provider.mjs` walks
+  // `tools` and asks `required` whether a name is one of the ones Zen insists
+  // on, and the gate and the sweep read the same two. A capture that lost
+  // either of them used to fail at the consumer with a TypeError that names
+  // nothing — "Cannot convert undefined or null to object" — and the sentence
+  // that says which capture to write is here, where every caller passes.
+  if (!isTable(profile.tools)) {
+    throw new Error(
+      captureError(
+        `the ${JSON.stringify(generation)} profile in the capture carries no tools table`,
+      ),
+    );
+  }
+  if (!Array.isArray(profile.required)) {
+    throw new Error(
+      captureError(
+        `the ${JSON.stringify(generation)} profile in the capture carries no required list`,
+      ),
+    );
+  }
   return profile;
 }
 
@@ -170,8 +208,13 @@ export function agentFor(generation, protocol = "chat") {
   // The release shape carries no provider-utils at all, and is composed the same
   // way whatever protocol was asked for. The absence is the whole of the test:
   // this is what selects the release branch, and the check below only ever sees
-  // a field that is there.
-  if (!agent.providerUtils) {
+  // a field that is there. Presence and not truthiness: a capture holding
+  // `providerUtils: ""` is not a release agent, it is a per-protocol one whose
+  // value is malformed, and the release branch used to take it — sending the
+  // reader after a `channel` and a `client` the capture never had, which is
+  // the opposite of what this branch's message promises. A value that is there
+  // and is not a table is named by the check below.
+  if (!("providerUtils" in agent)) {
     if (![agent.channel, agent.opencode, agent.client].every(filledIn)) {
       throw new Error(
         captureError(

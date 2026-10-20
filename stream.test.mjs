@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_BYTES, collapseResponse } from "./stream.mjs";
+import { MAX_BYTES, MAX_STREAM_INDEX, collapseResponse } from "./stream.mjs";
 
 const encoder = new TextEncoder();
 // Generous enough that a slow machine still reports a real hang rather than
@@ -96,6 +96,14 @@ async function json(text, protocol, options) {
 
 // The shape a collapsed upstream failure has, wherever one is asserted: the
 // contract lives here once rather than in each test that reads it.
+//
+// The upstream's wording is relayed to the client as it arrived: the 502
+// body carries it unchanged, so an upstream that puts a secret or an
+// internal detail in its error text has it read by whoever asked for the
+// reply. The suite pins that as it stands — the wording is the one thing
+// the client can act on — and the bound that keeps the text from growing
+// without end is pinned beside it ("an upstream error longer than the bound
+// is cut short"). A redaction would have to be written here as well.
 function assertProtocolError(body, protocol, message) {
   assert.equal(body.error.type, "upstream_error");
   if (message instanceof RegExp) assert.match(body.error.message, message);
@@ -604,6 +612,73 @@ test("SSE supports CR-only line endings", async () => {
     { chunkSize: 1 },
   );
   assert.equal(body.choices[0].message.content, "ok");
+});
+
+// The framing dispatches an event on an empty line, so a stream whose last
+// event was not followed by one — `data: [DONE]\n`, or a last line with no
+// newline at all — left that event undispatched. The completion marker among
+// it was never read, the reply was answered with a 502, and the text the
+// stream had already delivered was thrown away with it (measured on the same
+// bytes: two newlines answered 200 with the reply, one newline answered 502
+// with nothing). The pending event is dispatched at the end of the stream,
+// which the event-stream format does not do and this file does.
+//
+// What that does not make is half an event acceptable: bytes that are not a
+// whole event fail as they always have, and a stream cut short before its
+// marker still fails with the completion it never reported — the
+// distinction provider.mjs and tool-response.mjs read the same two cases
+// apart by.
+test("a stream that ends without its blank line still answers the reply it carried", async () => {
+  // The stream as the upstream wrote it, with the framing it left off.
+  const ending = (text, last) => text.replace(/\n\n$/, last);
+  const chat = event({ choices: [{ index: 0, delta: { content: "hello" } }] });
+  for (const last of ["\n", ""]) {
+    const response = await collapseResponse(
+      sse(ending(`${chat}${event("[DONE]")}`, last)),
+      "chat",
+    );
+    assert.equal(response.status, 200, `a Chat stream ending in ${JSON.stringify(last)} is a whole reply`);
+    assert.equal((await response.json()).choices[0].message.content, "hello");
+  }
+  // The protocols that end on their own terminal event answer the same way.
+  const responses =
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "hello",
+    }) +
+    event(
+      { type: "response.completed", response: { id: "r", status: "completed", output: [] } },
+      "response.completed",
+    );
+  for (const last of ["\n", ""]) {
+    const response = await collapseResponse(sse(ending(responses, last)), "responses");
+    assert.equal(
+      response.status,
+      200,
+      `a Responses stream ending in ${JSON.stringify(last)} is a whole reply`,
+    );
+    assert.equal((await response.json()).output[0].content[0].text, "hello");
+  }
+  const messages =
+    event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) +
+    event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } }) +
+    event({ type: "message_stop" }, "message_stop");
+  for (const last of ["\n", ""]) {
+    const response = await collapseResponse(sse(ending(messages, last)), "anthropic");
+    assert.equal(
+      response.status,
+      200,
+      `a Messages stream ending in ${JSON.stringify(last)} is a whole reply`,
+    );
+    assert.equal((await response.json()).content[0].text, "hello");
+  }
+  // A stream cut short in the middle of an event is still a failure, and a
+  // stream cut short before its marker is still one: the reply that was
+  // never completed is not a whole one.
+  await failure(`${chat}data: {"choices":[{"index":0,"delta":{"content":"hel`, "chat", /JSON/);
+  await failure(chat, "chat", /completion/);
 });
 
 test("Responses uses the complete final response without replacing authoritative fields", async () => {
@@ -1740,6 +1815,219 @@ test("Responses skips a snapshot entry that is not an item, instead of failing t
   }
 });
 
+// The place a part takes in an item is the upstream's own number, and an
+// array written at that number holds a hole for every place between: one
+// frame of a hundred bytes answered a reply of 327 821 bytes, every hole
+// written as a null, and the limit that bounds the bytes read says nothing
+// about a reply a thousand times the stream that described it (measured:
+// 304 bytes of SSE, 327 821 bytes of reply). The parts are held by the place
+// the upstream gave them, and the reply is written dense.
+test("Responses writes a far-off content index as a part, not as a hole-filled array", async () => {  const text =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "m", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.content_part.added",
+      output_index: 0,
+      content_index: 65535,
+      part: { type: "output_text", text: "kept", annotations: [] },
+    }) +
+    event({
+      type: "response.reasoning_summary_part.added",
+      output_index: 0,
+      summary_index: 65535,
+      part: { type: "summary_text", text: "thought" },
+    }) +
+    event(
+      { type: "response.completed", response: { id: "r", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const response = await collapseResponse(sse(text), "responses");
+  assert.equal(response.status, 200);
+  const raw = await response.text();
+  const body = JSON.parse(raw);
+  assert.deepEqual(body.output[0].content, [
+    { type: "output_text", text: "kept", annotations: [] },
+  ]);
+  assert.deepEqual(body.output[0].summary, [{ type: "summary_text", text: "thought" }]);
+  assert.doesNotMatch(raw, /null/, "a hole among the parts was written as a null");
+  assert.ok(
+    raw.length < 1024,
+    `a reply of ${raw.length} bytes for a stream of ${text.length} bytes`,
+  );
+});
+
+// The bound an upstream-stated index is read under, and it is exported because
+// the guard in `tool-response.mjs` reads the same number: the two paths over
+// one stream have to accept and refuse the same indexes, and two copies of the
+// number are two answers waiting to drift. This pins the number the collapse
+// path refuses above, so the two files cannot disagree about it without this
+// going red.
+test("the index bound is the one the guard reads", async () => {
+  assert.equal(MAX_STREAM_INDEX, 65535);
+  const text =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "m", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.content_part.added",
+      output_index: 0,
+      content_index: MAX_STREAM_INDEX + 1,
+      part: { type: "output_text", text: "too far", annotations: [] },
+    });
+  const response = await collapseResponse(sse(text), "responses");
+  assert.equal(response.status, 502, "an index above the bound was read");
+});
+
+// A snapshot that merely weighs something was taken for a whole view of the
+// accumulation, and the text the deltas had delivered went with it:
+// `{content: [{}]}` weighs one part by its length, and it is a part with no
+// text in it at all. A snapshot holding one character where the accumulation
+// holds a sentence is the same view. A snapshot stands in only where it is a
+// whole view of the accumulation: a field it carries in a shorter form than
+// the accumulation held is a partial view of it, and the accumulation stands.
+test("Responses keeps what a snapshot that carries less would discard", async () => {
+  const delivered =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "m", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "Hello world",
+    });
+  for (const [shape, item] of [
+    ["a part with no text", { id: "m", type: "message", role: "assistant", content: [{}] }],
+    [
+      "one character of the text",
+      { id: "m", type: "message", role: "assistant", content: [{ type: "output_text", text: "H" }] },
+    ],
+  ]) {
+    const body = await json(
+      delivered +
+        event({ type: "response.output_item.done", output_index: 0, item }) +
+        event(
+          { type: "response.completed", response: { id: "r", status: "completed", output: [] } },
+          "response.completed",
+        ),
+      "responses",
+    );
+    assert.equal(
+      body.output[0].content[0].text,
+      "Hello world",
+      `${shape} replaced the text the deltas delivered`,
+    );
+  }
+});
+
+// A terminal that carries a list of its own was taken for a whole view of the
+// reply, and its list replaced the accumulated one: a gateway that reports
+// the last item only answered 200 with one item where the stream carried two,
+// and the earlier one was gone with no word. The terminal's list is a whole
+// view only where it holds as many of the stream's items as the stream
+// delivered and names them; otherwise the accumulation stands in for the
+// collection the terminal lost.
+test("Responses keeps the items a terminal named fewer of than the stream carried", async () => {
+  const two =
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "a", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "first",
+    }) +
+    event({
+      type: "response.output_item.added",
+      output_index: 1,
+      item: { id: "b", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.output_text.delta",
+      output_index: 1,
+      content_index: 0,
+      delta: "second",
+    });
+  const last = {
+    id: "b",
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text: "second", annotations: [] }],
+  };
+  // The terminal names one item of the two the stream carried.
+  const fewer = await json(
+    two +
+      event(
+        { type: "response.completed", response: { id: "r", status: "completed", output: [last] } },
+        "response.completed",
+      ),
+    "responses",
+  );
+  assert.equal(fewer.output.length, 2, "an item the stream carried was dropped");
+  assert.deepEqual(fewer.output.map((item) => item.id), ["a", "b"]);
+  assert.equal(fewer.output[0].content[0].text, "first");
+  // And a terminal that names as many of them as the stream carried is the
+  // whole view it says it is.
+  const all = await json(
+    two +
+      event(
+        {
+          type: "response.completed",
+          response: {
+            id: "r",
+            status: "completed",
+            output: [
+              { id: "a", type: "message", role: "assistant", content: [{ type: "output_text", text: "first", annotations: [] }] },
+              last,
+            ],
+          },
+        },
+        "response.completed",
+      ),
+    "responses",
+  );
+  assert.equal(all.output.length, 2);
+  assert.deepEqual(all.output.map((item) => item.id), ["a", "b"]);
+});
+
+// `typeof [] === "object"`, so a terminal carrying a list was read as a reply
+// object: the reply was answered with that bare list as its whole body, and
+// every item the stream had accumulated was gone with it. A list is not a
+// reply object, and stands in for nothing — the same reading every snapshot
+// in this file gets.
+test("Responses reads a terminal whose response is a list as no reply object", async () => {
+  const body = await json(
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "m", type: "message", role: "assistant", content: [] },
+    }) +
+      event({
+        type: "response.output_text.delta",
+        output_index: 0,
+        content_index: 0,
+        delta: "kept",
+      }) +
+      event(
+        { type: "response.completed", response: [{ id: "m", type: "message" }] },
+        "response.completed",
+      ),
+    "responses",
+  );
+  assert.equal(body.output[0].content[0].text, "kept", "the accumulated item was lost");
+  assert.ok(Array.isArray(body.output), "the reply is a response, not a list of them");
+});
+
 // A frame that names a place is a statement about where its item sits, and one
 // the stream has already placed answers that frame: the item is updated, not
 // opened a second time. Opening a second one answered 200 with two entries
@@ -1924,6 +2212,41 @@ test("Anthropic takes a message_start's content only when it is a list of blocks
       body.content,
       [{ type: "text", text: "kept" }],
       `${shape}: the message_start's content replaced the blocks the stream filled in`,
+    );
+  }
+});
+
+// The message itself was spread onto the body with no shape check, while the
+// Responses accumulator takes the very same kind of snapshot through
+// `isSnapshotObject` for exactly this reason: spread as it stood, a string's
+// characters became the reply's own keys, so the reply answered 200 carrying
+// keys the upstream never named and no id at all. A message that is not an
+// object stands in for nothing.
+test("Anthropic takes a message_start's message only when it is an object", async () => {
+  for (const [shape, message] of [
+    ["a string", "not a message"],
+    ["a list", [{ id: "m" }]],
+    ["a number", 7],
+  ]) {
+    const body = await json(
+      event({ type: "message_start", message }, "message_start") +
+        event(
+          { type: "content_block_start", index: 0, content_block: { type: "text", text: "kept" } },
+          "content_block_start",
+        ) +
+        event({ type: "message_stop" }, "message_stop"),
+      "anthropic",
+    );
+    assert.deepEqual(
+      Object.keys(body).filter((key) => /^\d+$/.test(key)),
+      [],
+      `${shape}: the message's own entries became keys of the reply`,
+    );
+    assert.equal(body.id, undefined, `${shape}: the reply carries an id the upstream never named`);
+    assert.deepEqual(
+      body.content,
+      [{ type: "text", text: "kept" }],
+      `${shape}: the blocks the stream filled in did not stand`,
     );
   }
 });
@@ -2306,7 +2629,42 @@ test("protocol-specific finish reasons without terminal events remain truncated"
     "anthropic",
     /completion/,
   );
-  await failure("data: [DONE]\n", "chat", /completion/);
+  // A Chat stream that carries content and no marker was cut short, and a
+  // collapsed reply that was cut short fails: the client can ask again. The
+  // marker is what ends a Chat stream, and a marker that arrives without its
+  // blank line is still the marker (the test below).
+  await failure(
+    event({ choices: [{ index: 0, delta: { content: "partial" } }] }),
+    "chat",
+    /completion/,
+  );
+});
+
+// The upstream's own error text is answered to the client as it arrived — the
+// wording is the one thing the client can act on, and the suite pins it —
+// but it is bounded: an upstream error may carry a provider's internals, a
+// fragment of the request or a credential in a URL, and the 502 body is read
+// by whoever asked for the reply. The bound is a length and not a
+// redaction: what the upstream said about its own failure stays readable.
+test("an upstream error longer than the bound is cut short", async () => {
+  const long = "x".repeat(4096);
+  for (const [shape, text] of [
+    ["an error event", event({ error: { message: long } })],
+    ["an error message", event({ message: long }, "error")],
+    ["plain text", event(long, "error")],
+  ]) {
+    const response = await collapseResponse(sse(text), "chat");
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.ok(
+      body.error.message.length <= 513,
+      `${shape}: the message is ${body.error.message.length} characters long`,
+    );
+    assert.ok(
+      body.error.message.startsWith("x"),
+      `${shape}: the bound cut the beginning of the message, not its end`,
+    );
+  }
 });
 
 test("a [DONE] marker ends a non-chat stream only where it already ended", async () => {
@@ -2592,6 +2950,47 @@ test("bounded buffering also counts many small completed events", async () => {
     `pulled ${source.pulls()} chunks before the buffer limit`,
   );
   assert.equal(cancelled, true);
+});
+
+// The limit bounds the bytes read; the reply held in memory is a reply too,
+// and one larger than the limit is not answered: the reply is what is held,
+// and a body a thousand times the stream that described it is held like any
+// other (measured before the parts were held by the place the upstream gave
+// them: 304 bytes of SSE, 327 821 bytes of reply).
+//
+// The reply of a chat stream is its content and a fixed number of bytes
+// around it, and that number is measured here from a small stream rather than
+// assumed: the reply of a stream of a million characters says how much the
+// reply is larger than the stream, and the stream below is built to be
+// inside the limit while its reply is over it.
+test("a reply larger than the limit is refused, though the stream that produced it was inside it", { timeout: 60_000 }, async () => {
+  const chat = (content) => event({ choices: [{ index: 0, delta: { content } }] }) + event("[DONE]");
+  const measured = await collapseResponse(sse(chat("x".repeat(1000))), "chat");
+  const overhead = (await measured.text()).length - 1000;
+  assert.ok(overhead > 64, "the reply is larger than the stream that described it");
+  const text = chat("x".repeat(MAX_BYTES - overhead + 1));
+  assert.ok(text.length < MAX_BYTES, `the stream itself is ${text.length} bytes`);
+  // The bytes are handed out in one piece: a reply of this size is not read a
+  // few bytes at a time.
+  const bytes = encoder.encode(text);
+  const response = await collapseResponse(
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+    "chat",
+  );
+  assert.equal(response.status, 502, "a reply over the limit is not answered");
+  await assertProtocolError(
+    await response.json(),
+    "chat",
+    new RegExp(`${MAX_BYTES / (1024 * 1024)} MiB`),
+  );
 });
 
 test("read failures after a completion marker are not swallowed", async () => {

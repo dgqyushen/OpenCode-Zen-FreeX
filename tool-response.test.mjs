@@ -294,9 +294,15 @@ function parse(text) {
     });
 }
 // The shape of a guard failure, and the code that says which failure it was:
-// only a call of no tool the agent has is an undeclared one.
+// only a call of no tool the agent has is an undeclared one. Every protocol
+// carries the code: the guard computes it and used to drop it for the chat
+// and the Messages arm, and a client on those two could not tell an
+// undeclared tool from a size limit or a transport failure.
 function assertError(protocol, data, stream = true, code = "upstream_error") {
-  if (protocol === "chat") assert.equal(data.error.type, "upstream_error");
+  if (protocol === "chat") {
+    assert.equal(data.error.type, "upstream_error");
+    assert.equal(data.error.code, code);
+  }
   if (protocol === "responses") {
     if (stream) {
       assert.equal(data.type, "error");
@@ -309,6 +315,7 @@ function assertError(protocol, data, stream = true, code = "upstream_error") {
   if (protocol === "anthropic") {
     assert.equal(data.type, "error");
     assert.equal(data.error.type, "api_error");
+    assert.equal(data.error.code, code);
   }
   assert.equal(typeof (data.message ?? data.error?.message), "string");
 }
@@ -344,6 +351,21 @@ async function withTimeout(promise, ms = 5000) {
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+// The server's own log, read back: the guard writes a failure it does not
+// tell the client in full there, and a test reads what it wrote. The sink is
+// put back whatever the run does.
+async function withLog(run) {
+  const logged = [];
+  const sink = console.error;
+  console.error = (...args) => {
+    logged.push(args.map((value) => String(value)).join(" "));
+  };
+  try {
+    return { logged, value: await run() };
+  } finally {
+    console.error = sink;
   }
 }
 // One factory for every upstream mock below: a Response whose body is a
@@ -729,7 +751,17 @@ for (const protocol of protocols) {
     const result = await guardToolResponse(source.response, protocol, policy);
     const frames = parse(await withTimeout(result.text()));
     assert.equal(frames.length, 1);
-    assertError(protocol, frames[0].data);
+    // The code says which failure it was: the Messages arm's refusal is a
+    // call the guard cannot name at all (an undeclared one), the other two an
+    // unsupported kind of call. The Messages arm used to be told the same as
+    // the other two, the code was dropped for it, and a client could not tell
+    // the two failures apart.
+    assertError(
+      protocol,
+      frames[0].data,
+      true,
+      protocol === "anthropic" ? "undeclared_tool" : "upstream_error",
+    );
     if (protocol !== "chat") assert.equal(frames[0].name, "error");
     assert.equal(cancelled, true);
     assert.equal(source.response.body.locked, false);
@@ -910,6 +942,65 @@ for (const protocol of protocols) {
     }
   });
 
+  // The framing of the last event of a stream. The event-stream format
+  // dispatches an event on an empty line and discards what is left at the end
+  // of the stream; this guard does not, and neither does stream.mjs's
+  // collapse path: an event whose lines are whole is an event, and only the
+  // empty line that would dispatch it is missing. The guard read that as a
+  // stream cut inside an event, and a reply that had been delivered whole was
+  // answered with a 502 that threw the text away (measured on the same
+  // bytes: two newlines answered 200 with the reply, one newline answered 502
+  // with nothing — and the 502 was the guard's own, not the collapse path's).
+  test(`${protocol}: a whole last event is read though no empty line follows it`, async () => {
+    const whole = event(streamSnapshot(protocol, ["bash"])) + terminal(protocol).replace(/\n\n$/, "\n");
+    const guarded = await guardToolResponse(sse(whole), protocol, policy);
+    assert.equal(guarded.status, 200, `${protocol}: a whole reply was refused`);
+    const text = await guarded.text();
+    assert.deepEqual(callsIn(protocol, frameData(text)), ["Bash"], `${protocol}: the call was lost`);
+    // The deployment path: the collapse path over the guard's own bytes
+    // answers the same reply.
+    const collapsed = await collapseResponse(sse(text), protocol);
+    assert.equal(collapsed.status, 200, `${protocol}: the collapsed copy refused it`);
+    assert.deepEqual(
+      callsIn(protocol, [(await collapsed.json())]),
+      ["Bash"],
+      `${protocol}: the collapsed copy lost the call`,
+    );
+  });
+
+  // The same reply, one framing difference further: the last line arrives
+  // without even its terminator. The bytes of the line are whole, and the
+  // event they state is whole — the completion marker is the upstream's own end
+  // of the reply — so it is an event, and the two paths over one stream answer
+  // one reply. The question is about the content, not about the framing: a line
+  // cut in the middle of a JSON is not an event, and that is the other half
+  // below.
+  test(`${protocol}: a whole last event is read though no terminator follows it`, async () => {
+    const whole = event(streamSnapshot(protocol, ["bash"])) + terminal(protocol).replace(/\n\n$/, "");
+    const guarded = await guardToolResponse(sse(whole), protocol, policy);
+    assert.equal(guarded.status, 200, `${protocol}: a whole reply was refused`);
+    const text = await guarded.text();
+    assert.deepEqual(callsIn(protocol, frameData(text)), ["Bash"], `${protocol}: the call was lost`);
+    const collapsed = await collapseResponse(sse(text), protocol);
+    assert.equal(collapsed.status, 200, `${protocol}: the collapsed copy refused it`);
+  });
+
+  // The other half of that rule: a stream cut in the middle of its last
+  // event is still a cut one. Half a JSON is not an event, and the failure
+  // says which of the two it is.
+  test(`${protocol}: a last event cut in the middle still fails, and says it was cut`, async () => {
+    const cut = event(streamSnapshot(protocol, ["bash"])) + 'data: {"unfinished":';
+    const guarded = await guardToolResponse(sse(cut), protocol, policy);
+    const frames = parse(await guarded.text());
+    const last = frames.at(-1).data;
+    assertError(protocol, last);
+    assert.match(
+      last.message ?? last.error?.message ?? "",
+      /ended inside an event/,
+      `${protocol}: the failure does not say the stream was cut inside an event`,
+    );
+  });
+
   test(`${protocol}: downstream cancellation propagates its reason without pre-reading`, async () => {
     const reason = new Error("client stopped");
     let received;
@@ -924,8 +1015,43 @@ for (const protocol of protocols) {
     assert.equal(source.response.body.locked, false);
   });
 
-  test(`${protocol}: transport read failures preserve the original exception`, async () => {
-    const cause = new DOMException("upstream aborted", "AbortError");
+  test(`${protocol}: a transport failure is told in the guard's own shape, not handed over raw`, async () => {
+    const cause = new TypeError("upstream aborted");
+    const source = new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(cause);
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const result = await guardToolResponse(source, protocol, policy);
+    const { logged } = await withLog(async () => {
+      const text = await result.text();
+      // The client reads a failure it can parse, and not the text of the
+      // failure inside the guard: an aborted body told it nothing at all, and
+      // the message of an internal failure reached it as it came.
+      assertError(protocol, parse(text).at(-1).data);
+      assert.ok(
+        !text.includes("upstream aborted"),
+        `the internal failure reached the client: ${text}`,
+      );
+    });
+    // The raw failure is the server's own business, and the server's own log
+    // is where it went.
+    assert.ok(
+      logged.some((line) => line.includes("upstream aborted")),
+      `the server's log did not keep the raw failure: ${logged.join(" | ")}`,
+    );
+    assert.equal(source.body.locked, false);
+  });
+
+  // The other kind of failure that is not the guard's own: the client asked
+  // for the request to stop, and the reason it stopped by is a reason it
+  // already knows. It is handed over as it came, and it is not the failure
+  // the shape above is about.
+  test(`${protocol}: an abort the client asked for is handed over as it came`, async () => {
+    const cause = new DOMException("The operation was aborted.", "AbortError");
     const source = new Response(
       new ReadableStream({
         pull(controller) {
@@ -943,7 +1069,8 @@ for (const protocol of protocols) {
     const cause = new TypeError("terminated");
     const body = failingBody(cause);
     const result = await guardToolResponse(body.response, protocol, policy);
-    await assert.rejects(result.text(), (error) => error === cause);
+    const { value: text } = await withLog(() => result.text());
+    assertError(protocol, parse(text).at(-1).data);
     // The release alone left what was left of the body writing into a socket
     // nobody reads; the cancel is what stops it, and it carries the failure.
     assert.deepEqual(body.cancellations, [cause]);
@@ -956,7 +1083,18 @@ for (const protocol of protocols) {
       throw new Error("cancel failed");
     });
     const result = await guardToolResponse(body.response, protocol, policy);
-    await assert.rejects(result.text(), (error) => error === cause);
+    const { logged } = await withLog(() => result.text());
+    // The cancel's own failure does not stand in for the one that got here:
+    // the client is told the failure in the shape every other failure is
+    // told in, and the server's log keeps the one that got here.
+    assert.ok(
+      logged.some((line) => line.includes("terminated")),
+      `the server's log did not keep the raw failure: ${logged.join(" | ")}`,
+    );
+    assert.ok(
+      !logged.some((line) => line.includes("cancel failed")),
+      `the cancel's failure took the transport failure's place: ${logged.join(" | ")}`,
+    );
     assert.equal(body.released, true);
   });
 
@@ -2665,6 +2803,119 @@ test("chat: an invented call id misses the ids the reply already placed", async 
   );
 });
 
+// The ids a reply holds are the reply's, not one list's. Both places a call
+// is published hand the guard one choice's tool_calls at a time, and the set
+// the ids were read into held that list alone: a reply whose upstream names
+// its calls `call_1`, `call_2` in one choice and leaves a call of another
+// unnamed handed that call the id of the first — two calls of one reply under
+// one id, and a client keys its results by the id, so one call's result was
+// read as the other's. The whole reply's names are read before any id is
+// invented, and an invented one misses all of them.
+test("chat: an invented call id misses the ids the reply's other choices placed", async () => {
+  const named = (id, index, name) => ({
+    index,
+    id,
+    type: "function",
+    function: { name, arguments: "{}" },
+  });
+  const chatIdsOf = (values) =>
+    values
+      .flatMap((data) => data.choices ?? [])
+      .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
+      .map((call) => call.id);
+  // The counter's own value, so the reply below can hold the id the counter
+  // is about to invent.
+  const probe = await (
+    await guardToolResponse(
+      sse(event(chat({ tool_calls: [named(null, 0, "bash")] })) + terminal("chat")),
+      "chat",
+      policy,
+    )
+  ).text();
+  const last = Number(/(\d+)$/.exec(chatIdsOf(frameData(probe))[0] ?? "")?.[1]);
+  assert.ok(Number.isSafeInteger(last), `an invented id is readable: ${probe}`);
+  const held = `call_${last + 1}`;
+  const body = {
+    choices: [
+      { message: { role: "assistant", tool_calls: [named(held, 0, "bash")] } },
+      { message: { role: "assistant", tool_calls: [named(null, 0, "read")] } },
+    ],
+  };
+  const out = await (await guardToolResponse(Response.json(body), "chat", policy)).json();
+  const ids = out.choices.flatMap((choice) => choice.message.tool_calls.map((call) => call.id));
+  assert.equal(ids.length, 2, "both calls are kept");
+  assert.equal(new Set(ids).size, 2, `two calls of one reply share an id: ${ids.join(", ")}`);
+  assert.notEqual(ids[1], held, "the invented id is one the reply already placed");
+});
+
+// The same reply as a stream: the two choices are flushed one after the
+// other, and the id invented for the first is published before the second is
+// read. The two must still be two ids, or the client keys two calls by one
+// word.
+test("chat: a streamed reply's invented id misses the id its other choice placed", async () => {
+  const named = (id, index, name) => ({
+    index,
+    id,
+    type: "function",
+    function: { name, arguments: "{}" },
+  });
+  const chatIdsOf = (values) =>
+    values
+      .flatMap((data) => data.choices ?? [])
+      .flatMap((choice) => (choice.message ?? choice.delta)?.tool_calls ?? [])
+      .map((call) => call.id);
+  const probe = await (
+    await guardToolResponse(
+      sse(event(chat({ tool_calls: [named(null, 0, "bash")] })) + terminal("chat")),
+      "chat",
+      policy,
+    )
+  ).text();
+  const last = Number(/(\d+)$/.exec(chatIdsOf(frameData(probe))[0] ?? "")?.[1]);
+  assert.ok(Number.isSafeInteger(last), `an invented id is readable: ${probe}`);
+  const held = `call_${last + 1}`;
+  const text =
+    event(chat({ tool_calls: [named(null, 0, "bash")] }, null, 0)) +
+    event(chat({ tool_calls: [named(held, 0, "read")] }, null, 1)) +
+    terminal("chat");
+  const values = frameData(await (await guardToolResponse(sse(text), "chat", policy)).text());
+  const ids = chatIdsOf(values);
+  assert.equal(ids.length, 2, "both calls are kept");
+  assert.equal(new Set(ids).size, 2, `two calls of one reply share an id: ${ids.join(", ")}`);
+});
+
+// The id of a call left out is the word a Responses client keys the note in
+// its place by, and the place a call holds is the index inside one container:
+// a call in `output[0]` and a call in `output[1].content[0]` are both at 0 and
+// both became `msg_dropped_0` — one item to the client, and the second note
+// was never read. A word the reply already holds is missed, and the call is
+// given one of the guard's own.
+test("Responses: two dropped calls in two containers are two items", async () => {
+  const body = {
+    output: [
+      { type: "function_call", name: "", arguments: "{}" },
+      { type: "message", content: [{ type: "function_call", name: "", arguments: "{}" }] },
+    ],
+  };
+  const response = await guardToolResponse(Response.json(body), "responses", policy);
+  assert.equal(response.status, 200);
+  const items = (await response.json()).output;
+  const notes = [
+    items[0],
+    items[1].content.find((item) => item.type === "message"),
+  ].filter(Boolean);
+  assert.equal(notes.length, 2, "both calls were left out");
+  assert.deepEqual(
+    notes.map((note) => note.content[0].text),
+    [droppedNote(""), droppedNote("")],
+  );
+  assert.equal(
+    new Set(notes.map((note) => note.id)).size,
+    2,
+    `two notes of one reply share an id: ${notes.map((note) => note.id).join(", ")}`,
+  );
+});
+
 // A delta that carries `tool_calls: []` is not a call of anything: a gateway
 // re-emitting the shape with a role-only delta sends one, and no call is
 // being waited for. Reading it as a call opened a round with nothing in it —
@@ -3945,4 +4196,114 @@ test("a declared name of separators only is never handed another call (#76 follo
 test("chat: a frame that carries no choices reads as no calls", () => {
   assert.deepEqual(namesIn("chat", {}), []);
   assert.deepEqual(namesIn("chat", { choices: [] }), []);
+});
+
+// The bound stream.mjs's `index` reads (65535). The two paths over one
+// stream have to refuse the same indexes: this path took any safe integer
+// and refused only the negative ones, so a chat frame whose choice sat at
+// 70000 was published by the guard and refused by the collapse path — one
+// upstream, two answers, and a streaming client and one that reads no stream
+// told different things.
+test("chat: an index above the bound the collapse path reads is refused on both paths", async () => {
+  const text =
+    event({
+      id: "chatcmpl-1",
+      choices: [{ index: 70000, delta: { tool_calls: [call("bash")] } }],
+    }) + terminal("chat");
+  const guarded = await guardToolResponse(sse(text), "chat", policy);
+  const frames = parse(await guarded.text());
+  assertError("chat", frames.at(-1).data);
+  assert.match(
+    frames.at(-1).data.error?.message ?? "",
+    /Invalid upstream tool index/,
+    "the refusal does not say which index was refused",
+  );
+  // The collapse path over the same bytes refuses it too.
+  const collapsed = await collapseResponse(sse(text), "chat");
+  assert.equal(collapsed.status, 502, "the collapse path took the index the guard refused");
+});
+
+// The gap MAINTAINING.md records: the ids a client answers a call by were
+// minted for the chat shape only, so a Responses item and a Messages block
+// that carried none went out as they came — no id, no call_id — and both
+// protocols require the field. The client sends its result with the id it
+// was handed, and there was none.
+test("Responses and Messages: a call that carries no id leaves with one to answer it by", async () => {
+  const responses = await guardToolResponse(
+    Response.json({ output: [{ type: "function_call", name: "bash", arguments: "{}" }] }),
+    "responses",
+    policy,
+  );
+  assert.equal(responses.status, 200);
+  const item = (await responses.json()).output[0];
+  assert.ok(
+    typeof item.call_id === "string" && item.call_id !== "",
+    `the call left with no id to answer it with: ${JSON.stringify(item)}`,
+  );
+  const messages = await guardToolResponse(
+    Response.json({
+      type: "message",
+      content: [{ type: "tool_use", name: "bash", input: {} }],
+    }),
+    "anthropic",
+    policy,
+  );
+  assert.equal(messages.status, 200);
+  const block = (await messages.json()).content[0];
+  assert.ok(
+    typeof block.id === "string" && block.id !== "",
+    `the call left with no id to answer it with: ${JSON.stringify(block)}`,
+  );
+});
+
+// The id is minted once for the call: the frame that opens it, the frame that
+// closes it and the copy inside the terminal response are one call to the
+// client, and two ids for it are two calls.
+test("Responses: the id a stream invents is one id across the copies of the call", async () => {
+  const item = { type: "function_call", name: "bash", arguments: "" };
+  const done = { ...item, arguments: "{}", status: "completed" };
+  const text =
+    event(
+      { type: "response.output_item.added", output_index: 0, item },
+      "response.output_item.added",
+    ) +
+    event(
+      { type: "response.output_item.done", output_index: 0, item: done },
+      "response.output_item.done",
+    ) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [done] } },
+      "response.completed",
+    );
+  const guarded = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(guarded.status, 200);
+  const data = frameData(await guarded.text());
+  const ids = [
+    ...data.filter((value) => value.item).map((value) => value.item.call_id),
+    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
+      (value) => value.call_id,
+    ),
+  ];
+  assert.equal(ids.length, 3, "the added frame, the done frame and the terminal's copy");
+  assert.ok(
+    ids.every((id) => typeof id === "string" && id !== ""),
+    `a copy left with no id to answer it with: ${ids.join(", ")}`,
+  );
+  assert.equal(new Set(ids).size, 1, `one call answered ${ids.length} ids: ${ids.join(", ")}`);
+});
+
+// The code says which failure it was, and every protocol carries it: the
+// guard computed it and dropped it for the chat and the Messages arm, and a
+// client on those two could not tell an undeclared tool from a size limit or
+// a transport failure.
+test("every protocol's failure carries the code that says which failure it was", async () => {
+  for (const protocol of protocols) {
+    const broken = await guardToolResponse(
+      new Response("{broken", { headers: { "content-type": "application/json" } }),
+      protocol,
+      policy,
+    );
+    assert.equal(broken.status, 502);
+    assertError(protocol, await broken.json(), false, "upstream_error");
+  }
 });

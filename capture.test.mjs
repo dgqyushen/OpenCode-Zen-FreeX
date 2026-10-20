@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   capture,
   drySummary,
@@ -11,6 +11,7 @@ import {
   fingerprintTarget,
   invokedDirectly,
   neutralise,
+  numberFromEnv,
   report,
 } from "./capture.mjs";
 
@@ -28,10 +29,11 @@ import {
 // could (`report`) is handed the scratch path by every case that reaches it.
 
 // The shipped capture, read from the repository. `report` compares a run against
-// this, so a case that wants a particular comparison asks for it through the
-// request; the fixture is only ever the file the result would be written to. It
-// is read here and nowhere else, which is what keeps the read in one place a
-// reader can check against the claim above.
+// the file it writes, so a case that wants a particular comparison asks for it
+// through the request and the fixture it writes to; the shipped file is read
+// here for the agent and the required list the fixtures are built from, and
+// nowhere else, which is what keeps the read in one place a reader can check
+// against the claim above.
 const SHIPPED = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8")).profiles["1.x"];
 
 const NAMES = ["bash", "glob", "grep", "read"];
@@ -259,6 +261,69 @@ test("--fingerprint=<path> is read, not silently ignored", () => {
   assert.equal(fingerprintTarget(argv("--fingerprint", "/tmp/space.json", "--fingerprint=/tmp/inline.json"), {}), "/tmp/inline.json");
 });
 
+test("a number from the environment that is not a number is not used", () => {
+  // Both knobs are read with `Number()` and were never checked, so a mistyped
+  // one decided the run: `CAPTURE_TIMEOUT_MS=abc` is `NaN`, the watchdog fires
+  // at once, the child is killed before it has made a request, and the run
+  // reports "no request was captured" — the mistyped knob reported as an
+  // OpenCode problem. A port outside the range a port can be in fails the same
+  // way, inside `Bun.serve`, as an error that says nothing about the variable
+  // that was wrong.
+  const error = console.error;
+  const said = [];
+  console.error = (line) => said.push(String(line));
+  try {
+    assert.equal(numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, {}), 120_000, "an unset variable is the default");
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "" }),
+      120_000,
+      "an exported-but-empty variable is the default",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "5000" }),
+      5000,
+      "a number is used",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "abc" }),
+      120_000,
+      "a value that is not a number is not the timeout",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "0" }),
+      120_000,
+      "zero is not a timeout",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "-1" }),
+      120_000,
+      "a negative timeout is not a timeout",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_PORT", 8791, { CAPTURE_PORT: "9000" }, 65535),
+      9000,
+      "a port in the range is used",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_PORT", 8791, { CAPTURE_PORT: "70000" }, 65535),
+      8791,
+      "a port outside the range is not the port",
+    );
+  } finally {
+    console.error = error;
+  }
+  // Every refused variable is named: a knob that reads as set while it was not
+  // is worse than one that is unset, because the run answers for the default
+  // and the reader is looking at the wrong number.
+  assert.equal(said.length, 4, `every refused variable is named: ${said.join(" | ")}`);
+  for (const name of ["CAPTURE_TIMEOUT_MS", "CAPTURE_PORT"])
+    assert.equal(
+      said.some((line) => line.includes(name)),
+      true,
+      `the refused variable is named: ${said.join(" | ")}`,
+    );
+});
+
 test("the guard that keeps an import from running the capture", () => {
   // This process imported the file rather than running it, which is what this
   // guard is for. Before it, importing capture.mjs started a server and rewrote
@@ -276,6 +341,61 @@ test("the guard that keeps an import from running the capture", () => {
   // write. The `false` half is still the one that matters for isolation: if it
   // ever became `true` in a test process, every case below would start a server.
   assert.equal(invokedDirectly(), false);
+});
+
+test("a broken capture does not stop the tool that repairs it, and the tool repairs it", async (t) => {
+  // The remedy every failure in `core-tools.mjs` names is `bun run capture`, so
+  // that command has to run when the capture is broken — which it used to be
+  // unable to: `core-tools` reads the capture at import and throws, and the
+  // capture imported it, so `bun capture.mjs` died before its own body ran, on
+  // the very file it is here to write. The error the reader was given named a
+  // command that could not be run.
+  //
+  // Both halves are pinned here, from copies in a scratch directory so that the
+  // copy resolves a capture of its own: the consumer still fails at import (a
+  // broken capture is visible before the first request, not during it), and the
+  // tool starts anyway and rewrites the file.
+  const dir = mkdtempSync(join(tmpdir(), "zen-capture-broken-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const name of ["core-tools.mjs", "capture.mjs"])
+    writeFileSync(join(dir, name), readFileSync(new URL(`./${name}`, import.meta.url), "utf8"));
+  // The shape a capture breaks in most often: a file that is there and is not
+  // JSON. The other two — a file that is not there, and one that parses into
+  // something that is not a capture — are the same case as far as the tool is
+  // concerned, and the case below is the one that used to kill the import.
+  writeFileSync(join(dir, "fingerprint.json"), "{ not json");
+  const load = (name) => import(pathToFileURL(join(dir, name)).href);
+
+  const failure = await load("core-tools.mjs").then(
+    () => assert.fail("importing a copy whose capture is broken must fail"),
+    (error) => error,
+  );
+  assert.match(failure.message, /invalid JSON/, "the consumer is told what is wrong with the capture");
+  assert.match(failure.message, /bun run capture/, "and is sent to the command that repairs it");
+
+  // The tool that writes the capture starts with the capture broken, and says
+  // what it is going to do with the file it cannot read.
+  const { report: repair } = await load("capture.mjs");
+  const captureRun = offline(() =>
+    repair({ request: requestFor(bodyFor(toolsOf(NAMES))), code: 0 }),
+  );
+  try {
+    await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("is not JSON")),
+      true,
+      `a file that cannot be read is said out loud:\n  ${said}`,
+    );
+    const written = JSON.parse(readFileSync(join(dir, "fingerprint.json"), "utf8"));
+    assert.equal(
+      typeof written.profiles?.["1.x"]?.tools?.read?.description,
+      "string",
+      `the broken file is replaced by a capture that carries the profile:\n  ${written && JSON.stringify(written.profiles?.["1.x"]?.tools?.read)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("the entry-point decision, with the facts passed in not read off the process", () => {
@@ -554,10 +674,9 @@ test("a --dry report names the agent whenever it moved, required list or not", a
   // "the agent" whenever the required list had also changed. That guard is only
   // reached when the required list did *not* move, so the run that pins it has to
   // be one where the list stood still — and which list moved is not something a
-  // fixture gets to choose. `report` compares against the capture this process
-  // imported (`PROFILES`, capture.mjs:291), and the list it captures is the
-  // `REQUIRED` literal in capture.mjs, so the two agree for every run that is not
-  // a hand-edited fingerprint changing under a stale module: a stored list that
+  // fixture gets to choose. `report` compares against the file it writes, and
+  // the list it captures is the `REQUIRED` literal in capture.mjs, so the two
+  // agree for every run whose file was written by a capture: a stored list that
   // differs from the request is a list that *already* disagreed with `REQUIRED`,
   // and it is still written back over. The case that used to stand here put
   // `write` and `edit` in the fixture and called that "the list moved too", which
@@ -610,11 +729,11 @@ test("the --dry summary names the agent beside a change count when both moved", 
   // is the one case where "the agent" stands alone. The case the old guard was
   // about — a count *and* a moved agent, so "the agent" has to be said beside the
   // count — cannot be driven through `report` from a fixture, and the reason is
-  // structural rather than a gap in this file: `report` compares against the
-  // capture this process imported (`PROFILES`), while the list it captures and
-  // writes back is the `REQUIRED` literal in capture.mjs, so the two are the same
-  // list by construction and `requiredChanged` is false for every run. The guard
-  // `agentChanged && !requiredChanged` therefore decides exactly what
+  // structural rather than a gap in this file: the required list a run compares
+  // against is the one in the file it writes, and that list is the `REQUIRED`
+  // literal in capture.mjs whenever a capture wrote the file, so
+  // `requiredChanged` is false for every run of a file a capture wrote. The
+  // guard `agentChanged && !requiredChanged` therefore decides exactly what
   // `agentChanged` decides, which makes re-injecting it a behaviour-equivalent
   // mutation of `report` that no fixture can catch — not a case this test is
   // failing to build. `changed` is the half that does vary, and the pair that
@@ -672,6 +791,225 @@ test("an unchanged capture exits 0 and writes nothing", async () => {
   } finally {
     scratch.remove();
   }
+});
+
+test("the comparison is against the file that is written, not the copy this process imported", async () => {
+  // `--fingerprint` exists so a run can write another file, and the comparison
+  // was against the repository's own copy: a target that holds no such profile
+  // was reported as "nothing changed" and nothing was written, and a target
+  // that does differ could be reported as unchanged. The file that is written
+  // is the baseline, and the file that is written is this one.
+  //
+  // The fixture holds the shipped wording with one tool changed, and the
+  // request carries the shipped wording: against the repository's copy the run
+  // would find nothing to report, and against the file it writes it finds the
+  // tool that differs.
+  const names = Object.keys(SHIPPED.tools);
+  const scratch = shippedWording();
+  const stored = scratch.read();
+  stored.profiles["1.x"].tools.bash.description =
+    "A wording this file holds and the request does not carry. ".repeat(4);
+  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
+  const request = requestFor(bodyFor(names.map((name) => ({ type: "function", function: SHIPPED.tools[name] }))));
+  const captureRun = offline(() => report({ request, code: 0, fingerprint: scratch.path }));
+  try {
+    await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(
+      captureRun.lines.some((line) => line.startsWith("  bash") && line.includes("CHANGED")),
+      true,
+      `the file that is written is the baseline:\n  ${said}`,
+    );
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("wrote")),
+      true,
+      `a change against the file that is written is written:\n  ${said}`,
+    );
+    assert.equal(
+      scratch.read().profiles["1.x"].tools.bash.description,
+      SHIPPED.tools.bash.description,
+      "the file now holds what the request carried",
+    );
+  } finally {
+    scratch.remove();
+  }
+});
+
+test("the provider-utils a capture did not observe are the target's own, not the repository's", async () => {
+  // The write replaces the whole profile, so the per-protocol provider-utils
+  // this capture did not observe have to be carried over from the file being
+  // written. They were taken from the imported copy instead, so a capture
+  // written to another file overwrote that file's own values with the
+  // repository's, and a repository file edited while the capture was running
+  // lost those edits.
+  //
+  // The anthropic entry is the one that shows it: it is the value no capture
+  // can take, so the file's own is the only one there is.
+  const scratch = scratchFingerprint();
+  const stored = scratch.read();
+  stored.profiles["1.x"].agent.providerUtils = {
+    chat: "4.0.23",
+    responses: "4.0.40",
+    anthropic: "9.9.9",
+  };
+  writeFileSync(scratch.path, JSON.stringify(stored, null, 2));
+  const captureRun = offline(() =>
+    report({
+      request: requestFor(
+        bodyFor(toolsOf(NAMES)),
+        "opencode/1.19.3 ai-sdk/provider-utils/9.9.9 runtime/bun/1.3.14",
+      ),
+      code: 0,
+      fingerprint: scratch.path,
+    }),
+  );
+  try {
+    await captureRun.run();
+    const written = scratch.read().profiles["1.x"].agent.providerUtils;
+    assert.equal(written.chat, "9.9.9", "the protocol that was captured is the one that was captured");
+    assert.equal(written.responses, "4.0.40", "a protocol that was not observed is the target's own");
+    assert.equal(
+      written.anthropic,
+      "9.9.9",
+      "the anthropic entry is the target's own, and never the repository's",
+    );
+  } finally {
+    scratch.remove();
+  }
+});
+
+test("a file whose profiles are a list is written afresh, with the profile in it", async () => {
+  // A list is not a table of profiles, and it used to get through: the guard
+  // refused a list for the file and not for the file's `profiles`, so the
+  // profile was set on the array as a named property — which `JSON.stringify`
+  // drops from an array — and the run said it had written a capture. Every
+  // consumer of the file then refused to load it.
+  const root = mkdtempSync(join(tmpdir(), "zen-capture-"));
+  const path = join(root, "fingerprint.json");
+  writeFileSync(path, JSON.stringify({ _note: "fixture", profiles: [] }, null, 2));
+  const captureRun = offline(() =>
+    report({ request: requestFor(bodyFor(toolsOf(NAMES))), code: 0, fingerprint: path }),
+  );
+  try {
+    await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("holds no profiles object")),
+      true,
+      `a file whose profiles are not a table is said out loud:\n  ${said}`,
+    );
+    const written = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(Array.isArray(written.profiles), false, "the profiles are a table and not a list");
+    assert.equal(
+      typeof written.profiles["1.x"].tools.read.description,
+      "string",
+      "the profile that was captured is in the file",
+    );
+    assert.equal(written._note, "fixture", "the rest of the file is kept");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture whose User-Agent and tools name different generations is refused", async () => {
+  // The generation comes from the tool names and the agent's shape from the
+  // User-Agent, and nothing said the two belonged together: a capture pairing
+  // 1.x tools with a 2.x User-Agent was written as it was, and a file every
+  // consumer reads then carried the disagreement Zen refuses.
+  for (const [what, agent, tools] of [
+    ["a 2.x User-Agent with 1.x tools", "opencode/latest/2.0.29/cli", toolsOf(NAMES)],
+    ["a 1.x User-Agent with 2.x tools", "opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", toolsOf(["shell", "read"])],
+  ]) {
+    const scratch = scratchFingerprint();
+    const before = JSON.stringify(scratch.read());
+    const captureRun = offline(() =>
+      report({ request: requestFor(bodyFor(tools), agent), code: 0, fingerprint: scratch.path }),
+    );
+    try {
+      await captureRun.run();
+      const said = captureRun.lines.join("\n  ");
+      assert.equal(captureRun.code, 1, `${what}: is refused:\n  ${said}`);
+      assert.equal(
+        captureRun.lines.some((line) => line.includes("2.x") && line.includes("1.x")),
+        true,
+        `${what}: the refusal names both halves:\n  ${said}`,
+      );
+      assert.equal(JSON.stringify(scratch.read()), before, `${what}: a refused capture must not write`);
+    } finally {
+      scratch.remove();
+    }
+  }
+});
+
+test("a User-Agent that cannot be read is refused, and the file to fix is named", async () => {
+  // The agent is written by hand into the capture when it cannot be read, so
+  // the refusal has to name the file: the generation alone would leave the
+  // reader to work out which file that was.
+  const scratch = scratchFingerprint();
+  const before = JSON.stringify(scratch.read());
+  const captureRun = offline(() =>
+    report({
+      request: requestFor(bodyFor(toolsOf(NAMES)), "not a user-agent"),
+      code: 0,
+      fingerprint: scratch.path,
+    }),
+  );
+  try {
+    await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(captureRun.code, 1, `an unreadable User-Agent is refused:\n  ${said}`);
+    assert.equal(
+      captureRun.lines.some((line) => line.includes(scratch.path)),
+      true,
+      `the file to fix is named:\n  ${said}`,
+    );
+    assert.equal(JSON.stringify(scratch.read()), before, "a refused capture must not write");
+  } finally {
+    scratch.remove();
+  }
+});
+
+test("the anthropic provider-utils is reported as the one entry a capture cannot take", async () => {
+  // The value in the file is maintained by hand, because no capture can take
+  // it: the anthropic request shape is refused rather than read, and no free
+  // model speaks that protocol. A capture that cannot check it says so rather
+  // than letting the file look as current as the rest of it.
+  const scratch = scratchFingerprint();
+  const captureRun = offline(() =>
+    report({ request: requestFor(bodyFor(toolsOf(NAMES))), code: 0, fingerprint: scratch.path }),
+  );
+  try {
+    await captureRun.run();
+    const said = captureRun.lines.join("\n  ");
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("anthropic")),
+      true,
+      `the anthropic entry is named:\n  ${said}`,
+    );
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("@ai-sdk/anthropic")),
+      true,
+      `the note says what has to be checked:\n  ${said}`,
+    );
+    assert.equal(
+      captureRun.lines.some((line) => line.includes("cannot take")),
+      true,
+      `the note says that no capture can take it:\n  ${said}`,
+    );
+  } finally {
+    scratch.remove();
+  }
+});
+
+test("the shipped capture says that its anthropic provider-utils is maintained by hand", () => {
+  // The file is where a reader of the repository looks, and this entry is the
+  // one no capture can refresh: without a word in the file, the value looks as
+  // current as the two beside it, and a bump of @ai-sdk/anthropic would go
+  // unnoticed until Zen refuses a request with an opaque 403.
+  const shipped = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8"));
+  assert.match(shipped._note, /anthropic/, "the note names the entry a capture cannot take");
+  assert.match(shipped._note, /by hand/, "and says that it is maintained by hand");
+  assert.match(shipped._note, /@ai-sdk\/anthropic/, "and says when it has to be checked");
 });
 
 test("a changed capture writes the scratch fingerprint, and only there", async () => {
