@@ -61,7 +61,7 @@ node_modules/
 .[Nn][Pp][Mm][Rr][Cc]~
 [Nn][Pp][Mm][Rr][Cc]~
 !.[Nn][Pp][Mm][Rr][Cc].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
-!.[Nn][Pp][Mm][Rr][Cc].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
+![Nn][Pp][Mm][Rr][Cc].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
 # The credentials a tool writes into the checkout itself. `git config
 # credential.helper store` writes `.git-credentials` here as
 # `https://user:token@host` — the same class of leak as the npm token above,
@@ -105,3 +105,10 @@ _[Nn][Ee][Tt][Rr][Cc]
 ![Ii][Dd]_[Ee][Dd]25519.[Pp][Uu][Bb]
 ![Ii][Dd]_[Ee][Cc][Dd][Ss][Aa].[Pp][Uu][Bb]
 ![Ii][Dd]_[Dd][Ss][Aa].[Pp][Uu][Bb]
+
+# This fork's local working notes. `AGENT.md` has carried deploy notes and
+# once carried a token; it is not source, it is not in the published files
+# allowlist, and it must not be committable either. Written with the same
+# character classes as the rest of the secret rules, and without a leading
+# slash, so a nested `AGENT.md` is not a different file with a different rule.
+[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]

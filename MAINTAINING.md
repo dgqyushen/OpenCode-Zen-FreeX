@@ -49,15 +49,15 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | --- | --- | --- | --- |
 | `deepseek-v4.1-flash-free` | context | 326000 | the last point this route is measured to serve (326,702), rounded down on 2026-10-19 because its refusal names no number and refuses 326,750 itself |
 | `deepseek-v4.1-flash-free` | output | 384000 | the paid twin's figure, and nothing on this route confirms it today: the `[1, 393216]` sentence did not reproduce on a 2026-10-19 re-ask, which was answered 200 |
-| `mimo-v2.6-flash-free` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 tokens served, 1,750,000 characters; refused at 2,800,000 characters), not the 1048576 the route used to state |
+| `mimo-v2.6-flash-free` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 tokens served, 1,750,000 characters; the nearest reproduced refusal is 1,787,500 characters, and an earlier probe was refused at 2,800,000), not the 1048576 the route used to state |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
-| `big-pickle` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 served, 1,750,000 characters; refused at 2,800,000 characters), an axis an earlier sweep had left to the catalogue |
+| `big-pickle` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 served, 1,750,000 characters; the nearest reproduced refusal is 1,787,500 characters, and an earlier probe was refused at 2,800,000), an axis an earlier sweep had left to the catalogue |
 | `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much, named again on a 2026-10-19 re-ask |
 | `big-pickle` | input | 375000 | the window, not the sample: the catalogue's 160000 was falsified by a served prompt of 343,131 tokens, and this route names no input cap of its own, so the axis is declared at the window |
 | `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
 | `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
 | `ll-alpha-free` | output | 262144 | the ceiling the route's own refusal names, against a declared 65536 |
-| `glm-5.3-flash-free` | context | 323000 | the route's own enforcement, found by bracketing on 2026-10-20 (323,107 tokens served, 1,787,500 characters; a prompt of about 343,000 tokens is refused), not the paid twin's 1000000 |
+| `glm-5.3-flash-free` | context | 323000 | the route's own enforcement, found by bracketing on 2026-10-20 (323,107 tokens served, 1,506,250 characters; the nearest reproduced refusal is 1,525,000 characters, and a prompt of about 343,000 tokens - 1,600,000 characters - was refused earlier), not the paid twin's 1000000 |
 | `glm-5.3-flash-free` | output | 131072 | the paid twin's figure for the same upstream model |
 | `minimax-m3.1-flash-free` | context | 1048576 | the wall behind the catalogue's round million: models.dev declares 1048576 for this canonical model - two of nineteen provider entries say so, against seventeen that repeat 1000000 - and the bisection agrees with those two, 1,048,092 tokens served and 1,082,359 refused |
 | `minimax-m3.1-flash-free` | output | 512000 | the catalogue's own declaration for this id, left as declared: nothing above 32000 was watched on it, and lowering a ceiling on no evidence cuts replies off |
@@ -379,8 +379,9 @@ entry for this axis wins while that entry still applies, because the entry
 carries the samples behind it.
 
 **What the sweep leaves, and how it is read back.** The scheduled workflow
-(`.github/workflows/walls.yml`, hourly at :17) runs `limits-watch.mjs --sweep`,
-which measures the ids the listing offers and the snapshot does not name yet,
+(`.github/workflows/walls.yml`, hourly at :17) runs
+`bun limits-watch.mjs --sweep --write`, which measures the ids the listing
+offers and the snapshot does not name yet,
 plus the ids whose wall was never found - a snapshot row that says `openEnded`
 while the catalogue declares more than the snapshot ever served is an id whose
 wall is one rung up - and measures those at most once a week, because the ladder
@@ -392,13 +393,15 @@ model, and an id answered from there is never measured, so it is never "new"
 either. The rows of those ids are dropped from the snapshot as well - they are
 rows about a window nobody asked about - and the run names the ones it dropped.
 Each result is folded into `limits-observed.json` beside `limits.mjs`: the file
-is pushed as a branch and opened as a pull request, with a compare link in the
-run summary where the repository does not let Actions open one, and it never
-reaches `main` as a push - what reaches `main` is a merged pull request, which
-in a repository that allows it is what the run does itself (below). A wall that
-moves under an id already measured is not re-measured on that timer, and `--all`
-is a person asking for a fresh reading of everything that may be measured - the
-ids models.dev answers are not among them. That file is an input at run time
+is pushed to the rolling `walls/observed` branch and carried by its pull
+request - opened on the first changed run and updated in place on the ones after
+it - with a compare link in the run summary where the repository does not let
+Actions open one, and it never reaches `main` as a push - what reaches `main` is
+a merged pull request, which in a repository that allows it is what the run does
+itself (below). A wall that moves under an id already measured is not re-measured
+on that timer, and `--sweep --all` is a person asking for a fresh reading of
+everything that may be measured - the ids models.dev answers are not among them.
+That file is an input at run time
 now rather than only a workflow artifact: `measuredWalls()` reads it once per path
 and keeps the answer, taking the path from its argument, else
 `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the file beside the module, with an empty
@@ -412,6 +415,13 @@ table and its catalogue say, and nothing here may fail a request.
 models and learned nothing about any of them exits 1, and a run that asked
 nothing at all - every id was answered from models.dev - exits 0, because
 nothing failed and nothing was learned.
+
+`limits:watch` tells three answers apart, because the workflow reads the code to
+know what it has: 0 when the route was reached and offered at least one free id,
+1 when the route, the catalogue or the snapshot could not be read or written, and
+2 when the route was reached and offered no free id at all. An empty listing is
+not an outage, so 2 is reported as reached with nothing to publish rather than
+as a dead route.
 
 Each row contributes what it measured and no more: the largest prompt the route
 was watched to serve, floored to a whole thousand, the same rounding and for the same
@@ -449,9 +459,12 @@ The file says what its numbers are, because the names cannot change: a
 top-level `_units` names the unit of every field - `servedTokens` and `named`
 are tokens, `servedChars`, `refusedChars` and `refusedSizes` are characters,
 `at` is the day it was measured - and a reader who takes one for the other is
-wrong by a factor of four. `bun limits-watch.mjs --check` reads the file the
-plugin will read and says, line by line, what is wrong with it; it asks nothing
-and writes nothing, so it can be a gate on the file a run is about to publish.
+wrong by a factor of four. `bun limits-watch.mjs --check` reads the
+`limits-observed.json` beside `limits-watch.mjs` and says, line by line, what is
+wrong with it; it asks nothing and writes nothing, so it can be a gate on the
+file a run is about to publish. It does not follow
+`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` - the default path is that repository file
+- so name another path on the command line to check one.
 
 Applying one is reported as it happens: `OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` gets a
 `sweep-statement` line naming the model, the axis, the value, the wall behind it
@@ -461,11 +474,13 @@ is the number the runtime bracket searches around rather than the one the
 catalogue still prints.
 
 **What happens to a run.** A run that measured something new leaves one changed
-file on a branch, opens it as a pull request and merges it, so the measurement is
-on `main` before the run ends and an id Zen made free an hour ago has a measured
-window this hour instead of waiting for somebody to notice. The file is checked
+file on the rolling `walls/observed` branch, carries it in that branch's pull
+request - opened on the first changed run, updated in place on the ones after
+it - and merges it, so the measurement is on `main` before the run ends and an
+id Zen made free an hour ago has a measured window this hour instead of waiting
+for somebody to notice. The file is checked
 and the suite is run over it before that happens: a workflow started with
-`GITHUB_TOKEN` starts no workflow of its own, so the pull request this run opens
+`GITHUB_TOKEN` starts no workflow of its own, so the pull request on that branch
 runs no `ci.yml` of its own and the squash merge produces no `push` run either -
 this job checks what it is about to publish and runs the tests over it. The
 report travels in
@@ -541,7 +556,8 @@ which is the route naming its own window, on an upstream that words it
 differently from the DeepSeek ids. That figure was overtaken on 2026-10-19, when
 a prompt of about 408,000 tokens was refused — less than half of it — so the axis
 is the route's own enforcement found by bracketing (375,142 tokens served on
-2026-10-20, refused at 2,800,000 characters) rather than the number the route
+2026-10-20, the nearest reproduced refusal at 1,787,500 characters, after an
+earlier probe was refused at 2,800,000) rather than the number the route
 stated, the same way the DeepSeek id's stated million went. Its output is the
 first figure in this
 file resting on a vendor page: that same refusal came back with the 200000 it was
@@ -622,9 +638,9 @@ Only a 403 and a 426 are Zen answering about the fingerprint. A 5xx, a 429 or a
 reader to `capture` over an outage — as it does when nothing was reached, or when
 part of a run answered and part of it did not.
 
-`capture` needs `opencode` on PATH. It points a real OpenCode at a server running
-locally and reads the request it makes, so nothing is sent to Zen and no key is
-involved.
+`capture` needs Bun and `opencode` on PATH. It points a real OpenCode at a
+server running locally and reads the request it makes, so nothing is sent to Zen
+and no key is involved.
 
 It compares against the file it is about to write, not the copy this repository
 keeps, so `--fingerprint <path>` is the baseline and the tools it does not
@@ -634,9 +650,10 @@ refused: refusing would name a remedy - "run `bun run capture`" - that the broke
 file would have killed at its import, and the command that repairs it has to be
 able to start. A file that holds no `profiles` object keeps the rest of it and
 has its profiles written afresh. What the file held is said out loud, because a
-file replaced without a word is a file nobody knows was there. The script reaches
-for no Bun-only API - its own directory comes from the module's URL - so it runs
-on the Node the package declares as well.
+file replaced without a word is a file nobody knows was there. The Node floor
+`package.json` declares covers the modules a host imports, not this one:
+`capture` uses `Bun.serve` and `Bun.write`, so it runs under Bun, which is what
+`bun run capture` gives it.
 
 The `anthropic` provider-utils in `fingerprint.json` is the one entry a capture
 cannot take: no free model speaks that protocol, so the anthropic request shape
@@ -888,8 +905,9 @@ one outcome a release gate must not have.
 Both scripts read their endpoint and model from the environment when the
 defaults are wrong: `ZEN_BASE_URL`, `ZEN_CHECK_MODEL` (gate), `ZEN_CATALOG_URL`,
 `ZEN_GENERATION` (audit) and `CAPTURE_PORT` (capture). `.env.example` lists them
-with their defaults. Nothing loads a file by itself, so export them or copy that
-file to `.env` and export from it.
+with their defaults; it is in a repository checkout only, because it is not in
+`package.json`'s `files`. Nothing loads a file by itself, so export them or, in a
+checkout, copy that file to `.env` and export from it.
 
 ## Publishing
 
