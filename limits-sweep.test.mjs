@@ -231,3 +231,50 @@ test("a refusal about the window is still a bound", async () => {
   assert.deepEqual(counted.refusedSizes, [1_600_000], "a refusal about a size is a bound");
   assert.equal(counted.refused.length, 1);
 });
+
+// The rule, enforced where the requests are made: an id the catalogue declares
+// at a million or more is answered from models.dev and is not measured, whoever
+// asked for it. The run of 2026-10-20 asked three such ids and spent eleven
+// megabytes of prompts to learn what the catalogue already said.
+test("a million-token id is not measured, and the caller is told which", async () => {
+  const { measurableIds } = await subject;
+  const out = await measurableIds(["big-free", "small-free"], {
+    catalog: {
+      "big-free": { limit: { context: 1_000_000 } },
+      "small-free": { limit: { context: 262_144 } },
+    },
+  });
+  assert.deepEqual(out.answeredElsewhere, ["big-free"]);
+  assert.deepEqual(out.measured, ["small-free"]);
+});
+
+test("an id the catalogue does not declare a window for is measured", async () => {
+  const { measurableIds } = await subject;
+  const out = await measurableIds(["undeclared-free"], { catalog: {} });
+  assert.deepEqual(out.answeredElsewhere, []);
+  assert.deepEqual(out.measured, ["undeclared-free"]);
+});
+
+test("a catalogue that cannot be read does not change what is measured", async () => {
+  const { measurableIds } = await subject;
+  const out = await measurableIds(["some-free"], {
+    fetchCatalog: async () => {
+      throw new Error("the network is down");
+    },
+  });
+  assert.deepEqual(out.answeredElsewhere, [], "no catalogue is no declaration to be large");
+  assert.deepEqual(out.measured, ["some-free"]);
+});
+
+// The ladder's bottom rung sat above the window of every model this sweep
+// measures now, and a refusal at the bottom rung stops the climb: there is
+// nothing served underneath it to narrow between. So a model with a window of
+// a few hundred thousand tokens could never be bracketed at all.
+test("the ladder has a rung below the smallest window measured here", async () => {
+  const { LADDER, FIRST_SIZE } = await subject;
+  assert.ok(FIRST_SIZE < 1_000_000, "the bottom rung is below the ladder's own first size");
+  assert.equal(LADDER[0], FIRST_SIZE);
+  // And it is low enough to be served by a model whose wall is a sixth of a
+  // million tokens — 200,000 characters is about 50,000.
+  assert.ok(FIRST_SIZE / 4 < 262_144, "so a model declared at 262,144 has a rung it can serve");
+});

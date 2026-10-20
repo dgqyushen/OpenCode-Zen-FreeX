@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { CATALOG } from "./provider.mjs";
 import { baseFrom, offeredIds } from "./limits-audit.mjs";
 import { sweepModels as sweepThem } from "./limits-sweep.mjs";
+import { MODELS_DEV_MIN } from "./limits.mjs";
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
 const SNAPSHOT = fileURLToPath(new URL("./limits-observed.json", import.meta.url));
@@ -98,45 +99,58 @@ export async function watch({
   // run has to measure: nothing else here knows whether a model it has never seen
   // has a wall, and a wall nobody measured is a window every host gets wrong.
   //
-  // An id whose wall was never found is the second, and it is the one the timer
-  // used to leave alone for ever. `openEnded` does not mean "large": it means the
-  // top rung was SERVED, so the wall is somewhere above everything this sweep
-  // asked. For a 1,048,576-token id that was true of the old ladder and hid the
-  // whole gap — the snapshot said 898,459 for a model a hand measurement put at
-  // 1,048,092. A model in that state is re-measured on the timer when the
-  // catalogue declares more than the snapshot ever served, because that is the
-  // one case where the run can change a number: the ladder now reaches past the
-  // binary million, and an id declared at a million that was never served past
-  // 900,000 has an answer waiting.
+  // The rule that decides what is measured at all, and it is a rule about the
+  // CATALOGUE's number rather than about the model's size: an id the catalogue
+  // declares at a million or more is answered from models.dev — the largest
+  // entry any provider declares for the same canonical model — and is not
+  // measured. Only an id the catalogue declares BELOW a million is measured
+  // here, because only there does a measurement change the answer: the
+  // catalogue under-reports the small ones by a factor of three, and the big
+  // ones' real window is the binary million whatever the decimal one says.
   //
-  // It is bounded deliberately. A model whose wall is genuinely above the top
-  // rung stays `openEnded` however often it is asked, and re-measuring every such
-  // id every hour is a megabyte of prompts per hour for an answer that does not
-  // move. So the suspicion is a strict one — the catalogue declares a window, the
-  // snapshot has never reached it, and the snapshot is at least the ladder's old
-  // ceiling short of it, which is the shape the 1M ids were in — and `--all`
-  // remains the way to ask for a fresh reading of anything.
+  // Measuring the big ones was not harmless. On 2026-10-20 the sweep asked
+  // `minimax-m3.1-flash-free` and `beam-free` and `nemotron-3.5-super-vl-free`
+  // — ids whose value models.dev already answers — and spent eleven megabytes
+  // of prompts and half an hour of runner time to learn what the catalogue
+  // already said: 1,048,576. The run also made a mess of the snapshot, which
+  // then looked like evidence about a window nobody had asked about.
+  //
+  // So the exclusion is by declaration, not by outcome, and it holds for every
+  // way into this file: a new id, a suspect one, and `--all` alike.
   const declaredOf = (id) => {
     const declared = models?.[id]?.limit?.context;
     return Number.isSafeInteger(declared) && declared > 0 ? declared : undefined;
   };
-  const suspicion = keptOver.filter((id) => {
+  // The ids whose window models.dev answers, and which are therefore not asked
+  // about at all. An id the catalogue does not declare a window for is NOT one
+  // of these: there is no declaration to be large, so there is nothing for
+  // models.dev to correct, and it is measured.
+  const answeredElsewhere = offered.filter((id) => {
+    const declared = declaredOf(id);
+    return declared !== undefined && declared >= MODELS_DEV_MIN;
+  });
+  const measurable = offered.filter((id) => !answeredElsewhere.includes(id));
+  // A wall the catalogue's own number does not reach is a wall this sweep has
+  // to find, and only among the ids it is allowed to measure.
+  const suspicion = measurable.filter((id) => {
     const entry = measured[id];
     if (entry?.wall !== "openEnded") return false;
     const declared = declaredOf(id);
     const served = entry?.servedTokens;
     if (!Number.isSafeInteger(declared) || !Number.isSafeInteger(served)) return false;
-    // A tenth of the declared window, and at least 20,000 tokens: a count that
-    // differs by less than that is a host counting differently, not a wall.
+    // A tenth of the declared window: a count that differs by less than that is
+    // a host counting differently, not a wall.
     return served < declared * 0.9;
   });
-  // `--all` re-measures everything, which is what a person asking for a fresh
-  // reading of a model whose wall has moved wants, and what nobody wants to pay
-  // for on a timer.
-  const targets = sweep ? (all ? offered : [...new Set([...added, ...suspicion])]) : [];
+  // `--all` re-measures everything that may be measured, which is what a person
+  // asking for a fresh reading of a model's wall wants, and what nobody wants
+  // to pay for on a timer.
+  const targets = sweep ? (all ? measurable : [...new Set([...added.filter((id) => measurable.includes(id)), ...suspicion])]) : [];
   log(`${BASE}`);
   log(`${offered.length} free ids offered, ${keptOver.length} measured before, ${added.length} not`);
   if (added.length > 0) log(`  new: ${added.join(", ")}`);
+  if (answeredElsewhere.length > 0)
+    log(`  answered from models.dev, so not measured: ${answeredElsewhere.join(", ")}`);
   if (suspicion.length > 0 && sweep && !all)
     log(`  open-ended but under-declared, so measured again: ${suspicion.join(", ")}`);
   if (gone.length > 0) log(`  no longer offered: ${gone.join(", ")}`);
@@ -144,7 +158,25 @@ export async function watch({
   const results = targets.length > 0 ? await sweepModels(targets, log) : [];
   const next = { ...measured };
   for (const result of results) next[result.model] = { ...kept(result), at };
-  return { base: BASE, offered, added, gone, suspicion, measured: keptOver, results, snapshot: { models: next } };
+  // A row for an id that is answered from models.dev is a row about a window
+  // nobody asked about, and it is the row that makes the next run think the
+  // model is still a candidate: `openEnded` is what the suspicion rule reads.
+  // So the rows of the ids that are not measured are dropped rather than kept —
+  // the snapshot then holds what the sweep knows, which is the walls it went and
+  // found.
+  //
+  // The rule is applied to every row by what the catalogue declares, not only to
+  // the ids the route is offering today: `space-bunny-free` was retired by the
+  // route, its row was left behind, and it was declared at 1,048,576, so it is
+  // one of the ids models.dev answers and it has no row either.
+  for (const id of Object.keys(next)) {
+    const declared = declaredOf(id);
+    if (declared !== undefined && declared >= MODELS_DEV_MIN) delete next[id];
+  }
+  return {
+    base: BASE, offered, added, gone, suspicion, answeredElsewhere,
+    measured: keptOver, results, snapshot: { models: next },
+  };
 }
 
 export async function writeSnapshot(state, file = SNAPSHOT) {

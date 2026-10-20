@@ -19,21 +19,32 @@ on:
     # `--all` it measures the ids the listing offers and the snapshot does not
     # name yet, PLUS the ids whose wall was never found: a snapshot row that says
     # `openEnded` while the catalogue declares more than the snapshot ever
-    # served is an id whose wall is one rung up, and the ladder now reaches past
-    # the binary million, so those are measured again rather than left open.
+    # served is an id whose wall is one rung up, so those are measured again
+    # rather than left open.
+    #
+    # What it does NOT do is measure the ids the catalogue declares at a million
+    # or more. Those are answered from models.dev — the largest entry any
+    # provider declares for the same canonical model — and only an id the
+    # catalogue declares BELOW a million is measured, because only there can a
+    # measurement change the answer. The run of 2026-10-20 asked
+    # `minimax-m3.1-flash-free`, `beam-free` and `nemotron-3.5-super-vl-free`
+    # anyway and spent eleven megabytes of prompts and half an hour of runner
+    # time to learn the 1,048,576 the catalogue already said; the rule now
+    # holds for `--all` as well, and at the layer that makes the requests.
+    #
     # An hour in which Zen added nothing and nothing is open costs one listing
     # read and thirteen seconds - that is the measured cost of a run that finds
     # nothing to measure. What this frequency does not buy is a fresh reading of
     # a wall that moved under an id already measured: that is `--all`, and it
-    # stays a person's dispatch because re-measuring ten ids every hour is an
-    # hour of megabyte prompts for an answer that rarely changes.
+    # stays a person's dispatch because re-measuring every measurable id every
+    # hour is an hour of megabyte prompts for an answer that rarely changes.
     - cron: "17 * * * *"
   # The way to find out whether this works without waiting for the next hour, and
   # the way to re-measure one model by hand: run it from the Actions page.
   workflow_dispatch:
     inputs:
       sweep_all:
-        description: Re-measure every offered id, not only the ones with no measurement
+        description: Re-measure every id that may be measured, not only the ones with no measurement
         type: boolean
         default: false
 
@@ -181,7 +192,7 @@ jobs:
             echo
             echo "The rules the sweep applies — a failure that is not about a size is not a"
             echo "refusal, a refusal is asked twice before it counts, a wall needs two refused"
-            echo "sizes behind a served one, fourteen requests per model — are in"
+            echo "sizes behind a served one, fifteen requests per model — are in"
             echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
             echo "\`single-refusal\` rather than smoothed into a wall, and an upstream that is"
             echo "failing shows up as \`openEnded\` rather than as a small window."

@@ -47,8 +47,9 @@
 // and the table is what every host behind this plugin plans a conversation from.
 
 import { profileFor } from "./core-tools.mjs";
+import { CATALOG } from "./provider.mjs";
 import { baseFrom } from "./limits-audit.mjs";
-import { namedAxes, readBoundedText, refusalAxis } from "./limits.mjs";
+import { MODELS_DEV_MIN, namedAxes, readBoundedText, refusalAxis } from "./limits.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
@@ -83,6 +84,27 @@ const PROFILE = profileFor(GENERATION);
 // declaration the catalogue makes for a free id. A model whose wall is genuinely
 // above it still reports `openEnded` — now for a reason that is true.
 export const SIZES = [1_000_000, 1_600_000, 2_800_000, 4_200_000, 5_200_000];
+
+// The rung BELOW the ladder, and the one that decides whether a model with a
+// small window can be measured at all.
+//
+// This sweep measures the ids the catalogue declares below a million — the big
+// ones are answered from models.dev and are not asked about — and those are
+// exactly the ids whose walls are small. The ladder's own bottom rung of
+// 1,000,000 characters is about 250,000 tokens, which sits ABOVE the window of
+// a model like `glm-5.3-flash-free` (311,000) and far above a model with a
+// 128,000-token window; and a refusal at the bottom rung stops the climb,
+// because there is nothing served underneath it to narrow between. So the
+// ladder began one rung too high to bracket any window but the largest.
+//
+// One small rung below the ladder fixes that, and it costs exactly one
+// request: the narrowing always runs between the largest SERVED size and the
+// smallest refused one, so a rung below every wall does not widen the interval
+// it narrows. 200,000 characters is about 50,000 tokens, which every model
+// measured here serves.
+export const FIRST_SIZE = 200_000;
+// The ladder as it is walked, bottom rung first.
+export const LADDER = [FIRST_SIZE, ...SIZES];
 // A reply is cut off after this many tokens: the question is whether the prompt
 // was accepted, and the answer to that arrives before the first token does.
 const ASK_TOKENS = 16;
@@ -309,7 +331,7 @@ async function sweep(model, log) {
   // underneath it and so no interval to narrow, which is a different situation from
   // a wall found above a served rung.
   let walled = false;
-  for (const chars of SIZES) {
+  for (const chars of LADDER) {
     if (walled) break;
     const result = await believe(chars);
     if (result === undefined) break;
@@ -317,7 +339,7 @@ async function sweep(model, log) {
     if (now.refusedSizes.length > 0 && now.servedChars !== undefined) walled = true;
     // A refusal at the smallest size, believed twice, puts the wall below
     // everything this sweep would ask next: nothing is learned by asking bigger.
-    if (chars === SIZES[0] && now.servedChars === undefined && now.refusedSizes.length > 0) break;
+    if (chars === LADDER[0] && now.servedChars === undefined && now.refusedSizes.length > 0) break;
   }
 
   // Narrowing. The bound this file can declare is the largest size SERVED, so what
@@ -371,6 +393,47 @@ async function sweep(model, log) {
   };
 }
 
+// The ids this file is allowed to measure, and the ones it is not.
+//
+// A model the catalogue declares at a million or more is answered from
+// models.dev — the largest entry any provider declares for the same canonical
+// model — and is not measured here. Only an id the catalogue declares BELOW a
+// million is measured, because only there can a measurement change the
+// answer. The rule is enforced here as well as in the caller that picks the
+// ids, because this is where the requests are made: a run that asked
+// `minimax-m3.1-flash-free` and `beam-free` on 2026-10-20 spent eleven
+// megabytes of prompts to learn the 1,048,576 the catalogue's own catalogue
+// already said.
+//
+// The catalogue is read once for the whole run and a model it does not declare
+// a window for is measured: there is no declaration to be large, so there is
+// nothing for models.dev to correct.
+export async function measurableIds(models, { catalog, fetchCatalog } = {}) {
+  if (catalog === undefined && fetchCatalog) {
+    try {
+      const document = await fetchCatalog();
+      catalog = document?.opencode?.models ?? {};
+    } catch {
+      // A catalogue that cannot be read is not a reason to measure the ids
+      // that models.dev answers: without it, no id is known to be one of them,
+      // and the run is what it would have been before this rule.
+      catalog = {};
+    }
+  }
+  const declared = new Map();
+  for (const [id, row] of Object.entries(catalog ?? {})) {
+    const context = row?.limit?.context;
+    if (Number.isSafeInteger(context) && context > 0) declared.set(id, context);
+  }
+  const out = { measured: [], answeredElsewhere: [] };
+  for (const id of models) {
+    const context = declared.get(id);
+    if (context !== undefined && context >= MODELS_DEV_MIN) out.answeredElsewhere.push(id);
+    else out.measured.push(id);
+  }
+  return out;
+}
+
 export async function sweepModels(models, log = () => {}) {
   const results = [];
   for (const model of models) {
@@ -390,7 +453,23 @@ if (import.meta.main) {
     console.error("usage: bun limits-sweep.mjs [--json] <model-id> [<model-id> ...]");
     process.exit(2);
   }
-  const results = await sweepModels(models, json ? () => {} : (line) => console.log(line));
+  // The rule, enforced where the requests are made: an id the catalogue
+  // declares at a million or more is answered from models.dev and is not
+  // measured, whoever asked for it.
+  const catalogueURL = process.env.ZEN_CATALOG_URL ?? CATALOG;
+  const { measured, answeredElsewhere } = await measurableIds(models, {
+    fetchCatalog: async () => {
+      const response = await fetch(catalogueURL, { signal: AbortSignal.timeout(30000) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    },
+  });
+  if (answeredElsewhere.length > 0) {
+    console.error(
+      `not measured, because the catalogue declares them at a million or more and models.dev answers those: ${answeredElsewhere.join(", ")}`,
+    );
+  }
+  const results = await sweepModels(measured, json ? () => {} : (line) => console.log(line));
   if (json) console.log(JSON.stringify(results));
   else
     for (const result of results) {

@@ -143,15 +143,15 @@ test("an open-ended id the catalogue declares more for is measured again", async
   const swept = [];
   const state = await watch({
     sweep: true,
-    fetchJSON: catalogued(["minimax-free"], { "minimax-free": 1_000_000 }),
-    read: measuredWith({ "minimax-free": { servedTokens: 898_459, servedTokensLegacy: true } }),
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000 } }),
     sweepModels: async (ids) => {
       swept.push(...ids);
       return [];
     },
   });
-  assert.deepEqual(state.suspicion, ["minimax-free"]);
-  assert.deepEqual(swept, ["minimax-free"], "898,459 against a declared million is a wall never found");
+  assert.deepEqual(state.suspicion, ["small-free"]);
+  assert.deepEqual(swept, ["small-free"], "100,000 against a declared 262,144 is a wall never found");
 });
 
 test("an id already served to its declaration is not asked again", async () => {
@@ -159,8 +159,8 @@ test("an id already served to its declaration is not asked again", async () => {
   const swept = [];
   const state = await watch({
     sweep: true,
-    fetchJSON: catalogued(["served-free"], { "served-free": 1_000_000 }),
-    read: measuredWith({ "served-free": { servedTokens: 990_000 } }),
+    fetchJSON: catalogued(["served-free"], { "served-free": 262_144 }),
+    read: measuredWith({ "served-free": { servedTokens: 250_000 } }),
     sweepModels: async (ids) => {
       swept.push(...ids);
       return [];
@@ -175,7 +175,7 @@ test("a bracketed wall is already known, so it is not suspected", async () => {
   const swept = [];
   await watch({
     sweep: true,
-    fetchJSON: catalogued(["walled-free"], { "walled-free": 1_000_000 }),
+    fetchJSON: catalogued(["walled-free"], { "walled-free": 262_144 }),
     read: measuredWith({ "walled-free": { servedTokens: 100_000, wall: "bracketed" } }),
     sweepModels: async (ids) => {
       swept.push(...ids);
@@ -183,4 +183,80 @@ test("a bracketed wall is already known, so it is not suspected", async () => {
     },
   });
   assert.deepEqual(swept, [], "a wall this run already has is not a wall to look for again");
+});
+
+// The rule that decides what is measured at all: an id the catalogue declares
+// at a million or more is answered from models.dev — the largest entry any
+// provider declares for the same canonical model — and is not measured. Only an
+// id the catalogue declares BELOW a million is measured, because only there can
+// a measurement change the answer.
+//
+// The run of 2026-10-20 asked `minimax-m3.1-flash-free` and `beam-free` and
+// `nemotron-3.5-super-vl-free` — ids whose value models.dev already answers —
+// and spent eleven megabytes of prompts and half an hour of runner time to
+// learn the 1,048,576 the catalogue already said.
+test("an id the catalogue declares at a million is not measured", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    sweep: true,
+    all: true,
+    fetchJSON: catalogued(["big-free", "small-free"], { "big-free": 1_000_000, "small-free": 262_144 }),
+    read: measuredWith({ "big-free": { servedTokens: 898_459 } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.answeredElsewhere, ["big-free"], "the catalogue declares it at a million");
+  assert.deepEqual(swept, ["small-free"], "so only the one below the line is measured");
+});
+
+test("the open-ended state does not bring a million-token id back into measurement", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    sweep: true,
+    fetchJSON: catalogued(["big-free"], { "big-free": 1_048_576 }),
+    read: measuredWith({ "big-free": { servedTokens: 898_459 } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, [], "an open-ended id is not a candidate while models.dev answers it");
+  assert.deepEqual(swept, [], "and it is not asked about");
+});
+
+// A row for an id that is answered from models.dev is a row about a window
+// nobody asked about, and it is the row that makes the next run think the
+// model is still a candidate — `openEnded` is what the suspicion rule reads.
+test("a row for an id models.dev answers is dropped from the snapshot", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    sweep: false,
+    fetchJSON: catalogued(["big-free", "small-free"], { "big-free": 1_000_000, "small-free": 262_144 }),
+    read: measuredWith({ "big-free": { servedTokens: 898_459 }, "small-free": { servedTokens: 215_041 } }),
+    sweepModels: async () => [],
+  });
+  assert.deepEqual(Object.keys(state.snapshot.models), ["small-free"], "only what the sweep measured is kept");
+});
+
+// The rule holds for an id the catalogue does not declare a window for: there is
+// no declaration to be large, so there is nothing for models.dev to correct,
+// and it is measured.
+test("an id the catalogue does not declare a window for is measured", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    sweep: true,
+    fetchJSON: catalogued(["undeclared-free"], { "undeclared-free": undefined }),
+    read: measuredWith({}),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.answeredElsewhere, []);
+  assert.deepEqual(swept, ["undeclared-free"]);
 });
