@@ -34,14 +34,30 @@ test("a refusal below the largest served size is not a bound", async () => {
   assert.deepEqual(bracket.refusedSizes, [], "a refusal of something smaller than what was served says nothing");
 });
 
-test("a served size with no usage count is not a floor", async () => {
+test("a served size with no usage count is a floor, and carries no number to declare", async () => {
   const { tally } = await subject;
-  // A 200 that carries no `prompt_tokens` proves the prompt fitted and says
-  // nothing about how big it was: there is no number in it to declare.
+  // A 200 that carries no `prompt_tokens` proves the prompt fitted, and the
+  // size that fitted is the size that was asked — so the bracket has a floor
+  // under it. What it has not got is a count, and a count is what a
+  // declaration is made of.
+  //
+  // Counting only the sizes that came with a count left the bracket with no
+  // floor at all, and the floor is what the narrowing runs on and what the
+  // ladder's stop was gated on: two refusals then read as a ceiling with
+  // nothing under it — one of the shapes the rules say must not settle an
+  // axis — and the ladder went on asking sizes above a refusal whose answer
+  // was already known.
   const bracket = tally([served(1600000, undefined), refused(2200000), refused(2800000)]);
-  assert.equal(bracket.servedTokens, undefined);
-  assert.equal(bracket.servedChars, undefined);
-  assert.deepEqual(bracket.refusedSizes, [2200000, 2800000], "with nothing served, every refusal is above everything");
+  assert.equal(bracket.servedChars, 1600000, "the size that fitted is the floor of the bracket");
+  assert.equal(bracket.servedTokens, undefined, "and there is no count to declare from it");
+  assert.deepEqual(bracket.refusedSizes, [2200000, 2800000], "both refusals are above everything served");
+  // A count that did come back is still the number a declaration is made of,
+  // and it is read from the size it belongs to: the two are separate answers
+  // about separate asks, and the count is the smaller of the two here — a
+  // floor under the size, never over it.
+  const counted = tally([served(1000000, 215178), served(1600000, undefined)]);
+  assert.equal(counted.servedChars, 1600000, "the largest size served is the floor");
+  assert.equal(counted.servedTokens, 215178, "and the count is the largest one that came back");
 });
 
 test("the same size refused twice is one refused size, not two", async () => {
@@ -277,4 +293,104 @@ test("the ladder has a rung below the smallest window measured here", async () =
   // And it is low enough to be served by a model whose wall is a sixth of a
   // million tokens — 200,000 characters is about 50,000.
   assert.ok(FIRST_SIZE / 4 < 262_144, "so a model declared at 262,144 has a rung it can serve");
+});
+
+// The climb is what spends the shared credential, so the rule that ends it is
+// worth a case of its own. A refusal the route reproduced is the wall being
+// under the size that was just asked, so every larger rung is refused too and
+// asking one buys an answer already in hand.
+test("the ladder stops at a confirmed refusal, whether or not anything was served under it", async () => {
+  const { climbGoesOn } = await subject;
+  // The floor is what the narrowing runs on, not what the stop needs. The
+  // climb used to want a served floor as well, so a model whose first rung
+  // failed — or was served without a count — went on to be asked 2,800,000,
+  // 4,200,000 and 5,200,000 characters: three multi-megabyte requests for an
+  // answer the route had already given.
+  assert.equal(climbGoesOn({ kind: "refused" }), false, "a refusal the route reproduced ends the climb");
+  assert.equal(climbGoesOn({ kind: "served" }), true, "a served size lets the climb go on");
+  assert.equal(climbGoesOn({ kind: "error" }), true, "a failure says nothing about the size of the prompt");
+  assert.equal(climbGoesOn(undefined), false, "and an ask that did not happen ends the climb");
+});
+
+// The four shapes a result can have, and the words they are given. A named
+// window settles the axis on its own, a bracket needs two refused sizes above
+// a served one, one refusal is a hole in the bracket and none is a wall above
+// everything that was asked.
+test("the verdict is named in one place, and the four shapes are what they say", async () => {
+  const { verdictOf } = await subject;
+  assert.equal(verdictOf({ named: 1000000, refusedSizes: [4200000] }), "named", "the route stated its own window");
+  assert.equal(verdictOf({ refusedSizes: [1600000, 2800000] }), "bracketed", "two refused sizes above a served one");
+  assert.equal(verdictOf({ refusedSizes: [1600000] }), "single-refusal", "one refusal is a bracket with a hole in it");
+  assert.equal(verdictOf({ refusedSizes: [] }), "openEnded", "no refusal is a wall above everything asked");
+});
+
+// The exit code is what the workflow reads, and it has to say what happened.
+// The verdict cannot: a run in which every request failed comes back as
+// `openEnded` for every model, because nothing was served and nothing was
+// refused — so reading it as a sign of life made a run that never got an
+// answer exit 0, the opposite of what the comment above that line says.
+test("a run that learned nothing is a failure of the run, and the exit code says so", async () => {
+  const { exitCodeFor, learnedAbout } = await subject;
+  const nothingLearned = {
+    model: "some-free",
+    wall: "openEnded",
+    servedTokens: null,
+    servedChars: null,
+    refusedChars: null,
+    refusedSizes: [],
+  };
+  assert.equal(exitCodeFor([nothingLearned]), 1, "the route could not be asked about any of its models");
+  // A model the route served is a model the run learned something about, even
+  // where no wall was found: "no walls found" is an answer, not an outage.
+  assert.equal(
+    exitCodeFor([{ ...nothingLearned, servedChars: 5200000, servedTokens: 1301300 }]),
+    0,
+    "a model the route served is learned about",
+  );
+  // And a model the route refused is learned about too: the route answered,
+  // whatever it answered.
+  assert.equal(exitCodeFor([{ ...nothingLearned, refusedChars: 1600000 }]), 0, "a model the route refused is learned about");
+  // Nothing was asked at all — every id answered from models.dev — is not a
+  // failure: nothing failed, and nothing was learned either.
+  assert.equal(exitCodeFor([]), 0, "an empty result set is not a broken run");
+  // The same question, asked of one model: the survey writes a row per measured
+  // id, and a row for a model the route never answered says "no wall in reach"
+  // about a run that got no answer at all — and marks the id as measured, so
+  // it is never asked again.
+  assert.equal(learnedAbout(nothingLearned), false, "a model the route never answered is not learned about");
+  assert.equal(learnedAbout({ ...nothingLearned, servedChars: 5200000 }), true, "a model it served is");
+  assert.equal(learnedAbout({ ...nothingLearned, refusedChars: 1600000 }), true, "and a model it refused is too");
+  // A model the route served without a count is learned about as well: the
+  // size that fitted is the measurement, and the count is what is missing.
+  assert.equal(
+    learnedAbout({ ...nothingLearned, servedChars: 200000, servedTokens: null }),
+    true,
+    "a serve without a usage count is still a serve",
+  );
+});
+
+// A window the route states is the strongest answer this sweep gets, so a
+// number the read cut in half must not become one. The read's own `over` is
+// what says the body went on past what was read.
+test("a refusal body cut mid-number names no window", async () => {
+  const { namedWindow } = await subject;
+  // The read stopped before the body did, so the digits may have continued:
+  // `104857` may be `1048576`. A stated window outranks every bracket and
+  // carries no margin, so a truncated number would become the declared wall.
+  const cut = "This endpoint's maximum context length is 104857";
+  assert.equal(namedWindow(cut, true), undefined, "a number the read cut is not a window the route stated");
+  assert.equal(namedWindow(`${cut}6 tokens`, false), 1048576, "the same body read whole is the route's own number");
+});
+
+// The count is in the route's own bytes, and the route's own bytes are not
+// always compact: Python's `json.dumps` — and several OpenAI-compatible
+// gateways — write `"prompt_tokens": 215178` with a space after the colon.
+test("the count is read from the route's own bytes, compact or not", async () => {
+  const { promptTokens } = await subject;
+  // A serve whose count is missed reads as "served, but no usage count came
+  // back", and the count is what the floor is made of: the whole bracket
+  // degrades without it.
+  assert.equal(promptTokens('{"usage":{"prompt_tokens": 215178}}'), 215178, "a space after the colon is still the count");
+  assert.equal(promptTokens('{"usage":{"prompt_tokens":215178}}'), 215178, "and the compact form is too");
+  assert.equal(promptTokens('{"usage":{"completion_tokens":12}}'), undefined, "a body with no count says nothing");
 });

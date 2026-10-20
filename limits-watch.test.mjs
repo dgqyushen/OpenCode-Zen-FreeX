@@ -7,9 +7,11 @@
 // found the right ids would be testing Zen.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const subject = import("./limits-watch.mjs").catch((error) => {
   assert.fail(`limits-watch.mjs failed to load: ${error?.message ?? error}`);
@@ -259,4 +261,561 @@ test("an id the catalogue does not declare a window for is measured", async () =
   });
   assert.deepEqual(state.answeredElsewhere, []);
   assert.deepEqual(swept, ["undeclared-free"]);
+});
+
+// The report is what a pull request body is built from, and it used to claim
+// work that could never happen. The snapshot never holds a row for an id
+// models.dev answers — the run below drops those rows on every run — so such an
+// id was never measured and yet was named as "new" on every single run:
+// `minimax-m3.1-flash-free`, `beam-free` and `nemotron-3.5-super-vl-free` were
+// in that list an hour after an hour, for ever.
+test("an id models.dev answers is not new, because it is never measured", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    fetchJSON: catalogued(["big-free", "small-free"], { "big-free": 1_048_576, "small-free": 262_144 }),
+    read: measuredWith({}),
+    sweepModels: async () => [],
+  });
+  assert.deepEqual(state.added, ["small-free"], "the id that will be measured is the one that is new");
+  assert.deepEqual(state.answeredElsewhere, ["big-free"], "and the other is said under its own heading");
+});
+
+test("the report does not call an id models.dev answers new", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  await watch({
+    log: (line) => lines.push(line),
+    fetchJSON: catalogued(["big-free", "small-free"], { "big-free": 1_048_576, "small-free": 262_144 }),
+    read: measuredWith({}),
+    sweepModels: async () => [],
+  });
+  const said = lines.join("\n");
+  assert.ok(said.includes("new: small-free"), "the id that is going to be measured is named");
+  assert.ok(!/new:.*big-free/.test(said), "and the id that is never measured is not named as new");
+  assert.ok(
+    said.includes("answered from models.dev, so not measured: big-free"),
+    "it is said under its own heading, so the report is not silent about it",
+  );
+});
+
+// A row that disappears from the snapshot used to leave no trace: not in the
+// log, not in what the run returned, and not in anything a pull request body
+// could explain. The diff simply lost a measurement.
+test("a row that is dropped from the snapshot is named", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  const state = await watch({
+    log: (line) => lines.push(line),
+    fetchJSON: catalogued(["big-free", "small-free"], { "big-free": 1_048_576, "small-free": 262_144 }),
+    read: measuredWith({ "big-free": { servedTokens: 898_459 }, "small-free": { servedTokens: 215_041 } }),
+    sweepModels: async () => [],
+  });
+  assert.deepEqual(state.dropped, ["big-free"], "the id whose row is gone is named");
+  assert.deepEqual(Object.keys(state.snapshot.models), ["small-free"], "and the row really is gone");
+  assert.ok(
+    lines.some((line) => line.includes("dropped") && line.includes("big-free")),
+    "the report says so, so a pull request body can explain the diff",
+  );
+});
+
+// A row that carries a window the route stated in its own words is the one
+// row the plugin reads most eagerly: `limits.mjs` settles an axis outright on a
+// `named` number, where a bracketed one may only raise a declaration. A vendor
+// raising a declaration over a million does not un-state what the route said
+// about itself, so the row stays.
+test("a row that carries a window the route named survives the drop", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    fetchJSON: catalogued(["big-free"], { "big-free": 1_048_576 }),
+    read: measuredWith({ "big-free": { servedTokens: 898_459, wall: "named", named: 1_000_000 } }),
+    sweepModels: async () => [],
+  });
+  assert.deepEqual(state.dropped, [], "a window the route stated is not dropped");
+  assert.equal(state.snapshot.models["big-free"].named, 1_000_000, "and it is still in the snapshot");
+});
+
+// The suspicion rule is the one rule here with no bound of its own: a row that
+// says `openEnded` while the catalogue declares more than the row ever served
+// is an id whose wall may be one rung up, and the ladder is the same on every
+// run. Without the date on the row, the same question was paid for every hour
+// — up to fourteen requests and several megabytes of prompt each.
+test("an open-ended row measured yesterday is not asked about again", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-19" } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, [], "the row was measured a day ago");
+  assert.deepEqual(swept, [], "so the same question is not paid for again");
+});
+
+test("an open-ended row is asked about again once it is old enough", async () => {
+  const { watch, SUSPECT_AFTER_DAYS } = await subject;
+  const swept = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-13" } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.equal(SUSPECT_AFTER_DAYS, 7, "a week is the bound, and it is the row's age that is counted");
+  assert.deepEqual(state.suspicion, ["small-free"], "a row a week old is asked about again");
+  assert.deepEqual(swept, ["small-free"], "and the question is paid for once, not every hour");
+});
+
+test("an open-ended row a day short of the bound is not asked about again", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-14" } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, [], "six days is not yet a week");
+  assert.deepEqual(swept, [], "so nothing is asked");
+});
+
+// A row that is not a measurement is not a measurement. It used to count as one
+// anyway, because `added` is decided by the id being in the table: the id was
+// then never swept again, and the bad row was written straight back out, so
+// the corruption was permanent.
+test("a row that is not a measurement is dropped when the snapshot is read", async () => {
+  const { readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-rows-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(
+      file,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "good-free": { wall: "openEnded", servedTokens: 10 },
+          "text-free": "openEnded",
+          "number-free": 12,
+          "empty-free": {},
+          "list-free": [],
+        },
+      }),
+      "utf8",
+    );
+    const read = await readSnapshot(file);
+    assert.deepEqual(Object.keys(read.models), ["good-free"], "only a row that names a wall is a measurement");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("an id whose row is not a measurement is measured again", async () => {
+  const { watch, readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-bad-row-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, JSON.stringify({ version: 1, models: { "text-free": "openEnded" } }), "utf8");
+    const swept = [];
+    await watch({
+      sweep: true,
+      fetchJSON: route(["text-free"]),
+      read: () => readSnapshot(file),
+      sweepModels: async (ids) => {
+        swept.push(...ids);
+        return [];
+      },
+    });
+    assert.deepEqual(swept, ["text-free"], "the id was never measured, so it is measured now");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// A file this file did not write is no snapshot, and that is the same answer as
+// a missing one: there is nothing to compare against, and every offered id is
+// new.
+test("a snapshot written by another version of this file is no snapshot", async () => {
+  const { readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-version-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    for (const body of [
+      '{"version":2,"models":{"a-free":{"wall":"openEnded"}}}',
+      '{"models":{"a-free":{"wall":"openEnded"}}}',
+    ]) {
+      await writeFile(file, body, "utf8");
+      assert.deepEqual(await readSnapshot(file), { models: {} }, `${body} is not a snapshot this file understands`);
+    }
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// The snapshot is written beside the file and renamed over it. `writeFile`
+// truncates the target first, so a crash between the truncate and the write
+// left `limits-observed.json` empty — and `limits.mjs` answers with an empty
+// map when the JSON does not parse, so a half-written snapshot silently
+// stripped every measured wall from the running plugin.
+test("the snapshot is replaced whole, and never emptied on the way", async () => {
+  const { writeSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-atomic-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": { wall: "openEnded" } } }, file);
+    const before = statSync(file).ino;
+    await writeSnapshot({ models: { "a-free": { wall: "openEnded" }, "b-free": { wall: "bracketed" } } }, file);
+    const after = statSync(file).ino;
+    assert.notEqual(after, before, "the file is replaced, so a reader that had it open keeps the old one");
+    assert.equal(existsSync(`${file}.${process.pid}.tmp`), false, "and the temporary it was written through is gone");
+    const written = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(Object.keys(written.models), ["a-free", "b-free"], "the new file holds the new rows");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// A row counts the same window twice, in two units: `named` is tokens, the
+// rest are characters. The names cannot change — three files read this one —
+// so the units are stated beside the rows instead.
+test("the snapshot says what unit each of its numbers is in", async () => {
+  const { writeSnapshot, readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-units-${Date.now()}.json`);
+  try {
+    const body = await writeSnapshot(
+      {
+        models: {
+          "a-free": { wall: "named", named: 1_000_000, servedChars: 4_000_000, servedTokens: 1_000_000 },
+        },
+      },
+      file,
+    );
+    const written = JSON.parse(body);
+    assert.equal(written._units.named, "tokens", "the window the route named is a number of tokens");
+    assert.equal(written._units.servedChars, "characters", "and what was served is a number of characters");
+    assert.equal(written._units.refusedSizes, "characters", "and so is every size that was refused");
+    assert.equal(written.version, 1, "the version is still the one the readers know");
+    assert.deepEqual(Object.keys(written.models), ["a-free"], "the rows are where they were");
+    const read = await readSnapshot(file);
+    assert.deepEqual(Object.keys(read.models), ["a-free"], "and a reader that ignores the key still reads the rows");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("a snapshot written before the units were stated is read as it was", async () => {
+  const { readSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-no-units-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, JSON.stringify({ version: 1, models: { "a-free": { wall: "openEnded" } } }), "utf8");
+    const read = await readSnapshot(file);
+    assert.deepEqual(Object.keys(read.models), ["a-free"], "the key is only ever written, never required");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// The catalogue the run reads decides what is measured at all, so a deployment
+// that names one has to be read. `limits-audit.mjs` and `limits-sweep.mjs`
+// both honour the variable; this file read provider.mjs's own constant, which
+// no deployment can name.
+test("the catalogue comes from the environment when one is named", async () => {
+  const { catalogUrl, watch } = await subject;
+  const { CATALOG } = await import("./provider.mjs");
+  const named = "https://mirror.invalid/api.json";
+  assert.equal(catalogUrl({ ZEN_CATALOG_URL: named }), named, "the named catalogue is the one that is read");
+  assert.equal(catalogUrl({}), CATALOG, "and without one the production catalogue is");
+  const urls = [];
+  await watch({
+    fetchJSON: async (url) => {
+      urls.push(url);
+      return url.endsWith("/models") ? { data: [] } : { opencode: { models: {} } };
+    },
+    read: async () => ({ models: {} }),
+    sweepModels: async () => [],
+  });
+  assert.ok(urls.includes(catalogUrl()), "and the run fetches the catalogue from that URL");
+});
+
+// A route that answers 500, a name that does not resolve, a catalogue that
+// cannot be read and a snapshot that cannot be written all have to be heard
+// about: the exit code is how the workflow tells "reached the route" from
+// "could not reach it", and a stack trace is not an answer.
+//
+// Run as a program, because that is the only way the entry point exists: the
+// file's own `import.meta.main` is Bun's, so a runtime without it has no entry
+// point to ask about.
+const needsBun = process.versions.bun
+  ? undefined
+  : "the entry point is Bun's `import.meta.main`, so this needs Bun to run";
+test(
+  "a run that could not reach the route says so, and exits with the code the workflow reads",
+  { skip: needsBun },
+  async () => {
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 60000,
+      env: {
+        ...process.env,
+        // A closed port on the loopback: the connection is refused at once, so
+        // the run fails for the reason under test rather than by waiting.
+        ZEN_BASE_URL: "http://127.0.0.1:1/v1",
+        ZEN_CATALOG_URL: "http://127.0.0.1:1/api.json",
+      },
+    });
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 1, "a run that reached nothing is not a run that answered");
+    assert.ok(
+      said.includes("unable to read the route or the catalogue"),
+      `the failure is named in a sentence, not in a stack trace: ${said}`,
+    );
+    assert.ok(said.includes("Check the network and ZEN_BASE_URL"), "and the remedy is said with it");
+    assert.ok(!said.includes("limits-watch.mjs:"), "and no stack frame of this file is printed");
+  },
+);
+
+// The snapshot is what the plugin reads at run time: `limits.mjs` answers with
+// what the file holds, so a file that is not what the plugin can read is a
+// window every host gets wrong. The workflow publishes that file without a
+// person reading it, so the file has to be able to say that it is right — and
+// the check has to be able to say that it is not.
+const goodRow = {
+  servedTokens: 375142,
+  servedChars: 1750000,
+  refusedChars: 1787500,
+  refusedSizes: [1787500, 1825000],
+  wall: "bracketed",
+  at: "2026-10-20",
+};
+
+test("a snapshot this file wrote is one the plugin can read", async () => {
+  const { writeSnapshot, checkSnapshot, checkSnapshotFile } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-good-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": goodRow } }, file);
+    assert.deepEqual(checkSnapshot(JSON.parse(readFileSync(file, "utf8"))), [], "the file it writes passes its own check");
+    const report = await checkSnapshotFile(file);
+    assert.equal(report.ok, true, "and the check says so");
+    assert.deepEqual(report.problems, [], "with nothing to say about it");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("a row with a wall nobody knows is refused, and the row is named", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({
+    version: 1,
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    models: { "a-free": { ...goodRow, wall: "bracketedt" } },
+  });
+  assert.equal(problems.length, 1, "the row is the only thing wrong");
+  assert.ok(problems[0].startsWith("a-free:"), "the row is named: " + problems[0]);
+  assert.ok(problems[0].includes("bracketedt"), "and the wall it says is quoted: " + problems[0]);
+});
+
+test("a row that names two different refused sizes is refused", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({
+    version: 1,
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    models: { "a-free": { ...goodRow, refusedChars: 1787501 } },
+  });
+  assert.equal(problems.length, 1, "the row is the only thing wrong");
+  assert.ok(problems[0].includes("1787501") && problems[0].includes("1787500"), "and both sizes are said: " + problems[0]);
+});
+
+test("a row whose date is not a date is refused", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({
+    version: 1,
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    models: { "a-free": { ...goodRow, at: "2026-13-40" } },
+  });
+  assert.equal(problems.length, 1, "the row is the only thing wrong");
+  assert.ok(problems[0].includes("2026-13-40"), "and the date it says is quoted: " + problems[0]);
+});
+
+test("a row whose number is not a whole number is refused", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({
+    version: 1,
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    models: { "a-free": { ...goodRow, servedTokens: 375142.5 } },
+  });
+  assert.equal(problems.length, 1, "the row is the only thing wrong");
+  assert.ok(problems[0].includes("servedTokens"), "and the number it says is named: " + problems[0]);
+});
+
+test("a file that does not say what unit its numbers are in is refused", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({ version: 1, models: { "a-free": goodRow } });
+  assert.equal(problems.length, 1, "the file is the only thing wrong");
+  assert.ok(problems[0].includes("unit"), "and what is missing is said: " + problems[0]);
+});
+
+test("a file that says the wrong unit for a number is refused", async () => {
+  const { checkSnapshot } = await subject;
+  const problems = checkSnapshot({
+    version: 1,
+    _units: { servedTokens: "characters", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    models: { "a-free": goodRow },
+  });
+  assert.equal(problems.length, 1, "the file is the only thing wrong");
+  assert.ok(problems[0].includes("servedTokens") && problems[0].includes("tokens"), "and the unit it says is named: " + problems[0]);
+});
+
+test("a snapshot that cannot be read and one that is not JSON are told apart", async () => {
+  const { checkSnapshotFile } = await subject;
+  const missing = join(tmpdir(), `zen-observed-${process.pid}-gone-${Date.now()}.json`);
+  const unreadable = await checkSnapshotFile(missing);
+  assert.equal(unreadable.ok, false, "a file that is not there is not a snapshot");
+  assert.equal(unreadable.why, "unreadable", "and it is said as a file that could not be read");
+  assert.ok(unreadable.problems[0].includes("could not be read"), "in so many words: " + unreadable.problems[0]);
+  const file = join(tmpdir(), `zen-observed-${process.pid}-junk-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, "not json at all", "utf8");
+    const notJson = await checkSnapshotFile(file);
+    assert.equal(notJson.ok, false, "a file that is not JSON is not a snapshot");
+    assert.equal(notJson.why, "not-json", "and it is said as a file that is not JSON");
+    assert.ok(notJson.problems[0].includes("not JSON"), "in so many words: " + notJson.problems[0]);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("--check reads the file, writes nothing, and asks nothing", async () => {
+  const { writeSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-check-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": goodRow } }, file);
+    const before = readFileSync(file, "utf8");
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [script, "--check", file], {
+      encoding: "utf8",
+      timeout: 60000,
+      env: {
+        ...process.env,
+        // A closed port on the loopback: the check asks nothing, so a run that
+        // reached for the route would fail here rather than pass quietly.
+        ZEN_BASE_URL: "http://127.0.0.1:1/v1",
+        ZEN_CATALOG_URL: "http://127.0.0.1:1/api.json",
+      },
+    });
+    assert.equal(run.status, 0, `a snapshot the plugin can read passes: ${run.stdout ?? ""}${run.stderr ?? ""}`);
+    assert.equal(readFileSync(file, "utf8"), before, "and the file it read is the file it left");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("--check says which row is wrong, and exits with the code the workflow reads", async () => {
+  const { writeSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-bad-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": { ...goodRow, wall: "nonsense" } } }, file);
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [script, "--check", file], { encoding: "utf8", timeout: 60000 });
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 1, "a snapshot the plugin cannot read does not pass");
+    assert.ok(said.includes("a-free:"), "the row is named: " + said);
+    assert.ok(said.includes("nonsense"), "and what is wrong with it is said: " + said);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// A result the sweep learned nothing about is not a measurement. A run in which
+// every request failed comes back as `openEnded` with nothing served and
+// nothing refused — and written into the snapshot, that row says "no wall in
+// reach" about a run that never got an answer, overwriting an earlier good
+// measurement and marking the id as measured for ever.
+test("a result the run learned nothing about gets no row, and is named", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  const state = await watch({
+    sweep: true,
+    log: (line) => lines.push(line),
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({}),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+      },
+    ],
+  });
+  assert.deepEqual(state.unlearned, ["small-free"], "the id the run learned nothing about is named");
+  assert.deepEqual(Object.keys(state.snapshot.models), [], "and no row was written for it");
+  assert.ok(
+    lines.some((line) => line.includes("learned nothing") && line.includes("small-free")),
+    "the report says so, so a pull request body can explain it",
+  );
+});
+
+test("an earlier good measurement is not overwritten by a run that learned nothing", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    sweep: true,
+    // `--all`, because an id that already has a row is not asked about again
+    // by the timer — and the row has to be in the way for this to be about
+    // overwriting it.
+    all: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 215_041, wall: "bracketed" } }),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+      },
+    ],
+  });
+  assert.deepEqual(state.unlearned, ["small-free"], "the run learned nothing about the id");
+  assert.equal(state.snapshot.models["small-free"].wall, "bracketed", "and the row it had stands");
+  assert.equal(state.snapshot.models["small-free"].servedTokens, 215_041, "with the number it carried");
+});
+
+test("a result the route served without a count is a measurement, and is kept", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    sweep: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({}),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: 200_000,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+      },
+    ],
+  });
+  assert.deepEqual(state.unlearned, [], "the route served a size, so the run learned something");
+  assert.equal(state.snapshot.models["small-free"].servedChars, 200_000, "and the row is written");
 });

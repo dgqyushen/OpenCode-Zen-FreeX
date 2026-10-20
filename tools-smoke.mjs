@@ -40,6 +40,9 @@
 //              no entry in that profile's `tools`: nothing was asked about the
 //              fingerprint, and fingerprint.json is what has to change
 //   unreachable the free tier could not be asked at all
+//   timed-out  the request was still in flight when the deadline passed: the
+//              route did not say no, it did not say anything at all, and that
+//              is neither a refusal nor an outage
 //
 // Exit code is 0 when at least one generation's floor is answered. A generation
 // being refused is not a failure while another still works, and `malformed` is
@@ -50,7 +53,16 @@ import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES, agentFor } from "./core-tools.mjs";
+import { readBoundedText } from "./limits.mjs";
 import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
+
+// How many characters of an error body are read. A refusal is short, and the
+// one thing this gate quotes is the sentence inside it, so the budget is the
+// same one limits-audit.mjs reads a refusal with. The reader is limits.mjs's
+// `readBoundedText`: the deadline, the budget and the release of the rest of
+// the body are all its, and limits.mjs imports only node builtins, so nothing
+// here closes a cycle.
+const READ_BUDGET = 4096;
 
 // The endpoint, from the one place that owns it: a copy here was a second answer
 // that drifted the moment the endpoint moved — this gate would probe the old host
@@ -66,7 +78,19 @@ import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
 // drifted when it was copied; the rule is a single expression whose second copy
 // is reached only where `limits-audit.mjs` is not loaded. Moving `baseFrom` to a
 // module both can import without a cycle is the fix if a third caller appears.
-const BASE = (process.env.ZEN_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
+//
+// An empty value names no base. `??` reads it as set, so `ZEN_BASE_URL=` — a
+// line a profile export leaves behind — made the base the empty string and the
+// request the relative URL `/chat/completions`, which `fetch` refuses to parse:
+// the catch-all reported `unreachable` and the summary said the free tier could
+// not be reached, a fault in the reader's own variable reported as an outage of
+// the service. `limits-audit.mjs`'s `baseFrom` answers it this way, and the rule
+// cannot be imported back without a cycle, so it is stated here as well.
+const BASE = (
+  process.env.ZEN_BASE_URL === undefined || process.env.ZEN_BASE_URL.trim() === ""
+    ? DEFAULT_BASE
+    : process.env.ZEN_BASE_URL.trim()
+).replace(/\/+$/, "");
 // The model the gate probes with. It has to be a model the route still serves,
 // and it stopped being one: `space-bunny-free` was retired by the route on
 // 2026-10-19 and every request with it is answered 410, so every run of this
@@ -75,7 +99,15 @@ const BASE = (process.env.ZEN_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
 // equipment like any other and it expires; what changed here is that the
 // failure is now NAMED rather than being one more line of a run that says
 // nothing, so the next expiry is a sentence about the probe and not a silence.
-const MODEL = process.env.ZEN_CHECK_MODEL ?? "minimax-m3.1-flash-free";
+//
+// An empty value names no model either: `ZEN_CHECK_MODEL=` sent `model: ""`,
+// and the route answered that with a 404 the gate reports as `probe-gone` —
+// the probe model is gone — when the truth is that the reader's own variable
+// was empty. The default is what an unset variable means.
+const MODEL =
+  process.env.ZEN_CHECK_MODEL === undefined || process.env.ZEN_CHECK_MODEL.trim() === ""
+    ? "minimax-m3.1-flash-free"
+    : process.env.ZEN_CHECK_MODEL.trim();
 
 // A session id of the shape OpenCode makes, since that is part of what is asked.
 // It is provider.mjs's own `opencodeID` rather than a copy of it: the id is one
@@ -158,73 +190,95 @@ export async function check(generation, profile, shape, namesOf) {
     return malformed(generation, shape, error);
   }
   const { headers, body } = request;
+  let response;
   try {
-    const response = await fetch(`${BASE}/chat/completions`, {
+    response = await fetch(`${BASE}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(30000),
     });
-    // The status is the verdict; the body only ever explains one. Reading it
-    // first made a 200 whose body was cut — a reset mid-stream, or the 30s
-    // timeout firing while it was still arriving — look like `unreachable`,
-    // "the free tier could not be reached at all", for a request Zen had
-    // answered. Nothing more is read on the success path either: a body nobody
-    // reads is a body nobody has to receive. It is let go of rather than left
-    // dangling, the way provider.mjs's readRemote releases the body of a
-    // response it does not read: an unread body holds its connection open until
-    // the GC gets to it, and a gate that probes one host twice does not need two
-    // sockets held for a verdict it already has. A cancel that fails is not a
-    // verdict either, so it is swallowed here — and the status is still the
-    // answer whatever the release did.
-    if (response.ok) {
-      await response.body?.cancel().catch(() => {});
-      return { generation, shape, verdict: "answered", detail: `as ${headers.get("user-agent")}` };
-    }
-    // The 426 body is released for the same reason as the answered one, and
-    // released here rather than above the `ok` check because the two branches
-    // below are the opposite case: they *do* read the body, to quote what Zen
-    // said about the fingerprint, and a release hoisted above them would take
-    // that away. This branch reads nothing — its detail is the fixed sentence
-    // below, since a 426 means Zen wants a newer OpenCode and there is nothing in
-    // the body this gate could add — so the body is let go of rather than left
-    // for the GC to close.
-    if (response.status === 426) {
-      await response.body?.cancel().catch(() => {});
-      return {
-        generation,
-        shape,
-        verdict: "superseded",
-        detail: "Zen wants a newer OpenCode than this profile claims",
-      };
-    }
-    // A body that cannot be read leaves the status standing: a 403 whose body
-    // was lost is still a 403, and `says` has nothing to add to it.
-    const text = await response.text().catch(() => "");
-    // Only a 403 is the answer this gate reads: Zen quoting the fingerprint
-    // back. A 5xx, a 429 or a 401 says something about the service or the way
-    // it was asked, and reading any of them as "the fingerprint is stale" sends
-    // the reader to `capture` over a problem capturing cannot fix.
-    if (response.status === 403)
-      return { generation, shape, verdict: "refused", detail: `HTTP 403${says(text)}` };
-    // A probe model the route no longer serves is a fact about the PROBE, and
-    // this gate is about the fingerprint. 410 is the route retiring an id and
-    // 404 is the route not knowing it, and both answer a question about the
-    // model this run chose to ask with — a question ZEN_CHECK_MODEL answers.
-    // They are not the fingerprint being stale, and reporting them as "failed"
-    // put them in the same column as an outage, which is where a reader stops
-    // looking.
-    if (response.status === 410 || response.status === 404)
-      return {
-        generation,
-        shape,
-        verdict: "probe-gone",
-        detail: `HTTP ${response.status}${says(text)} — the probe model is gone; set ZEN_CHECK_MODEL to one the route serves`,
-      };
-    return { generation, shape, verdict: "failed", detail: `HTTP ${response.status}${says(text)}` };
   } catch (error) {
-    return { generation, shape, verdict: "unreachable", detail: error.message };
+    // Only the transport is caught here. A timeout, a refused connection and a
+    // fault in this file are three different things, and the summary reads
+    // `unreachable` as "the free tier could not be reached at all" — so a
+    // request that was still in flight when the deadline passed was reported
+    // as an outage of the service. The two are told apart here, and the
+    // summary knows the difference.
+    const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+    return {
+      generation,
+      shape,
+      verdict: timedOut ? "timed-out" : "unreachable",
+      detail: error.message,
+    };
   }
+  // The status is the verdict; the body only ever explains one. Reading it
+  // first made a 200 whose body was cut — a reset mid-stream, or the 30s
+  // timeout firing while it was still arriving — look like `unreachable`,
+  // "the free tier could not be reached at all", for a request Zen had
+  // answered. Nothing more is read on the success path either: a body nobody
+  // reads is a body nobody has to receive. It is let go of rather than left
+  // dangling, the way provider.mjs's readRemote releases the body of a
+  // response it does not read: an unread body holds its connection open until
+  // the GC gets to it, and a gate that probes one host twice does not need two
+  // sockets held for a verdict it already has. A cancel that fails is not a
+  // verdict either, so it is swallowed here — and the status is still the
+  // answer whatever the release did.
+  if (response.ok) {
+    await response.body?.cancel().catch(() => {});
+    return { generation, shape, verdict: "answered", detail: `as ${headers.get("user-agent")}` };
+  }
+  // The 426 body is released for the same reason as the answered one, and
+  // released here rather than above the `ok` check because the two branches
+  // below are the opposite case: they *do* read the body, to quote what Zen
+  // said about the fingerprint, and a release hoisted above them would take
+  // that away. This branch reads nothing — its detail is the fixed sentence
+  // below, since a 426 means Zen wants a newer OpenCode and there is nothing in
+  // the body this gate could add — so the body is let go of rather than left
+  // for the GC to close.
+  if (response.status === 426) {
+    await response.body?.cancel().catch(() => {});
+    return {
+      generation,
+      shape,
+      verdict: "superseded",
+      detail: "Zen wants a newer OpenCode than this profile claims",
+    };
+  }
+  // A body that cannot be read leaves the status standing: a 403 whose body
+  // was lost is still a 403, and `says` has nothing to add to it.
+  //
+  // The read gets its own short deadline. The 30 s above is the request's,
+  // and a signal governs the body as well as the request, so a body that
+  // arrived after it was aborted: the text fell back to "", and Zen's sentence
+  // — the one thing this gate quotes — was lost, leaving a bare `HTTP 403`
+  // that reads as a refusal Zen had nothing to say about. limits.mjs's
+  // `readBoundedText` carries that deadline, bounds the body and releases the
+  // rest of it, and it imports only node builtins, so there is no cycle to
+  // close.
+  const { text } = await readBoundedText(response, READ_BUDGET).catch(() => ({ text: "" }));
+  // Only a 403 is the answer this gate reads: Zen quoting the fingerprint
+  // back. A 5xx, a 429 or a 401 says something about the service or the way
+  // it was asked, and reading any of them as "the fingerprint is stale" sends
+  // the reader to `capture` over a problem capturing cannot fix.
+  if (response.status === 403)
+    return { generation, shape, verdict: "refused", detail: `HTTP 403${says(text)}` };
+  // A probe model the route no longer serves is a fact about the PROBE, and
+  // this gate is about the fingerprint. 410 is the route retiring an id and
+  // 404 is the route not knowing it, and both answer a question about the
+  // model this run chose to ask with — a question ZEN_CHECK_MODEL answers.
+  // They are not the fingerprint being stale, and reporting them as "failed"
+  // put them in the same column as an outage, which is where a reader stops
+  // looking.
+  if (response.status === 410 || response.status === 404)
+    return {
+      generation,
+      shape,
+      verdict: "probe-gone",
+      detail: `HTTP ${response.status}${says(text)} — the probe model is gone; set ZEN_CHECK_MODEL to one the route serves`,
+    };
+  return { generation, shape, verdict: "failed", detail: `HTTP ${response.status}${says(text)}` };
 }
 
 // Whether this module is the file that was run rather than one the tests
@@ -238,6 +292,46 @@ function invokedDirectly() {
   // The runtime gave no answer, so the paths have to. Both sides are arguments
   // to `isEntryPoint` below, which is where the question is actually decided.
   return isEntryPoint({ argv1: process.argv[1], moduleUrl: import.meta.url });
+}
+
+// The codes a host answers with when it cannot make a link at all — no
+// privilege for a symlink, a file system without hard links, a Windows that has
+// neither — as opposed to an error a fixture made by mistake. Only these may
+// become a skip; anything else has to fail, because a case that silently does
+// nothing is a case that reports success without checking.
+//
+// `EINVAL` is not on this list, and it is the one code here that a mistake in
+// the fixture can produce. Neither `link` nor `symlink` lists EINVAL among
+// its errors — a file system that cannot make links answers ENOSYS, ENOTSUP
+// or EPERM — while an invalid argument is exactly what EINVAL means, so the
+// code that says "this host cannot do it" is also the code that says "these
+// arguments are wrong". Read as unsupported, a fixture that passed the wrong
+// arguments would skip instead of failing, and a skipped case is one that
+// reports success without checking anything.
+//
+// `EXDEV` is not on this list either, and it is the more dangerous of the two
+// to leave in, because it is the code most likely to arrive from a genuinely
+// broken fixture. It means the two paths are on different mounts or volumes —
+// a statement about where the fixture put its files, not about what the host
+// can do. No host can hard-link across a volume, so a fixture whose two halves
+// landed on different drives would be skipped as "this host cannot make links"
+// on a host that makes them perfectly well: a broken fixture reporting success
+// having checked nothing.
+//
+// The policy is here, in the module that ships, rather than in a test file
+// that checked a copy of itself: the rule used to exist only as a copy inside
+// tools-smoke.test.mjs, and the one implementation of the decision in the
+// repository — `linked()` in limits-audit.test.mjs — turned EVERY error into a
+// skip, the two codes above included. A rule that is asserted against a copy
+// proves only that the copy agrees with itself.
+//
+// Exported so both test files assert the same decision.
+export const UNSUPPORTED_LINK_CODES = ["EPERM", "EACCES", "ENOSYS", "ENOTSUP"];
+
+// The error as one of this host's refusals to make a link, or undefined when it
+// is anything else — and anything else has to fail the case that hit it.
+export function unsupportedError(error) {
+  return UNSUPPORTED_LINK_CODES.includes(error?.code) ? error : undefined;
 }
 
 /**
@@ -327,10 +421,15 @@ export function fileIdentity(stats) {
 // this could not settle (`undefined`) exits above rather than reaching it.
 const entry = invokedDirectly();
 if (entry === undefined) {
-  console.error(
+  // Thrown rather than exited on: this is module evaluation, so `process.exit(1)`
+  // here kills the importer — a test runner, a loader, anything that asked for
+  // these helpers — and can truncate what is written to stderr when it is a
+  // pipe. limits-audit.mjs answers the same question the same way, with
+  // UNDETERMINED_ENTRY, and a run that reaches it still dies non-zero: an
+  // uncaught error is a non-zero exit, and the decision is the caller's.
+  throw new Error(
     "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run check:gate`.",
   );
-  process.exit(1);
 }
 
 // The one-line summary of a run in which the floor was not served everywhere it
@@ -392,6 +491,16 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
     }
     if (verdicts.some(fingerprint)) {
       return "Some of the floor requests were answered about the fingerprint and some were not, which is not a fact about the fingerprint either way. Check the network or ZEN_BASE_URL and ask again.";
+    }
+    // A timeout is neither an answer nor an outage. The request was still in
+    // flight when the deadline passed, so the route did not say no about the
+    // wording and it did not say nothing because it could not be reached — it
+    // did not answer at all. Saying the free tier "could not be reached at
+    // all" about that sends the reader to the network for a request that was
+    // still in flight, and saying Zen answered every floor request says
+    // something the run does not know.
+    if (verdicts.includes("timed-out")) {
+      return "The free tier did not answer before this gate's deadline, so this says nothing about the fingerprint. Ask again, or check the route's load — a request that is still in flight is not a refusal.";
     }
     if (!verdicts.some((verdict) => verdict === "unreachable")) {
       return "Zen answered every floor request, but none of them with a verdict on the fingerprint, so this says nothing about it. Check the service or ZEN_BASE_URL and ask again.";

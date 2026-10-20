@@ -42,7 +42,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROFILES, profileFor } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedAxes, readBoundedText } from "./limits.mjs";
-import { SDK, bootstrapProtocols, isFree } from "./models.mjs";
+import { SDK, bootstrapProtocols, isFree, limitFor } from "./models.mjs";
 import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
@@ -64,7 +64,42 @@ export function baseFrom(value) {
   // check the network" about a variable that was wrong before it was used.
   // Whitespace names no base either, for the same reason.
   const text = value === undefined || value === null ? DEFAULT_BASE : String(value);
-  return (text.trim() === "" ? DEFAULT_BASE : text).replace(/\/+$/, "");
+  const trimmed = text.trim();
+  if (trimmed === "") return DEFAULT_BASE;
+  // The rest of provider.mjs's `httpURL` rule, which this base has to answer
+  // too — it was copied here as half of it, and the half that was missing is
+  // the half that fails the same unexplained way:
+  //
+  //   * The whitespace is judged before the text is used, and the trimmed text
+  //     is what is returned. A base written as `" https://host "` kept its
+  //     spaces, so the trailing-slash strip never fired and the audit fetched
+  //     `https://host/%20/models` — a 404 reported as "the route or the
+  //     catalogue could not be read … check the network and ZEN_BASE_URL", a
+  //     network message about a whitespace typo.
+  //   * A base carrying credentials, a query or a fragment is refused, as
+  //     `httpURL` refuses it. Pasted into the middle of a URL here it becomes
+  //     `https://host?x=1/models`, which is a URL with a query in the path and
+  //     fails the same unexplained way.
+  let url;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error(
+      `ZEN_BASE_URL is not a URL: ${JSON.stringify(trimmed)}. It has to be an HTTP(S) URL such as ${DEFAULT_BASE}.`,
+    );
+  }
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(
+      `ZEN_BASE_URL must be an HTTP(S) URL without credentials, query or fragment: ${JSON.stringify(trimmed)}.`,
+    );
+  }
+  return url.href.replace(/\/+$/, "");
 }
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
@@ -133,12 +168,27 @@ export function groupByUpstream(rows) {
 }
 
 // A row as `run` builds it: the catalogue's own pair under `declared`, which is
-// what the "catalogue says …" note prints, and the pair the plugin really puts on
-// the wire under `effective` — the catalogue's with limits.mjs over it. The two
-// are the same for every id with no evidence against it, which is most of them.
+// what the "catalogue says …" note prints, and the pair the plugin declares for
+// the id under `effective` — the catalogue's with limits.mjs's evidence over it.
+//
+// The canonical id comes along because it is what earns the models.dev second
+// opinion: `canonical_model_id` is the name models.dev publishes the same
+// weights under, and a free id is one provider's alias of them. Without it the
+// second opinion is never read, and a million the catalogue declares as 1000000
+// stays 1000000 here while the wire carries the binary 1048576 — the table and
+// the sibling comparison then disagree with the number the hosts behind the
+// plugin are given, and a candidate raised off that is a candidate about the
+// wrong number.
+//
+// What is not restated here is models.mjs's own default for an axis the
+// catalogue does not declare (32768/4096), and its rule that an axis has to be
+// a usable whole number: those are the plugin's, and a second copy of them
+// here would be a second answer to drift. models.mjs owns the wire pair, and
+// this asks it for that pair rather than rebuilding it.
 export function withEffective(row, table = LIMITS) {
   const declared = row.declared ?? {};
-  return { ...row, effective: { ...declared, ...limitOverrides(row.id, declared, table) } };
+  const effective = limitFor(row.id, declared, row.canonical, table);
+  return { ...row, effective };
 }
 
 // The pair the sibling comparison below is made against: what the plugin
@@ -151,11 +201,39 @@ export function withEffective(row, table = LIMITS) {
 // catalogue.
 const judgement = (row) => row.effective ?? row.declared ?? {};
 
-// What is worth a measurement, in the order it should be read. `covered` are the
-// ids limits.mjs already carries evidence for, which are said once and not
-// raised again. Exported for the tests.
+// The evidence limits.mjs already carries, one entry per (id, axis).
+//
+// The table is per axis and not per id: `ll-alpha-free` and
+// `longcat-2.5-preview-free` carry an output entry and no context entry,
+// `nemotron-3.5-lightning-free` carries a context entry and no output entry,
+// and `space-bunny-free` carries an input entry only. An id the table covers
+// on one axis is still open on the other, so the covered set is built per axis
+// and not per id — see `findings` below, where the difference decides whether
+// a finding is raised or dropped without a word.
+//
+// Exported for the tests.
+export function coveredAxes(table = LIMITS) {
+  const covered = new Set();
+  for (const [id, record] of Object.entries(table ?? {}))
+    for (const axis of Object.keys(record ?? {})) covered.add(`${id}:${axis}`);
+  return covered;
+}
+
+// What is worth a measurement, in the order it should be read. `covered` are
+// the (id, axis) pairs limits.mjs already carries evidence for, which are said
+// once and not raised again. Exported for the tests.
 export function findings(rows, covered = new Set()) {
   const out = [];
+  // Evidence for one axis is not evidence for another. LIMITS carries an
+  // output entry for `ll-alpha-free` and no context entry, so a window the
+  // route names for that id is new information and has to be raised — and the
+  // covered set said nothing about it, because it said "this id is covered"
+  // and the whole row was skipped. The set therefore answers per axis
+  // (`id:axis`), and a row is only settled when both of its axes are.
+  //
+  // A row that is settled on one axis and open on the other is still read: its
+  // status is in the table above, but the open axis is a question.
+  const settled = (id, axis) => covered.has(`${id}:${axis}`);
   for (const row of rows) {
     // The catalogue's own pair, because that is what these two lines say. Every
     // row `run` builds also carries `effective` — the same pair with limits.mjs's
@@ -164,24 +242,32 @@ export function findings(rows, covered = new Set()) {
     // the point. Here they are not: an id the table does not cover would have had
     // the plugin's own number printed as the catalogue's.
     const declared = row.declared ?? {};
-    // An id limits.mjs already carries evidence for is not asked for again: its
-    // numbers are in the table and repeating them here would bury what is new.
-    // Its status is still printed in the table above, so a model that dies is
-    // not hidden by this — only its numbers stop being a question.
-    if (covered.has(row.id)) continue;
-    if (row.ceiling !== undefined && row.ceiling !== declared.output)
+    // A row that the table settles on both of its axes is not asked for again:
+    // its numbers are in the table and repeating them here would bury what is
+    // new. Its status is still printed in the table above, so a model that
+    // dies is not hidden by this — only its numbers stop being a question.
+    if (settled(row.id, "output") && settled(row.id, "context")) continue;
+    // A model that does not speak the shape this audit asks with is not a limits
+    // finding and must not sit in this list for ever: it is said once, beside the
+    // ids that were not asked at all.
+    //
+    // The check comes above the two comparisons, because a refusal that names
+    // another API shape and also mentions a number is the route answering about
+    // its shape and not about its limits: read after them it was reported as a
+    // ceiling or a window the route never stated, which is exactly what the
+    // sentence above says must not happen. The sibling comparison below honours
+    // the same rule (`spoke = list.filter((row) => !protocolScoped(row))`), and
+    // so does the run's own count of what answered.
+    if (protocolScoped(row)) continue;
+    if (row.ceiling !== undefined && row.ceiling !== declared.output && !settled(row.id, "output"))
       out.push(
         `${row.id}: the route names a ceiling of ${row.ceiling} completion tokens, the catalogue declares ${declared.output ?? "none"}`,
       );
-    if (row.window !== undefined && row.window !== declared.context)
+    if (row.window !== undefined && row.window !== declared.context && !settled(row.id, "context"))
       out.push(
         `${row.id}: a refusal named a window of ${row.window}, the catalogue declares ${declared.context ?? "none"}`,
       );
     const named = row.ceiling !== undefined || row.window !== undefined;
-    // A model that does not speak the shape this audit asks with is not a limits
-    // finding and must not sit in this list for ever: it is said once, beside the
-    // ids that were not asked at all.
-    if (protocolScoped(row)) continue;
     if (row.status !== 200 && row.status !== 0 && !named) {
       // What is left is worth reading: a 410, and a 400 that named nothing. A 0
       // is a question that was never answered — timeout, DNS, a closed socket —
@@ -205,7 +291,10 @@ export function findings(rows, covered = new Set()) {
     if (new Set(spoke.map((row) => `${pair(row).context}/${pair(row).output}`)).size < 2) continue;
     const largest = (axis) => Math.max(...spoke.map((row) => pair(row)[axis] ?? 0));
     for (const row of spoke) {
-      if (covered.has(row.id)) continue;
+      // Settled on both axes means the table already carries this id's numbers,
+      // so there is nothing new to raise about it; settled on one of them
+      // leaves the other open, and the other is what this comparison is about.
+      if (settled(row.id, "output") && settled(row.id, "context")) continue;
       if ((pair(row).context ?? 0) >= largest("context") && (pair(row).output ?? 0) >= largest("output"))
         continue;
       const siblings = spoke
@@ -503,12 +592,39 @@ export async function run() {
     const batch = await Promise.all(
       asked.slice(at, at + POOL).map(async (id) => {
         const answer = await ask(id, names);
-        // The pair the plugin puts on the wire travels with the row, so the
-        // table, the sibling list and the candidates all read one number
-        // instead of three that can be computed from different things. The
-        // catalogue's row for the id is an own read, like the two above it: a
-        // declaration read through the prototype is one nobody made.
-        return withEffective({ id, declared: ownIn(models, id)?.limit ?? {}, ...answer });
+        // The pair the plugin declares travels with the row, so the table, the
+        // sibling list and the candidates all read one number instead of three
+        // that can be computed from different things. The catalogue's row for
+        // the id is an own read, like the two above it: a declaration read
+        // through the prototype is one nobody made. The canonical id is the
+        // name the same weights are published under, and it is what earns the
+        // models.dev second opinion.
+        const catalogue = ownIn(models, id);
+        try {
+          return withEffective({
+            id,
+            declared: catalogue?.limit ?? {},
+            canonical: catalogue?.canonical_model_id,
+            ...answer,
+          });
+        } catch (error) {
+          // One row that cannot be built is this id's row, not the end of the
+          // batch. A throw here rejects the whole `Promise.all`, so every id
+          // the run asked is thrown away — the batch already collected into
+          // `rows` too — and the failure reaches the entry point as "unable to
+          // ask … The route or the catalogue could not be read. Check the
+          // network and ZEN_BASE_URL": a bug in this file's own bookkeeping
+          // reported as a network failure, with every id's status-0 row lost.
+          // `ask` already treats "this id cannot be built" as that id's row;
+          // the same guard belongs here.
+          return {
+            id,
+            declared: {},
+            canonical: undefined,
+            ...answer,
+            says: error?.message ?? String(error),
+          };
+        }
       }),
     );
     rows.push(...batch);
@@ -516,8 +632,10 @@ export async function run() {
 
   // What the plugin declares is the catalogue's limit with limits.mjs over it,
   // so that is what is printed; the catalogue's own pair is shown beside it when
-  // the two differ, since that is the under-report being answered.
-  for (const { id, declared, effective, ...answer } of rows) {
+  // the two differ, since that is the under-report being answered. The
+  // canonical id is taken out with the rest of the row's bookkeeping: it is
+  // what the pair was built from, not something the route said.
+  for (const { id, declared, effective, canonical, ...answer } of rows) {
     const moved = effective.context !== declared.context || effective.output !== declared.output;
     const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
     const mark = answer.status === 200 ? "  " : "! ";
@@ -546,10 +664,21 @@ export async function run() {
   // row that either served the request or named a limit: `ceiling` and `window`
   // are the two axes only a refusal that stated something produces, and a row
   // that named nothing has neither.
+  //
+  // A refusal for the id's shape is not an answer about limits either, whatever
+  // it names: the route said it speaks another API, and the number in the same
+  // sentence is about that shape, not about this model's window. `findings` does
+  // not print such a row, so counting it here made a run where every id refused
+  // for its shape exit 0 with candidates it should not have printed.
   const answered = rows.filter(
-    (row) => row.status === 200 || row.ceiling !== undefined || row.window !== undefined,
+    (row) =>
+      row.status === 200 ||
+      (!protocolScoped(row) && (row.ceiling !== undefined || row.window !== undefined)),
   );
-  const candidates = findings(rows, new Set(Object.keys(LIMITS)));
+  // The evidence limits.mjs already carries, per axis: the table settles an
+  // id's output without settling its context, and a finding about the axis it
+  // does not settle is new information.
+  const candidates = findings(rows, coveredAxes());
   // Two different kinds of id, said as two lines. `elsewhere` was never asked —
   // the snapshot places it on a protocol this audit does not speak, and the
   // protocol it names is worth printing. A row refused for its shape was asked

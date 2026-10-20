@@ -18,6 +18,7 @@ import {
   isEntryPoint,
   refusedSummary,
   requestFor,
+  unsupportedError,
 } from "./tools-smoke.mjs";
 import { agentFor } from "./core-tools.mjs";
 
@@ -50,32 +51,32 @@ async function withScratch(body) {
 // skip; anything else has to fail, because a case that silently does nothing is
 // a case that reports success without checking.
 //
-// `EINVAL` was in this list and is not any more, because it is the one code here
-// that a mistake in the fixture can produce. Neither `link` nor `symlink` lists
-// EINVAL among its errors — a file system that cannot make links answers ENOSYS,
-// ENOTSUP or EPERM — while an invalid argument is exactly what EINVAL means, so
-// the code that says "this host cannot do it" is also the code that says "these
+// `EINVAL` is not in this list, and it is the one code here that a mistake in
+// the fixture can produce. Neither `link` nor `symlink` lists EINVAL among its
+// errors — a file system that cannot make links answers ENOSYS, ENOTSUP or
+// EPERM — while an invalid argument is exactly what EINVAL means, so the code
+// that says "this host cannot do it" is also the code that says "these
 // arguments are wrong". Read as unsupported, a fixture that passed the wrong
-// arguments would skip instead of failing, and a skipped case is one that reports
-// success without checking anything.
+// arguments would skip instead of failing, and a skipped case is one that
+// reports success without checking anything.
 //
-// `EXDEV` was in this list for the same wrong reason, and it is the more
-// dangerous of the two to leave in, because it is the code most likely to arrive
-// from a genuinely broken fixture. It means the two paths are on different mounts
-// or volumes — a statement about where the fixture put its files, not about what
-// the host can do. No host can hard-link across a volume, so a fixture whose two
-// halves landed on different drives would be skipped as "this host cannot make
-// links" on a host that makes them perfectly well: a broken fixture reporting
-// success having checked nothing. It is in the failure list below, and `EXDEV`
-// must stay out of this one.
+// `EXDEV` is not in this list either, and it is the more dangerous of the two
+// to leave in, because it is the code most likely to arrive from a genuinely
+// broken fixture. It means the two paths are on different mounts or volumes —
+// a statement about where the fixture put its files, not about what the host
+// can do. No host can hard-link across a volume, so a fixture whose two halves
+// landed on different drives would be skipped as "this host cannot make links"
+// on a host that makes them perfectly well: a broken fixture reporting success
+// having checked nothing. It is in the failure list below, and `EXDEV` must
+// stay out of this one.
 //
 // The codes that are left are the ones a host with no links to give answers
 // with; nothing else may become a skip.
-const UNSUPPORTED = ["EPERM", "EACCES", "ENOSYS", "ENOTSUP"];
-
-function unsupportedError(error) {
-  return UNSUPPORTED.includes(error?.code) ? error : undefined;
-}
+//
+// The decision itself is not here: it is `unsupportedError`, imported from the
+// module that ships, so the rule is the one the code under test applies rather
+// than a copy of it that agrees with itself. The list below is what that
+// exported decision is asked about.
 
 test("the file that was run is that file, and a different file is not", () => {
   // The spelling the loader resolves to, handed back as argv[1].
@@ -236,9 +237,13 @@ test("the skip list holds the codes a host without links answers with, and nothi
   // here and a name claiming otherwise would be the same kind of overclaim as an
   // assertion that holds for the wrong reason. What is checked is the
   // classification `unsupportedError` applies, which is what decides whether a
-  // link failure becomes a skip or a failure: a host with no links to give answers
-  // with one of these codes, and everything else — EINVAL included, which is how
-  // the fixture's own argument mistakes arrive — has to fail the case. The
+  // link failure becomes a skip or a failure — and that classification is the
+  // one the shipped module makes, imported above rather than copied here: a copy
+  // proves only that the copy agrees with itself, and the rule used to live only
+  // in this file while the one implementation of the decision in the repository
+  // turned every error into a skip. A host with no links to give answers with
+  // one of these codes, and everything else — EINVAL included, which is how the
+  // fixture's own argument mistakes arrive — has to fail the case. The
   // `undefined` and code-less entries are the same answer for the same reason:
   // nothing about them says the host cannot do it.
   for (const code of ["EPERM", "EACCES", "ENOSYS", "ENOTSUP"])
@@ -341,22 +346,38 @@ test("every answer the gate reads is let go of, not left dangling", async () => 
   //
   // `check` is called the way the fan-out calls it, with a profile and a name
   // list, so what is pinned is the gate's own path and not a copy of it.
+  // The body a stubbed answer carries. It is the shape the gate really reads:
+  // the reader is limits.mjs's `readBoundedText`, which pulls from the body's
+  // stream and releases it, so a fake with only a `text()` method would prove
+  // nothing about the code under test. The counts are the gate's own calls —
+  // a release it makes, and a chunk it is handed.
   const box = (body, message = "nope") => {
     let cancels = 0;
     let reads = 0;
+    const payload = JSON.stringify({ error: { message } });
     Object.defineProperty(body, "body", {
       configurable: true,
       value: {
+        // A body nobody reads is let go of, and this counts that.
         cancel: () => {
           cancels++;
           return Promise.resolve();
         },
+        // ...and the reader the bounded read pulls from, for the body it does
+        // read: one chunk, and then the end of it.
+        getReader: () => ({
+          read: () => {
+            if (reads > 0) return Promise.resolve({ done: true, value: undefined });
+            reads++;
+            return Promise.resolve({ done: false, value: new TextEncoder().encode(payload) });
+          },
+          cancel: () => {
+            cancels++;
+            return Promise.resolve();
+          },
+        }),
       },
     });
-    body.text = () => {
-      reads++;
-      return Promise.resolve('{"error":{"message":' + JSON.stringify(message) + "}}");
-    };
     return { response: body, tally: () => ({ cancels, reads }) };
   };
   const profile = { tools: { read: { name: "read", description: "r" } } };
@@ -415,8 +436,8 @@ test("every answer the gate reads is let go of, not left dangling", async () => 
     assert.equal(other.result.verdict, verdict, `HTTP ${status} is ${verdict}`);
     assert.deepEqual(
       other.tally,
-      { cancels: 0, reads: 1 },
-      "a body carrying the refusal is consumed exactly once, by the read that explains it",
+      { cancels: 1, reads: 1 },
+      "a body carrying the refusal is read once and then released by the reader that read it",
     );
   }
 
@@ -445,6 +466,34 @@ test("every answer the gate reads is let go of, not left dangling", async () => 
     { cancels: 0, reads: 0 },
     "a request that never arrived has no body to release",
   );
+});
+
+test("a request still in flight when the deadline passed is not an outage of the service", async () => {
+  // The catch around the request used to cover the whole body of it, so every
+  // fault it could see became `unreachable` — "the free tier could not be
+  // reached at all" — and the summary sent the reader to the network for a
+  // request that was still in flight. A timeout is a different thing: the
+  // route did not say no, it did not say anything at all.
+  const profile = { tools: { read: { name: "read", description: "r" } } };
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    const error = new Error("The operation was aborted due to timeout");
+    error.name = "TimeoutError";
+    throw error;
+  };
+  try {
+    const result = await check("1.x", profile, "floor", () => ["read"]);
+    assert.equal(result.verdict, "timed-out", "a timeout is told apart from an unreachable route");
+    assert.match(result.detail, /timeout/i, "and the detail says what happened");
+  } finally {
+    globalThis.fetch = original;
+  }
+  // The summary knows the difference too: "could not be reached at all" is not
+  // what a timeout says, and neither is "Zen answered every floor request".
+  const summary = refusedSummary({ served: 0, unbuilt: [], unserved: ["timed-out"] });
+  assert.match(summary, /did not answer before/);
+  assert.equal(/could not be reached at all/.test(summary), false, summary);
+  assert.equal(/Zen answered every floor request/.test(summary), false, summary);
 });
 
 test("a summary names what the rows actually said, never a refusal that did not happen", () => {

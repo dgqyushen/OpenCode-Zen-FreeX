@@ -16,20 +16,136 @@ const PROTOCOLS = {
   systemone: "systemone",
 };
 
-export function parseProtocolDocs(text) {
-  const protocols = {};
-  const pattern =
-    /\|[^|]+\|\s*`?([^|`\s]+)`?\s*\|\s*`[^`]+\/v1\/(chat\/completions|responses|messages|systemone)`/g;
-  for (const match of text.matchAll(pattern)) {
-    protocols[match[1]] = PROTOCOLS[match[2]];
-  }
-  return protocols;
+// The same four endpoints, as the pattern that finds one of them inside a
+// cell. The endpoint is looked for in the cell rather than at a fixed place in
+// the row, because a table that gains a column moves the cell it was in — and
+// a parser that knows one position reads the whole table as empty, which is
+// how a responses-only model ends up asked at /chat/completions.
+const ENDPOINT = /\/v1\/(chat\/completions|responses|messages|systemone)\b/;
+
+// A model id, as the shape one is written in. Zen's ids are letters, digits,
+// dots, dashes and underscores; a cell that is anything else — a display name
+// with spaces in it, a sentence — is not an id this plugin can ask for.
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// A note this file makes goes to a sink a host installs, or to stderr when the
+// environment asks for it — the same arrangement limits.mjs uses for its own
+// notes, and for the same reason: the runtime modules of this plugin do not
+// print, because a line on every discovery is a chatty error path of its own.
+//
+// The docs parse is the one place here where a failure has no other trace: a
+// table whose shape changed leaves every model on the snapshot's protocol, and
+// a model the docs name as /v1/responses is then asked at /chat/completions and
+// fails upstream with an error the host cannot explain. Nothing downstream can
+// tell that apart from "the docs say nothing", so the parse says it here.
+export const MODELS_DEBUG_ENV = "OPENCODE_ZEN_FREE_MODELS_DEBUG";
+let diagnostic = null;
+
+// Install the sink these notes are handed to, and return the one it replaced
+// (null when there was none) so a caller can put back what it found.
+export function modelDiagnostics(sink) {
+  const previous = diagnostic;
+  diagnostic = typeof sink === "function" ? sink : null;
+  return previous;
 }
 
+function note(entry) {
+  try {
+    if (diagnostic) diagnostic(entry);
+    else if (globalThis.process?.env?.[MODELS_DEBUG_ENV])
+      console.warn(`[opencode-zen-freex] ${entry}`);
+  } catch {
+    // A note is not worth a failed discovery.
+  }
+}
+
+// The id a row names, as the shape one is written in: plain, in backticks, or
+// as the label of a link. A cell that is none of those is not an id, and a row
+// that does not name one is left out rather than guessed at.
+function modelId(cell) {
+  const text = String(cell ?? "").replace(/`/g, "").trim();
+  const linked = /^\[([^\]]+)\]\([^)]*\)$/.exec(text);
+  const id = (linked ? linked[1] : text).trim();
+  return MODEL_ID.test(id) ? id : undefined;
+}
+
+// What is wrong with a document that was read and could not be read, in one
+// line: what broke, and what to do about it. A document with rows and no
+// endpoint in any of them is a table whose shape changed — the parse is what
+// is out of date, not the document — and a document with no rows at all is not
+// the table this file reads at all. A document with at least one endpoint is
+// fine, however many of its rows are about something else: a pricing row names
+// no endpoint, and an endpoint outside the four is not one this plugin asks.
+function parseNote(document, rows, matched) {
+  if (matched > 0) return undefined;
+  if (rows === 0)
+    return (
+      `the protocol docs document has no table row in it (${document.length} characters): ` +
+      "every model is left on the snapshot's protocol — check that the docs URL still serves the models table"
+    );
+  return (
+    `the protocol docs table has ${rows} rows and none of them names an endpoint this plugin asks ` +
+    "(/v1/chat/completions, /v1/responses, /v1/messages, /v1/systemone): the table's shape changed " +
+    "and every model is left on the snapshot's protocol"
+  );
+}
+
+// What a read of the protocol docs found: the protocols it names, the table
+// rows it saw, and the rows an endpoint could be read out of. The counts are
+// the difference between "the docs say nothing" and "the docs were read and
+// this file could not read them" — the first is a fact about the document, the
+// second a fact about this parser, and only the second is a failure to say.
+export function parseProtocolDocsReport(text) {
+  const protocols = {};
+  const document = String(text ?? "");
+  let rows = 0;
+  let matched = 0;
+  for (const line of document.split("\n")) {
+    const row = line.trim();
+    if (!row.startsWith("|")) continue;
+    rows += 1;
+    const cells = row.split("|").map((cell) => cell.trim());
+    const at = cells.findIndex((cell) => ENDPOINT.test(cell));
+    // The id is the cell before the endpoint, not the second cell of the row:
+    // a table that gains a column — or loses one, or renames one — still says
+    // which id it is talking about right before it says which endpoint that id
+    // is asked at.
+    if (at < 1) continue;
+    const id = modelId(cells[at - 1]);
+    if (!id) continue;
+    protocols[id] = PROTOCOLS[ENDPOINT.exec(cells[at])[1]];
+    matched += 1;
+  }
+  return { protocols, rows, matched, note: parseNote(document, rows, matched) };
+}
+
+// The protocols the docs name, and a note when they name none: a parse that
+// fails silently is the failure this pair exists to end, so the note is made
+// here, where the document was read, rather than in the caller that cannot
+// tell an empty answer from an unreadable document.
+export function parseProtocolDocs(text) {
+  const report = parseProtocolDocsReport(text);
+  if (report.note) note(report.note);
+  return report.protocols;
+}
+
+// Which protocol a package name speaks, as this file's names for them. The
+// package is a string, and the catalogue writes other things as well: a
+// number, a boolean, an object. `npm?.` covers the two shapes that are not
+// there at all and nothing else, so `npm.includes` on a number was a
+// TypeError — and that throw left `sdkProtocol` → `protocolFor` →
+// `buildModels` → the discovery that called it, so one dirty row upstream
+// took every free model with it. That is the failure the rest of this file is
+// written to prevent, and this field was the one that had no guard.
+//
+// A package that is not a string names no protocol this plugin asks, which is
+// the same fact the `-free` rule below is for: the id is offered on its own
+// name, at the provider's own protocol, rather than dropped.
 function sdkProtocol(npm) {
-  if (npm?.includes("anthropic")) return "anthropic";
+  if (typeof npm !== "string") return undefined;
+  if (npm.includes("anthropic")) return "anthropic";
   if (npm === SDK.responses) return "responses";
-  if (npm?.includes("openai-compatible")) return "chat";
+  if (npm.includes("openai-compatible")) return "chat";
 }
 
 // Whether a value the catalogue wrote is a description of a model, as opposed to
@@ -189,10 +305,30 @@ const modalities = (values) =>
 // the spread below, so the host was handed `context: null` as the model's window.
 const usable = (value) => Number.isSafeInteger(value) && value > 0;
 
+// The axes a host reads a model's size from, and the only ones this file
+// copies. The catalogue writes what it writes into `limit`, and it may write
+// an axis nobody named: a `max_input` beside the `input` this file knows, or
+// a name from a schema this plugin has never heard of. The row is checked for
+// being an object, but its keys were not checked, so every one of them was
+// copied — and a limit map is the one object a host plans a prompt from, so an
+// axis nobody reads is not a smaller thing there: it is a number the host
+// cannot interpret, in the map it interprets.
+//
+// The three are the ones the evidence below is written in: `limits.mjs` reads
+// and writes the same three, and so does the host's own `context_window` and
+// `max_input_tokens`.
+const KNOWN_AXES = new Set(["context", "input", "output"]);
+
 // The limit the model is offered with, from the axes that are usable: the
 // defaults first, then the catalogue's own numbers, then what the plugin has
 // evidence for — each level only contributing axes it can actually state.
-function limitFor(id, declared, canonical) {
+//
+// Exported, because this is the pair the plugin puts on the wire and the
+// maintenance tool that reports on limits has to compare against the same one:
+// a second copy of the defaults and the "an axis has to be a usable whole
+// number" rule is a second answer to drift. The table is a parameter so a
+// caller can hand in its own — the shipped one is the default.
+export function limitFor(id, declared, canonical, table = LIMITS) {
   const limit = { context: 32768, output: 4096 };
   // An axis map has to be one, by the same rule the row is read by. `limit` is
   // an object of named axes, and `Object.entries` reads a list as its indices:
@@ -201,12 +337,13 @@ function limitFor(id, declared, canonical) {
   // on the one object a host plans a prompt from. The evidence lookup is handed
   // the same map, so neither level can read an axis off a shape that has none.
   const axes = isDescription(declared) ? declared : {};
-  for (const [axis, value] of Object.entries(axes)) if (usable(value)) limit[axis] = value;
+  for (const [axis, value] of Object.entries(axes))
+    if (KNOWN_AXES.has(axis) && usable(value)) limit[axis] = value;
   // `canonical` is the id for the same weights, which is the only name
   // models.dev publishes a row under: a free id is one provider's alias and the
   // second opinion is matched by weights, not by the name this route gave it.
-  for (const [axis, value] of Object.entries(limitOverrides(id, axes, LIMITS, undefined, undefined, undefined, undefined, canonical)))
-    limit[axis] = value;
+  for (const [axis, value] of Object.entries(limitOverrides(id, axes, table, undefined, undefined, undefined, undefined, canonical)))
+    if (KNOWN_AXES.has(axis)) limit[axis] = value;
   return limit;
 }
 
@@ -238,13 +375,14 @@ export function buildModels(ids, provider, protocols, baseURL) {
     // worth failing discovery over, and the `-free` name is already this file's
     // rule for an id the catalogue cannot speak for.
     //
-    // Skipped rather than reported, and the difference matters: a report would
-    // need a sink on this path, and the only sinks in this tree are
-    // limits.mjs's, which are about limits. What a skipped row costs is a model
-    // the catalogue itself could not describe — no protocol, no limits, no
-    // capabilities — and the models that are described are still offered, which
-    // is the outcome this file exists for. A row this malformed is also visible
-    // where it is made: it is the catalogue's own data, upstream of discovery.
+    // Skipped rather than reported, and the difference matters: what a skipped
+    // row costs is a model the catalogue itself could not describe — no
+    // protocol, no limits, no capabilities — and the models that are described
+    // are still offered, which is the outcome this file exists for. A row this
+    // malformed is also visible where it is made: it is the catalogue's own
+    // data, upstream of discovery — and the note this file does have a sink
+    // for is the other failure, the one nothing downstream can see: the docs
+    // table above, read into nothing.
     const listed = Object.hasOwn(catalogue, id) ? catalogue[id] : undefined;
     const raw = isDescription(listed) ? listed : undefined;
     const model = raw ?? {};

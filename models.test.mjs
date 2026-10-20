@@ -445,6 +445,94 @@ test("a catalogue entry that resolves to no protocol still leaves a free id to i
   assert.equal(spoken["chatty-free"].api.npm, "@ai-sdk/openai-compatible");
 });
 
+// The package a row names is a string, and the catalogue writes other things
+// as well: a number, a boolean, an object. `npm?.` covers the two shapes that
+// are not there at all and nothing else, so `npm.includes` on a number was a
+// TypeError — and that throw left `sdkProtocol` → `protocolFor` →
+// `buildModels` → the discovery that called it, so one dirty row upstream took
+// every free model with it. Every other field the catalogue can dirty is
+// guarded in this file; this one was the one that was not.
+//
+// A package that is not a string names no protocol this plugin asks, which is
+// the same fact the half-described row above is: the field is skipped, the rest
+// of the row is still read, and the id is offered on its own name at the
+// provider's own protocol.
+test("a package the catalogue wrote in another shape does not take the models beside it with it", async () => {
+  const { buildModels } = await subject;
+  for (const npm of [5, true, {}, [], null]) {
+    const label = `a package written as ${JSON.stringify(npm) ?? typeof npm}`;
+    const catalogue = {
+      npm: "@ai-sdk/openai-compatible",
+      models: {
+        "keeper-free": { cost: { input: 0, output: 0 }, limit: { context: 4096 } },
+        "dirty-free": { provider: { npm }, cost: { input: 0, output: 0 } },
+      },
+    };
+    const models = buildModels(["keeper-free", "dirty-free"], catalogue, {}, baseURL);
+    assert.deepEqual(
+      Object.keys(models).sort(),
+      ["dirty-free", "keeper-free"],
+      `${label}: no row is lost`,
+    );
+    assert.equal(
+      models["keeper-free"].limit.context,
+      4096,
+      `${label}: the row beside it keeps what the catalogue says`,
+    );
+    assert.equal(
+      models["dirty-free"].api.npm,
+      "@ai-sdk/openai-compatible",
+      `${label}: a package that names no protocol leaves the id on the provider's own`,
+    );
+  }
+  // The same shape on the provider itself: the top-level package is read on
+  // the `-free` fallback, so it was the same throw on the same path.
+  const models = buildModels(
+    ["keeper-free"],
+    { npm: 5, models: { "keeper-free": { cost: { input: 0, output: 0 } } } },
+    {},
+    baseURL,
+  );
+  assert.deepEqual(Object.keys(models), ["keeper-free"]);
+  assert.equal(models["keeper-free"].api.npm, "@ai-sdk/openai-compatible");
+});
+
+// The limit map is the one object a host plans a prompt from. The row it
+// comes from is checked for being an object, but its keys were not checked: a
+// row with `limit: { context: 1000, output: 500, max_input: 8000 }` handed the
+// host an axis no host reads, beside the two it does — a number the host
+// cannot interpret, in the map it interprets. Only the axes this file knows
+// about are copied.
+test("a limit axis nobody named is not handed to the host", async () => {
+  const { buildModels } = await subject;
+  const catalogue = {
+    npm: "@ai-sdk/openai-compatible",
+    models: {
+      "stray-axis-free": {
+        cost: { input: 0, output: 0 },
+        limit: { context: 1000, output: 500, max_input: 8000 },
+      },
+      "known-axes-free": {
+        cost: { input: 0, output: 0 },
+        limit: { context: 200000, input: 160000, output: 32000 },
+      },
+    },
+  };
+  const models = buildModels(["stray-axis-free", "known-axes-free"], catalogue, {}, baseURL);
+  assert.deepEqual(models["stray-axis-free"].limit, { context: 1000, output: 500 });
+  assert.deepEqual(models["known-axes-free"].limit, {
+    context: 200000,
+    input: 160000,
+    output: 32000,
+  });
+  for (const [id, model] of Object.entries(models))
+    for (const axis of Object.keys(model.limit))
+      assert.ok(
+        ["context", "input", "output"].includes(axis),
+        `${id}.${axis} is an axis a host reads`,
+      );
+});
+
 test("an unknown id is offered on its own free name, never on a guessed endpoint", async () => {
   const { buildModels } = await subject;
   assert.equal(typeof buildModels, "function", "model discovery must be implemented");
@@ -896,6 +984,72 @@ test("reads the console docs' endpoint table, and Jev stays out as SystemOne", a
   assert.deepEqual(Object.keys(models), ["step-5-preview-free"]);
 });
 
+// The docs table is read by the endpoint a row names and the id beside it, not
+// by the position of a column. The parse used to assume the id was the second
+// cell of the row and the endpoint the third, so a table that gained a column
+// — or lost one, or renamed one — came back empty, and an empty answer is
+// what "the docs say nothing" looks like: every model fell back to the
+// `-free` guess and a responses-only model was asked at /chat/completions.
+test("the protocol docs table is read by the endpoint cell, not by the column's position", async () => {
+  const { parseProtocolDocs } = await subject;
+  // A column the parse did not expect, in front of the id: the id is the cell
+  // right before the endpoint, so the row is still read.
+  const protocols = parseProtocolDocs(
+    [
+      "| Model | Tier | id | endpoint | sdk |",
+      "| Coder | free | coder-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |",
+      "| Muse | free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |",
+    ].join("\n"),
+  );
+  assert.deepEqual(protocols, { "coder-free": "chat", "muse-spark-free": "responses" });
+  // An id written as a link is still the id the row names.
+  const linked = parseProtocolDocs(
+    "| Model | id | endpoint | sdk |\n| Coder | [`coder-free`](https://example.test/coder-free) | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |",
+  );
+  assert.deepEqual(linked, { "coder-free": "chat" });
+});
+
+// A parse that finds no endpoint used to be indistinguishable from a document
+// that says nothing: the caller could not tell "the table changed shape" from
+// "the docs say nothing", so every model fell back to the snapshot's protocol
+// and nobody knew. The parse now says so, and the report says what it read —
+// the rows it saw, and the rows an endpoint could be read out of.
+test("a protocol docs table that cannot be read is reported, not swallowed", async () => {
+  const { parseProtocolDocs, parseProtocolDocsReport, modelDiagnostics } = await subject;
+  const notes = [];
+  const previous = modelDiagnostics((entry) => notes.push(entry));
+  try {
+    // A table whose shape changed: rows, and no endpoint in any of them.
+    const changed =
+      "| Model | id | endpoint | sdk |\n| Coder | coder-free | `https://example.test/ask` | `@ai-sdk/openai-compatible` |";
+    const report = parseProtocolDocsReport(changed);
+    assert.equal(report.rows, 2, "the table's rows are counted");
+    assert.equal(report.matched, 0, "and none of them named an endpoint this plugin asks");
+    assert.match(report.note, /table has 2 rows and none of them names an endpoint/);
+    assert.deepEqual(parseProtocolDocs(changed), {}, "a table that cannot be read answers nothing");
+    assert.equal(notes.length, 1, "and it says so");
+    assert.match(notes[0], /shape changed/);
+    // A document that is not the table at all.
+    const other = "<html><body>not the models table</body></html>";
+    const otherReport = parseProtocolDocsReport(other);
+    assert.equal(otherReport.rows, 0, "a document without a table has no rows");
+    assert.match(otherReport.note, /no table row in it/);
+    parseProtocolDocs(other);
+    assert.equal(notes.length, 2, "and a document that is not the table says so too");
+    // A table that reads: nothing to report, and the protocols it names.
+    const good =
+      "| Model | id | endpoint | sdk |\n| Coder | coder-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |";
+    const goodReport = parseProtocolDocsReport(good);
+    assert.equal(goodReport.rows, 2);
+    assert.equal(goodReport.matched, 1);
+    assert.equal(goodReport.note, undefined, "a table that reads has nothing to report");
+    parseProtocolDocs(good);
+    assert.equal(notes.length, 2, "and says nothing");
+  } finally {
+    modelDiagnostics(previous);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Not a change of subject: everything above this line is about `models.mjs`, and
 // the cases below are `provider.mjs`'s discovery-lease invariants, driven from
@@ -949,16 +1103,21 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 // the signal that ends it, and the only way that end is observable from here is
 // that signal: aborted is what `fetch` does with one, inside and outside this
 // stub, so a read that ended and one that is still waiting are told apart by it.
-function discoveryUpstream() {
+//
+// The listing and the catalogue are what a case hands in: the defaults are the
+// fixture every other case here wants, and a case that needs a row written in
+// another shape brings its own.
+function discoveryUpstream({ listing, catalog } = {}) {
   const reads = [];
   const held = [];
   let holding = false;
   let refusal = null;
   const original = globalThis.fetch;
   const answer = (url) => {
-    if (url.endsWith("/models")) return Response.json({ data: [{ id: "chat-free" }] });
+    if (url.endsWith("/models"))
+      return Response.json(listing ?? { data: [{ id: "chat-free" }] });
     if (url.endsWith("/catalog"))
-      return Response.json({ opencode: { models: { "chat-free": {} } } });
+      return Response.json(catalog ?? { opencode: { models: { "chat-free": {} } } });
     if (url.endsWith("/docs")) return new Response("| Model | id | endpoint |");
     if (refusal)
       return new Response(refusal.body, {
@@ -1231,4 +1390,32 @@ test("a refusal read short says so without naming a reason it cannot know", asyn
     long.slice(0, 512) + "…",
     "the opening that was read is carried along",
   );
+});
+
+// Not a lease invariant, and here for the reason the ones above are: the
+// discovery is provider.mjs's, and the row that has to survive it is the
+// catalogue's. A catalogue row that writes its package in another shape used
+// to throw out of `buildModels`, and the throw was the discovery's — so every
+// free model went with it, which is the one outcome the whole shape rule in
+// models.mjs exists to prevent. The row here is a number where a package name
+// belongs, and the models beside it are still offered.
+test("a catalogue row with a package in another shape does not end the discovery", async (t) => {
+  const upstream = discoveryUpstream({
+    listing: { data: [{ id: "chat-free" }, { id: "dirty-free" }] },
+    catalog: {
+      opencode: {
+        models: {
+          "chat-free": {},
+          "dirty-free": { provider: { npm: 5 } },
+        },
+      },
+    },
+  });
+  t.after(() => upstream.restore());
+  const { server } = (await providerModule).default;
+  const plugin = await server({}, zenURLs);
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.ok(models["chat-free"], "the discovery answered");
+  assert.ok(models["dirty-free"], "and the row with the dirty package is still offered");
+  assert.equal(models["dirty-free"].api.npm, "@ai-sdk/openai-compatible");
 });

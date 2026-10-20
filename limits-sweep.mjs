@@ -145,6 +145,45 @@ const promptOf = (chars) => SENTENCE.repeat(Math.ceil(chars / SENTENCE.length)).
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The count the route reported for the prompt, or undefined when it reported
+// none.
+//
+// The count is in the route's own bytes, and the route's own bytes are not
+// always compact: Python's `json.dumps` — and several OpenAI-compatible
+// gateways — write `"prompt_tokens": 215178` with a space after the colon. A
+// pattern that does not allow the space reads that serve as "no usage count
+// came back", and the count is what the floor is made of: the whole bracket
+// degrades without it.
+//
+// Exported so the pattern can be pinned against the shapes a gateway writes,
+// without a served request.
+export function promptTokens(text) {
+  const tokens = Number.parseInt(/"prompt_tokens"\s*:\s*(\d+)/.exec(text)?.[1] ?? "", 10);
+  return Number.isSafeInteger(tokens) ? tokens : undefined;
+}
+
+// The window a refusal named, read through limits.mjs's cut-aware reader.
+//
+// The reader is the plugin's own, so the sweep and the running plugin agree on
+// what a named window looks like — `nemotron-3.5-lightning-free` answers with
+// "This endpoint's maximum context length is 1000000 tokens", which the sweep
+// used to keep only as an opaque `says` string while it went on bisecting
+// toward a number the route had already given it.
+//
+// `over` is the read's own answer to whether it stopped before the body did,
+// and it goes with the text because it is the difference between a number the
+// route stated and a number the read cut in half: a refusal body that ends
+// mid-number (`maximum context length is 104857`, cut from `1048576`) read
+// without it becomes the route's stated window, and a stated window outranks
+// every bracket and carries no margin — so a truncated digit would become the
+// declared wall. `limits-audit.mjs` reads the same body through the same two
+// arguments, and the two have to agree about what a stated window is.
+//
+// Exported so the rule can be pinned without a live refusal.
+export function namedWindow(text, over) {
+  return namedAxes(text, READ_BUDGET, over).context;
+}
+
 // One request. The answer is reduced to what a bracket needs: whether the prompt
 // was served, the route's own count when it was, and the words it used when it
 // was not.
@@ -178,20 +217,20 @@ async function once(model, chars) {
     } catch (error) {
       return { chars, kind: "error", says: error?.message ?? String(error) };
     }
-    const tokens = Number.parseInt(/"prompt_tokens":(\d+)/.exec(text)?.[1] ?? "", 10);
-    return Number.isSafeInteger(tokens)
-      ? { chars, kind: "served", tokens }
-      : { chars, kind: "served", tokens: undefined, says: "served, but no usage count came back" };
+    // The count is in the route's own bytes, and the route's own bytes are not
+    // always compact — `promptTokens` says which shapes, and why a missed count
+    // costs the whole bracket.
+    const tokens = promptTokens(text);
+    return tokens === undefined
+      ? { chars, kind: "served", tokens: undefined, says: "served, but no usage count came back" }
+      : { chars, kind: "served", tokens };
   }
-  const { text } = await readBoundedText(response, READ_BUDGET).catch(() => ({ text: "" }));
+  const { text, over } = await readBoundedText(response, READ_BUDGET).catch(() => ({ text: "", over: true }));
   // A refusal that names the window states it, and a stated number is better than
   // any bracket: no bisection needed, no margin guessed, nothing left to narrow.
-  // The reader is `limits.mjs`'s own, so the sweep and the running plugin agree on
-  // what a named window looks like — `nemotron-3.5-lightning-free` answers with
-  // "This endpoint's maximum context length is 1000000 tokens", which the sweep
-  // used to keep only as an opaque `says` string while it went on bisecting toward
-  // a number the route had already given it.
-  const named = namedAxes(text).context;
+  // The read's own `over` goes with the text, so a number the read cut in half
+  // is not read as a window the route stated — `namedWindow` says why.
+  const named = namedWindow(text, over);
   // A failure is a refusal only when it is about the SIZE. A 400 that says
   // nothing about a length is the endpoint failing, and reading it as a wall
   // is how a flaky upstream becomes a small window: measured 2026-10-20 on
@@ -232,10 +271,24 @@ async function ask(model, chars, log) {
 // as a bound, and a case that could only check it through six live requests would
 // not be checking it.
 export function tally(asked) {
-  const served = asked.filter((one) => one.kind === "served" && Number.isSafeInteger(one.tokens));
+  const served = asked.filter((one) => one.kind === "served");
   const refused = asked.filter((one) => one.kind === "refused");
+  // The floor is the largest size the route SERVED, whether or not it counted
+  // the prompt: a 200 without a `usage` count still proves the prompt fitted,
+  // and the size that fitted is the size that was asked. Counting only the
+  // sizes that came with a count left a route that serves without one with no
+  // floor at all — and a floor is what the narrowing runs on and what the
+  // ladder's stop used to be gated on, so the bracket lost both: two refusals
+  // then read as a ceiling with nothing under it, and the ladder went on
+  // asking sizes above a refusal whose answer was already known.
   const servedChars = served.reduce((best, one) => (best === undefined || one.chars > best ? one.chars : best), undefined);
-  const servedTokens = served.reduce(
+  // The count is a different answer, and it comes from the sizes that carried
+  // one: it is what a declaration is made of, so it is the largest count that
+  // came back — a floor under the size, never over it. A size served without
+  // a count carries no number to declare, and declaring nothing is better than
+  // declaring the count of a smaller prompt.
+  const counted = served.filter((one) => Number.isSafeInteger(one.tokens));
+  const servedTokens = counted.reduce(
     (best, one) => (best === undefined || one.tokens > best ? one.tokens : best),
     undefined,
   );
@@ -276,6 +329,80 @@ export function nextAsk(bracket, spent) {
   if (high - low <= high * NARROW_TO) return undefined;
   const mid = Math.floor((low + high) / 2);
   return mid > low && mid < high ? mid : undefined;
+}
+
+// What the answers so far say about the wall, in the four shapes a result can
+// have. Named, bracketed, one refusal or none — and each says something
+// different about where the wall is, so the words are picked in one place
+// rather than through a chain of ternaries at the call site.
+//
+//   named           the route stated its own window; nothing is left to narrow
+//   bracketed       two refused sizes above a served one — the weakest evidence
+//                   this file accepts for a wall, and the only shape that
+//                   settles an axis
+//   single-refusal  one refused size and nothing under it: a hole in the
+//                   bracket, reported as what it is
+//   openEnded       nothing was refused: the wall is above everything asked
+//
+// Exported so the tests can pin the four shapes without six live requests.
+export function verdictOf(bracket) {
+  if (bracket?.named !== undefined) return "named";
+  const refused = bracket?.refusedSizes?.length ?? 0;
+  if (refused >= 2) return "bracketed";
+  if (refused === 1) return "single-refusal";
+  return "openEnded";
+}
+
+// Whether the ladder goes on to the next rung after this answer.
+//
+// A refusal the route reproduced is the wall being under the size that was just
+// asked, so every larger rung is refused too and asking one spends the shared
+// credential on an answer already in hand. The floor is what the narrowing
+// runs on, not what the stop needs: the climb used to want a served floor as
+// well, and a model whose first rung failed was asked 2,800,000, 4,200,000 and
+// 5,200,000 characters for answers it already had.
+//
+// A failure is not a refusal and does not end the climb: it says nothing about
+// the size of the prompt, and the next rung is still worth asking.
+//
+// Exported so the rule can be pinned without six live requests — the climb is
+// what spends the quota, so the rule that ends it is worth a case of its own.
+export function climbGoesOn(result) {
+  return result !== undefined && result.kind !== "refused";
+}
+
+// Whether a result says the route was asked about that model at all.
+//
+// A model the route served or refused is a model the run learned something
+// about; a model whose every request failed is a model the route could not be
+// asked about, and nothing about it is known. The verdict cannot answer this:
+// `openEnded` is what a run in which every request failed comes back as, because
+// nothing was served and nothing was refused, so reading it as a sign of life
+// made a run that never got an answer look like a model with no wall in reach.
+//
+// Exported because the question is asked of one model as well as of a run: the
+// survey writes a row per measured id, and a row for a model the route never
+// answered says "no wall in reach" about a run that got no answer at all — and
+// marks the id as measured, so it is never asked again.
+export function learnedAbout(result) {
+  const present = (value) => value !== undefined && value !== null;
+  return present(result?.servedChars) || present(result?.refusedChars);
+}
+
+// The exit code of a run, which says what the run learned and nothing else.
+//
+// A run of nothing but models the route could not be asked about has learned
+// nothing at all — which is what the workflow has to be able to tell apart
+// from "no walls found".
+//
+// An empty result set is not a failure: every id was answered from models.dev
+// and none of them was asked, so nothing failed and nothing was learned.
+//
+// Exported so the rule can be pinned without a run.
+export function exitCodeFor(results) {
+  const list = Array.isArray(results) ? results : [];
+  if (list.length === 0) return 0;
+  return list.some(learnedAbout) ? 0 : 1;
 }
 
 // The bracket for one model. `spent` and `asked` are reported so a reader can see
@@ -327,19 +454,18 @@ async function sweep(model, log) {
   // grow with it: a model walled at 1,600,000 would also have been asked 2,800,000
   // and 4,200,000, four more requests for an answer already in hand.
   //
-  // A refusal at the smallest size keeps its own rule: there is nothing served
-  // underneath it and so no interval to narrow, which is a different situation from
-  // a wall found above a served rung.
-  let walled = false;
+  // The refusal is what ends the climb, and it ends it whether or not something
+  // was served underneath it: a floor is what the narrowing runs on, not what
+  // the stop needs. The climb used to want both, and a model whose first rung
+  // failed — or was served without a count — went on to be asked 2,800,000,
+  // 4,200,000 and 5,200,000 characters, three multi-megabyte requests for an
+  // answer the route had already given.
   for (const chars of LADDER) {
-    if (walled) break;
     const result = await believe(chars);
-    if (result === undefined) break;
-    const now = tally(asked);
-    if (now.refusedSizes.length > 0 && now.servedChars !== undefined) walled = true;
-    // A refusal at the smallest size, believed twice, puts the wall below
-    // everything this sweep would ask next: nothing is learned by asking bigger.
-    if (chars === LADDER[0] && now.servedChars === undefined && now.refusedSizes.length > 0) break;
+    // `believe` asks the identical request again and voids a refusal the route
+    // did not reproduce, so a refusal that reaches this line is one the route
+    // answered twice.
+    if (!climbGoesOn(result)) break;
   }
 
   // Narrowing. The bound this file can declare is the largest size SERVED, so what
@@ -356,10 +482,18 @@ async function sweep(model, log) {
   // wider than `NARROW_TO` of the refused size, it asks the midpoint of (served,
   // refused): a served midpoint raises the floor without spending a refusal, and a
   // refused one halves what is left, so each step buys up to half of the gap.
+  //
+  // An ask that moved nothing is not asked again: the same midpoint coming back
+  // means the bracket did not change, and the request bought nothing at all. It
+  // used to happen — a serve that carried no usage count raised no floor, so the
+  // midpoint came back identical and the loop asked it again and again until the
+  // budget was gone.
+  let lastAsked = undefined;
   for (;;) {
     const now = tally(asked);
     const next = nextAsk(now, spent);
-    if (next === undefined) break;
+    if (next === undefined || next === lastAsked) break;
+    lastAsked = next;
     const result = await believe(next);
     if (result === undefined || result.kind === "error") break;
   }
@@ -381,8 +515,10 @@ async function sweep(model, log) {
     // Two refused sizes behind a served one is the weakest evidence this file
     // accepts for a wall. One is a bracket with a hole in it and is reported as
     // such rather than smoothed into a wall, and none is a model whose wall is
-    // above everything that was asked.
-    wall: now.named !== undefined ? "named" : now.refusedSizes.length >= 2 ? "bracketed" : now.refusedSizes.length === 1 ? "single-refusal" : "openEnded",
+    // above everything that was asked. The four shapes are named in one place —
+    // `verdictOf` — so the words a result carries and the words a reader is
+    // given cannot be two answers.
+    wall: verdictOf(now),
     says: [...new Set(now.refused.map((one) => one.says).filter((said) => said !== ""))].slice(0, 2),
     asked: asked.map((one) => ({
       chars: one.chars,
@@ -451,36 +587,57 @@ if (import.meta.main) {
   const models = args.filter((arg) => !arg.startsWith("--"));
   if (models.length === 0) {
     console.error("usage: bun limits-sweep.mjs [--json] <model-id> [<model-id> ...]");
-    process.exit(2);
-  }
-  // The rule, enforced where the requests are made: an id the catalogue
-  // declares at a million or more is answered from models.dev and is not
-  // measured, whoever asked for it.
-  const catalogueURL = process.env.ZEN_CATALOG_URL ?? CATALOG;
-  const { measured, answeredElsewhere } = await measurableIds(models, {
-    fetchCatalog: async () => {
-      const response = await fetch(catalogueURL, { signal: AbortSignal.timeout(30000) });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.json();
-    },
-  });
-  if (answeredElsewhere.length > 0) {
-    console.error(
-      `not measured, because the catalogue declares them at a million or more and models.dev answers those: ${answeredElsewhere.join(", ")}`,
-    );
-  }
-  const results = await sweepModels(measured, json ? () => {} : (line) => console.log(line));
-  if (json) console.log(JSON.stringify(results));
-  else
-    for (const result of results) {
-      console.log("");
-      console.log(`  ${result.model}`);
-      console.log(`    served      ${result.servedTokens ?? "-"} tokens (${result.servedChars ?? "-"} characters)`);
-      console.log(`    refused at  ${result.refusedChars ?? "-"} characters ${result.refusedSizes.length > 1 ? `(and ${result.refusedSizes.slice(1).join(", ")})` : ""}`);
-      console.log(`    verdict     ${result.wall}, ${result.spent} of ${BUDGET} requests spent`);
+    // `process.exitCode` rather than `process.exit`: stderr to a pipe is written
+    // asynchronously, and `process.exit` can cut the sentence above off before
+    // it is out. The code is the same either way — nothing is measured after
+    // this line — so the whole entry point sets codes and lets the process end
+    // on its own.
+    process.exitCode = 2;
+  } else {
+    // The rule, enforced where the requests are made: an id the catalogue
+    // declares at a million or more is answered from models.dev and is not
+    // measured, whoever asked for it.
+    const catalogueURL = process.env.ZEN_CATALOG_URL ?? CATALOG;
+    const { measured, answeredElsewhere } = await measurableIds(models, {
+      fetchCatalog: async () => {
+        const response = await fetch(catalogueURL, { signal: AbortSignal.timeout(30000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      },
+    });
+    if (answeredElsewhere.length > 0) {
+      console.error(
+        `not measured, because the catalogue declares them at a million or more and models.dev answers those: ${answeredElsewhere.join(", ")}`,
+      );
     }
-  // A sweep that learned nothing about any of its models is a failure of the run,
-  // not a clean bill of health: it means the route could not be asked. That is
-  // what the workflow has to be able to tell apart from "no walls found".
-  process.exit(results.some((result) => result.wall === "bracketed" || result.wall === "openEnded" || result.servedTokens !== null) ? 0 : 1);
+    const results = await sweepModels(measured, json ? () => {} : (line) => console.log(line));
+    if (json) console.log(JSON.stringify(results));
+    else
+      for (const result of results) {
+        console.log("");
+        console.log(`  ${result.model}`);
+        console.log(`    served      ${result.servedTokens ?? "-"} tokens (${result.servedChars ?? "-"} characters)`);
+        console.log(`    refused at  ${result.refusedChars ?? "-"} characters ${result.refusedSizes.length > 1 ? `(and ${result.refusedSizes.slice(1).join(", ")})` : ""}`);
+        console.log(`    verdict     ${result.wall}, ${result.spent} of ${BUDGET} requests spent`);
+      }
+    // What the run learned, and what it says about the route. A model the route
+    // served or refused is a model the run learned something about; a model
+    // whose every request failed is a model the route could not be asked about,
+    // and a run of nothing but those has learned nothing at all — which is
+    // what the workflow has to be able to tell apart from "no walls found".
+    //
+    // The verdict alone cannot answer that, which is what this line used to
+    // get wrong: `openEnded` is what a run in which every request failed comes
+    // back as, because nothing was served and nothing was refused, so reading
+    // it as a sign of life made a run that never got an answer exit 0 — the
+    // opposite of what the sentence above it says.
+    if (results.length > 0 && exitCodeFor(results) !== 0)
+      console.error(
+        `nothing was learned about any of these models: the route was asked and answered none of them, so this run says nothing about their windows.`,
+      );
+    // `process.exitCode` rather than `process.exit`: stdout to a pipe is
+    // written asynchronously, and the JSON line above is what the workflow
+    // reads — `process.exit` can cut it off.
+    process.exitCode = exitCodeFor(results);
+  }
 }

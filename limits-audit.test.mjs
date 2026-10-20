@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { unsupportedError } from "./tools-smoke.mjs";
 
 // The subject is imported by each test rather than at file load. The module
 // decides at evaluation whether it was run or imported, and throws when it
@@ -278,8 +279,106 @@ test("one upstream model declared twice, unlike, makes the smaller declaration t
     lines[0],
     /^big-pickle: declared 200000\/32000, and mimo-v2\.6-flash is also served as mimo-v2\.6-flash-free \(343000\/131072\)$/,
   );
-  // an id limits.mjs already carries evidence for is said once, not raised again
-  assert.deepEqual(findings(rows, new Set(["big-pickle"])), []);
+  // an id limits.mjs already carries evidence for is said once, not raised
+  // again — and the table carries it per axis, so the covered set says which
+  // axes: `big-pickle` carries a context entry and an output entry, so both of
+  // its axes are settled and it is not raised.
+  assert.deepEqual(findings(rows, new Set(["big-pickle:context", "big-pickle:output"])), []);
+});
+
+// The table is per axis and not per id: `ll-alpha-free` and
+// `longcat-2.5-preview-free` carry an output entry and no context entry,
+// `nemotron-3.5-lightning-free` carries a context entry and no output entry,
+// and `space-bunny-free` carries an input entry only. An id the table covers on
+// one axis is still open on the other, so a window the route names for it is
+// new information — the finding this list exists to surface — and the covered
+// set used to drop the whole row for it, without a word.
+test("evidence for one axis is not evidence for another, so an open axis is still read", async () => {
+  const { coveredAxes, findings } = await subject();
+  const covered = coveredAxes();
+  assert.equal(covered.has("ll-alpha-free:output"), true, "the table carries its output");
+  assert.equal(covered.has("ll-alpha-free:context"), false, "and no context entry, so its window is open");
+  assert.equal(covered.has("nemotron-3.5-lightning-free:context"), true, "and it carries a context entry");
+  assert.equal(
+    covered.has("nemotron-3.5-lightning-free:output"),
+    false,
+    "so its completion ceiling is open",
+  );
+  // The window the route names is raised: the catalogue declares another
+  // number, and the table says nothing about this axis.
+  assert.deepEqual(
+    findings(
+      [
+        {
+          id: "ll-alpha-free",
+          declared: { context: 200000, output: 32000 },
+          status: 400,
+          window: 1048576,
+          says: "",
+        },
+      ],
+      covered,
+    ),
+    ["ll-alpha-free: a refusal named a window of 1048576, the catalogue declares 200000"],
+  );
+  // ...and the axis the table does carry is not raised again.
+  assert.deepEqual(
+    findings(
+      [
+        {
+          id: "ll-alpha-free",
+          declared: { context: 200000, output: 32000 },
+          status: 400,
+          ceiling: 131072,
+          says: "",
+        },
+      ],
+      covered,
+    ),
+    [],
+    "the output axis is settled by the table, so it is not a question",
+  );
+  // An id the table settles on both axes is not asked for again at all.
+  assert.deepEqual(
+    findings(
+      [
+        {
+          id: "deepseek-v4.1-flash-free",
+          declared: { context: 200000, output: 32000 },
+          status: 400,
+          window: 1048576,
+          ceiling: 131072,
+          says: "",
+        },
+      ],
+      covered,
+    ),
+    [],
+    "both axes are settled, so the row is not read",
+  );
+});
+
+// A model that does not speak the shape this audit asks with is said once,
+// beside the ids that were not asked, and it must not sit in the candidate list
+// — neither as a limit it never stated nor as a status line. The check used to
+// come after the two comparisons, so a refusal that named another shape and
+// also mentioned a number was reported as a ceiling or a window the route never
+// stated, and the run counted it as answered.
+test("a refusal for the id's shape is not a finding about limits, whatever number it names", async () => {
+  const { findings, protocolScoped } = await subject();
+  const row = {
+    id: "other-shape-free",
+    declared: { context: 200000, output: 32000 },
+    status: 400,
+    window: 1048576,
+    ceiling: 131072,
+    says: "This model speaks the messages protocol; its maximum context length is 1048576 tokens.",
+  };
+  assert.equal(protocolScoped(row), true, "the row names another shape");
+  assert.deepEqual(findings([row]), [], "and it is not a finding about limits");
+  // The same row with nothing named in it is the same answer: it was refused
+  // for its shape, and that is said once, beside the ids that were not asked.
+  assert.deepEqual(findings([{ ...row, window: undefined, ceiling: undefined }]), []);
 });
 
 test("a row refused for its shape is never also an under-declaration candidate", async () => {
@@ -353,6 +452,13 @@ test("the run/import question answers true, false, or an honest nothing", async 
 // report-without-verifying this pair of cases exists to prevent. `true` is the
 // only answer that means the fixture was built; whether the link is really there
 // is what the cases' own `statSync` assertions say.
+//
+// Which errors may become that skip is not decided here either: it is
+// `unsupportedError`, imported from the module that ships, because a rule that
+// lives only in a test file is a copy of a policy nobody applies. This function
+// used to skip on EVERY error — including `EINVAL` and `EXDEV`, the two codes
+// that mean the fixture itself is wrong — so a broken fixture reported a pass it
+// never earned.
 function linked(t, make, what) {
   try {
     make();
@@ -360,7 +466,9 @@ function linked(t, make, what) {
   } catch (error) {
     // A host that will not make a link — an unprivileged Windows account, a
     // file system with no links — cannot be asked this question at all.
-    t.skip(`this host will not make ${what}: ${error?.message ?? error}`);
+    const unsupported = unsupportedError(error);
+    if (!unsupported) throw error;
+    t.skip(`this host will not make ${what}: ${unsupported.message}`);
     return undefined;
   }
 }
@@ -445,6 +553,34 @@ test("a fixture this host cannot build is skipped, never reported as a pass", as
   // point named, the question stays open rather than answering "not this file",
   // which is the `false` that means "asked nothing, exit 0".
   assert.equal(entryVerdict({ main: undefined, url: pathToFileURL(real).href, argv: ["node"] }), undefined);
+});
+
+test("a fixture that is wrong is a failure here too, and never a skip", () => {
+  // `linked` used to turn EVERY error into a skip, so a fixture that passed the
+  // wrong arguments — EINVAL — or one that split itself across volumes — EXDEV
+  // — reported a pass it never earned and read exactly like a host that cannot
+  // make links. The codes that may become a skip are the shipped module's
+  // decision (`unsupportedError`, imported above), and these two are not among
+  // them.
+  const asked = {};
+  const t = { skip: (why) => (asked.reason = why) };
+  for (const code of ["EINVAL", "EXDEV"]) {
+    assert.throws(
+      () =>
+        linked(
+          t,
+          () => {
+            const error = new Error(`${code}: the fixture is wrong`);
+            error.code = code;
+            throw error;
+          },
+          "a hard link",
+        ),
+      new RegExp(code),
+      `${code} is a broken fixture, and it has to fail the case`,
+    );
+    assert.equal(asked.reason, undefined, `${code} must not become a skip`);
+  }
 });
 
 test("an identity the file system will not give leaves the question open", async () => {
@@ -1222,6 +1358,34 @@ test("a base URL with a trailing slash does not become a doubled path", async ()
   assert.equal(baseFrom(""), DEFAULT_BASE, "an empty base is no base at all");
   assert.equal(baseFrom("   "), DEFAULT_BASE, "and neither is one that names nothing but whitespace");
   assert.equal(`${baseFrom("")}/models`, `${DEFAULT_BASE}/models`, "the URL built from it is still absolute");
+  // Whitespace around a base is a typo, not a different host. The trimmed text
+  // is what is used, so the trailing-slash strip fires and the URL built from
+  // it is the one the operator meant — the raw text used to keep its spaces,
+  // and the audit fetched `https://host/%20/models`, which is a 404 reported as
+  // "the route or the catalogue could not be read … check the network".
+  assert.equal(
+    baseFrom("  https://opencode.ai/inference/v1/  "),
+    "https://opencode.ai/inference/v1",
+    "a base written with spaces around it is the base without them",
+  );
+  // The rest of provider.mjs's `httpURL` rule, which this base has to answer
+  // too: a base carrying credentials, a query or a fragment is refused there,
+  // and pasted into the middle of a URL here it fails the same unexplained
+  // way. It is refused in a sentence of its own, rather than becoming a URL
+  // that cannot be fetched.
+  for (const value of [
+    "https://user:pass@opencode.ai/inference/v1",
+    "https://opencode.ai/inference/v1?key=1",
+    "https://opencode.ai/inference/v1#section",
+  ])
+    assert.throws(
+      () => baseFrom(value),
+      /ZEN_BASE_URL/,
+      `${value} names no base this tool can use, and says so`,
+    );
+  // And a base that is not a URL at all says so, rather than becoming a
+  // relative path fetched from nowhere.
+  assert.throws(() => baseFrom("opencode.ai/inference/v1"), /ZEN_BASE_URL is not a URL/);
   // and the reason the rule exists, in the URLs this file really builds
   for (const value of ["https://opencode.ai/inference/v1/", "https://opencode.ai/inference/v1"]) {
     const models = `${baseFrom(value)}/models`;

@@ -110,7 +110,7 @@ export const LIMITS = {
       declaredAt: 200000,
       measured: "2026-10-20",
       samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
-      how: "the route's own enforcement, found by bracketing, and 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: a prompt of about 408,000 tokens is refused now, less than half of it, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 343,131 and about 407,725 tokens is not known — the sweep stopped at the first refusal — and the figure declared sits under both.",
+      how: "the route's own enforcement, found by bracketing, and 375,000 is the largest served sample rounded down so that a host's count may differ from the route's. The 1048576 this entry used to carry is withdrawn: what the route used to serve it refuses now, which is the same way deepseek-v4.1-flash-free's stated million went. The exact position of the wall between 1,750,000 characters (served, 375,142 tokens) and the 2,800,000 characters the route refused is not known - the sweep stopped at the first refusal it could reproduce, and the refusal of 1,750,000 characters that the route then served again was voided - and the figure declared sits under both.",
     },
     output: {
       value: 131072,
@@ -128,7 +128,7 @@ export const LIMITS = {
       declaredAt: 200000,
       measured: "2026-10-20",
       samples: "375,142 tokens served (1,750,000 characters, counted by the route) on 2026-10-20, where an earlier sweep had served 343,131 (1,600,000 characters) and refused 1,900,000, 2,200,000 and 2,800,000 characters. The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000 - a refusal of 1,750,000 that was then served (375,142 tokens) and voided, which is the rule that a refusal nobody can reproduce is not a wall.",
-      how: "the route's own enforcement, found by bracketing; 343,000 is the largest served sample rounded down so that a host's count may differ from the route's. This entry used to say the axis was left to the catalogue because the one attempt to measure it answered 200 with an empty body, which is not an answer: a 2026-10-19 sweep did measure it, and the catalogue's 200000 is a third of what the route serves.",
+      how: "the route's own enforcement, found by bracketing; 375,000 is the largest served sample rounded down so that a host's count may differ from the route's. This entry used to say the axis was left to the catalogue because the one attempt to measure it answered 200 with an empty body, which is not an answer: a 2026-10-19 sweep did measure it, and the catalogue's 200000 is a third of what the route serves.",
     },
     output: {
       value: 131072,
@@ -196,7 +196,7 @@ export const LIMITS = {
       declaredAt: 200000,
       measured: "2026-10-20",
       samples: "323,107 tokens served (1,787,500 characters, counted by the route) on 2026-10-20, where an earlier sweep the same day had served 311,109 (1,450,000 characters). The 2026-10-20 run asked 200,000 (44,244 tokens), 1,000,000 (215,030) and 1,600,000 (343,121), was refused at 2,800,000, and narrowed through 2,200,000, 1,900,000 and 1,750,000. This id's upstream was failing intermittently earlier the same day - a request of 547,384 characters was answered and one of 540,983 was refused, which no wall does - and a failure that is not about a size is not counted as one.",
-      how: "the route's own enforcement, found by bracketing, and 311,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: a prompt of about 343,000 tokens is refused, so the paid id's window is not one this endpoint serves. The wall's exact position between 311,109 and about 343,348 tokens is not known — the sweep stopped at the first refusal. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
+      how: "the route's own enforcement, found by bracketing, and 323,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: the paid id's window is not one this endpoint serves, and the refusal that withdrew it was answered by a serve of the same size the next day, which is this id's instability rather than a wall. The wall's exact position between 323,107 tokens (1,787,500 characters) and the size the route refused is not known - the sweep stopped at the first refusal it could reproduce. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
     },
     output: {
       value: 131072,
@@ -248,7 +248,7 @@ export const LIMITS = {
       declaredAt: 1048576,
       measured: "2026-10-20",
       samples: "1,048,361 tokens served (counted by `usage.prompt_tokens`, bisected from 255,000 words at 4.193 tokens/word); 1,071,887 tokens refused. The served sample lands within 215 tokens of the binary 1048576, so this is the binary wall and the catalogue's 1048576 is already the right scale here.",
-      how: "the route's own enforcement, found by bisection because its refusal states no number. The catalogue declares 1048576 and the route serves 1,048,361, so the declaration is correct in scale and only wants the envelope's room: 1048000 is the largest served sample rounded down. This entry exists so the sweep does not have to rediscover a wall that is the catalogue's own number.",
+      how: "the route's own enforcement, found by bisection because its refusal states no number. The catalogue declares 1048576 and the route serves 1,048,361 of it, so the declaration is correct in scale and is the binary wall itself rather than a rounded sample: the served sample lands within 215 tokens of it, and the figure declared is that wall. This entry exists so the sweep does not have to rediscover a wall that is the catalogue's own number.",
     },
     output: {
       value: 131072,
@@ -524,13 +524,23 @@ const BRACKETS = new Map();
 // answers with what it replaced. The records are copied rather than shared, so a
 // caller that puts one back cannot be surprised by the observer that ran in
 // between: a record is the one mutable thing in this file.
+//
+// A record put back is read the way a record out of a state file is read, and
+// that includes the scale: this is the documented way to swap the whole bracket
+// state, so a snapshot taken with an older estimator could be handed in here and
+// would bound a window with a count whose unit was wrong — the very failure the
+// scale guard was added for on the file path. "A record measured on another
+// scale is not this record" is true of a caller's record as much as of a file's.
 export function limitAdaptivity(restore) {
   const previous = new Map();
   for (const [id, record] of BRACKETS) previous.set(id, { ...record });
   if (restore !== undefined) {
     BRACKETS.clear();
-    for (const [id, record] of restore ?? [])
-      if (isUsableId(id) && record && typeof record === "object") BRACKETS.set(id, { ...record });
+    for (const [id, record] of restore ?? []) {
+      if (!isUsableId(id) || !record || typeof record !== "object") continue;
+      if (record.scale !== ESTIMATE_SCALE) continue;
+      BRACKETS.set(id, { ...record });
+    }
   }
   return previous;
 }
@@ -618,12 +628,20 @@ function derivedCeiling(record, seeded) {
   // its own number and may be declared as it stands; one this file estimated is
   // a character count, so it is stepped under rather than sat on — declaring the
   // exact size that was just refused is how a search turns into a loop.
+  //
+  // The cap is what holds an ESTIMATED search back, and a number the route said
+  // out loud is not that: the same number is applied as it stands everywhere
+  // else in this file — the refusal that named it publishes it as the
+  // declaration, a statement made while the process runs overrides the table,
+  // and the sweep's `named` row settles the axis — so capping it here alone made
+  // a route-named window of 2,000,000 tokens come back as 1,048,576, which is
+  // this file's own ceiling talking about a size the route had answered for.
   const margin = ceil === undefined || record?.exact === true ? undefined : Math.floor(ceil * (1 - REFUSAL_MARGIN));
   const bound =
     ceil === undefined
       ? cap
       : record?.exact === true
-        ? Math.min(ceil, cap)
+        ? ceil
         : Math.min(margin, cap);
   // A margin that is a fraction of `ceil` is not a margin at all when the bracket
   // is narrow: 2% of a refused size 4000 tokens above the floor is 80 tokens below
@@ -776,20 +794,39 @@ export function observeServedRequest(id, size, seeded, brackets = BRACKETS, now 
     record.seen > (usable(record.raisedAtSeen) ? record.raisedAtSeen : 0) &&
     raisesAllowed(record, now)
   ) {
+    // A raise is a raise only if it raises. The declaration may be pulled down by
+    // a refusal — that is what a refusal is for, and the route is the one saying
+    // so — but a probe that did not move it may not lower it: the request that
+    // filled the declaration was served, and publishing a smaller window over it
+    // is a statement the route never made.
+    //
+    // The derived value could be below the declaration even though the route
+    // served the request that asked for it: the bound a refusal puts under a
+    // declaration is a fraction of the size that was refused, and a window the
+    // route named is above the cap this file searches under. Measured 2026-10-20:
+    // a route that named a window of 2,000,000 tokens had it published as
+    // 1,048,576 — the declaration went DOWN under a `wall-raised` note that said
+    // it had gone up.
+    //
+    // So the declaration is raised and the raise is recorded separately, and
+    // neither happens unless the declaration actually moved: a raise that does
+    // not raise may not spend the demand that pays for the next one, because
+    // the host cannot send a larger request than the window it was given, and
+    // that window did not grow.
     const was = ceiling;
-    record.step = Math.min(Math.max(record.step * 2, record.step + MIN_STEP), stepMax(seeded));
-    record.raisedAt = now;
-    record.raisedAtSeen = record.seen;
-    record.ceiling = derivedCeiling(record, seeded);
-    if (record.ceiling !== was)
-      note({
-        kind: "wall-raised",
-        id,
-        value: record.ceiling,
-        was,
-        floor: record.seen,
-        step: record.step,
-      });
+    // The step a raise would take, computed with the declaration it would be
+    // derived from: the step is how far above the proven floor the declaration
+    // is willing to go, so it is part of what the raise moves and is written
+    // down only when the declaration moved with it.
+    const step = Math.min(Math.max(record.step * 2, record.step + MIN_STEP), stepMax(seeded));
+    const raised = derivedCeiling({ ...record, step }, seeded);
+    if (usable(raised) && raised > was) {
+      record.step = step;
+      record.raisedAt = now;
+      record.raisedAtSeen = record.seen;
+      record.ceiling = raised;
+      note({ kind: "wall-raised", id, value: raised, was, floor: record.seen, step });
+    }
   }
   scheduleSave();
   return { ...record };
@@ -883,6 +920,9 @@ const isUsableId = (id) => typeof id === "string" && id !== "";
 // nothing that has to be cleaned up by hand. It is written atomically — a
 // temporary file beside it and a rename over it — because a half-written state
 // file is worse than none: it would be read as a bracket somebody measured.
+// The temporary file is named per write and the writes are serialised behind
+// each other, because two of them inside one process landing on one path is
+// the same half-written file arriving by another road.
 //
 // Nothing here may fail a request. A file that cannot be written is a bracket
 // that is not remembered; a file that cannot be read is a model with no history.
@@ -918,6 +958,9 @@ const SAVE_DEBOUNCE_MS = 5000;
 // a request path that must not be talked into a large read.
 const DEFAULT_SNAPSHOT_URL = new URL("./limits-observed.json", import.meta.url);
 const SNAPSHOT_LIMIT = 256 * 1024;
+// The shape of the snapshot this build reads. A file that names another version
+// is a file written by a build that means something else by these rows.
+const SNAPSHOT_VERSION = 1;
 
 // What a served sample is floored to before it is declared. The route counts the
 // prompt it was sent and the host counts the prompt it is planning, and the two
@@ -1061,19 +1104,46 @@ export function limitStateJSON(brackets = BRACKETS) {
   return JSON.stringify({ version: STATE_VERSION, models });
 }
 
+// The temporary file a write goes through, and the counter that keeps two
+// writes from sharing one. The name used to be fixed per process, so two saves
+// overlapping inside this process wrote the same path: the second truncated the
+// file the first was about to rename, and the rename failed — a save that
+// returned false for a state file that was there. Measured 2026-10-20: a second
+// `saveLimitState()` answered false because of exactly that race.
+let saveSequence = 0;
+
+// The save in flight, if any. The writes are serialised behind it, because a
+// rename is atomic but two renames of two temporary files are not one another's
+// order: the state file has to hold one whole state, and the reader takes it
+// as measured brackets.
+let saveInFlight = Promise.resolve();
+
 export async function saveLimitState(file = limitStatePath(), brackets = BRACKETS) {
   if (!file || brackets.size === 0) return false;
-  try {
-    const text = limitStateJSON(brackets);
-    if (text.length > STATE_LIMIT) return false;
-    await mkdir(dirname(file), { recursive: true });
-    const temporary = `${file}.${process.pid}.tmp`;
-    await writeFile(temporary, text, { encoding: "utf8" });
-    await rename(temporary, file);
-    return true;
-  } catch {
-    return false;
-  }
+  const write = async () => {
+    try {
+      // The bytes are taken when the write happens, not when it was asked for:
+      // a save that waited behind another one has the newer state to write.
+      const text = limitStateJSON(brackets);
+      if (text.length > STATE_LIMIT) return false;
+      await mkdir(dirname(file), { recursive: true });
+      const temporary = `${file}.${process.pid}.${saveSequence++}.tmp`;
+      await writeFile(temporary, text, { encoding: "utf8" });
+      await rename(temporary, file);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Behind the write in flight, if there is one. A failure is not carried
+  // forward: the next save is a save of its own and does not inherit the last
+  // one's trouble.
+  const run = saveInFlight.then(write, write);
+  saveInFlight = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 // Two decisions this file makes leave no trace of themselves: a live value
@@ -1183,6 +1253,53 @@ function numberFrom(match) {
 // themselves.
 const READ_DEADLINE_MS = 3000;
 
+// The two ways a wait may end, as one signal.
+//
+// `AbortSignal.any` landed in Node 20.3 and this package declares Node 18.17,
+// where the call is a TypeError. It sat outside the try that swallows errors on
+// an error path, so on Node 18 every refusal body went unread: no route-stated
+// window was ever learned and no completion cap either, and the failure was
+// silent — the diagnostic sink was never told. So the combination is made by
+// hand where the runtime cannot make it.
+//
+// Exported because the same call is made elsewhere in this plugin for the same
+// reason, and one implementation of it is one thing to get right.
+export function linkAbortSignals(signals) {
+  const controller = new AbortController();
+  const bound = [];
+  for (const source of signals) {
+    if (!source || typeof source.addEventListener !== "function") continue;
+    if (source.aborted) {
+      controller.abort(source.reason);
+      break;
+    }
+    const onAbort = () => {
+      if (controller.signal.aborted) return;
+      controller.abort(source.reason);
+    };
+    source.addEventListener("abort", onAbort, { once: true });
+    bound.push([source, onAbort]);
+  }
+  return {
+    signal: controller.signal,
+    // The sources are somebody else's — one of them is the caller's own
+    // cancellation — and a listener left on them outlives the wait that asked
+    // for it. `AbortSignal.any` does not need this; the hand-made one does.
+    dispose() {
+      for (const [source, onAbort] of bound) source.removeEventListener("abort", onAbort);
+      bound.length = 0;
+    },
+  };
+}
+
+// The combination, with the runtime's own when it has one. Answers a signal and
+// the way to let go of it, so a caller reads the same either way.
+export function anyAbortSignals(signals) {
+  if (typeof globalThis.AbortSignal?.any === "function")
+    return { signal: globalThis.AbortSignal.any(signals), dispose() {} };
+  return linkAbortSignals(signals);
+}
+
 export async function readBoundedText(response, limit = 4096, { signal } = {}) {
   let reader;
   try {
@@ -1198,7 +1315,8 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
   // way.
   if (!reader) return { text: "", ended: true, over: false };
   const deadline = AbortSignal.timeout(READ_DEADLINE_MS);
-  const bound = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const combined = signal ? anyAbortSignals([signal, deadline]) : undefined;
+  const bound = combined ? combined.signal : deadline;
   // The wait ending is this read's to remember, not the reader's: cancelling a
   // stream resolves its pending `read()` as done, so a body cut short by the
   // deadline would come back looking like one that ended — and a number at the
@@ -1257,6 +1375,8 @@ export async function readBoundedText(response, limit = 4096, { signal } = {}) {
     // cancelled by the deadline lands here too, which is the point of it.
   }
   bound.removeEventListener("abort", abort);
+  // ...and the sources the wait was watching go back to whoever owns them.
+  combined?.dispose();
   // A read the wait cut short saw no end of body, whatever the cancelled reader
   // said about it.
   if (cut) ended = false;
@@ -1434,6 +1554,27 @@ export function limitsSnapshotPath(explicit, env = globalThis.process?.env) {
 // listing for an answer that cannot have moved.
 const wallReads = new Map();
 
+// Whether a row tells one story about its own ceiling. The sweep writes the
+// first refused size twice — as `refusedChars` and as the head of
+// `refusedSizes` — and a row whose two copies disagree was edited by hand into
+// a state where it says two things about one number. There is no reading of
+// that which is the measurement, so the row is not one.
+function rowAgreesWithItself(row) {
+  const scalar = row?.refusedChars;
+  const list = row?.refusedSizes;
+  // A row that names neither carries no copy of the ceiling and contradicts
+  // nothing: the sweep writes both, but a row written by hand may carry only
+  // what it was asked for.
+  if (scalar === undefined) return true;
+  if (list !== undefined && !Array.isArray(list)) return false;
+  const first = Array.isArray(list) ? list[0] : undefined;
+  // "Nothing was refused" is `null` beside an empty list, and one of the two
+  // without the other is a row that says a refusal happened and does not say
+  // which.
+  if (scalar === null) return first === undefined;
+  return first === scalar;
+}
+
 // What the sweep measured, as the context axis may use it. One entry per id that
 // has a served sample: the largest prompt the route was watched to serve, floored
 // to a whole thousand so a host whose count differs from the route's is still
@@ -1451,6 +1592,30 @@ const wallReads = new Map();
 // same way — no measurement — because they all mean the same thing: this build
 // declares what its table and its catalogue say and nothing else. Nothing here
 // may fail a request, so nothing here throws.
+//
+// A version this build does not know is the same answer. The `version` field
+// says what shape the rows are in, and a file written by another build may hold
+// rows this one would read as measurements of something else — which is what
+// the field is for. The state file is read the same way, and has been since it
+// was written.
+//
+// A row that says how many CHARACTERS the route served and not how many tokens
+// is not read here either, and that is a decision rather than an oversight. The
+// route served the prompt but sent back no count of its own, so the row holds a
+// size this file did not receive from the route — and the only way to turn
+// characters into tokens here is the estimator's own ratio, which exists to
+// guess how big a REQUEST is so that a request may be sent. `estimateTokens`
+// says so itself: the sweep does not use it at all, it asks the route and reads
+// `prompt_tokens`. The same ratio turned into a declaration would publish an
+// estimate as the wall the route enforces, which is the one thing a declaration
+// is not allowed to be: the numbers on this axis are the route's own counts or
+// the ones the sweep read back, and a row without one of those is a floor this
+// file cannot state.
+//
+// So such a row is invisible here on purpose. The sweep keeps it — a route that
+// served without counting is evidence that it serves — and the table's own
+// number still stands for that model, which is the declaration a build makes
+// when nothing here has measured anything.
 export function measuredWalls(file) {
   const path = limitsSnapshotPath(file);
   if (!path) return new Map();
@@ -1461,10 +1626,19 @@ export function measuredWalls(file) {
   try {
     const text = readFileSync(path, { encoding: "utf8" });
     if (typeof text !== "string" || text.length > SNAPSHOT_LIMIT) return walls;
-    const models = JSON.parse(text)?.models;
+    const document = JSON.parse(text);
+    if (document?.version !== SNAPSHOT_VERSION) return walls;
+    const models = document?.models;
     if (!models || typeof models !== "object" || Array.isArray(models)) return walls;
     for (const [id, row] of Object.entries(models)) {
       if (!isUsableId(id)) continue;
+      // A row that disagrees with itself is not a measurement. `refusedChars` is
+      // the first refused size written down twice — once as a number and once
+      // as the head of the list — and a row edited by hand into a state where
+      // the two copies differ says two things about one ceiling. Which of them
+      // to believe is a guess, so the row is not read at all: it is the same
+      // answer as a row that was never measured.
+      if (!rowAgreesWithItself(row)) continue;
       const wall = typeof row?.wall === "string" ? row.wall : undefined;
       const at = typeof row?.at === "string" ? row.at : undefined;
       // A window the route stated in its own words answers the axis outright: it is
@@ -1524,14 +1698,23 @@ export const MODELS_DEV_MIN = 1_000_000;
 const MODELS_DEV = new Map();
 // What a canonical id is claimed at, and by whom, for diagnostics.
 const MODELS_DEV_BY = new Map();
+// Who claimed each canonical id. The winning claim alone cannot say how many
+// providers described a model: only the largest is kept, so the count was a
+// count of models with a claim at all — every one of them — and the evidence
+// the number was for, a model one provider describes saying nothing a
+// catalogue would not, was thrown away with the claims that lost.
+const MODELS_DEV_PROVIDERS = new Map();
 
 // Reads a models.dev document into the two maps above. Returns how many models
 // it saw two or more claims for, which is the number worth logging: a model one
-// provider describes says nothing a catalogue would not.
+// provider describes says nothing a catalogue would not. A claim is a provider
+// describing a model, so the count is of the models more than one provider
+// described — and the claims that lost are counted too, because the evidence is
+// that a second provider said the same thing, not that it said it louder.
 export function modelsDevClaims(document) {
   MODELS_DEV.clear();
   MODELS_DEV_BY.clear();
-  let contested = 0;
+  MODELS_DEV_PROVIDERS.clear();
   for (const [provider, entry] of Object.entries(document?.providers ?? document ?? {})) {
     const models = entry?.models;
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
@@ -1542,6 +1725,12 @@ export function modelsDevClaims(document) {
       if (!canonical) continue;
       const context = model?.limit?.context;
       if (!usable(context)) continue;
+      // Every provider that describes the model is counted, whoever won: two
+      // providers describing the same weights is the cross-provider evidence,
+      // and one provider describing the same model twice is still one provider.
+      const claimed = MODELS_DEV_PROVIDERS.get(canonical) ?? new Set();
+      claimed.add(provider);
+      MODELS_DEV_PROVIDERS.set(canonical, claimed);
       const held = MODELS_DEV.get(canonical);
       if (held === undefined) {
         MODELS_DEV.set(canonical, context);
@@ -1554,8 +1743,8 @@ export function modelsDevClaims(document) {
       }
     }
   }
-  for (const canonical of MODELS_DEV.keys())
-    if ((MODELS_DEV_BY.get(canonical) ?? "").split("/").length > 1) contested += 1;
+  let contested = 0;
+  for (const providers of MODELS_DEV_PROVIDERS.values()) if (providers.size > 1) contested += 1;
   return { models: MODELS_DEV.size, contested };
 }
 

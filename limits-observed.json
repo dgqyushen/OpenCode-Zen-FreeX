@@ -1,5 +1,13 @@
 {
   "version": 1,
+  "_units": {
+    "servedTokens": "tokens",
+    "servedChars": "characters",
+    "refusedChars": "characters",
+    "refusedSizes": "characters",
+    "named": "tokens",
+    "at": "date, YYYY-MM-DD"
+  },
   "models": {
     "big-pickle": {
       "servedTokens": 375142,

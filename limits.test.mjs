@@ -3,9 +3,9 @@ import test from "node:test";
 // The adaptive cases read and write real files: a state file is the one thing
 // this module puts on disk, and a case with a stubbed file system would not be
 // testing the one promise made about it — that a bracket survives a restart.
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const subject = import("./limits.mjs").catch((error) => {
@@ -24,6 +24,16 @@ const DECLARED = { context: 200000, output: 32000 };
 const SNAPSHOT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT";
 process.env[SNAPSHOT_ENV] = "";
 const SHIPPED_SNAPSHOT = fileURLToPath(new URL("./limits-observed.json", import.meta.url));
+
+// The brackets this suite learns are written by the module's debounced writer,
+// and a test run may not write the operator's copy of that file: the cases below
+// call `observeServedRequest`/`observeRefusedRequest`, which schedule that
+// write, and `loadLimitState` puts records into the same global map the writer
+// publishes. An empty value keeps the state in memory, which is what every case
+// here wants — the cases that exercise the file itself name a path of their
+// own. `index.test.mjs` and `models.test.mjs` say the same thing for the same
+// reason.
+process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
 
 // A read that never ends is the shape of the defect this file's first fix is
 // about: `readBoundedText` used to cancel a branch of `response.clone()`'s tee,
@@ -336,7 +346,7 @@ test("a declaration carried only by the caller's prototype is not a declaration"
 // too. A record the table handed over with one axis is then one override more
 // than it declared.
 test("an axis carried only by the record's prototype is not evidence", async () => {
-  const { limitOverrides } = await subject;
+  const { limitOverrides, LIMITS } = await subject;
   // The pair the caller declares is the one the inherited axis was measured
   // against, and the record's own axis is one the catalogue has not moved, so
   // nothing but the own-property rule stands between the inherited number and
@@ -360,22 +370,30 @@ test("an axis carried only by the record's prototype is not evidence", async () 
     limitOverrides("phantom-axis-free", { context: 200000, output: 32000 }, table),
     { context: 999999, output: 64000 },
   );
-  // and a marker on `Object.prototype` is the same read: no record declares it,
-  // so no model is measured against it — on any table, shipped one included. The
-  // patch goes on inside the `try` whose `finally` takes it off: a global
-  // assignment applied before the restore can be reached is one that outlives
-  // this case's own failure and leaves the prototype dirty for every later case
-  // in the process that reads it.
-  try {
-    Object.prototype.context = { value: 999999, source: "route", declaredAt: 200000 };
-    assert.deepEqual(limitOverrides("nothing-measured-free", { context: 200000, output: 32000 }), {});
-    assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }), {
-      context: 326000,
-      output: 384000,
-    });
-  } finally {
-    delete Object.prototype.context;
-  }
+  // and a marker on a prototype is the same read: no record declares it, so no
+  // model is measured against it — on any table, shipped one included. The
+  // prototype here is one this case made, and not `Object.prototype`: the
+  // project's rules forbid writing to a native prototype, and a global patch
+  // would put an enumerable key on every plain object in the process — the
+  // fixtures of this file, the module under test and every other suite sharing
+  // the runner — so that a `for...in` over any of them walks a key it never
+  // had. The same read with a prototype nobody wrote is the read that matters.
+  const carried = { context: { value: 999999, source: "route", declaredAt: 200000 } };
+  const polluted = Object.assign(Object.create(carried), LIMITS);
+  assert.deepEqual(
+    limitOverrides("nothing-measured-free", { context: 200000, output: 32000 }, polluted),
+    {},
+    "a marker inherited by the table is not a record the table holds",
+  );
+  assert.deepEqual(limitOverrides("deepseek-v4.1-flash-free", { context: 200000, output: 32000 }, polluted), {
+    context: 326000,
+    output: 384000,
+  });
+  assert.equal(
+    Object.prototype.context,
+    undefined,
+    "and the native prototype is left exactly as it was found",
+  );
 });
 
 test("weaker evidence may raise a limit but never lower one", async () => {
@@ -1186,6 +1204,44 @@ test("a caller's own signal ends the wait and keeps what was read", async () => 
   }
 });
 
+// The two ways a wait ends are the caller's own cancellation and the module's
+// deadline, and they are one signal. `AbortSignal.any` landed in Node 20.3 and
+// this package declares Node 18.17, where the call is a TypeError — and it sat
+// outside the try that swallows errors on an error path, so on Node 18 every
+// refusal body went unread: no route-stated window was learned, no completion
+// cap either, and the diagnostic sink was never told. So the two are linked by
+// hand where the runtime cannot link them.
+test("a wait ends when either of the signals it watches ends", async () => {
+  const { linkAbortSignals, anyAbortSignals } = await subject;
+  const first = new AbortController();
+  const second = new AbortController();
+  const linked = linkAbortSignals([first.signal, second.signal]);
+  assert.equal(linked.signal.aborted, false, "nothing has ended the wait yet");
+  first.abort();
+  assert.equal(linked.signal.aborted, true, "the caller's own cancellation ends it");
+  // ...and the other way round: the deadline is the module's own.
+  const third = new AbortController();
+  const fourth = new AbortController();
+  const other = linkAbortSignals([third.signal, fourth.signal]);
+  fourth.abort();
+  assert.equal(other.signal.aborted, true, "and so does the deadline");
+  // A signal that had already ended ends the wait before it starts.
+  const ended = new AbortController();
+  ended.abort();
+  assert.equal(linkAbortSignals([ended.signal]).signal.aborted, true, "an ended signal ends it at once");
+  // The listeners go back to whoever owns the signals they were on: a wait that
+  // is over must not answer the caller's next cancellation.
+  const kept = new AbortController();
+  const finished = linkAbortSignals([kept.signal]);
+  finished.dispose();
+  kept.abort();
+  assert.equal(finished.signal.aborted, false, "a wait that is over answers nothing");
+  // Where the runtime has its own answer, it is used, and it is the same shape.
+  const combined = anyAbortSignals([new AbortController().signal]);
+  assert.equal(combined.signal.aborted, false);
+  assert.equal(typeof combined.dispose, "function", "and it can be let go of either way");
+});
+
 // What the wait being cut has to mean: the last characters read are not the end
 // of the body, so a number ending there is not a number the route stated. A
 // cancelled reader answers its pending `read()` as done, which on its own would
@@ -1831,6 +1887,102 @@ test("a raise is paid for by demand the host has shown since the last one", asyn
   );
 });
 
+// A raise is a raise only if it raises.
+//
+// The declaration may be pulled down by a refusal — that is what a refusal is
+// for, and the route is the one saying so — but a probe that did not move it
+// may not lower it, and it may not spend the demand that pays for the next one.
+// The case that showed it: a route named a window of 2,000,000 tokens in its own
+// words. That number is above the 1,048,576 this file caps an estimated search
+// at, so the bound the declaration was held under came back as the cap, and the
+// raise published 1,048,576 over a declaration of 2,000,000 — under a
+// `wall-raised` note that said it had gone UP. The host was then handed a
+// window that had shrunk, so it could not fill it, so the demand that pays for
+// the next raise could never arrive: the evidence had been spent on a raise
+// that never happened.
+test("a raise may not pull the declaration down, and a raise that does not raise spends nothing", async () => {
+  const { observeServedRequest, observeRefusedRequest, limitBracket, limitDiagnostics } = await subject;
+  const notes = [];
+  const previous = limitDiagnostics((entry) => notes.push(entry));
+  const brackets = new Map();
+  try {
+    // The route names its window in its own words.
+    observeRefusedRequest("named-cap-free", { tokens: 2000000 }, 200000, brackets, 1000, 2000000);
+    const named = limitBracket("named-cap-free", brackets);
+    assert.equal(named.ceiling, 2000000, "the declaration is the window the route named");
+    // The host fills the declaration and the cooldown passes, so the search may
+    // raise it.
+    observeServedRequest("named-cap-free", { tokens: 1900000 }, 200000, brackets, 901001);
+    const after = limitBracket("named-cap-free", brackets);
+    assert.equal(after.ceiling, 2000000, "a raise may not pull the declaration down");
+    assert.equal(after.raisedAtSeen, 0, "and it does not spend the demand that pays for the next one");
+    assert.equal(after.raisedAt, 1000, "nor start the cooldown it would have started");
+    assert.equal(after.step, named.step, "nor move the probe");
+    assert.deepEqual(
+      notes.filter((entry) => entry.kind === "wall-raised"),
+      [],
+      "and no note says a raise happened",
+    );
+  } finally {
+    limitDiagnostics(previous);
+  }
+});
+
+// The same rule for a record that came back from a state file, where the
+// declaration may sit above the bound a refusal drew: the bound is 2% under the
+// size that was refused, so a declaration above that bound is one the search
+// reached past — and a probe that derives the bound back may not publish it.
+// The request that filled the declaration was served, so nothing here is a
+// statement the route has not made.
+test("a raise may not pull a declaration read back from a state file down either", async () => {
+  const { ESTIMATE_SCALE, observeServedRequest, limitBracket, limitDiagnostics } = await subject;
+  const notes = [];
+  const previous = limitDiagnostics((entry) => notes.push(entry));
+  const brackets = new Map([
+    ["read-back-free", {
+      floor: 250000, ceil: 290000, ceiling: 300000, step: 10000, scale: ESTIMATE_SCALE,
+      refusals: 1, seen: 250000, raisedAtSeen: 0, seededFrom: 200000, raisedAt: 0,
+      refusedAt: 1000, seenAt: 0,
+    }],
+    // The other half: a record whose declaration the search cannot move at all,
+    // because the floor and the step are already under it. The raise is asked
+    // for and there is nowhere to go — and a raise that goes nowhere may not
+    // spend the demand that pays for the next one, because the host cannot
+    // send a larger request than the window it was given, and that window did
+    // not grow.
+    ["stuck-free", {
+      floor: 250000, ceil: 310000, ceiling: 300000, step: 10000, scale: ESTIMATE_SCALE,
+      refusals: 1, seen: 250000, raisedAtSeen: 0, seededFrom: 200000, raisedAt: 0,
+      refusedAt: 1000, seenAt: 0,
+    }],
+  ]);
+  try {
+    // The host fills the declaration: the request is served, so the floor moves
+    // to 270000 and the bound the refusal drew is still above it.
+    observeServedRequest("read-back-free", { tokens: 270000 }, 200000, brackets, 900001);
+    const after = limitBracket("read-back-free", brackets);
+    assert.equal(after.ceil, 290000, "the bound the refusal drew is still there");
+    assert.equal(after.ceiling, 300000, "the declaration is where it was");
+    assert.equal(after.raisedAtSeen, 0, "and the demand is still there to pay for a raise");
+    assert.equal(after.step, 10000, "and the probe has not moved");
+    // The same record, filling the declaration the same way: the search derives
+    // the declaration it already has, so there is nothing to raise.
+    observeServedRequest("stuck-free", { tokens: 270000 }, 200000, brackets, 900001);
+    const stuck = limitBracket("stuck-free", brackets);
+    assert.equal(stuck.ceiling, 300000, "the declaration is where it was");
+    assert.equal(stuck.raisedAtSeen, 0, "and the demand is still there to pay for a raise");
+    assert.equal(stuck.raisedAt, 0, "and no cooldown has started");
+    assert.equal(stuck.step, 10000, "and the probe has not moved");
+    assert.deepEqual(
+      notes.filter((entry) => entry.kind === "wall-raised"),
+      [],
+      "and no note says a raise happened",
+    );
+  } finally {
+    limitDiagnostics(previous);
+  }
+});
+
 test("what the route taught outranks the table for its axis, and a model nothing was asked of keeps the table", async () => {
   const { observeServedRequest, observeRefusedRequest, limitOverrides } = await subject;
   const brackets = new Map();
@@ -1896,11 +2048,44 @@ test("a bracket survives a restart through one file, and a file that is not one 
     assert.equal(read.ceil, 170000, "and the bound the refusal put under it");
     assert.equal(read.refusals, 1);
     // The write is atomic: a temporary file beside the name, renamed over it, so
-    // a reader never sees half a state file.
-    assert.equal(existsSync(`${file}.${process.pid}.tmp`), false, "no temporary file is left behind");
+    // a reader never sees half a state file — and the temporary file is gone.
+    assert.deepEqual(
+      readdirSync(dirname(file)).filter((name) => name.startsWith(`${basename(file)}.`)),
+      [],
+      "no temporary file is left behind",
+    );
     assert.deepEqual(JSON.parse(limitStateJSON(brackets)).models["kept-free"].ceil, 170000);
   } finally {
     limitAdaptivity(new Map());
+    rmSync(file, { force: true });
+  }
+});
+
+// Two saves inside one process used to land on one temporary path: the second
+// truncated the file the first was about to rename, the rename failed, and the
+// save answered false for a state file that was there. Measured 2026-10-20.
+test("two saves at once both land, and the file holds one whole state", async () => {
+  const { ESTIMATE_SCALE, saveLimitState } = await subject;
+  const file = join(tmpdir(), `zen-limits-race-${process.pid}-${Date.now()}.json`);
+  const brackets = new Map([
+    ["kept-free", {
+      floor: 90000, ceiling: 100000, step: 1024, scale: ESTIMATE_SCALE, refusals: 0,
+      raisedAtSeen: 0, seen: 90000, seededFrom: 100000, raisedAt: 0, refusedAt: 0, seenAt: 0,
+    }],
+  ]);
+  try {
+    const [first, second] = await Promise.all([saveLimitState(file, brackets), saveLimitState(file, brackets)]);
+    assert.equal(first, true, "the first save lands");
+    assert.equal(second, true, "and so does the one that overlapped it");
+    // One whole state, not half of one: the file is what the next process reads
+    // as measured brackets.
+    assert.equal(JSON.parse(readFileSync(file, { encoding: "utf8" })).models["kept-free"].ceiling, 100000);
+    assert.deepEqual(
+      readdirSync(dirname(file)).filter((name) => name.startsWith(`${basename(file)}.`)),
+      [],
+      "and no temporary file is left behind",
+    );
+  } finally {
     rmSync(file, { force: true });
   }
 });
@@ -1997,18 +2182,54 @@ test("a state file is read field by field, and none of it may become a bracket n
 });
 
 test("a report of a state file cannot itself become the state, and a state with no models in it is not written", async () => {
-  const { limitAdaptivity, limitStateJSON } = await subject;
+  const { ESTIMATE_SCALE, limitAdaptivity, limitStateJSON } = await subject;
   // A map with nothing in it writes a file with nothing in it, which is read
   // back as no state: writing one would be a file that says a bracket exists.
   assert.equal(limitStateJSON(new Map()), JSON.stringify({ version: 1, models: {} }));
   // Restoring a state hands back a copy: a caller that mutates what it was given
-  // is mutating its own record and not the one the plugin reads.
-  const held = limitAdaptivity(new Map([["copy-free", { floor: 10, ceiling: 20 }]]));
+  // is mutating its own record and not the one the plugin reads. The record
+  // carries the scale it was measured on, because a record from another
+  // estimator is not evidence on this one — the same rule the state file is
+  // read under, and the same reason it is asked for here.
+  const held = limitAdaptivity(new Map([["copy-free", { floor: 10, ceiling: 20, scale: ESTIMATE_SCALE }]]));
   const first = limitAdaptivity();
   first.get("copy-free").floor = 999;
   assert.equal(limitAdaptivity().get("copy-free").floor, 10);
   limitAdaptivity(new Map());
   limitAdaptivity(held);
+});
+
+// A record measured on another scale is not this record, and the file path has
+// always said so. The state can also be handed in by a caller, and that is the
+// documented way to swap it, so a snapshot taken with an older estimator could
+// otherwise bound a window with a count whose unit was wrong — the very failure
+// the scale guard was added for.
+test("a record measured on another scale is not restored either", async () => {
+  const { ESTIMATE_SCALE, limitAdaptivity, limitBracket } = await subject;
+  const previous = limitAdaptivity(new Map());
+  const record = { floor: 228286, ceiling: 223942, step: 1024, refusals: 0, seededFrom: 223942, seen: 228286 };
+  try {
+    limitAdaptivity(
+      new Map([
+        ["scaled-free", { ...record, scale: ESTIMATE_SCALE }],
+        ["old-scale-free", { ...record, scale: ESTIMATE_SCALE - 1 }],
+        ["no-scale-free", { ...record }],
+      ]),
+    );
+    assert.ok(limitBracket("scaled-free"), "a record measured on this scale is restored");
+    assert.equal(
+      limitBracket("old-scale-free"),
+      undefined,
+      "a record from another estimator is not evidence on this one",
+    );
+    assert.equal(
+      limitBracket("no-scale-free"),
+      undefined,
+      "and a record that names no scale is from before there was one",
+    );
+  } finally {
+    limitAdaptivity(previous);
+  }
 });
 
 // The sweep's tier. Everything above this point is answered with no snapshot
@@ -2195,30 +2416,80 @@ test("a served sample is floored to a whole thousand, and a wall nobody hit is a
   }
 });
 
+// The sweep writes the first refused size twice — as a number and as the head of
+// the list — and a row whose two copies disagree was edited by hand into a state
+// where it says two things about one ceiling. Which of them to believe is a
+// guess, so the row is not read at all: it is the same answer as a row that was
+// never measured.
+test("a snapshot row that disagrees with itself is not a measurement", async () => {
+  const { measuredWalls } = await subject;
+  const at = join(tmpdir(), `zen-sweep-split-${process.pid}-${Date.now()}.json`);
+  try {
+    writeFileSync(
+      at,
+      JSON.stringify({
+        version: 1,
+        models: {
+          "agreeing-free": { servedTokens: 343131, refusedChars: 1900000, refusedSizes: [1900000, 2100000], wall: "bracketed" },
+          "split-free": { servedTokens: 343131, refusedChars: 1900000, refusedSizes: [2100000], wall: "bracketed" },
+          "one-sided-free": { servedTokens: 343131, refusedChars: 1900000, wall: "bracketed" },
+          "nothing-refused-free": { servedTokens: 343131, refusedChars: null, refusedSizes: [], wall: "openEnded" },
+        },
+      }),
+    );
+    const walls = measuredWalls(at);
+    assert.ok(walls.get("agreeing-free"), "a row that agrees with itself is read");
+    assert.equal(walls.has("split-free"), false, "and one whose two copies differ is not");
+    assert.equal(walls.has("one-sided-free"), false, "nor one that has a ceiling and no list of refusals");
+    assert.ok(walls.get("nothing-refused-free"), "a row that says nothing was refused is read");
+  } finally {
+    rmSync(at, { force: true });
+  }
+});
+
 test("the sweep is read once per file, and a file that is not one is no measurement", async () => {
   const { measuredWalls } = await subject;
   const at = join(tmpdir(), `zen-sweep-once-${process.pid}-${Date.now()}.json`);
   const broken = join(tmpdir(), `zen-broken-${process.pid}-${Date.now()}.json`);
   const listed = join(tmpdir(), `zen-listed-${process.pid}-${Date.now()}.json`);
+  const other = join(tmpdir(), `zen-other-version-${process.pid}-${Date.now()}.json`);
+  const unversioned = join(tmpdir(), `zen-unversioned-${process.pid}-${Date.now()}.json`);
   try {
-    writeFileSync(at, JSON.stringify({ models: { "once-free": { servedTokens: 100000, wall: "bracketed" } } }));
+    writeFileSync(at, JSON.stringify({ version: 1, models: { "once-free": { servedTokens: 100000, wall: "bracketed" } } }));
     assert.equal(measuredWalls(at).get("once-free").value, 100000);
     // The file is an input that changes when somebody commits a run's result, not
     // while a process serves requests: what is already read stands, so the same
     // path is never a syscall per model list.
-    writeFileSync(at, JSON.stringify({ models: { "once-free": { servedTokens: 900000, wall: "bracketed" } } }));
+    writeFileSync(at, JSON.stringify({ version: 1, models: { "once-free": { servedTokens: 900000, wall: "bracketed" } } }));
     assert.equal(measuredWalls(at).get("once-free").value, 100000);
     // A path that is not there, one holding something else, and one whose models
     // are not a map all answer the way a build with no snapshot answers.
     assert.equal(measuredWalls(join(tmpdir(), `zen-absent-${process.pid}-${Date.now()}.json`)).size, 0);
     writeFileSync(broken, "{ this is not json");
     assert.equal(measuredWalls(broken).size, 0);
-    writeFileSync(listed, JSON.stringify({ models: ["a", "b"] }));
+    writeFileSync(listed, JSON.stringify({ version: 1, models: ["a", "b"] }));
     assert.equal(measuredWalls(listed).size, 0);
+    // A version this build does not know is no measurement either: the field says
+    // what shape the rows are in, and rows written for another shape would be
+    // read here as measurements of this one. The state file has been read this
+    // way since it was written.
+    writeFileSync(
+      other,
+      JSON.stringify({ version: 99, models: { "future-free": { servedTokens: 100000, wall: "bracketed" } } }),
+    );
+    assert.equal(measuredWalls(other).size, 0, "a snapshot of another version is not read");
+    // ...and so is one that names no version at all.
+    writeFileSync(
+      unversioned,
+      JSON.stringify({ models: { "unversioned-free": { servedTokens: 100000, wall: "bracketed" } } }),
+    );
+    assert.equal(measuredWalls(unversioned).size, 0, "a snapshot that names no version is not read");
   } finally {
     rmSync(at, { force: true });
     rmSync(broken, { force: true });
     rmSync(listed, { force: true });
+    rmSync(other, { force: true });
+    rmSync(unversioned, { force: true });
   }
 });
 
@@ -2361,7 +2632,7 @@ test("a snapshot past the read ceiling is no measurement, and one naming the pro
     // smaller listing.
     writeFileSync(
       big,
-      JSON.stringify({ models: { "filler-free": { servedTokens: 300000, wall: "bracketed" }, pad: "x".repeat(300 * 1024) } }),
+      JSON.stringify({ version: 1, models: { "filler-free": { servedTokens: 300000, wall: "bracketed" }, pad: "x".repeat(300 * 1024) } }),
     );
     assert.equal(measuredWalls(big).size, 0);
     // `__proto__` and `toString` are keys like any other in a Map, and reading them
@@ -2369,7 +2640,7 @@ test("a snapshot past the read ceiling is no measurement, and one naming the pro
     // catalogue never offers such an id, and the ids this reads for are the ones
     // the file names. What matters is that nothing inherited becomes a measurement,
     // which `Object.entries` over a parsed object cannot produce.
-    writeFileSync(proto, '{"models":{"__proto__":{"servedTokens":900000,"wall":"bracketed"},"toString":{"servedTokens":900000,"wall":"bracketed"}}}');
+    writeFileSync(proto, '{"version":1,"models":{"__proto__":{"servedTokens":900000,"wall":"bracketed"},"toString":{"servedTokens":900000,"wall":"bracketed"}}}');
     const walls = measuredWalls(proto);
     assert.equal(walls.size, 2);
     assert.equal(walls.get("__proto__").value, 900000);
@@ -2413,6 +2684,44 @@ test("a models.dev row with no canonical id is not matched to anything", async (
     providers: { a: { models: { alias: { limit: { context: 9_000_000 } } } } },
   });
   assert.equal(modelsDevLimit("alias"), undefined, "an alias nobody can match is not a claim about a model");
+});
+
+// The counter says how many models it saw two or more claims for, and it could
+// not: only the winning claim was kept, so the count was the number of models
+// with a claim at all — every one of them. The evidence it was for, a model one
+// provider describes saying nothing a catalogue would not, was thrown away with
+// the claims that lost.
+test("a model one provider describes is not contested, and one several describe is", async () => {
+  const { modelsDevClaims } = await import("./limits.mjs");
+  try {
+    const one = modelsDevClaims({
+      providers: {
+        a: { models: { one: { canonical_model_id: "x/one", limit: { context: 1_000_000 } } } },
+        b: { models: { two: { canonical_model_id: "x/two", limit: { context: 1_000_000 } } } },
+      },
+    });
+    assert.equal(one.models, 2);
+    assert.equal(one.contested, 0, "one provider each is nobody's cross-provider evidence");
+    // Two providers describing the same weights are, and one provider describing
+    // the same model twice is still one provider.
+    const several = modelsDevClaims({
+      providers: {
+        a: { models: { one: { canonical_model_id: "x/one", limit: { context: 1_000_000 } } } },
+        b: { models: { two: { canonical_model_id: "x/one", limit: { context: 1_048_576 } } } },
+        c: {
+          models: {
+            three: { canonical_model_id: "x/three", limit: { context: 1_000_000 } },
+            four: { canonical_model_id: "x/three", limit: { context: 1_000_000 } },
+          },
+        },
+      },
+    });
+    assert.equal(several.models, 2);
+    assert.equal(several.contested, 1, "one model was described by two providers");
+  } finally {
+    // The claims are module-global, so the map is left as it was found.
+    modelsDevClaims({});
+  }
 });
 
 test("the second opinion only answers an axis the catalogue declares at a million", async () => {
@@ -2503,13 +2812,13 @@ test("a claim below a measurement never pulls the measurement down", async () =>
 // `adopted === undefined`. It therefore waited for ever: the deployment kept
 // answering 1000000 with the claim map full and a 1048576 claim in it.
 test("a bracket seeded at the catalogue number does not pin the second opinion", async () => {
-  const { limitOverrides, modelsDevClaims, limitAdaptivity } = await import("./limits.mjs");
+  const { limitOverrides, modelsDevClaims, limitAdaptivity, ESTIMATE_SCALE } = await import("./limits.mjs");
   modelsDevClaims({
     providers: { a: { models: { m: { canonical_model_id: "v/seeded", limit: { context: 1_048_576 } } } } },
   });
   const previous = limitAdaptivity(
     new Map([["id", {
-      floor: 0, ceil: undefined, exact: false, refusals: 0,
+      floor: 0, ceil: undefined, exact: false, refusals: 0, scale: ESTIMATE_SCALE,
       step: 50_000, seededFrom: 1_000_000, ceiling: 1_000_000,
     }]]),
   );
@@ -2526,13 +2835,13 @@ test("a bracket seeded at the catalogue number does not pin the second opinion",
 // And a bracket the ROUTE grew past the claim still wins: that is a size this
 // route served, which no provider's page can contradict.
 test("a bracket the route raised above the claim is not lowered", async () => {
-  const { limitOverrides, modelsDevClaims, limitAdaptivity } = await import("./limits.mjs");
+  const { limitOverrides, modelsDevClaims, limitAdaptivity, ESTIMATE_SCALE } = await import("./limits.mjs");
   modelsDevClaims({
     providers: { a: { models: { m: { canonical_model_id: "v/high", limit: { context: 1_048_576 } } } } },
   });
   const previous = limitAdaptivity(
     new Map([["id", {
-      floor: 1_100_000, ceil: undefined, exact: false, refusals: 0,
+      floor: 1_100_000, ceil: undefined, exact: false, refusals: 0, scale: ESTIMATE_SCALE,
       step: 50_000, seededFrom: 1_000_000, ceiling: 1_100_000,
     }]]),
   );
