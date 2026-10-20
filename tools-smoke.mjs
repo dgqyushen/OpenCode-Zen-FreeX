@@ -52,9 +52,10 @@
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { baseFrom } from "./base-url.mjs";
 import { PROFILES, agentFor } from "./core-tools.mjs";
 import { readBoundedText } from "./limits.mjs";
-import { DEFAULT_BASE, opencodeID, outboundHeaders } from "./provider.mjs";
+import { opencodeID, outboundHeaders } from "./provider.mjs";
 
 // How many characters of an error body are read. A refusal is short, and the
 // one thing this gate quotes is the sentence inside it, so the budget is the
@@ -70,27 +71,33 @@ const READ_BUDGET = 4096;
 // slashes are stripped because the plugin puts the value through `httpURL`, which
 // does the same: `ZEN_BASE_URL=https://…/v1/` must not become `//chat/completions`.
 //
-// The stripping is a second copy of the rule `limits-audit.mjs` exports as
-// `baseFrom`, and it is kept as a copy deliberately rather than imported: that
-// file already imports `chatRequest` from here, so importing the rule back would
-// close a cycle between the two. What the two share is the one place the endpoint
-// itself comes from — `DEFAULT_BASE`, imported above — and that is the half that
-// drifted when it was copied; the rule is a single expression whose second copy
-// is reached only where `limits-audit.mjs` is not loaded. Moving `baseFrom` to a
-// module both can import without a cycle is the fix if a third caller appears.
+// The rule that does that — and that refuses a base which is not an HTTP(S) URL,
+// or carries credentials, a query or a fragment — lives in `base-url.mjs`, shared
+// with `limits-audit.mjs`. The copy that used to be here trimmed only, so a
+// `ftp://…` or `https://user:pass@…` value passed the gate's validation and went
+// out as a request; the audit's rule rejected it, and the two tools disagreed
+// about the same variable. The rule cannot live in `limits-audit.mjs` any more:
+// that file imports `chatRequest` from here, so importing it back would close a
+// cycle. `base-url.mjs` is a maintenance module like this one and is not shipped.
+//
+// Resolved when it is needed rather than at module evaluation. Importing this
+// module must not throw on a malformed variable it does not own: `limits-audit`
+// and `limits-sweep` import it for `chatRequest`, and one bad environment line
+// used to be their failure too. A run still validates it first (see the entry
+// block below), so the gate reports the variable instead of a stack trace.
 //
 // An empty value names no base. `??` reads it as set, so `ZEN_BASE_URL=` — a
 // line a profile export leaves behind — made the base the empty string and the
 // request the relative URL `/chat/completions`, which `fetch` refuses to parse:
 // the catch-all reported `unreachable` and the summary said the free tier could
 // not be reached, a fault in the reader's own variable reported as an outage of
-// the service. `limits-audit.mjs`'s `baseFrom` answers it this way, and the rule
-// cannot be imported back without a cycle, so it is stated here as well.
-const BASE = (
-  process.env.ZEN_BASE_URL === undefined || process.env.ZEN_BASE_URL.trim() === ""
-    ? DEFAULT_BASE
-    : process.env.ZEN_BASE_URL.trim()
-).replace(/\/+$/, "");
+// the service. `baseFrom` answers it the same way.
+//
+// Exported so a test can ask the shared rule through this module and see that
+// the gate really reads it, rather than a copy that could drift again.
+export function baseURL(value = process.env.ZEN_BASE_URL) {
+  return baseFrom(value);
+}
 // The model the gate probes with. It has to be a model the route still serves,
 // and it stopped being one: `space-bunny-free` was retired by the route on
 // 2026-10-19 and every request with it is answered 410, so every run of this
@@ -190,12 +197,20 @@ export async function check(generation, profile, shape, namesOf) {
     return malformed(generation, shape, error);
   }
   const { headers, body } = request;
+  // Both are built before the transport `try`: a base that will not parse is
+  // this file's input being wrong, and a body that will not serialize is a
+  // defect in the request. Left inside the `try`, either was caught by the
+  // transport's handler and reported as `unreachable` — the one verdict that
+  // says the free tier could not be reached at all, about a request that was
+  // never sent. From here down, only the transport is caught.
+  const endpoint = `${baseURL()}/chat/completions`;
+  const payload = JSON.stringify(body);
   let response;
   try {
-    response = await fetch(`${BASE}/chat/completions`, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: payload,
       signal: AbortSignal.timeout(30000),
     });
   } catch (error) {
@@ -415,21 +430,26 @@ export function fileIdentity(stats) {
   return stats.ino === 0n ? undefined : `${stats.dev}:${stats.ino}`;
 }
 
+// What is said when the run/import question has no answer. Exported so a test
+// can pin the sentence an importer or a run sees.
+export const UNDETERMINED_ENTRY =
+  "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run check:gate`.";
+
 // Only a run asks Zen. index.test.mjs imports this module to hold its request
-// against the plugin's, and an import must not reach the network. That import is
-// the only way past this line that asks nothing: a run is `true`, and anything
-// this could not settle (`undefined`) exits above rather than reaching it.
+// against the plugin's, and an import must not reach the network.
+//
+// An answer this could not settle (`undefined`) is printed and recorded as a
+// non-zero exit rather than thrown: this is module evaluation, so a throw here
+// kills the importer — `limits-audit.mjs` and `limits-sweep.mjs` both import
+// `chatRequest` — before its own code can run. A run that reaches this branch
+// still exits non-zero, because `process.exitCode` is the process's answer and
+// nothing was asked, so the gate cannot report success. An importer keeps its
+// exports; under a runtime that can answer (Bun, Node ≥ 22.18) this branch is
+// not reached by an import at all, where `import.meta.main` is `false`.
 const entry = invokedDirectly();
 if (entry === undefined) {
-  // Thrown rather than exited on: this is module evaluation, so `process.exit(1)`
-  // here kills the importer — a test runner, a loader, anything that asked for
-  // these helpers — and can truncate what is written to stderr when it is a
-  // pipe. limits-audit.mjs answers the same question the same way, with
-  // UNDETERMINED_ENTRY, and a run that reaches it still dies non-zero: an
-  // uncaught error is a non-zero exit, and the decision is the caller's.
-  throw new Error(
-    "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run check:gate`.",
-  );
+  console.error(UNDETERMINED_ENTRY);
+  process.exitCode = 1;
 }
 
 // The one-line summary of a run in which the floor was not served everywhere it
@@ -547,6 +567,17 @@ export function refusedSummary({ served, unbuilt = [], unserved = [] }) {
 }
 
 if (entry) {
+  // Validated before anything is asked. `check` resolves the same base for each
+  // request, but by then it is inside a fan-out; here a run can name the
+  // variable that is wrong instead of leaving a rejected promise and a stack
+  // trace, and no request is built on a base that is not an HTTP(S) URL.
+  try {
+    baseURL();
+  } catch (error) {
+    console.error(`\ncheck:gate — unable to ask: ${error?.message ?? error}`);
+    console.error("Check ZEN_BASE_URL, then ask again.");
+    process.exit(1);
+  }
   // Each request is independent and every result is printed in order, so the
   // profiles are asked at once and, within each profile, so are its two shapes:
   // awaiting the floor before its own full pushed that full request back by
@@ -577,7 +608,7 @@ if (entry) {
   // the refusals the summary talks about, and it is the one outcome whose fix is
   // in `fingerprint.json` rather than in the network or the wording.
   const unbuilt = floor.filter((result) => result.verdict === "malformed");
-  console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${BASE}`);
+  console.log(`\n${served.length}/${floor.length} generations serve a host that is not OpenCode at ${baseURL()}`);
 
   // A generation whose full shape is served while its floor is not is the case
   // this gate was widened to see: the plugin would work for a host bringing its

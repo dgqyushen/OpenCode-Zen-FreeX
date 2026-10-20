@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   linkSync,
   mkdirSync,
@@ -13,6 +14,8 @@ import { join, relative } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  UNDETERMINED_ENTRY,
+  baseURL,
   check,
   fileIdentity,
   isEntryPoint,
@@ -21,6 +24,7 @@ import {
   unsupportedError,
 } from "./tools-smoke.mjs";
 import { agentFor } from "./core-tools.mjs";
+import { DEFAULT_BASE } from "./provider.mjs";
 
 // The question "was this file run, or is it being imported" is what stands
 // between the gate asking Zen and the gate reporting success without asking, so
@@ -624,4 +628,73 @@ test("a run that probed with a retired model says so", () => {
   assert.match(summary, /not about the fingerprint/);
   assert.match(summary, /ZEN_CHECK_MODEL/);
   assert.doesNotMatch(summary, /capturing again/, "and it does not send the reader to capture");
+});
+
+test("a body that cannot be serialized is this file's fault, not an outage", async () => {
+  // `JSON.stringify` used to run inside the transport `try`, so a request that
+  // could not be serialized was caught by the same handler as a refused
+  // connection and reported as `unreachable` — "the free tier could not be
+  // reached at all" — about a request that was never sent. It is built before
+  // the guard now, so it comes back as itself.
+  const profile = { tools: { read: { name: "read", description: 10n } } };
+  const real = globalThis.fetch;
+  let asked = false;
+  globalThis.fetch = async () => {
+    asked = true;
+    throw new Error("the network was asked");
+  };
+  try {
+    await assert.rejects(
+      () => check("1.x", profile, "floor", () => ["read"]),
+      /BigInt/,
+      "a serialization failure has to arrive as itself, not as a verdict",
+    );
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(asked, false, "nothing may be sent when the body could not be serialized");
+});
+
+test("the gate's base validation is the audit's, not a trim-only copy", () => {
+  // The copy here accepted `ftp://…` and a credentialed URL, and the audit's
+  // rule refused them: two answers about one variable. Both import `baseFrom`
+  // from `base-url.mjs` now, and this asks the gate's own export.
+  assert.equal(baseURL("https://opencode.ai/inference/v1/"), "https://opencode.ai/inference/v1");
+  assert.equal(baseURL(""), DEFAULT_BASE, "an empty base is no base, as in the audit");
+  assert.equal(baseURL(undefined), DEFAULT_BASE);
+  for (const value of [
+    "ftp://opencode.ai/inference/v1",
+    "https://user:pass@opencode.ai/inference/v1",
+    "https://opencode.ai/inference/v1?key=1",
+    "opencode.ai/inference/v1",
+  ])
+    assert.throws(() => baseURL(value), /ZEN_BASE_URL/, `${value} is not a base the gate can ask`);
+});
+
+test("a malformed ZEN_BASE_URL is named by a run instead of becoming a request", () => {
+  // A run validates the base before it builds anything. The gate used to send
+  // `ftp://…` or a credentialed URL straight through the trim-only copy; now
+  // the same rule the audit uses answers it, and the sentence names the
+  // variable rather than leaving a rejected fan-out behind.
+  const directory = fileURLToPath(new URL(".", import.meta.url));
+  const run = spawnSync(process.execPath, ["tools-smoke.mjs"], {
+    cwd: directory,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, ZEN_BASE_URL: "ftp://opencode.ai/inference/v1" },
+  });
+  const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+  assert.equal(run.status, 1, `a run cannot report success on a base it cannot use:\n${output}`);
+  assert.match(output, /unable to ask/, `the run has to say it could not ask:\n${output}`);
+  assert.match(output, /ZEN_BASE_URL/, `and name the variable that is wrong:\n${output}`);
+  assert.equal(/\n\s+at /.test(output), false, `not with a stack trace:\n${output}`);
+});
+
+test("the undetermined-entry sentence is exported to importers, not thrown at them", () => {
+  // The throw this replaces was module evaluation, so it killed every importer
+  // of `chatRequest` — limits-audit and limits-sweep. The branch now prints and
+  // asks for a non-zero exit without throwing, and its sentence is an export a
+  // test can pin.
+  assert.match(UNDETERMINED_ENTRY, /Run it with `bun run check:gate`/);
+  assert.equal(typeof check, "function", "the exports an importer asked for are still here");
 });

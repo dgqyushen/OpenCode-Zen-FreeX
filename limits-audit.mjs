@@ -43,66 +43,29 @@ import { fileURLToPath } from "node:url";
 import { PROFILES, profileFor } from "./core-tools.mjs";
 import { LIMITS, limitOverrides, namedAxes, readBoundedText } from "./limits.mjs";
 import { SDK, bootstrapProtocols, isFree, limitFor } from "./models.mjs";
-import { CATALOG, DEFAULT_BASE } from "./provider.mjs";
+import { CATALOG } from "./provider.mjs";
+import { baseFrom } from "./base-url.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
-// The route's own base, without the trailing slash a deployment's `ZEN_BASE_URL`
-// often carries. Every URL below is that base plus a path, and a base left with
-// its slash makes `//models` and `//chat/completions`: some routes treat the
-// doubled slash as a different path or answer it themselves, and the failure
-// reads as "the route or the catalogue could not be read … check the network"
-// about a variable the operator set by hand. This is provider.mjs's own rule for
-// its three URLs (`httpURL`, `url.href.replace(/\/+$/, "")`) stated here,
-// because the audit reads its base from the environment at module load and does
-// not go through the server to get at it. Exported so the rule can be asked
-// about directly: a constant would only show the answer for one spelling.
-export function baseFrom(value) {
-  // An empty string is a variable that names no base: `ZEN_BASE_URL=` in a
-  // profile exports one, and `??` reads it as set, so the base became the empty
-  // string and every URL below it a relative path (`/models`) — a request to no
-  // host at all, reported as "the route or the catalogue could not be read …
-  // check the network" about a variable that was wrong before it was used.
-  // Whitespace names no base either, for the same reason.
-  const text = value === undefined || value === null ? DEFAULT_BASE : String(value);
-  const trimmed = text.trim();
-  if (trimmed === "") return DEFAULT_BASE;
-  // The rest of provider.mjs's `httpURL` rule, which this base has to answer
-  // too — it was copied here as half of it, and the half that was missing is
-  // the half that fails the same unexplained way:
-  //
-  //   * The whitespace is judged before the text is used, and the trimmed text
-  //     is what is returned. A base written as `" https://host "` kept its
-  //     spaces, so the trailing-slash strip never fired and the audit fetched
-  //     `https://host/%20/models` — a 404 reported as "the route or the
-  //     catalogue could not be read … check the network and ZEN_BASE_URL", a
-  //     network message about a whitespace typo.
-  //   * A base carrying credentials, a query or a fragment is refused, as
-  //     `httpURL` refuses it. Pasted into the middle of a URL here it becomes
-  //     `https://host?x=1/models`, which is a URL with a query in the path and
-  //     fails the same unexplained way.
-  let url;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error(
-      `ZEN_BASE_URL is not a URL: ${JSON.stringify(trimmed)}. It has to be an HTTP(S) URL such as ${DEFAULT_BASE}.`,
-    );
-  }
-  if (
-    !["http:", "https:"].includes(url.protocol) ||
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash
-  ) {
-    throw new Error(
-      `ZEN_BASE_URL must be an HTTP(S) URL without credentials, query or fragment: ${JSON.stringify(trimmed)}.`,
-    );
-  }
-  return url.href.replace(/\/+$/, "");
+// The rule that turns `ZEN_BASE_URL` into a base lives in `base-url.mjs`, shared
+// with `tools-smoke.mjs`: the one copy used to know the full rule while the
+// gate's knew only how to trim, so the two answered a malformed base two
+// different ways. Re-exported because the tests and readers ask the audit for
+// the rule, as they did when it was declared here.
+export { baseFrom };
+
+// The base is parsed when it is asked for, not while this module is evaluated.
+// A malformed `ZEN_BASE_URL` used to throw on the `const BASE = ...` line that
+// stood here — before the entry point's own `try/catch` — so the operator got a stack
+// trace out of an import instead of the "unable to ask … check ZEN_BASE_URL"
+// sentence the entry prints. The parse is memoised so a run asks once, and a
+// test can import these helpers with any environment at all.
+let parsedBase;
+export function baseURL() {
+  if (parsedBase === undefined) parsedBase = baseFrom(process.env.ZEN_BASE_URL);
+  return parsedBase;
 }
 
-const BASE = baseFrom(process.env.ZEN_BASE_URL);
 const CATALOG_URL = process.env.ZEN_CATALOG_URL ?? CATALOG;
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
 // How many characters of a response body the audit reads. The reader is
@@ -191,6 +154,64 @@ export function withEffective(row, table = LIMITS) {
   return { ...row, effective };
 }
 
+// The row `run` builds when `withEffective` throws. It has to be a row like any
+// other: the print loop reads `effective` and compares it with `declared`, so a
+// fallback without `effective` made one failed id throw a `TypeError` out of the
+// loop and take every printed row with it — the exact failure the catch above
+// exists to prevent. The catalogue's own pair stays on the row as well, because
+// the "catalogue says …" note is built from it and dropping it printed
+// `undefined` beside a sibling that had done nothing wrong.
+//
+// `effective: {}` is deliberate rather than a copy of `declared`: nothing was
+// resolved for this id, and printing the catalogue's pair in the plugin's column
+// would state a declaration this run never computed. `rowLine` prints it as
+// "—/—" and the row's `says` is what the line is about.
+//
+// Exported so a test can pin the shape the catch hands the print loop.
+export function failedRow({ id, catalogue, answer, error }) {
+  // The row failed to be built, but the route's own sentence (when there was
+  // one) is still the answer the run got: it is kept, and the bookkeeping error
+  // that stopped the pair from being computed is said beside it rather than
+  // instead of it. Without this, a route that refused the ask read as a
+  // bookkeeping failure and its message was lost.
+  const bookkeeping = error?.message ?? String(error);
+  return {
+    id,
+    declared: catalogue?.limit ?? {},
+    canonical: catalogue?.canonical_model_id,
+    effective: {},
+    ...answer,
+    says: answer?.says ? `${answer.says} (row: ${bookkeeping})` : bookkeeping,
+  };
+}
+
+// One row as the table prints it. A function rather than a loop body so the
+// tolerance for a missing number can be asked about directly: `declared` and
+// `effective` are each read through a default here, and every number is printed
+// through `?? "—"`, so a row that carries neither is a line of dashes rather
+// than a `TypeError` that ends the audit's output halfway through.
+//
+// Exported for the tests.
+export function rowLine(row) {
+  // `?? {}` rather than a destructuring default: a row carrying an explicit
+  // `null` for either pair is the shape a failed row or a hand-made test can
+  // produce, and `null` would reach `pair(null).context` and throw the line
+  // that was added so a failed row could still print.
+  const declared = row.declared ?? {};
+  const effective = row.effective ?? {};
+  const { id, canonical, ...answer } = row;
+  const moved = effective.context !== declared.context || effective.output !== declared.output;
+  const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
+  const mark = answer.status === 200 ? "  " : "! ";
+  return (
+    `${mark}${id.padEnd(34)} ${pair(effective).padStart(17)}` +
+    `${moved ? `  (catalogue ${pair(declared)})` : ""}  ${answer.status}` +
+    `${answer.upstream ? `  ${answer.upstream}${answer.endpoint ? ` via ${answer.endpoint}` : ""}` : ""}` +
+    `${answer.ceiling !== undefined ? `  ceiling=${answer.ceiling}` : ""}${answer.window !== undefined ? `  window=${answer.window}` : ""}` +
+    `${answer.says ? `  — ${answer.says}` : ""}`
+  );
+}
+
 // The pair the sibling comparison below is made against: what the plugin
 // declares, not what the catalogue lists under it. Reading `declared` there
 // while the table printed `effective` is how a sibling the plugin declares far
@@ -199,7 +220,10 @@ export function withEffective(row, table = LIMITS) {
 // catalogue read `row.declared` instead — they are about the catalogue's own
 // number, and reading this pair there attributed limits.mjs's override to the
 // catalogue.
-const judgement = (row) => row.effective ?? row.declared ?? {};
+const judgement = (row) =>
+  row.effective && Object.keys(row.effective).length
+    ? row.effective
+    : row.declared ?? {};
 
 // The evidence limits.mjs already carries, one entry per (id, axis).
 //
@@ -348,6 +372,12 @@ async function getJSON(url) {
 // Exported so a test can hand it a broken request without asking the route: a
 // request that cannot be built is answered before anything is sent.
 export async function ask(id, names) {
+  // Read before the guard below, not inside it: a base that will not parse is
+  // this file's input being wrong, and the catch that turns a request's failure
+  // into a status-0 row would report it as a model that could not be reached.
+  // `run` asks for the same base once at the top, so a real audit never gets
+  // here with a bad one.
+  const BASE = baseURL();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45000);
   try {
@@ -551,6 +581,12 @@ if (entry) {
 // answers it gives, and a test that reached only the helpers beside it could not
 // say whether they agree with each other.
 export async function run() {
+  // Parsed here rather than at module evaluation: a malformed `ZEN_BASE_URL`
+  // throws out of `run`, which the entry point already catches and answers with
+  // the "unable to ask … check ZEN_BASE_URL" sentence. Thrown from module
+  // evaluation instead, it escaped that catch and reached the operator as a
+  // stack trace about an import.
+  const BASE = baseURL();
   // Through core-tools' accessor, as in `ask` above: it answers the failure with
   // a sentence naming the generation and what the capture holds, which is what
   // the entry point's own `Object.hasOwn` check reports for a generation nobody
@@ -571,7 +607,12 @@ export async function run() {
   // count exists to make visible. Retirement is part of `isFree`, so a retired
   // id belongs to neither number. `Object.keys` is what makes the row read an
   // own one here: it names the catalogue's own ids and nothing else.
-  const free = Object.keys(models).filter((id) => isFree(id, models[id]));
+  // `?? {}` for the row a catalogue writes as `null`: the row is not a
+  // description, and `offeredIds` above already falls back to the id's own name
+  // for it. Passed straight through, `isRetired(null)` threw while this line
+  // counted the catalogue — before the first id was asked — and the entry point
+  // reported the whole audit as an unreadable route.
+  const free = Object.keys(models).filter((id) => isFree(id, models[id] ?? {}));
   console.log(`limits audit — ${BASE}`);
   console.log(`${ids.length} free ids are offered; the catalogue still describes ${free.length}\n`);
 
@@ -616,14 +657,10 @@ export async function run() {
           // network and ZEN_BASE_URL": a bug in this file's own bookkeeping
           // reported as a network failure, with every id's status-0 row lost.
           // `ask` already treats "this id cannot be built" as that id's row;
-          // the same guard belongs here.
-          return {
-            id,
-            declared: {},
-            canonical: undefined,
-            ...answer,
-            says: error?.message ?? String(error),
-          };
+          // the same guard belongs here. The row keeps the catalogue's own pair
+          // and gets an empty `effective`, so the print loop below agrees with
+          // every other row instead of throwing on this one.
+          return failedRow({ id, catalogue, answer, error });
         }
       }),
     );
@@ -634,19 +671,10 @@ export async function run() {
   // so that is what is printed; the catalogue's own pair is shown beside it when
   // the two differ, since that is the under-report being answered. The
   // canonical id is taken out with the rest of the row's bookkeeping: it is
-  // what the pair was built from, not something the route said.
-  for (const { id, declared, effective, canonical, ...answer } of rows) {
-    const moved = effective.context !== declared.context || effective.output !== declared.output;
-    const pair = (limit) => `${limit.context ?? "—"}/${limit.output ?? "—"}`;
-    const mark = answer.status === 200 ? "  " : "! ";
-    console.log(
-      `${mark}${id.padEnd(34)} ${pair(effective).padStart(17)}` +
-        `${moved ? `  (catalogue ${pair(declared)})` : ""}  ${answer.status}` +
-        `${answer.upstream ? `  ${answer.upstream}${answer.endpoint ? ` via ${answer.endpoint}` : ""}` : ""}` +
-        `${answer.ceiling !== undefined ? `  ceiling=${answer.ceiling}` : ""}${answer.window !== undefined ? `  window=${answer.window}` : ""}` +
-        `${answer.says ? `  — ${answer.says}` : ""}`,
-    );
-  }
+  // what the pair was built from, not something the route said. `rowLine` reads
+  // each number through a default, so a row that failed before it had any is
+  // still one line rather than the end of the table.
+  for (const row of rows) console.log(rowLine(row));
 
   // "Answered" is this file's own word for a positive result, and a 200 is not
   // the only shape it takes: an upstream that validates the ceiling it was asked

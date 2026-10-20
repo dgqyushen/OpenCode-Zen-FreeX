@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { linkSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -1394,4 +1395,88 @@ test("a base URL with a trailing slash does not become a doubled path", async ()
     assert.equal(asked, "https://opencode.ai/inference/v1/chat/completions", asked);
     assert.equal(models.slice(models.indexOf("://") + 3).includes("//"), false, models);
   }
+});
+
+// The catalogue writes `null` for a row it could not fill in. `offeredIds` has
+// always answered a missing row with the id's own name; the count of what the
+// catalogue describes passed the row straight to `isFree`, whose `isRetired(null)`
+// threw there — before the first id was asked — and the entry point reported the
+// whole audit as an unreadable route. A row that names itself free is offered by
+// its name and counted; a row that does not is simply not free.
+test("a catalogue row written as null does not end the audit's own count", async () => {
+  const { run } = await subject();
+  const catalog = JSON.parse(JSON.stringify(RUN_CATALOG));
+  catalog.opencode.models["null-row"] = null;
+  catalog.opencode.models["null-row-free"] = null;
+  const { lines, code } = await auditRun(
+    { "audit-run-a-free": {}, "audit-run-b-free": {} },
+    run,
+    { catalog },
+  );
+  const printed = lines.join("\n");
+  // Two fixture ids name themselves free; the null row that does not is not
+  // counted, and the null row that does is — the same fallback `offeredIds` reads.
+  assert.match(
+    printed,
+    /2 free ids are offered; the catalogue still describes 3/,
+    `the count has to survive a null row:\n${printed}`,
+  );
+  assert.equal(code, 0, `the run answered, so a null row must not change the exit code:\n${printed}`);
+});
+
+// The fallback row the catch builds has to be a row like any other. Without
+// `effective`, the print loop read `effective.context` and threw, turning one
+// failed id into the end of the table — and without the catalogue's `declared`,
+// the sibling note printed `undefined`. `rowLine` is the loop, exported so both
+// halves can be asked about without making `withEffective` fail on demand.
+test("a row that could not be built is printed like every other row", async () => {
+  const { failedRow, rowLine } = await subject();
+  const row = failedRow({
+    id: "failed-row-free",
+    catalogue: { limit: { context: 200000, output: 32000 }, canonical_model_id: "weights" },
+    answer: { status: 0, says: "the upstream said no" },
+    error: new Error("could not resolve the pair"),
+  });
+  assert.deepEqual(row.declared, { context: 200000, output: 32000 }, "the catalogue's pair is kept");
+  assert.equal(row.canonical, "weights", "and so is the name the second opinion is looked up by");
+  assert.deepEqual(row.effective, {}, "nothing was resolved, so the plugin's column stays empty");
+  assert.equal(
+    row.says,
+    "the upstream said no (row: could not resolve the pair)",
+    "the route's sentence is kept, and the bookkeeping reason is said beside it",
+  );
+
+  const line = rowLine(row);
+  assert.match(line, /^! failed-row-free/, line);
+  assert.match(line, /—\/—/, `an unresolved pair prints as dashes:\n${line}`);
+  assert.match(line, /\(catalogue 200000\/32000\)/, `and the catalogue's pair is still shown:\n${line}`);
+  assert.match(line, /could not resolve the pair/, line);
+
+  // The tolerance itself: a row with neither pair at all — the shape a failure
+  // before any bookkeeping leaves — is one line of dashes, not a TypeError.
+  const bare = rowLine({ id: "bare-free", status: 0, says: "nothing was built" });
+  assert.match(bare, /^! bare-free/, bare);
+  assert.match(bare, /—\/—/, bare);
+  assert.match(bare, /nothing was built/, bare);
+});
+
+// A malformed `ZEN_BASE_URL` used to throw while the module was being evaluated,
+// before the entry point's own `try/catch`: the operator got a stack trace about
+// an import instead of the sentence that names the variable. The base is parsed
+// when the run asks for it now, so the entry reports it and sets exit code 1.
+// A subprocess, because the throw was in module evaluation; no request is made
+// — the base fails before the listing is fetched.
+test("a malformed ZEN_BASE_URL is the entry point's sentence, not an import stack", () => {
+  const root = dirname(fileURLToPath(import.meta.url));
+  const run = spawnSync(process.execPath, ["limits-audit.mjs"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, ZEN_BASE_URL: "ftp://opencode.ai/inference/v1" },
+  });
+  const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+  assert.equal(run.status, 1, `a base that cannot be used is a failed run:\n${output}`);
+  assert.match(output, /unable to ask/, `the entry point has to say it could not ask:\n${output}`);
+  assert.match(output, /ZEN_BASE_URL/, `and name the variable that is wrong:\n${output}`);
+  assert.equal(/\n\s+at /.test(output), false, `the report is a sentence, not a stack trace:\n${output}`);
 });

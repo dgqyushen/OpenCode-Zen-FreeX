@@ -38,9 +38,24 @@ const field = manifest?.packageManager;
 // The manager is named apart from the version, so a field that names another
 // manager is told apart from one that names this manager with the wrong
 // version. The two are different mistakes and the message says which.
-const manager = typeof field === "string" ? field.split("@")[0] : undefined;
-const declared = typeof field === "string" ? field.split("@")[1] : undefined;
+//
+// The field is allowed a Corepack integrity suffix: `bun@1.4.3+sha256.<hash>`
+// names the same version as `bun@1.4.3`, and the suffix is metadata about the
+// pin rather than part of what `bun --version` prints. The `@` is located from
+// the end (`lastIndexOf`) so a manager name can never be what splits the field,
+// and only the version up to the first `+` is compared. `split("@")[1]` read
+// the whole `1.4.3+sha256.…` as the version and reported drift that was not
+// there.
+const at = typeof field === "string" ? field.lastIndexOf("@") : -1;
+const manager = at > 0 ? field.slice(0, at) : undefined;
+const declared = at > 0 ? field.slice(at + 1).split("+")[0] : undefined;
 
+if (!declared) {
+  console.error(
+    `package.json declares ${JSON.stringify(field ?? null)}, which names no Bun version; declare it as bun@${expected}.`,
+  );
+  process.exit(1);
+}
 if (manager !== "bun") {
   console.error(
     `package.json declares ${JSON.stringify(field ?? null)}, which does not name the Bun this workflow pins; declare it as bun@${expected}.`,
@@ -57,7 +72,37 @@ if (declared !== expected) {
 // The version that is actually on PATH: the pin and the version `setup-bun`
 // resolved were otherwise never compared, and a mismatch would leave the
 // report describing a runtime the project does not declare.
-const actual = spawnSync("bun", ["--version"], { encoding: "utf8" }).stdout?.trim() ?? "";
+//
+// `spawnSync` reports a binary that is missing, a timeout or a signal as a
+// result with `error`/`status` rather than by throwing. Read only through
+// `stdout`, all of those became the empty string and this script said "the Bun
+// that just ran is " — a CI runtime problem misdiagnosed as a version
+// disagreement, which is the one thing this sentence must not do.
+const run = spawnSync("bun", ["--version"], { encoding: "utf8", timeout: 30000 });
+
+if (run.error) {
+  console.error(
+    `bun could not be run: ${run.error.message}; the Bun this workflow pins (${expected}) could not be compared.`,
+  );
+  process.exit(1);
+}
+if (run.status !== 0) {
+  const detail = `${run.signal ? `, killed by ${run.signal}` : ""}`;
+  console.error(
+    `bun --version exited ${run.status ?? "without a status"}${detail}: ${(run.stderr ?? "").trim() || "it printed no message"}; the Bun this workflow pins (${expected}) could not be compared.`,
+  );
+  process.exit(1);
+}
+
+const actual = run.stdout?.trim() ?? "";
+
+if (actual === "") {
+  const said = (run.stderr ?? "").trim();
+  console.error(
+    `bun --version exited 0 but printed no version${said ? ` (stderr: ${said})` : ""}; the Bun this workflow pins (${expected}) could not be compared.`,
+  );
+  process.exit(1);
+}
 
 if (actual !== expected) {
   console.error(

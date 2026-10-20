@@ -463,7 +463,20 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
   const target = readTarget(fingerprint);
   const before = target.profiles[generation];
   if (agent.providerUtils) {
-    agent.providerUtils = { ...before?.agent?.providerUtils, [protocol]: agent.providerUtils[protocol] };
+    // Only the protocol this run observed is this capture's answer. The other
+    // two are values no capture can take — the one User-Agent describes the
+    // protocol OpenCode used, not the versions of the other clients — so they
+    // are carried over from the file being written, and from nowhere else.
+    // `parseAgent` fills all three keys from that one version for its callers;
+    // copying those into a target that has no profile yet would invent two
+    // versions nobody observed, and a target that has a profile would lose its
+    // own. A target with no profile therefore gets the observed protocol and
+    // the anthropic note below says the remaining entry has to be written by
+    // hand; that is a smaller lie than a fabricated User-Agent.
+    agent.providerUtils = {
+      ...before?.agent?.providerUtils,
+      [protocol]: agent.providerUtils[protocol],
+    };
   }
   // The whole profile is compared, not only the tools the new capture happens to
   // carry: the write below replaces `{ agent, required, tools }` entire, so a tool
@@ -679,34 +692,48 @@ if (entry) {
   // as it arrives: two requests in flight at once would both be writing this one
   // file, and the writes interleave into it.
   let longest = { agent: null, body: "" };
-  const server = Bun.serve({
-    port: PORT,
-    hostname: "127.0.0.1",
-    async fetch(request) {
-      try {
-        const url = new URL(request.url);
-        if (url.pathname.endsWith("/models"))
-          return Response.json({ object: "list", data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }] });
-        const body = await request.text();
-        if (body.length > longest.body.length) longest = { agent: request.headers.get("user-agent"), body };
-        return new Response(
-          [
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"big-pickle","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}',
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"big-pickle","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
-            "data: [DONE]",
-            "",
-          ].join("\n\n"),
-          { headers: { "content-type": "text/event-stream" } },
-        );
-      } catch (cause) {
-        // A client that aborts mid-request rejects inside this handler, and an
-        // unhandled rejection here would end the run with a stack trace instead
-        // of the sentence below. The body is not this script's to keep.
-        console.error(`the capture server could not read a request: ${cause?.message ?? cause}`);
-        return new Response("", { status: 400 });
-      }
-    },
-  });
+  let server;
+  try {
+    server = Bun.serve({
+      port: PORT,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        try {
+          const url = new URL(request.url);
+          if (url.pathname.endsWith("/models"))
+            return Response.json({ object: "list", data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }] });
+          const body = await request.text();
+          if (body.length > longest.body.length) longest = { agent: request.headers.get("user-agent"), body };
+          return new Response(
+            [
+              'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"big-pickle","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}',
+              'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"big-pickle","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+              "data: [DONE]",
+              "",
+            ].join("\n\n"),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        } catch (cause) {
+          // A client that aborts mid-request rejects inside this handler, and an
+          // unhandled rejection here would end the run with a stack trace instead
+          // of the sentence below. The body is not this script's to keep.
+          console.error(`the capture server could not read a request: ${cause?.message ?? cause}`);
+          return new Response("", { status: 400 });
+        }
+      },
+    });
+  } catch (cause) {
+    // A port that is already taken used to end the run inside `Bun.serve` with a
+    // raw stack that named neither the port nor the variable that chose it —
+    // and `.env.example` promises that a knob the run ignores is said out loud.
+    // This is the one failure here the reader can fix in one line, so it is a
+    // sentence about the knob and the port, not a stack about a socket.
+    console.error(
+      `the capture server could not listen on 127.0.0.1:${PORT}: ${cause?.message ?? cause}. ` +
+        `Set CAPTURE_PORT to a port nothing else is using (${PORT} is taken), then run the capture again.`,
+    );
+    process.exit(1);
+  }
 
   const home = mkdtempSync(join(tmpdir(), "zen-capture-home-"));
   // Where OpenCode looks for its config is XDG_CONFIG_HOME/opencode, and the

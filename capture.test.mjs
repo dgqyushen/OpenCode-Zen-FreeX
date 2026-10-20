@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +16,12 @@ import {
   numberFromEnv,
   report,
 } from "./capture.mjs";
+
+// This file's directory from the module's own URL, not `import.meta.dir`, which
+// is Bun's own: under Node it is `undefined`, so every `join` below threw before
+// the first test ran and the Node compatibility `capture.mjs` keeps could never
+// be exercised. `capture.mjs` states the same rule for its own `HERE`.
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 
 // The capture itself may not be run here: a real run starts a server and writes
 // a fingerprint. So the two halves either side of that run are driven directly —
@@ -34,7 +42,7 @@ import {
 // here for the agent and the required list the fixtures are built from, and
 // nowhere else, which is what keeps the read in one place a reader can check
 // against the claim above.
-const SHIPPED = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8")).profiles["1.x"];
+const SHIPPED = JSON.parse(readFileSync(join(HERE, "fingerprint.json"), "utf8")).profiles["1.x"];
 
 const NAMES = ["bash", "glob", "grep", "read"];
 const SCHEMA = { type: "object", properties: { path: { type: "string" } } };
@@ -222,7 +230,7 @@ test("a --fingerprint value that is another flag is not a path", () => {
   // written must not be decided by a typo. A missing value and a flag-shaped
   // one both fall back to the default, and the environment still wins only when
   // the flag named nothing usable.
-  const fallback = join(import.meta.dir, "fingerprint.json");
+  const fallback = join(HERE, "fingerprint.json");
   const argv = (...rest) => ["bun", "capture.mjs", ...rest];
   assert.equal(fingerprintTarget(argv("--fingerprint", "/tmp/x.json"), {}), "/tmp/x.json");
   assert.equal(fingerprintTarget(argv("--fingerprint", "--dry"), {}), fallback);
@@ -245,7 +253,7 @@ test("--fingerprint=<path> is read, not silently ignored", () => {
   // element, the flag fell back to the default, and the write landed on the
   // repository's own fingerprint.json — the one outcome the flag exists to
   // prevent, arrived at without a word. Both spellings name the same thing.
-  const fallback = join(import.meta.dir, "fingerprint.json");
+  const fallback = join(HERE, "fingerprint.json");
   const argv = (...rest) => ["bun", "capture.mjs", ...rest];
   assert.equal(fingerprintTarget(argv("--fingerprint=/tmp/x.json"), {}), "/tmp/x.json");
   // An `=` with nothing after it names nothing, exactly as the bare flag does.
@@ -323,6 +331,42 @@ test("a number from the environment that is not a number is not used", () => {
       `the refused variable is named: ${said.join(" | ")}`,
     );
 });
+
+// A port that is already taken is a sentence about the knob, not a stack trace
+// out of Bun.serve. The server is real and the run is a real subprocess, because
+// the failure only exists where a socket does: a stub would pin the message
+// without pinning that a taken port reaches it. `Bun.serve` is what the run
+// under test uses, so this cannot be exercised on a runtime without Bun.
+test(
+  "a capture port that is already taken is named instead of ending in a stack",
+  { timeout: 30_000, skip: typeof Bun === "undefined" ? "capture runs on bun's server" : false },
+  async () => {
+    const taken = createServer();
+    await new Promise((resolve, reject) => {
+      taken.once("error", reject);
+      taken.listen(0, "127.0.0.1", resolve);
+    });
+    const { port } = taken.address();
+    try {
+      const run = spawnSync(process.execPath, ["capture.mjs", "--dry"], {
+        cwd: HERE,
+        encoding: "utf8",
+        timeout: 20_000,
+        env: { ...process.env, CAPTURE_PORT: String(port) },
+      });
+      const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+      assert.notEqual(run.status, 0, `a run that cannot listen must not report success:\n${output}`);
+      assert.match(
+        output,
+        /CAPTURE_PORT/,
+        `the sentence has to name the knob that chose the port:\n${output}`,
+      );
+      assert.match(output, new RegExp(`\\b${port}\\b`), `and the port it could not take:\n${output}`);
+    } finally {
+      await new Promise((resolve) => taken.close(resolve));
+    }
+  },
+);
 
 test("the guard that keeps an import from running the capture", () => {
   // This process imported the file rather than running it, which is what this
@@ -417,7 +461,7 @@ test("the entry-point decision, with the facts passed in not read off the proces
   // `invokedDirectly()` passes: the flag if the runtime has one, this module's
   // URL, and `process.argv`.
   const here = fileURLToPath(import.meta.url);
-  const other = join(import.meta.dir, "capture-not-the-entry-point.mjs");
+  const other = join(HERE, "capture-not-the-entry-point.mjs");
   const entry = (facts) => entryDecision({ url: import.meta.url, ...facts });
 
   // A runtime that offers the flag has answered the question, and its `false`
@@ -878,6 +922,47 @@ test("the provider-utils a capture did not observe are the target's own, not the
   }
 });
 
+test("a first capture to a file with no profile writes only the protocol it observed", async () => {
+  // A target with no profile is the ordinary first run of `--fingerprint` to a
+  // new file — `before` is undefined — and it is also a profile someone deleted.
+  // The write replaces the profile entire, and the one thing this run actually
+  // observed is the protocol the User-Agent describes. The other entries are
+  // versions no capture can take (the shipped file keeps them by hand), so
+  // inventing them from the observed one would put a version nobody saw into a
+  // User-Agent the plugin then sends. The file therefore carries the observed
+  // protocol, and the anthropic note says the hand-maintained entry is still to
+  // be written.
+  const root = mkdtempSync(join(tmpdir(), "zen-capture-"));
+  const path = join(root, "fingerprint.json");
+  writeFileSync(path, JSON.stringify({ _note: "fixture", profiles: {} }, null, 2));
+  const version = "9.9.9";
+  const captureRun = offline(() =>
+    report({
+      request: requestFor(
+        bodyFor(toolsOf(NAMES)),
+        `opencode/1.19.3 ai-sdk/provider-utils/${version} runtime/bun/1.3.14`,
+      ),
+      code: 0,
+      fingerprint: path,
+    }),
+  );
+  try {
+    await captureRun.run();
+    const written = JSON.parse(readFileSync(path, "utf8")).profiles["1.x"].agent.providerUtils;
+    assert.deepEqual(
+      written,
+      { chat: version },
+      "only the protocol this capture observed is written; the others are not invented",
+    );
+    assert.ok(
+      captureRun.lines.some((line) => line.includes("has to be written by hand")),
+      "and the hand-maintained entry is said to be missing rather than filled in",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a file whose profiles are a list is written afresh, with the profile in it", async () => {
   // A list is not a table of profiles, and it used to get through: the guard
   // refused a list for the file and not for the file's `profiles`, so the
@@ -1006,7 +1091,7 @@ test("the shipped capture says that its anthropic provider-utils is maintained b
   // one no capture can refresh: without a word in the file, the value looks as
   // current as the two beside it, and a bump of @ai-sdk/anthropic would go
   // unnoticed until Zen refuses a request with an opaque 403.
-  const shipped = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8"));
+  const shipped = JSON.parse(readFileSync(join(HERE, "fingerprint.json"), "utf8"));
   assert.match(shipped._note, /anthropic/, "the note names the entry a capture cannot take");
   assert.match(shipped._note, /by hand/, "and says that it is maintained by hand");
   assert.match(shipped._note, /@ai-sdk\/anthropic/, "and says when it has to be checked");
@@ -1181,7 +1266,7 @@ test("the shell's wording is put back to the shell the tool runs, not the host's
 // a live session caught and a unit test should have. `fingerprint.json` is only
 // as neutral as the run that wrote it, so the file is checked rather than trusted.
 test("the shipped capture carries no shell but the one it runs", () => {
-  const shipped = JSON.parse(readFileSync(join(import.meta.dir, "fingerprint.json"), "utf8"));
+  const shipped = JSON.parse(readFileSync(join(HERE, "fingerprint.json"), "utf8"));
   for (const [generation, profile] of Object.entries(shipped.profiles)) {
     for (const [name, tool] of Object.entries(profile.tools)) {
       const description = tool.description;
