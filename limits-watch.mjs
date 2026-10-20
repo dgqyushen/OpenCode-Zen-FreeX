@@ -97,19 +97,54 @@ export async function watch({
   // An id that is offered and has no snapshot entry is the one thing a scheduled
   // run has to measure: nothing else here knows whether a model it has never seen
   // has a wall, and a wall nobody measured is a window every host gets wrong.
+  //
+  // An id whose wall was never found is the second, and it is the one the timer
+  // used to leave alone for ever. `openEnded` does not mean "large": it means the
+  // top rung was SERVED, so the wall is somewhere above everything this sweep
+  // asked. For a 1,048,576-token id that was true of the old ladder and hid the
+  // whole gap — the snapshot said 898,459 for a model a hand measurement put at
+  // 1,048,092. A model in that state is re-measured on the timer when the
+  // catalogue declares more than the snapshot ever served, because that is the
+  // one case where the run can change a number: the ladder now reaches past the
+  // binary million, and an id declared at a million that was never served past
+  // 900,000 has an answer waiting.
+  //
+  // It is bounded deliberately. A model whose wall is genuinely above the top
+  // rung stays `openEnded` however often it is asked, and re-measuring every such
+  // id every hour is a megabyte of prompts per hour for an answer that does not
+  // move. So the suspicion is a strict one — the catalogue declares a window, the
+  // snapshot has never reached it, and the snapshot is at least the ladder's old
+  // ceiling short of it, which is the shape the 1M ids were in — and `--all`
+  // remains the way to ask for a fresh reading of anything.
+  const declaredOf = (id) => {
+    const declared = models?.[id]?.limit?.context;
+    return Number.isSafeInteger(declared) && declared > 0 ? declared : undefined;
+  };
+  const suspicion = keptOver.filter((id) => {
+    const entry = measured[id];
+    if (entry?.wall !== "openEnded") return false;
+    const declared = declaredOf(id);
+    const served = entry?.servedTokens;
+    if (!Number.isSafeInteger(declared) || !Number.isSafeInteger(served)) return false;
+    // A tenth of the declared window, and at least 20,000 tokens: a count that
+    // differs by less than that is a host counting differently, not a wall.
+    return served < declared * 0.9;
+  });
   // `--all` re-measures everything, which is what a person asking for a fresh
   // reading of a model whose wall has moved wants, and what nobody wants to pay
   // for on a timer.
-  const targets = sweep ? (all ? offered : added) : [];
+  const targets = sweep ? (all ? offered : [...new Set([...added, ...suspicion])]) : [];
   log(`${BASE}`);
   log(`${offered.length} free ids offered, ${keptOver.length} measured before, ${added.length} not`);
   if (added.length > 0) log(`  new: ${added.join(", ")}`);
+  if (suspicion.length > 0 && sweep && !all)
+    log(`  open-ended but under-declared, so measured again: ${suspicion.join(", ")}`);
   if (gone.length > 0) log(`  no longer offered: ${gone.join(", ")}`);
   if (all && sweep) log(`  --all: re-measuring all ${offered.length}`);
   const results = targets.length > 0 ? await sweepModels(targets, log) : [];
   const next = { ...measured };
   for (const result of results) next[result.model] = { ...kept(result), at };
-  return { base: BASE, offered, added, gone, measured: keptOver, results, snapshot: { models: next } };
+  return { base: BASE, offered, added, gone, suspicion, measured: keptOver, results, snapshot: { models: next } };
 }
 
 export async function writeSnapshot(state, file = SNAPSHOT) {

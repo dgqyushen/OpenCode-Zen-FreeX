@@ -116,3 +116,71 @@ test("a snapshot that is missing, or is not one, is no snapshot", async () => {
     rmSync(file, { force: true });
   }
 });
+
+// The second thing a timer has to notice, and the one it used to miss for ever:
+// an id whose wall was never found. `openEnded` means the top rung was SERVED, so
+// the run has no bracket — and for a 1,048,576-token id under a ladder that
+// stopped at 4,200,000 characters, that was true while the snapshot said 898,459
+// against a wall of 1,048,092. Such a model is measured again on the timer, but
+// only while the catalogue still declares more than the snapshot ever served.
+const catalogued = (ids, declared) => async (url) =>
+  url.endsWith("/models")
+    ? { data: ids.map((id) => ({ id })) }
+    : {
+        opencode: {
+          models: Object.fromEntries(ids.map((id) => [id, { name: id, limit: { context: declared[id] } }])),
+        },
+      };
+
+const measuredWith = (entries) => async () => ({
+  models: Object.fromEntries(
+    Object.entries(entries).map(([id, v]) => [id, { wall: "openEnded", ...v }]),
+  ),
+});
+
+test("an open-ended id the catalogue declares more for is measured again", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    sweep: true,
+    fetchJSON: catalogued(["minimax-free"], { "minimax-free": 1_000_000 }),
+    read: measuredWith({ "minimax-free": { servedTokens: 898_459, servedTokensLegacy: true } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, ["minimax-free"]);
+  assert.deepEqual(swept, ["minimax-free"], "898,459 against a declared million is a wall never found");
+});
+
+test("an id already served to its declaration is not asked again", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  const state = await watch({
+    sweep: true,
+    fetchJSON: catalogued(["served-free"], { "served-free": 1_000_000 }),
+    read: measuredWith({ "served-free": { servedTokens: 990_000 } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(state.suspicion, []);
+  assert.deepEqual(swept, [], "within a tenth of the declaration is a host counting differently");
+});
+
+test("a bracketed wall is already known, so it is not suspected", async () => {
+  const { watch } = await subject;
+  const swept = [];
+  await watch({
+    sweep: true,
+    fetchJSON: catalogued(["walled-free"], { "walled-free": 1_000_000 }),
+    read: measuredWith({ "walled-free": { servedTokens: 100_000, wall: "bracketed" } }),
+    sweepModels: async (ids) => {
+      swept.push(...ids);
+      return [];
+    },
+  });
+  assert.deepEqual(swept, [], "a wall this run already has is not a wall to look for again");
+});

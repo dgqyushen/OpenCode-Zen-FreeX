@@ -207,6 +207,58 @@ export const LIMITS = {
       how: "the same paid twin declares 131072 on this axis",
     },
   },
+  // The catalogue calls this model a 1M-context model and writes 1000000 — the
+  // decimal million. The wall behind it is the binary one, and the gap between
+  // them is 48,576 tokens a host would never be allowed to use: 1,048,092 was
+  // served and counted by the route, which is 1,048,576 minus a few hundred
+  // tokens of message overhead, while 1,082,359 was refused. So this is the same
+  // wall `beam-free` and the other 1048576 ids sit behind, and the catalogue's
+  // round number is the one value on this route measured to be under-reporting
+  // by more than the route's own envelope costs.
+  //
+  // Nothing was declared over it: 1048092 is the largest size served, rounded
+  // down, not the wall itself. The refusal names no number, so the wall is only
+  // known to lie between that sample and the first refusal, and a host that
+  // builds to the top of its window is refused at the same size as a host that
+  // builds to nothing. 1040000 keeps the last thousand tokens — about the
+  // overhead of a message envelope, measured at 484 tokens here — as room for a
+  // host that counts differently from the route.
+  "minimax-m3.1-flash-free": {
+    context: {
+      value: 1040000,
+      source: "route",
+      declaredAt: 1000000,
+      measured: "2026-10-20",
+      samples: "1,048,092 tokens served (counted by `usage.prompt_tokens`, bisected from 274,375 words at 3.936 tokens/word); 1,082,359 tokens refused. Earlier the same day 1,046,141 was served and 1,046,764 refused, so the wall moves by a few hundred tokens with the envelope and sits just under 1048576 rather than at the 1000000 the catalogue writes.",
+      how: "the route's own enforcement, found by bisection because its refusal states no number: `400 context window exceeds limit`. The catalogue's 1000000 is the decimal million and is under-reporting by about 48,000 tokens; the wall is the binary 1048576. 1040000 is the largest served sample rounded down far enough to leave the envelope's room, and is not a figure the route ever stated.",
+    },
+    output: {
+      value: 512000,
+      source: "route-twin",
+      declaredAt: 512000,
+      measured: "2026-10-20",
+      samples: "nothing watched above 32000 on this id; the catalogue declares 512000 and no refusal was asked for it",
+      how: "the catalogue declares 512000 for this same free id, which is the one completion ceiling this route states for it. Left at the declaration rather than lowered: nothing here measured it, and lowering a ceiling on no evidence cuts replies off.",
+    },
+  },
+  "beam-free": {
+    context: {
+      value: 1048000,
+      source: "route",
+      declaredAt: 1048576,
+      measured: "2026-10-20",
+      samples: "1,048,361 tokens served (counted by `usage.prompt_tokens`, bisected from 255,000 words at 4.193 tokens/word); 1,071,887 tokens refused. The served sample lands within 215 tokens of the binary 1048576, so this is the binary wall and the catalogue's 1048576 is already the right scale here.",
+      how: "the route's own enforcement, found by bisection because its refusal states no number. The catalogue declares 1048576 and the route serves 1,048,361, so the declaration is correct in scale and only wants the envelope's room: 1048000 is the largest served sample rounded down. This entry exists so the sweep does not have to rediscover a wall that is the catalogue's own number.",
+    },
+    output: {
+      value: 131072,
+      source: "vendor",
+      declaredAt: 131072,
+      measured: "2026-10-20",
+      samples: "nothing above 32000 watched on this route",
+      how: "the catalogue declares 131072 for this id; nothing here measured it, and the axis is left as declared.",
+    },
+  },
   // Measured the day a host's window for this id was reported half its size.
   // Only the input axis moves: the window and the ceiling are what this route
   // declares, and what was served agrees with both.

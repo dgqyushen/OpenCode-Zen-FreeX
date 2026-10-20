@@ -60,16 +60,29 @@ const PROFILE = profileFor(GENERATION);
 // 1,520,000 characters — and the outer ones are wide enough that a model with no
 // wall in reach is reported as such instead of being chased upwards.
 //
-// The top rung is 4,200,000 characters because a declaration of 1,000,000 tokens
-// needs 3,996,000 of them to be tested at all, and `nemotron-3.5-lightning-free`
-// carries exactly that declaration. At 2,800,000 the ladder stopped at about
-// 700,000 tokens and could neither confirm nor refute a million, so a catalogue
-// that over-declared there would keep over-declaring: the runtime bracket would
-// declare a window the route refuses, and each refusal is a turn somebody pays
-// for. Asking the size is what turns an unfalsifiable claim into a measurement,
-// and a model whose wall is genuinely above the top rung still reports
-// `openEnded`, which is the honest answer.
-export const SIZES = [1_000_000, 1_600_000, 2_800_000, 4_200_000];
+// The top rung is 5,200,000 characters because a declaration of 1,048,576 tokens
+// needs about 4,190,000 of them to be tested at all (at this route's ~3.996
+// characters per token), and five ids in the current catalogue declare exactly
+// that.
+//
+// The ladder used to stop at 4,200,000, which is about 1,050,500 tokens: 2,000
+// tokens ABOVE the binary wall. That looks like enough to find a million-token
+// wall and was not, for a reason that is arithmetic rather than luck. A wall is
+// only *bracketed* once a size is refused ABOVE a size that was served, and the
+// top rung was accepted by every 1,048,576-token id on the route — so the run
+// reported `openEnded` and the snapshot kept the largest size it had actually
+// served. `minimax-m3.1-flash-free` carried 898,459 tokens against a wall
+// measured by hand at 1,048,092; `beam-free`, `nemotron-3.5-super-vl-free`,
+// `nemotron-3.5-lightning-free` and `space-bunny-free` all sat at 599k or fewer.
+// The one number this sweep exists to produce was under-reported for every large
+// id on the route, and nothing in the run said so: `openEnded` reads as "no wall
+// in reach", which is exactly what a wall one rung up looks like.
+//
+// 5,200,000 characters is about 1,301,300 tokens, which clears the whole class
+// of 1,048,576 ids instead of sitting inside it, and stays under the largest
+// declaration the catalogue makes for a free id. A model whose wall is genuinely
+// above it still reports `openEnded` — now for a reason that is true.
+export const SIZES = [1_000_000, 1_600_000, 2_800_000, 4_200_000, 5_200_000];
 // A reply is cut off after this many tokens: the question is whether the prompt
 // was accepted, and the answer to that arrives before the first token does.
 const ASK_TOKENS = 16;
@@ -84,9 +97,15 @@ const PACE_MS = 5000;
 // a (1,000,000 .. 1,600,000) bracket needs five to close to `NARROW_TO`. The budget
 // was therefore the other half of why no bracket was ever narrowed — raising it is
 // what lets the repaired loop reach the wall rather than stop a third short of it.
-// Eleven leaves seven for bisection, which closes the widest bracket this ladder
-// produces with room for one refused midpoint along the way.
-export const BUDGET = 11;
+//
+// Fourteen, because the ladder now has a fifth rung and the bracket it produces
+// for a million-token id is wide: (4,200,000 .. 5,200,000) is a quarter of the
+// asked size, which needs seven bisections to close to `NARROW_TO`. Five rungs,
+// one confirmation, seven bisections and one refused midpoint along the way is
+// fourteen. The alternative — a narrower ladder around a million — would have to
+// know which ids are large before measuring them, which is the thing being
+// measured.
+export const BUDGET = 14;
 // How close a bracket is worth closing to, as a fraction of the refused size. The
 // declared floor is within this of the wall once the loop stops, and a host cannot
 // act on a difference this small: the margin the plugin declares under a measured
