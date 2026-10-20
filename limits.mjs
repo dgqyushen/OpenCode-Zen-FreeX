@@ -160,8 +160,8 @@ export const LIMITS = {
       value: 1000000,
       source: "route",
       declaredAt: 262144,
-      measured: "2026-10-15",
-      samples: "a refusal that named the window, which is what `bun run limits:audit` asks for; nothing near the wall has been served yet",
+      measured: "2026-10-20",
+      samples: "a refusal that named the window on 2026-10-15, which is what `bun run limits:audit` asks for; and on 2026-10-20 a prompt of 974,358 tokens was SERVED (`usage.prompt_tokens`), against a catalogue that declares 262144 — so the named million is not a ceiling the pasted round number merely claims, it is a scale the route demonstrably serves at nearly 3.7 times the declaration",
       how: "\"This endpoint's maximum context length is 1000000 tokens. However, you requested about …\" — read from the refusal the audit provoked by asking for more completion tokens than the window leaves, on the same upstream that words it as the mimo entry above. The catalogue declares 262144 for this id.",
     },
   },
@@ -225,12 +225,12 @@ export const LIMITS = {
   // host that counts differently from the route.
   "minimax-m3.1-flash-free": {
     context: {
-      value: 1040000,
-      source: "route",
+      value: 1048576,
+      source: "models.dev",
       declaredAt: 1000000,
       measured: "2026-10-20",
       samples: "1,048,092 tokens served (counted by `usage.prompt_tokens`, bisected from 274,375 words at 3.936 tokens/word); 1,082,359 tokens refused. Earlier the same day 1,046,141 was served and 1,046,764 refused, so the wall moves by a few hundred tokens with the envelope and sits just under 1048576 rather than at the 1000000 the catalogue writes.",
-      how: "the route's own enforcement, found by bisection because its refusal states no number: `400 context window exceeds limit`. The catalogue's 1000000 is the decimal million and is under-reporting by about 48,000 tokens; the wall is the binary 1048576. 1040000 is the largest served sample rounded down far enough to leave the envelope's room, and is not a figure the route ever stated.",
+      how: "the catalogue writes 1000000, the decimal million, and the wall behind it is the binary 1048576. models.dev declares 1048576 for this canonical model — llmgateway/minimax-m3.1-flash and llmgateway-providers are the only two of nineteen entries that say so, against seventeen that repeat the catalogue's 1000000 — and the bisection above agrees with those two and with nothing else. Declared at the wall rather than under it: a host deducts its own envelope, and this route's is measured at about 484 tokens, which 1048576 covers.",
     },
     output: {
       value: 512000,
@@ -243,8 +243,8 @@ export const LIMITS = {
   },
   "beam-free": {
     context: {
-      value: 1048000,
-      source: "route",
+      value: 1048576,
+      source: "models.dev",
       declaredAt: 1048576,
       measured: "2026-10-20",
       samples: "1,048,361 tokens served (counted by `usage.prompt_tokens`, bisected from 255,000 words at 4.193 tokens/word); 1,071,887 tokens refused. The served sample lands within 215 tokens of the binary 1048576, so this is the binary wall and the catalogue's 1048576 is already the right scale here.",
@@ -1436,6 +1436,85 @@ export function measuredWalls(file) {
   return walls;
 }
 
+// ---- models.dev as a second opinion -----------------------------------------
+//
+// The catalogue is not the only place a free id's window is written down.
+// models.dev republishes the same records — same schema, same
+// `canonical_model_id`, in practice the same upstream of the catalogue — across
+// several hundred providers, and it is the only cross-provider view of a model
+// that exists without asking the model.
+//
+// It is not an oracle. It has one failure the catalogue shares and one it does
+// not. The shared one is rounding: MiniMax's own entry says a "1M context
+// window" and writes 1000000, the decimal million, for a wall that is 1048576
+// — seventeen of the nineteen entries for that canonical model repeat it, and
+// only llmgateway says 1048576. Taking a majority vote over that population is
+// therefore the wrong aggregation and the reason this reads the MAXIMUM: a
+// provider that under-states a window costs its own users the difference, and
+// one that over-states it is refused at the top of its window, so among
+// providers claiming to serve the same weights the largest declaration is the
+// one that is trying to use all of it.
+//
+// What it is used for is one rule, and only for the ids the catalogue already
+// declares at a million or more: those are exactly the ids whose declaration is
+// a round number that no measurement here has falsified, and the largest
+// models.dev figure for the same canonical model says what scale that round
+// number was meant in. It never lowers a declaration, and an id the catalogue
+// declares under a million is left to measurement — `MODELS_DEV_MIN` is where
+// that line is, and the reason is that a big claim is checkable by one refused
+// request while a small one is only checkable by climbing to it.
+export const MODELS_DEV_MIN = 1_000_000;
+
+// The declarations, by canonical model id, as a caller can hold them. Filled by
+// `modelsDevClaims` from a document a caller fetched, so nothing here reaches
+// the network: a plugin that blocked a model list on a third party would be
+// slower for everybody and wrong for anybody behind a firewall.
+const MODELS_DEV = new Map();
+// What a canonical id is claimed at, and by whom, for diagnostics.
+const MODELS_DEV_BY = new Map();
+
+// Reads a models.dev document into the two maps above. Returns how many models
+// it saw two or more claims for, which is the number worth logging: a model one
+// provider describes says nothing a catalogue would not.
+export function modelsDevClaims(document) {
+  MODELS_DEV.clear();
+  MODELS_DEV_BY.clear();
+  let contested = 0;
+  for (const [provider, entry] of Object.entries(document?.providers ?? document ?? {})) {
+    const models = entry?.models;
+    if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+    for (const [modelId, model] of Object.entries(models)) {
+      const canonical = typeof model?.canonical_model_id === "string" ? model.canonical_model_id : undefined;
+      // A row with no canonical id is about one provider's own alias and cannot
+      // be matched to the catalogue's id for the same weights, so it is not read.
+      if (!canonical) continue;
+      const context = model?.limit?.context;
+      if (!usable(context)) continue;
+      const held = MODELS_DEV.get(canonical);
+      if (held === undefined) {
+        MODELS_DEV.set(canonical, context);
+        MODELS_DEV_BY.set(canonical, `${provider}/${modelId}`);
+        continue;
+      }
+      if (context > held) {
+        MODELS_DEV.set(canonical, context);
+        MODELS_DEV_BY.set(canonical, `${provider}/${modelId}`);
+      }
+    }
+  }
+  for (const canonical of MODELS_DEV.keys())
+    if ((MODELS_DEV_BY.get(canonical) ?? "").split("/").length > 1) contested += 1;
+  return { models: MODELS_DEV.size, contested };
+}
+
+export function modelsDevLimit(canonical) {
+  return typeof canonical === "string" ? MODELS_DEV.get(canonical) : undefined;
+}
+
+export function modelsDevSource(canonical) {
+  return typeof canonical === "string" ? MODELS_DEV_BY.get(canonical) : undefined;
+}
+
 // What this plugin declares for a model instead of what the catalogue says, as
 // a plain object to spread over the catalogue's own limit. Empty when there is
 // no evidence, when the evidence was measured against a different catalogue, or
@@ -1448,6 +1527,7 @@ export function limitOverrides(
   observedOutput = OBSERVED_OUTPUT,
   brackets = BRACKETS,
   walls = measuredWalls(),
+  canonical,
 ) {
   const overrides = {};
   // A record has to be this table's own. `table[id]` otherwise answers out of
@@ -1537,6 +1617,28 @@ export function limitOverrides(
       };
     const seeded = settled.value;
     const adopted = axis === "context" ? adoptedCeiling(id, seeded, brackets) : undefined;
+    // A second opinion on the scale of a round number, and only there: the
+    // catalogue declares this axis at a million or more, nothing here has
+    // measured it, and models.dev publishes a figure for the same canonical
+    // model. `MODELS_DEV_MIN` is the line because a big claim is falsifiable by
+    // one refused request while a small one is only falsifiable by climbing to
+    // it — and every id under the line is measured instead, which is what the
+    // sweep is for. It never lowers anything: `value < declaredValue` falls to
+    // the raise-only rule below like any other weak tier.
+    let secondOpinion;
+    if (
+      axis === "context" &&
+      live === undefined &&
+      adopted === undefined &&
+      settled.source === undefined &&
+      Number.isSafeInteger(declaredValue) &&
+      declaredValue >= MODELS_DEV_MIN
+    ) {
+      const claimed = modelsDevLimit(canonical);
+      if (usable(claimed) && claimed > declaredValue) {
+        secondOpinion = { value: claimed, source: "models.dev" };
+      }
+    }
     let value;
     let source = settled.source;
     if (live !== undefined) {
@@ -1547,7 +1649,8 @@ export function limitOverrides(
     } else if (adopted !== undefined) {
       value = adopted;
     } else {
-      value = settled.value;
+      value = secondOpinion ? secondOpinion.value : settled.value;
+      if (secondOpinion) source = secondOpinion.source;
       if (entry && !applies) {
         // Measured against a catalogue that has moved, or against an axis the
         // catalogue no longer declares. Its value is void, and saying so is the

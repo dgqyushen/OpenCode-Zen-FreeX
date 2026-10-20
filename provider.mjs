@@ -11,6 +11,7 @@ import {
 } from "./models.mjs";
 import {
   loadLimitState,
+  modelsDevClaims,
   observeRefusedRequest,
   observeRouteStatement,
   observeServedRequest,
@@ -24,6 +25,9 @@ import { guardToolResponse } from "./tool-response.mjs";
 // FreeTierError now, however the request is made.
 export const DEFAULT_BASE = "https://opencode.ai/inference/v1";
 export const CATALOG = "https://models.opencode.ai/api.json";
+// The cross-provider view of the same models, matched by `canonical_model_id`.
+// See MODELS_DEV_MIN in limits.mjs for the one rule its numbers are used for.
+export const MODELS_DEV_URL = "https://models.dev/api.json";
 const DOCS =
   "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx";
 const PATHS = { chat: "/chat/completions", responses: "/responses", anthropic: "/messages" };
@@ -555,6 +559,18 @@ async function server(_input, options = {}) {
   const baseURL = httpURL(options.baseURL ?? DEFAULT_BASE);
   const catalogURL = httpURL(options.catalogURL ?? CATALOG);
   const docsURL = httpURL(options.docsURL ?? DOCS);
+  // Injectable like the two above, and for the same reason: a test that had to
+  // reach models.dev to exercise discovery would be testing models.dev, and one
+  // that reached it per case would turn a unit suite into a network suite. A
+  // caller passing `undefined` gets no second opinion at all.
+  // `null` means "ask nobody", which is what a test wants and what a host that
+  // has its own opinion of this data would pass. Anything else is a URL.
+  const opinionURL =
+    options.modelsDevURL === null
+      ? undefined
+      : options.modelsDevURL === undefined
+        ? httpURL(MODELS_DEV_URL)
+        : httpURL(options.modelsDevURL);
   let known = buildModels(
     Object.keys(bootstrapProvider.models),
     bootstrapProvider,
@@ -720,12 +736,26 @@ async function server(_input, options = {}) {
 
   async function reading(signal) {
     const headers = { authorization: "Bearer public", "x-opencode-client": "cli" };
-    const [listing, catalog, docs] = await Promise.allSettled([
+    const [listing, catalog, docs, opinion] = await Promise.allSettled([
       readRemote(`${baseURL}/models`, true, headers, signal),
       readRemote(catalogURL, true, undefined, signal),
       readRemote(docsURL, false, undefined, signal),
+      // models.dev is a second opinion on the SCALE of a round declaration, and
+      // nothing else here depends on it: a machine that cannot reach it gets the
+      // catalogue's own numbers, which is what it had before this read existed.
+      // It is asked in the same breath so it costs no turn of its own, and it is
+      // allowed to fail quietly for the same reason.
+      opinionURL === undefined ? Promise.reject(new Error("no second opinion")) : readRemote(opinionURL, false, undefined, signal),
     ]);
     signal?.throwIfAborted();
+    if (opinion.status === "fulfilled") {
+      try {
+        modelsDevClaims(opinion.value);
+      } catch {
+        // A document that is not the one expected is a document this build does
+        // not read: the catalogue still answers, and nothing here may fail a list.
+      }
+    }
     let partial = false;
     if (catalog.status === "fulfilled" && catalog.value?.opencode?.models) {
       metadata = catalog.value.opencode;

@@ -935,7 +935,10 @@ const zenBase = "https://zen.test/v1";
 const zenCatalog = "https://zen.test/catalog";
 const zenDocs = "https://zen.test/docs";
 const publicAuth = async () => ({ type: "api", key: "public" });
-const zenURLs = { baseURL: zenBase, catalogURL: zenCatalog, docsURL: zenDocs };
+// `modelsDevURL: null` is the third-party read switched off, as in index.test.mjs:
+// these cases are about what the catalogue says, and a suite that reached
+// models.dev per case would be a network suite.
+const zenURLs = { baseURL: zenBase, catalogURL: zenCatalog, docsURL: zenDocs, modelsDevURL: null };
 
 // A macrotask boundary. The loader reaches its discovery through microtasks —
 // the auth lookup, the request body — so by the time a timer callback runs, a

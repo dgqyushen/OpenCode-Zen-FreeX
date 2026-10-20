@@ -392,6 +392,11 @@ async function fixture(t, input = {}) {
     baseURL: `${origin}/v1`,
     catalogURL: `${origin}/catalog`,
     docsURL: `${origin}/docs`,
+    // No second opinion by default: these cases are about what the catalogue
+    // and the route say, and reaching models.dev from each of them would put a
+    // third party in the middle of every assertion. The cases that are ABOUT the
+    // second opinion serve it from this same origin.
+    modelsDevURL: null,
   });
   return { plugin, state, origin };
 }

@@ -2373,3 +2373,64 @@ test("a snapshot past the read ceiling is no measurement, and one naming the pro
     rmSync(proto, { force: true });
   }
 });
+
+// models.dev is read as a second opinion on the SCALE of a round number, and
+// nowhere else. The rule is one line of policy with two halves that fail
+// differently: applied to an id under a million it would raise a window on a
+// claim nobody measured, and applied as a majority vote it would take 1000000
+// over 1048576 seventeen times out of nineteen — which is what the population
+// for MiniMax's canonical model actually looks like.
+test("models.dev is read as the largest claim, never as a vote", async () => {
+  const { modelsDevClaims, modelsDevLimit } = await import("./limits.mjs");
+  const doc = {
+    providers: {
+      a: { models: { one: { canonical_model_id: "x/model", limit: { context: 1_000_000 } } } },
+      b: { models: { two: { canonical_model_id: "x/model", limit: { context: 1_048_576 } } } },
+      c: { models: { three: { canonical_model_id: "x/model", limit: { context: 1_000_000 } } } },
+      d: { models: { four: { canonical_model_id: "x/model", limit: { context: 1_000_000 } } } },
+    },
+  };
+  const info = modelsDevClaims(doc);
+  assert.equal(info.models, 1);
+  assert.equal(
+    modelsDevLimit("x/model"),
+    1_048_576,
+    "three providers saying 1000000 do not outvote the one that says 1048576",
+  );
+});
+
+test("a models.dev row with no canonical id is not matched to anything", async () => {
+  const { modelsDevClaims, modelsDevLimit } = await import("./limits.mjs");
+  modelsDevClaims({
+    providers: { a: { models: { alias: { limit: { context: 9_000_000 } } } } },
+  });
+  assert.equal(modelsDevLimit("alias"), undefined, "an alias nobody can match is not a claim about a model");
+});
+
+test("the second opinion only answers an axis the catalogue declares at a million", async () => {
+  const { limitOverrides, modelsDevClaims, MODELS_DEV_MIN } = await import("./limits.mjs");
+  assert.equal(MODELS_DEV_MIN, 1_000_000);
+  modelsDevClaims({
+    providers: {
+      a: { models: { big: { canonical_model_id: "v/big", limit: { context: 1_048_576 } } } },
+      b: { models: { small: { canonical_model_id: "v/small", limit: { context: 1_048_576 } } } },
+    },
+  });
+  const blank = { table: {}, observed: new Map(), observedOutput: new Map(), brackets: new Map(), walls: new Map() };
+  const args = (declared, canonical) => [
+    "id",
+    declared,
+    blank.table,
+    blank.observed,
+    blank.observedOutput,
+    blank.brackets,
+    blank.walls,
+    canonical,
+  ];
+  // Declared at a million: the second opinion is allowed to say the scale.
+  assert.deepEqual(limitOverrides(...args({ context: 1_000_000 }, "v/big")), { context: 1_048_576 });
+  // Declared under it: measurement answers, and a third party's claim does not.
+  assert.deepEqual(limitOverrides(...args({ context: 200_000 }, "v/small")), {});
+  // Never lowered either way.
+  assert.deepEqual(limitOverrides(...args({ context: 2_000_000 }, "v/big")), {});
+});

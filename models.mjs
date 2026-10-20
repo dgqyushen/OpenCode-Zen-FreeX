@@ -1,4 +1,4 @@
-import { limitOverrides } from "./limits.mjs";
+import { LIMITS, limitOverrides } from "./limits.mjs";
 
 export const PROVIDER = "opencode-zen-free";
 export const SDK = {
@@ -192,7 +192,7 @@ const usable = (value) => Number.isSafeInteger(value) && value > 0;
 // The limit the model is offered with, from the axes that are usable: the
 // defaults first, then the catalogue's own numbers, then what the plugin has
 // evidence for — each level only contributing axes it can actually state.
-function limitFor(id, declared) {
+function limitFor(id, declared, canonical) {
   const limit = { context: 32768, output: 4096 };
   // An axis map has to be one, by the same rule the row is read by. `limit` is
   // an object of named axes, and `Object.entries` reads a list as its indices:
@@ -202,7 +202,11 @@ function limitFor(id, declared) {
   // the same map, so neither level can read an axis off a shape that has none.
   const axes = isDescription(declared) ? declared : {};
   for (const [axis, value] of Object.entries(axes)) if (usable(value)) limit[axis] = value;
-  for (const [axis, value] of Object.entries(limitOverrides(id, axes))) limit[axis] = value;
+  // `canonical` is the id for the same weights, which is the only name
+  // models.dev publishes a row under: a free id is one provider's alias and the
+  // second opinion is matched by weights, not by the name this route gave it.
+  for (const [axis, value] of Object.entries(limitOverrides(id, axes, LIMITS, undefined, undefined, undefined, undefined, canonical)))
+    limit[axis] = value;
   return limit;
 }
 
@@ -276,7 +280,7 @@ export function buildModels(ids, provider, protocols, baseURL) {
       providerID: PROVIDER,
       name: model.name ?? id,
       api: { id, url: baseURL, npm: SDK[protocol] },
-      limit: limitFor(id, model.limit),
+      limit: limitFor(id, model.limit, model.canonical_model_id),
       capabilities: {
         temperature: model.temperature ?? true,
         reasoning: model.reasoning ?? false,
