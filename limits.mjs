@@ -194,9 +194,9 @@ export const LIMITS = {
       value: 311000,
       source: "route",
       declaredAt: 200000,
-      measured: "2026-10-19",
-      samples: "311,109 tokens served (1,450,000 characters, counted by the route) and 279,086 before it (1,300,000 characters), both answered from; 1,600,000 characters (about 343,348 tokens) refused with context_length_exceeded, as was 2,800,000 characters. The 232,685-token prompt served on 2026-10-16 still fits inside what is declared here.",
-      how: "the route's own enforcement, found by bracketing, and 311,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: a prompt of about 343,000 tokens is refused, so the paid id's window is not one this endpoint serves. The wall's exact position between 311,109 and about 343,348 tokens is not known — the sweep stopped at the first refusal.",
+      measured: "2026-10-20",
+      samples: "311,109 tokens served (1,450,000 characters, counted by the route) and 279,086 before it (1,300,000 characters), both answered from; 1,600,000 characters (about 343,348 tokens) refused with context_length_exceeded, as was 2,800,000 characters. The 232,685-token prompt served on 2026-10-16 still fits inside what is declared here. On 2026-10-20 this id's UPSTREAM was failing intermittently, and the measurement of that afternoon is not to be read as a wall: a request of 547,384 characters was answered while one of 540,983 was refused, which no wall can do, and the bracket that made of it (floor 136973 over ceiling 135381) pinned the declaration at a third of this entry. Asked again the same day it behaved like a wall: 60,000 words (211,050 tokens) served, and 90,000 words (about 318,000 tokens) refused six times out of six with 'Your request resulted in more tokens than this model's maximum context length allows'.",
+      how: "the route's own enforcement, found by bracketing, and 311,000 is the largest served sample rounded down so that a host's count may differ from the route's. The twin-derived 1000000 this entry used to carry is withdrawn: a prompt of about 343,000 tokens is refused, so the paid id's window is not one this endpoint serves. The wall's exact position between 311,109 and about 343,348 tokens is not known — the sweep stopped at the first refusal. The 2026-10-20 instability is the reason the run's own bracket is not evidence: a refusal under a size the route served is the endpoint's opinion, not the wall's, and both the plugin and the sweep now refuse to read it as one. When this id's upstream is failing, a measurement of it says something about the upstream and not about the window.",
     },
     output: {
       value: 131072,
@@ -789,6 +789,26 @@ export function observeRefusedRequest(
   const ceil = usable(size?.tokens) ? size.tokens : 0;
   if (ceil === 0 && !usable(named)) return undefined;
   const record = recordFor(brackets, id, seeded, now);
+  // A refusal UNDER the largest size the route is known to have served is not a
+  // bound. It cannot be one: a wall refuses what is above it and serves what is
+  // below, so a refusal under a served size is the endpoint's opinion rather than
+  // the wall's. Measured 2026-10-20 on `glm-5.3-flash-free`, whose upstream was
+  // failing intermittently: a request of 547,384 characters was answered and one
+  // of 540,983 was refused — an inversion no wall produces, and the bracket it
+  // made (floor 136973 over ceiling 135381) is what the declaration was then
+  // pinned to, at a third of the window the table holds and a size the same
+  // route served forty thousand tokens above.
+  //
+  // So the refusal is void: it draws no bound, it does not spend the refusal
+  // budget, and it does not reset the raise cooldown. The floor is a size the
+  // route answered, and it is the strongest thing this file knows; a refusal
+  // under it is noise by definition. This is the mirror of what a serve at or
+  // above the ceiling already does, and it is the same rule the sweep's own
+  // reduction has always applied — only the running plugin did not have it.
+  if (ceil > 0 && record.floor > 0 && ceil < record.floor) {
+    note({ kind: "wall-refusal-under-floor", id, refused: ceil, floor: record.floor });
+    return { ...record };
+  }
   record.refusals += 1;
   record.refusedAt = now;
   record.raisedAt = now;
@@ -1345,6 +1365,15 @@ const CONTEXT_TALK = [
   /prompt is too long/i,
   /messages are too long/i,
   /exceeds the maximum/i,
+  // "invalid params, context window exceeds limit (2013)" — the same refusal in
+  // the route's other words, measured 2026-10-20 on `minimax-m3.1-flash-free`
+  // and `beam-free`, and it was missing here: a 400 that names no number and
+  // says none of the sentences above read as about no axis at all, so the
+  // plugin did not learn a wall the route had just named in the only words it
+  // used, and the sweep — which counted every 400 as a bound — learned it
+  // anyway. The two disagreed about the same event, and the one that was wrong
+  // about it was the careful one.
+  /context window exceeds/i,
 ];
 const OUTPUT_TALK = [/max_tokens/i, /completion tokens/i];
 

@@ -202,3 +202,32 @@ test("a window the route named is read from the refusal instead of bisected", as
   ]);
   assert.equal(below.named, undefined, "a refusal the route went on to serve names nothing");
 });
+
+// A failure is a refusal only when it is about the SIZE. The sweep used to call
+// every 400 a bound, so an upstream that fails intermittently became a small
+// window — measured 2026-10-20 on `glm-5.3-flash-free`, whose upstream answered
+// "Upstream request failed: [400] Provider returned error" to prompts it had
+// served minutes earlier.
+test("a failure that is not about a size is not a refusal", async () => {
+  const { tally } = await subject;
+  // What the sweep now records for each kind of answer.
+  const asked = [
+    { chars: 1_000_000, kind: "served", tokens: 215_041 },
+    { chars: 1_600_000, kind: "error", status: 400, says: "Upstream request failed: [400] Provider returned error" },
+  ];
+  const counted = tally(asked);
+  assert.equal(counted.servedChars, 1_000_000, "the serve is what it was");
+  assert.deepEqual(counted.refusedSizes, [], "an upstream fault is not a bound");
+  assert.equal(counted.refused.length, 0, "and it is not a refusal to narrow toward");
+});
+
+test("a refusal about the window is still a bound", async () => {
+  const { tally } = await subject;
+  const asked = [
+    { chars: 1_000_000, kind: "served", tokens: 215_041 },
+    { chars: 1_600_000, kind: "refused", status: 400, says: "Your request resulted in more tokens than this model's maximum context length allows." },
+  ];
+  const counted = tally(asked);
+  assert.deepEqual(counted.refusedSizes, [1_600_000], "a refusal about a size is a bound");
+  assert.equal(counted.refused.length, 1);
+});

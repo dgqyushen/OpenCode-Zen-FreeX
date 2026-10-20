@@ -2537,3 +2537,63 @@ test("a bracket the route raised above the claim is not lowered", async () => {
     limitAdaptivity(previous);
   }
 });
+
+// A refusal under the largest size the route is known to have served is not a
+// bound. It cannot be one: a wall refuses what is above it and serves what is
+// below. Measured 2026-10-20 on `glm-5.3-flash-free`, whose upstream was failing
+// intermittently — a request of 547,384 characters was answered and one of
+// 540,983 was refused, and the bracket that made of it (floor 136973 over
+// ceiling 135381) pinned the declaration at a third of the window.
+test("a refusal under a served size is void, and spends nothing", async () => {
+  const { observeRefusedRequest, limitAdaptivity } = await import("./limits.mjs");
+  const previous = limitAdaptivity(new Map());
+  try {
+    const brackets = new Map();
+    // The route answered a request of 200,000 tokens.
+    brackets.set("id", {
+      floor: 200_000, ceil: undefined, exact: false, refusals: 0,
+      step: 1024, seededFrom: 200_000, ceiling: 200_000, seen: 200_000,
+    });
+    const after = observeRefusedRequest("id", { tokens: 150_000 }, 200_000, brackets);
+    assert.equal(after.refusals, 0, "a refusal under the floor does not spend the budget");
+    assert.equal(after.ceil, undefined, "and draws no bound");
+    assert.equal(after.ceiling, 200_000, "the declaration is not moved by it");
+  } finally {
+    limitAdaptivity(previous);
+  }
+});
+
+test("a refusal above a served size is still a bound", async () => {
+  const { observeRefusedRequest, limitAdaptivity } = await import("./limits.mjs");
+  const previous = limitAdaptivity(new Map());
+  try {
+    const brackets = new Map();
+    brackets.set("id", {
+      floor: 200_000, ceil: undefined, exact: false, refusals: 0,
+      step: 1024, seededFrom: 200_000, ceiling: 200_000, seen: 200_000,
+    });
+    const after = observeRefusedRequest("id", { tokens: 300_000 }, 200_000, brackets);
+    assert.equal(after.refusals, 1, "a refusal above the floor is a bound and costs one");
+    assert.equal(after.ceil, 300_000);
+  } finally {
+    limitAdaptivity(previous);
+  }
+});
+
+// The route's other wording for the same refusal, which the reader did not
+// know: "invalid params, context window exceeds limit (2013)". Without it, a
+// 400 that names no number read as about no axis at all, so the plugin did not
+// learn a wall the route had just named.
+test("the route's second wording for a too-long prompt is read as one", async () => {
+  const { refusalAxis } = await import("./limits.mjs");
+  assert.equal(
+    refusalAxis(400, "Upstream request failed: [bad_request_error] invalid params, context window exceeds limit (2013)"),
+    "context",
+  );
+  // And an upstream fault is still about no axis, which is what stopped the
+  // sweep from narrowing toward a wall that was not there.
+  assert.equal(
+    refusalAxis(400, "Upstream request failed: [400] Provider returned error"),
+    undefined,
+  );
+});

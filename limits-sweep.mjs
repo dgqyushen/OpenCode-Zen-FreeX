@@ -48,7 +48,7 @@
 
 import { profileFor } from "./core-tools.mjs";
 import { baseFrom } from "./limits-audit.mjs";
-import { namedAxes, readBoundedText } from "./limits.mjs";
+import { namedAxes, readBoundedText, refusalAxis } from "./limits.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
 const BASE = baseFrom(process.env.ZEN_BASE_URL);
@@ -170,6 +170,21 @@ async function once(model, chars) {
   // used to keep only as an opaque `says` string while it went on bisecting toward
   // a number the route had already given it.
   const named = namedAxes(text).context;
+  // A failure is a refusal only when it is about the SIZE. A 400 that says
+  // nothing about a length is the endpoint failing, and reading it as a wall
+  // is how a flaky upstream becomes a small window: measured 2026-10-20 on
+  // `glm-5.3-flash-free`, whose upstream answered "Upstream request failed:
+  // [400] Provider returned error" to prompts it had served minutes earlier,
+  // and the sweep — which called every 400 a bound — narrowed toward a wall
+  // that was not there.
+  //
+  // The reader is the plugin's own `refusalAxis`, so the sweep and the running
+  // plugin agree about what a refusal is: a numbered sentence first, then the
+  // wording, and a failure about no axis at all moves nothing.
+  const axis = refusalAxis(response.status, text, named ? { context: named } : {});
+  if (axis !== "context") {
+    return { chars, kind: "error", status: response.status, says: text.slice(0, 400) };
+  }
   return { chars, kind: "refused", status: response.status, named, says: text.slice(0, 400) };
 }
 
