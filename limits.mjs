@@ -567,6 +567,29 @@ function adoptedCeiling(id, seeded, brackets) {
   // rather than the one that was read.
   const floor = usable(record.floor) ? record.floor : 0;
   if (usable(record.ceiling) && record.ceiling < floor) record.ceiling = floor;
+  // A bracket may RAISE a declaration and never pull one down — but only when
+  // the bracket carries no evidence of its own, because a bracket that HAS
+  // evidence is the route teaching this process a smaller window, and that is a
+  // stronger tier than the table.
+  //
+  // A record is a search state, and it is seeded from whatever the declaration
+  // was when the record was born. `glm-5.3-flash-free` was seeded when the table
+  // said 311,000; the table was then measured again and says 323,000, and the
+  // record — read back from the state file — still answered 311,000, so the
+  // model was published a third smaller than the table, and a third smaller
+  // than the 323,107 tokens the route had demonstrably served. That record has
+  // no refused size of its own: its ceiling was derived from its seed and
+  // nothing else, so it is not a measurement at all, it is the seed remembered.
+  //
+  // A record that DID draw a bound of its own is left alone. The inverted case
+  // is the one that matters: a refusal at 228,513 with a serve at 228,286 is
+  // the route saying the wall is below the table's 326,000, and a search state
+  // that has evidence of its own is a stronger tier than the table.
+  //
+  // The clamp repairs the record as it goes, so the next save writes the
+  // corrected ceiling rather than the one that was read.
+  const evidence = usable(record.ceil) || (Number.isSafeInteger(record.refusals) && record.refusals > 0);
+  if (!evidence && usable(seeded) && usable(record.ceiling) && record.ceiling < seeded) record.ceiling = seeded;
   return record.ceiling;
 }
 

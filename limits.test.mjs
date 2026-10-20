@@ -2605,3 +2605,62 @@ test("the route's second wording for a too-long prompt is read as one", async ()
     undefined,
   );
 });
+
+// A bracket is a search state, and it is seeded from whatever the declaration
+// was when it was born. It may RAISE a declaration and never pull one down —
+// and that has to hold against the table as well as against the catalogue's
+// number.
+//
+// `glm-5.3-flash-free` was seeded when the table said 311,000; the table was
+// then measured again and says 323,000, and the record read back from the state
+// file still answered 311,000 — so the model was published a third smaller than
+// the table, and a third smaller than the 323,107 tokens the route had served.
+test("a bracket seeded from an older declaration may not pull the new one down", async () => {
+  const { limitOverrides } = await subject;
+  const brackets = new Map([
+    ["glm-5.3-flash-free", { floor: 136_973, ceiling: 311_000, step: 1024, scale: 2, refusals: 0, seededFrom: 311_000, seen: 136_973 }],
+  ]);
+  const over = limitOverrides(
+    "glm-5.3-flash-free", { context: 200_000, output: 32_000 }, undefined, undefined, undefined, brackets, undefined,
+  );
+  assert.equal(over.context, 323_000, "the table's measurement stands; a search state may not lower it");
+});
+
+// And the clamp repairs the record as it goes, so the state file is written
+// with the corrected ceiling rather than the stale one.
+test("the clamp repairs the record it read", async () => {
+  const { limitOverrides } = await subject;
+  const record = { floor: 136_973, ceiling: 311_000, step: 1024, scale: 2, refusals: 0, seededFrom: 311_000, seen: 136_973 };
+  const brackets = new Map([["glm-5.3-flash-free", record]]);
+  limitOverrides(
+    "glm-5.3-flash-free", { context: 200_000, output: 32_000 }, undefined, undefined, undefined, brackets, undefined,
+  );
+  assert.equal(record.ceiling, 323_000, "so the next save writes the corrected number");
+});
+
+// A bracket that RAISES above the table still wins: that is a size this route
+// served, which no table can contradict.
+test("a bracket above the table still raises it", async () => {
+  const { limitOverrides } = await subject;
+  const brackets = new Map([
+    ["glm-5.3-flash-free", { floor: 400_000, ceiling: 400_000, step: 1024, scale: 2, refusals: 0, seededFrom: 200_000, seen: 400_000 }],
+  ]);
+  const over = limitOverrides(
+    "glm-5.3-flash-free", { context: 200_000, output: 32_000 }, undefined, undefined, undefined, brackets, undefined,
+  );
+  assert.equal(over.context, 400_000);
+});
+
+// A bracket that DID draw a bound of its own is left alone: a refusal with a
+// serve just under it is the route saying the wall is below the table's, and
+// that is a stronger tier than the table.
+test("a bracket with evidence of its own still lowers the table", async () => {
+  const { limitOverrides } = await subject;
+  const brackets = new Map([
+    ["glm-5.3-flash-free", { floor: 136_973, ceil: 137_244, ceiling: 136_973, step: 1024, scale: 2, refusals: 3, seededFrom: 311_000, seen: 136_973 }],
+  ]);
+  const over = limitOverrides(
+    "glm-5.3-flash-free", { context: 200_000, output: 32_000 }, undefined, undefined, undefined, brackets, undefined,
+  );
+  assert.equal(over.context, 136_973, "the route's own refusal outranks the table");
+});
