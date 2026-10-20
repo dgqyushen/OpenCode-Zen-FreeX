@@ -42,6 +42,37 @@ node_modules/
 # which `.[Nn][Pp][Mm][Rr][Cc]` does not match. This dotless spelling is kept
 # beside it, and carries the same case coverage, so neither form is narrowed.
 [Nn][Pp][Mm][Rr][Cc]
+# The two rules above name the token file itself. A copy of it is the same
+# secret under a different name, and those are the names a copy takes: an
+# editor's backup (`.npmrc.bak`, `.npmrc~`), a per-project override
+# (`.npmrc.local`), and the dotless spellings of both. A rule that only
+# matches the exact basename leaves the commonest way a token leaves a
+# checkout uncovered, so the variants are matched as a family — and, as with
+# `.env` above, a template is put back by name rather than left inside the
+# rule that would have swallowed it.
+.[Nn][Pp][Mm][Rr][Cc].*
+[Nn][Pp][Mm][Rr][Cc].*
+# A backup an editor leaves carries a tilde, not a dot, so the two rules above
+# — which both need that dot — miss it. The tilde is its own spelling for the
+# same three names, and it is written out per family for the same reason the
+# rest of this file is: the shape is precise, so a file that merely begins
+# with a dot is not caught by it.
+.[Ee][Nn][Vv]~
+.[Nn][Pp][Mm][Rr][Cc]~
+[Nn][Pp][Mm][Rr][Cc]~
+!.[Nn][Pp][Mm][Rr][Cc].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
+!.[Nn][Pp][Mm][Rr][Cc].[Ee][Xx][Aa][Mm][Pp][Ll][Ee]
+# The credentials a tool writes into the checkout itself. `git config
+# credential.helper store` writes `.git-credentials` here as
+# `https://user:token@host` — the same class of leak as the npm token above,
+# and one that lands in the working tree rather than beside it. `.netrc` is
+# what curl reads, `_netrc` what wget reads, and `.pypirc` is where a package
+# index token goes. None of them is written by this repository; all of them
+# are written by something a developer runs while working in it.
+.[Gg][Ii][Tt]-[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll][Ss]
+.[Nn][Ee][Tt][Rr][Cc]
+_[Nn][Ee][Tt][Rr][Cc]
+.[Pp][Yy][Pp][Ii][Rr][Cc]
 # Every secret pattern below is spelled as a double-written character class,
 # `*.[Pp][Ee][Mm]` rather than `*.pem`. `.gitignore` matching is case-sensitive
 # and follows `core.ignorecase`, so on a case-sensitive checkout (Linux CI, a

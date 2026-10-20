@@ -30,6 +30,15 @@ jobs:
       # checkout v5 moved to Node 24, so v4 was also running on a runtime GitHub
       # has deprecated; v7 needs a runner newer than v2.327.1, which a hosted one is.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token is not needed after the clone, and the steps that follow run
+          # repository code: `bun test` runs every `*.test.mjs` in the tree, and on
+          # `pull_request` that code is PR-supplied and can come from a fork. With
+          # the credential left in place it sits in `.git/config` as an
+          # `http.<url>.extraheader` entry that anything running in the workspace
+          # can read and send. Nothing in this job calls the GitHub API, so the
+          # credential is dropped as soon as the checkout is done with it.
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -46,27 +55,30 @@ jobs:
       # the field: the manager the field names is checked apart from the version
       # after its `@`, so the check does not rest on the field reading exactly
       # `bun@<pin>` while claiming to be about the version alone.
+      #
+      # The assertion lives in a script because the gate job needs it too, and the
+      # gate's report is the artifact a reviewer actually reads: a verdict
+      # produced by a Bun the project does not declare is worth less than no
+      # verdict, and this job's own check cannot see it.
       - name: The pinned Bun is the one package.json declares
-        run: |
-          field="$(bun -e "console.log(require('./package.json').packageManager)")"
-          case "$field" in
-            bun@*) declared="${field#bun@}" ;;
-            *)
-              echo "package.json declares $field, which does not name the Bun this workflow pins; declare it as bun@$BUN_VERSION." >&2
-              exit 1
-              ;;
-          esac
-          if [ "$declared" != "$BUN_VERSION" ]; then
-            echo "package.json declares Bun $declared while this workflow pins $BUN_VERSION; bump both together." >&2
-            exit 1
-          fi
-          actual="$(bun --version)"
-          if [ "$actual" != "$BUN_VERSION" ]; then
-            echo "package.json declares Bun $declared and this workflow pins $BUN_VERSION, but the Bun that just ran is $actual; bump both together." >&2
-            exit 1
-          fi
+        run: bun assert-bun-version.mjs "$BUN_VERSION"
       # These never touch the network: they are the plugin's own behaviour.
       - run: bun test
+      # The ignore rules only decide for paths git is not already tracking, so
+      # they cannot say that a credential file was never committed — and this
+      # repository is published to npm, where a committed `.git-credentials` or
+      # `.npmrc` would ship with the tarball's history. The rules are the first
+      # line of defence; this is the one that can still see a file that was
+      # added before the rule existed.
+      - name: No credential file is tracked
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files | grep -Ei '(^|/)(\.env|\.env\.[^/]*|\.npmrc|npmrc|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|der))$' | grep -Ev '(^|/)\.env\.example$|(^|/)\.npmrc\.example$|\.pub$' || true)"
+          if [ -n "$tracked" ]; then
+            echo "::error::these tracked files hold a credential and must not be committed:"
+            echo "$tracked"
+            exit 1
+          fi
 
   # The free tier moves. This is how a move is noticed rather than reported.
   # It reports, it does not block: Zen being down is not this repository's fault,
@@ -91,9 +103,21 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # As in the `test` job: nothing here calls the GitHub API, and the
+          # step that follows runs repository code, so the token is dropped as
+          # soon as the checkout is done with it.
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # The same runtime the suite ran on, asserted the same way. The gate's
+      # report is the artifact a reviewer reads, so a verdict produced by a Bun
+      # the project does not declare is worth less than no verdict at all — and
+      # this job is the one that runs after a red `test`, where the suite's own
+      # check never ran.
+      - name: The pinned Bun is the one package.json declares
+        run: bun assert-bun-version.mjs "$BUN_VERSION"
       # The step is allowed to fail, the job is not: a green run that says
       # nothing is worse than a red one, because the only check that notices Zen
       # moving would pass run after run. Its report goes to the run summary, so a
@@ -122,11 +146,17 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Note a gate that did not pass
-        if: steps.gate.outcome == 'failure'
+        if: steps.gate.outcome != 'success'
         # The one exit code covers several unrelated diagnoses — Zen has moved past
         # every generation, a `required` name has no tool behind it in
         # fingerprint.json, or the floor was rate-limited/5xx'd and never judged —
         # and the step outcome carries no cause. Naming one of them here is the
         # misdirection the gate's own verdict lines exist to prevent, so this says
         # where the cause is written instead of guessing at it.
-        run: echo "::warning title=Zen gate did not pass::The gate did not pass; read the run summary — its verdict lines say whether Zen moved, which profile is malformed, or whether the free tier could not be judged."
+        #
+        # Every outcome that is not a success is noted, not only the failing one:
+        # a gate that was skipped — because a step before it failed — is a run
+        # that said nothing about Zen at all, and a run that said nothing is
+        # exactly what this gate exists to notice.
+        run: |
+          echo "::warning title=Zen gate did not pass::The gate did not pass (outcome: ${{ steps.gate.outcome }}); read the run summary — its verdict lines say whether Zen moved, which profile is malformed, or whether the free tier could not be judged."

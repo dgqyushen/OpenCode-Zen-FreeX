@@ -38,6 +38,11 @@
     "magpie"
   ],
   "license": "MIT",
+  "author": "tkhs101 <https://github.com/tkhs101>",
+  "contributors": [
+    "xiaozhou26 (upstream author of zen-free)",
+    "OpenCode-Zen-FreeX contributors"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tkhs101/OpenCode-Zen-FreeX.git"
@@ -49,13 +54,20 @@
   "engines": {
     "node": ">=18.17.0"
   },
+  "devEngines": {
+    "runtime": {
+      "name": "bun",
+      "version": "1.4.3",
+      "onFail": "warn"
+    }
+  },
   "scripts": {
     "test": "bun test",
-    "check:gate": "bun tools-smoke.mjs",
-    "limits:audit": "bun limits-audit.mjs",
-    "capture": "bun capture.mjs",
-    "limits:sweep": "bun limits-sweep.mjs",
-    "limits:watch": "bun limits-watch.mjs"
+    "check:gate": "test -f tools-smoke.mjs || { echo \"check:gate runs from a repository checkout; the published package does not ship tools-smoke.mjs.\" >&2; exit 1; }; bun tools-smoke.mjs",
+    "limits:audit": "test -f limits-audit.mjs || { echo \"limits:audit runs from a repository checkout; the published package does not ship limits-audit.mjs.\" >&2; exit 1; }; bun limits-audit.mjs",
+    "capture": "test -f capture.mjs || { echo \"capture runs from a repository checkout; the published package does not ship capture.mjs.\" >&2; exit 1; }; bun capture.mjs",
+    "limits:sweep": "test -f limits-sweep.mjs || { echo \"limits:sweep runs from a repository checkout; the published package does not ship limits-sweep.mjs.\" >&2; exit 1; }; bun limits-sweep.mjs",
+    "limits:watch": "test -f limits-watch.mjs || { echo \"limits:watch runs from a repository checkout; the published package does not ship limits-watch.mjs.\" >&2; exit 1; }; bun limits-watch.mjs"
   },
   "packageManager": "bun@1.4.3",
   "magpie": {

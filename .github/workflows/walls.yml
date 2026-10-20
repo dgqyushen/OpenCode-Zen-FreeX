@@ -20,7 +20,11 @@ on:
     # name yet, PLUS the ids whose wall was never found: a snapshot row that says
     # `openEnded` while the catalogue declares more than the snapshot ever
     # served is an id whose wall is one rung up, so those are measured again
-    # rather than left open.
+    # rather than left open — but at most once a week, because the ladder is
+    # the same on every run and only the catalogue's number and the route's own
+    # build change, and neither of those is an hourly event. An id that is
+    # still open after a week is one the free tier has not moved for, and
+    # paying for it every hour says nothing the weekly run does not.
     #
     # What it does NOT do is measure the ids the catalogue declares at a million
     # or more. Those are answered from models.dev — the largest entry any
@@ -30,7 +34,9 @@ on:
     # `minimax-m3.1-flash-free`, `beam-free` and `nemotron-3.5-super-vl-free`
     # anyway and spent eleven megabytes of prompts and half an hour of runner
     # time to learn the 1,048,576 the catalogue already said; the rule now
-    # holds for `--all` as well, and at the layer that makes the requests.
+    # holds for `--all` as well, and at the layer that makes the requests. An id
+    # answered from models.dev is not "new" either: it is never measured here,
+    # so it is never work this run has left to do.
     #
     # An hour in which Zen added nothing and nothing is open costs one listing
     # read and thirteen seconds - that is the measured cost of a run that finds
@@ -90,6 +96,14 @@ jobs:
       # Pinned to the commit its version names, as in `ci.yml`: a tag can be moved
       # under a workflow that holds a token.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token is not needed after the clone, and the step that follows
+          # runs a script that asks the network and writes a file. The job's
+          # permissions are `contents: write` and `pull-requests: write`, so the
+          # credential left in `.git/config` by default is a write credential
+          # sitting in the working tree the measurement process can read. The
+          # publish step authenticates for itself, where it needs the token.
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -125,12 +139,32 @@ jobs:
       # A run that could not ask says so, and stops rather than opening a pull
       # request about a route it never reached.
       - name: Stop when the route was not reached
-        if: steps.watch.outcome == 'failure'
+        id: reached
+        if: always()
+        # A run that could not ask says so, and publishes nothing — but it does
+        # not fail the build. This contradicts the policy stated twice in this
+        # file ("Allowed to fail, and the job is not: … a red scheduled build is
+        # one everybody learns to ignore"), and a red build is the one alarm
+        # everybody learns to ignore. Zen being unreachable is not this
+        # repository's fault.
+        #
+        # The exit code is the only signal there is, so it is read here and
+        # turned into an output the publish steps are gated on: what decides
+        # whether anything is published is the fact that the route was reached,
+        # not the colour of the run. The survey also writes the snapshot before
+        # it exits non-zero, so a run that asked nothing has still touched the
+        # file — which is another reason the publish steps, not the build, are
+        # where the answer to that is given.
         run: |
-          echo "::warning title=Wall survey did not finish::The survey did not finish; read the run summary for what it managed to ask."
-          exit 1
+          if [ "${{ steps.watch.outcome }}" = "success" ]; then
+            echo "reached=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reached=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Wall survey did not reach the route::The survey did not finish; read the run summary for what it managed to ask. Nothing is published."
+          fi
       - name: Is there anything to show?
         id: diff
+        if: steps.reached.outputs.reached == 'true'
         run: |
           if git diff --quiet -- limits-observed.json; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -139,6 +173,21 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git --no-pager diff --stat -- limits-observed.json
           fi
+      # The snapshot is not a report: `limits.mjs` reads it at run time, so
+      # whatever lands here becomes the window a host is told for an id the table
+      # does not name. It is checked before it is published, and the suite runs
+      # over it, because nothing else does: a workflow started with
+      # `GITHUB_TOKEN` does not start a workflow, so the pull request this run
+      # opens runs no `ci.yml` of its own and the squash merge produces no
+      # `push` run either. The numbers are bounded by construction — that is an
+      # invariant of `limits-sweep.mjs` — but an invariant is not the same as a
+      # check on the artifact that is about to be published.
+      - name: Is the measurement publishable?
+        if: steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bun limits-watch.mjs --check
+          bun test
       # A repository can forbid Actions from opening pull requests — it forbids it
       # by default, and this workflow met that: the branch pushed and the pull
       # request was refused, which reddened a run whose measurement was fine. So
@@ -160,11 +209,25 @@ jobs:
       # WALLS_AUTOMERGE to `off`; nothing else about the run changes.
       - name: Open a pull request with the measurement
         id: open
-        if: steps.diff.outputs.changed == 'true'
+        if: steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The variable is read from the environment rather than interpolated
+          # into the script: a free-text repository value spliced into a `run:`
+          # block is the classic expression-injection shape, and the value is
+          # not supposed to be code. It is set by an administrator rather than
+          # by a pull request, so it is not an attacker-controlled path today —
+          # but the fix costs one line and the shape is what causes accidents.
+          WALLS_AUTOMERGE: ${{ vars.WALLS_AUTOMERGE }}
         run: |
           set -euo pipefail
+          # The checkout dropped the credential, so the push has to authenticate
+          # for itself. `gh` is already the tool this step uses to open and to
+          # merge the pull request, and `gh auth setup-git` points git at the
+          # same credential — the token never has to be written into
+          # `.git/config` by hand, and it is not lying in the working tree the
+          # measurement step could read.
+          gh auth setup-git
           branch="walls/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -187,12 +250,16 @@ jobs:
             echo "contradicts one of those entries is the reason to rewrite the entry."
             echo
             echo '```'
-            cat watch-report.txt
+            # The report is a convenience, and its absence must not take the
+            # publish step down with it: the branch is already pushed by the
+            # time this runs, so a failure here would leave an orphan branch
+            # and no summary saying that the branch exists.
+            cat watch-report.txt 2>/dev/null || echo 'The survey printed no report.'
             echo '```'
             echo
             echo "The rules the sweep applies — a failure that is not about a size is not a"
             echo "refusal, a refusal is asked twice before it counts, a wall needs two refused"
-            echo "sizes behind a served one, fifteen requests per model — are in"
+            echo "sizes behind a served one, fourteen requests per model — are in"
             echo "\`limits-sweep.mjs\`. A bracket this run could not narrow is reported as"
             echo "\`single-refusal\` rather than smoothed into a wall, and an upstream that is"
             echo "failing shows up as \`openEnded\` rather than as a small window."
@@ -205,7 +272,7 @@ jobs:
           fi
           echo "opened=$opened" >> "$GITHUB_OUTPUT"
           merged=false
-          if [ "${{ vars.WALLS_AUTOMERGE }}" = "off" ]; then
+          if [ "$WALLS_AUTOMERGE" = "off" ]; then
             echo "::notice title=Merge left to a person::WALLS_AUTOMERGE is off for this repository, so the pull request was left open."
           elif [ "$opened" = "true" ]; then
             paths=$(gh pr view "$branch" --json files --jq '[.files[].path] | join(",")')
@@ -227,24 +294,33 @@ jobs:
           fi
           echo "merged=$merged" >> "$GITHUB_OUTPUT"
       - name: Where the measurement is
-        if: steps.diff.outputs.changed == 'true'
+        if: steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
+        # The step's own outputs are read from the environment rather than
+        # spliced into the script: they are workflow-derived today, but a value
+        # that reaches a shell through an interpolation is a value that can
+        # reach it as code, and keeping them in `env:` costs nothing.
+        env:
+          MERGED: ${{ steps.open.outputs.merged }}
+          OPENED: ${{ steps.open.outputs.opened }}
+          BRANCH: ${{ steps.open.outputs.branch }}
+          COMPARE: ${{ steps.open.outputs.compare }}
         run: |
           {
             echo
             echo "## Where the measurement is"
             echo
-            if [ "${{ steps.open.outputs.merged }}" = "true" ]; then
-              echo "This run measured something new and merged it to \`main\`: \`${{ steps.open.outputs.branch }}\`"
+            if [ "$MERGED" = "true" ]; then
+              echo "This run measured something new and merged it to \`main\`: \`$BRANCH\`"
               echo "was opened as a pull request, checked to be the snapshot and nothing else, squashed"
               echo "and its branch deleted."
-            elif [ "${{ steps.open.outputs.opened }}" = "true" ]; then
-              echo "A pull request was opened for \`${{ steps.open.outputs.branch }}\` and left for a person to"
+            elif [ "$OPENED" = "true" ]; then
+              echo "A pull request was opened for \`$BRANCH\` and left for a person to"
               echo "merge, either because \`WALLS_AUTOMERGE\` is \`off\` or because the run could not merge it."
             else
               echo "This repository does not let GitHub Actions open pull requests, so the branch"
-              echo "\`${{ steps.open.outputs.branch }}\` was pushed and the pull request is a click:"
+              echo "\`$BRANCH\` was pushed and the pull request is a click:"
               echo
-              echo "${{ steps.open.outputs.compare }}"
+              echo "$COMPARE"
             fi
             echo
             echo "\`limits-observed.json\` is not only a report. The plugin reads it when it"
