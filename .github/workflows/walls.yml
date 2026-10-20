@@ -45,8 +45,12 @@ on:
     # stays a person's dispatch because re-measuring every measurable id every
     # hour is an hour of megabyte prompts for an answer that rarely changes.
     - cron: "17 * * * *"
-  # The way to find out whether this works without waiting for the next hour, and
-  # the way to re-measure one model by hand: run it from the Actions page.
+  # The way to find out whether this works without waiting for the next hour:
+  # run it from the Actions page. The default dispatch is the incremental sweep
+  # the schedule runs — ids with no measurement, plus open rows the catalogue
+  # says are worth another rung. `sweep_all=true` re-measures every id that may
+  # be measured. There is no single-model input here; measuring one id by hand
+  # is `bun run limits:sweep <id>` from a checkout.
   workflow_dispatch:
     inputs:
       sweep_all:
@@ -107,13 +111,34 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # The pin in this file is the fourth place the version is named — `ci.yml`
+      # pins the same value and `package.json` names the manager, while nothing
+      # compared this workflow's copy. A scheduled measurement that ran on an
+      # undeclared Bun would auto-merge its numbers into `main`, which is exactly
+      # the drift the assertion exists to stop on the other side, so the same
+      # script the test jobs run runs here too.
+      - name: The pinned Bun is the one package.json declares
+        run: bun assert-bun-version.mjs "$BUN_VERSION"
+      # Before the survey reaches the network, the snapshot and this script's own
+      # reader are checked with no network at all. A `limits-observed.json` that
+      # is not what the plugin will read, or a `limits-watch.mjs` that cannot read
+      # it, is a repository fault; it must fail loudly here rather than be folded
+      # into the survey's "the route could not be asked" and disappear from a
+      # green scheduled run. The survey below stays allowed to fail; this does
+      # not, because a fault in our own files is not the route's fault.
+      - name: The snapshot is one the plugin can read
+        run: bun limits-watch.mjs --check
       # The trio the gate reports on: whether the route still offers what the
       # table describes, which ids have never been measured, and — for the ones
       # that have not — where their wall is.
       #
       # Allowed to fail, and the job is not: Zen being unreachable is not this
       # repository's fault, and a red scheduled build is one everybody learns to
-      # ignore. What the step printed is the finding either way.
+      # ignore. What the step printed is the finding either way, and its exit
+      # code is preserved as an output because it carries the distinction the
+      # step colour cannot: 0 is a route that answered with ids to consider,
+      # 2 is a route that answered and offered no free ids, everything else is
+      # a route that could not be asked.
       - name: What is offered, against what was measured
         id: watch
         continue-on-error: true
@@ -124,47 +149,92 @@ jobs:
         env:
           ALL: ${{ inputs.sweep_all == true && '--all' || '' }}
         run: |
+          # The exit code is read, not left to the colour of the step. `set +e`
+          # keeps the runner's implicit `-e` from ending the step before the
+          # code is captured, and `PIPESTATUS[0]` is the script's own answer
+          # rather than `tee`'s. Exiting with it afterwards keeps the outcome
+          # informative (0 success, 2 failure-but-answered), while
+          # `continue-on-error` keeps the job green either way.
+          set +e
           set -o pipefail
           bun limits-watch.mjs --sweep $ALL --write 2>&1 | tee watch-report.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      # The survey's own exit code is shown beside the step outcome, because the
+      # outcome cannot tell 1 (could not ask) from 2 (asked, nothing offered):
+      # both are a failed step under `continue-on-error`. The report quotes the
+      # route's own text (`limits-watch` prints up to 400 characters of a
+      # response body), so it is rendered indented rather than inside a ``` fence:
+      # a line of route text can close a fence and inject markdown into the run
+      # summary. Indentation has no closing token.
       - name: Publish the report
         if: always()
+        env:
+          OUTCOME: ${{ steps.watch.outcome }}
+          CODE: ${{ steps.watch.outputs.code }}
         run: |
           {
-            echo "## Wall survey — ${{ steps.watch.outcome }}"
+            if [ -n "$CODE" ]; then
+              echo "## Wall survey — $OUTCOME (exit code $CODE)"
+            else
+              echo "## Wall survey — $OUTCOME"
+            fi
             echo
-            echo '```'
-            cat watch-report.txt 2>/dev/null || echo 'The run printed nothing, so it may never have asked.'
-            echo '```'
+            echo "The report below quotes what the survey printed; it is text from this branch and the route, not interpreted."
+            echo
+            sed 's/^/    /' watch-report.txt 2>/dev/null || echo 'The run printed nothing, so it may never have asked.'
           } >> "$GITHUB_STEP_SUMMARY"
       # A run that could not ask says so, and stops rather than opening a pull
       # request about a route it never reached.
+      #
+      # A run that could not ask publishes nothing — but it does not fail the
+      # build. This contradicts the policy stated twice in this file ("Allowed
+      # to fail, and the job is not: … a red scheduled build is one everybody
+      # learns to ignore"), and a red build is the one alarm everybody learns to
+      # ignore. Zen being unreachable is not this repository's fault.
+      #
+      # The script's exit code is the only signal there is, so it is read here
+      # and turned into an output the publish steps are gated on: what decides
+      # whether anything is published is the fact that the route was reached,
+      # not the colour of the run. The survey also writes the snapshot before
+      # it exits non-zero, so a run that asked nothing has still touched the
+      # file — which is another reason the publish steps, not the build, are
+      # where the answer to that is given. Code 2 is the state this file used to
+      # collapse into "unreached": the route answered and simply offered no free
+      # ids. Nothing is published for it, but it was reached, and it is a
+      # successful ask with nothing to show rather than an outage.
       - name: Stop when the route was not reached
         id: reached
         if: always()
-        # A run that could not ask says so, and publishes nothing — but it does
-        # not fail the build. This contradicts the policy stated twice in this
-        # file ("Allowed to fail, and the job is not: … a red scheduled build is
-        # one everybody learns to ignore"), and a red build is the one alarm
-        # everybody learns to ignore. Zen being unreachable is not this
-        # repository's fault.
-        #
-        # The exit code is the only signal there is, so it is read here and
-        # turned into an output the publish steps are gated on: what decides
-        # whether anything is published is the fact that the route was reached,
-        # not the colour of the run. The survey also writes the snapshot before
-        # it exits non-zero, so a run that asked nothing has still touched the
-        # file — which is another reason the publish steps, not the build, are
-        # where the answer to that is given.
+        env:
+          # Read through the environment rather than spliced into the script:
+          # the value is workflow-derived today, but a value that reaches a
+          # shell through an interpolation is a value that can reach it as code.
+          CODE: ${{ steps.watch.outputs.code }}
         run: |
-          if [ "${{ steps.watch.outcome }}" = "success" ]; then
-            echo "reached=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "reached=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Wall survey did not reach the route::The survey did not finish; read the run summary for what it managed to ask. Nothing is published."
+          reached=false
+          if [ "$CODE" = "0" ] || [ "$CODE" = "2" ]; then
+            reached=true
+          fi
+          echo "reached=$reached" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" = "2" ]; then
+            echo "::warning title=No free ids were offered::The route answered but offered no free ids; nothing published."
+          elif [ "$reached" != "true" ]; then
+            # The empty code is the survey that never ran — the pre-check above
+            # failed, or the job stopped before it. That is still "not reached"
+            # for the purpose of publishing, and the loud failure is elsewhere.
+            echo "::warning title=Wall survey did not reach the route::The survey did not finish (exit code \`$CODE\`); read the run summary for what it managed to ask. Nothing is published."
           fi
       - name: Is there anything to show?
         id: diff
-        if: steps.reached.outputs.reached == 'true'
+        # Code 2 is a route that answered and offered no free ids: there is no
+        # measurement to publish for it, even if the snapshot on disk happens to
+        # differ — an edit produced from an empty listing is not a measurement
+        # this run should carry. The warning above is the whole report; gating
+        # here is what makes "nothing published" true rather than inferred.
+        if: steps.reached.outputs.reached == 'true' && steps.watch.outputs.code == '0'
         run: |
           if git diff --quiet -- limits-observed.json; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -196,17 +266,18 @@ jobs:
       # gets the pull request; one that has not gets a branch and a link, which is
       # a person's click rather than a red run.
       #
-      # It then merges what it opened, which is what makes a timer worth having: a
-      # window that waits for somebody to click is a window a new model does not
-      # get, and the run that found it is the one that knows what it found. Two
-      # things make an unattended merge safe, and neither is a promise. The pull
-      # request is the snapshot and nothing else, checked against what GitHub says
-      # the pull request changes rather than assumed, and left for a person if that
-      # guard ever fails. And the numbers themselves are bounded by construction:
-      # a row's value is a size the route was watched to serve, floored, so it can
-      # never be above one, and the table still has the first word for every id it
-      # names. A repository that wants the click anyway sets the variable
-      # WALLS_AUTOMERGE to `off`; nothing else about the run changes.
+      # It then merges what it opened or reused, which is what makes a timer
+      # worth having: a window that waits for somebody to click is a window a new
+      # model does not get, and the run that found it is the one that knows what
+      # it found. Two things make an unattended merge safe, and neither is a
+      # promise. The pull request is the snapshot and nothing else, checked
+      # against what GitHub says the pull request changes rather than assumed,
+      # and left for a person if that guard ever fails. And the numbers
+      # themselves are bounded by construction: a row's value is a size the route
+      # was watched to serve, floored, so it can never be above one, and the
+      # table still has the first word for every id it names. A repository that
+      # wants the click anyway sets the variable WALLS_AUTOMERGE to `off`;
+      # nothing else about the run changes.
       - name: Open a pull request with the measurement
         id: open
         if: steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
@@ -228,13 +299,62 @@ jobs:
           # `.git/config` by hand, and it is not lying in the working tree the
           # measurement step could read.
           gh auth setup-git
-          branch="walls/$(date -u +%Y-%m-%d)-${GITHUB_RUN_ID}"
+          # One branch for the measurement, always the same name. A per-run
+          # branch name made every unmerged hour a new branch and a new pull
+          # request; a fixed one makes every run an update of the same pull
+          # request, and re-running a failed run an update of the same branch
+          # rather than a non-fast-forward collision with it. The branch is
+          # machine-owned: the only writer is this job, and the concurrency group
+          # above keeps two runs from writing it at once.
+          branch="walls/observed"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
+          # The measurement is in the working tree and uncommitted. Copy it
+          # aside before moving the checkout to the rolling branch: a checkout
+          # over a modified tracked file is refused, and the branch's copy of
+          # limits-observed.json is not the one this run just measured.
+          measurement="$(mktemp)"
+          cp limits-observed.json "$measurement"
+          git checkout -- limits-observed.json
+          # Continue from the machine-owned branch when there is one, so the new
+          # measurement lands on top of what the open pull request already has;
+          # otherwise start from the commit this job checked out (the default
+          # branch on a schedule, as this workflow only runs there and on a
+          # dispatch). The fetch is shallow for the same reason the checkout is:
+          # the branch's parent is on the server, so the push still has all it
+          # needs.
+          # `git ls-remote --exit-code` answers 2 for "no such ref" and a
+          # different non-zero (128 and friends) when the query itself failed.
+          # The two are not the same fact: a branch that is not there starts
+          # from this checkout, while a remote that could not be asked must not
+          # be read as one — force-pushing a main-based branch over a rolling
+          # branch that was never fetched would drop the measurement it
+          # carries.
+          set +e
+          git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1
+          remote_code=$?
+          set -e
+          if [ "$remote_code" -eq 0 ]; then
+            git fetch --depth=1 --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+            git checkout -B "$branch" "origin/$branch"
+          elif [ "$remote_code" -eq 2 ]; then
+            git checkout -B "$branch"
+          else
+            echo "::error title=Could not read the rolling branch::git ls-remote failed (status $remote_code); the measurement was not published."
+            exit 1
+          fi
+          cp "$measurement" limits-observed.json
+          rm -f "$measurement"
           git add limits-observed.json
-          git commit -m "chore: record the walls measured on $(date -u +%Y-%m-%d)"
-          git push -u origin "$branch"
+          if git diff --cached --quiet; then
+            echo "The rolling branch already carries exactly this measurement, so there is no new commit."
+          else
+            git commit -m "chore: record the walls measured on $(date -u +%Y-%m-%d)"
+          fi
+          # Force, because this branch is the workflow's own file: a re-run has
+          # to replace the tip a failed run left behind, and a branch this run
+          # rebuilt from main may not be a descendant of the old tip.
+          git push --force origin "$branch"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo "compare=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1" >> "$GITHUB_OUTPUT"
           {
@@ -264,9 +384,37 @@ jobs:
             echo "\`single-refusal\` rather than smoothed into a wall, and an upstream that is"
             echo "failing shows up as \`openEnded\` rather than as a small window."
           } > pr-body.md
+          # Reuse the open pull request for this branch when there is one. The
+          # fixed branch already makes a later run an update of the same pull
+          # request, but `gh pr create` would still fail on an existing one, so
+          # the number is looked up first and creation is the fallback. The
+          # lookup is allowed to fail: a failure to read pull requests is
+          # reported and treated as "none found", not as a red run about a
+          # measurement that was fine.
+          existing=""
+          set +e
+          existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number')"
+          list_code=$?
+          set -e
+          if [ "$list_code" -ne 0 ]; then
+            echo "::warning title=Could not look for an existing pull request::gh pr list failed (status $list_code); the run will try to create one."
+            existing=""
+          fi
           opened=false
-          if gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch"; then
+          number=""
+          if [ -n "$existing" ]; then
+            number="$existing"
+            echo "::notice title=Reusing the open pull request::Pull request #$number already has $branch as its head; this run updated that pull request."
             opened=true
+          elif creation="$(gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch" 2>&1)"; then
+            opened=true
+            # `gh pr create` prints the new pull request's URL, and its number is
+            # the URL's last path component. The number is what the merge state
+            # is read by below: a lookup by branch names only an OPEN pull
+            # request, and the one this run merges is closed by the time it is
+            # read.
+            number="${creation##*/}"
+            echo "::notice title=Pull request opened::Pull request #$number carries $branch."
           else
             echo "::warning title=Pull request not opened::This repository does not let GitHub Actions open pull requests, so the branch was pushed and no pull request was made. Open it from the link in the run summary, or allow it under Settings > Actions > General > Workflow permissions."
           fi
@@ -274,19 +422,74 @@ jobs:
           merged=false
           if [ "$WALLS_AUTOMERGE" = "off" ]; then
             echo "::notice title=Merge left to a person::WALLS_AUTOMERGE is off for this repository, so the pull request was left open."
-          elif [ "$opened" = "true" ]; then
-            paths=$(gh pr view "$branch" --json files --jq '[.files[].path] | join(",")')
-            if [ "$paths" = "limits-observed.json" ]; then
-              # Mergeability is computed after the pull request exists, so the first
-              # ask can come back with nothing to merge yet.
+          elif [ "$opened" = "true" ] && [ -n "$number" ]; then
+            # Read the files the pull request actually changes, by number for
+            # the same reason the state is read that way: a branch lookup sees
+            # only an open pull request, and the number was captured above.
+            # The read is allowed to fail, and a failed read is not evidence
+            # that the pull request is only the snapshot: it is a reason to
+            # leave it alone.
+            paths=""
+            set +e
+            paths="$(gh pr view "$number" --json files --jq '[.files[].path] | join(",")' 2>&1)"
+            view_code=$?
+            set -e
+            if [ "$view_code" -ne 0 ]; then
+              echo "::warning title=Could not read the pull request files::gh pr view #$number failed (status $view_code), so the pull request was left for a person."
+              paths=""
+            fi
+            if [ -z "$paths" ]; then
+              # A path list that could not be read is not a pull request that
+              # changes nothing; it is a pull request whose contents are
+              # unknown, and merging it unattended is the one thing this guard
+              # exists to refuse.
+              echo "::warning title=Not merged automatically::The files changed by pull request #$number could not be read, so it was left for a person."
+            elif [ "$paths" = "limits-observed.json" ]; then
+              # Mergeability is computed after the pull request exists, so the
+              # first ask can come back with nothing to merge yet.
+              merge_state=""
               for attempt in 1 2 3 4; do
-                if gh pr merge "$branch" --squash; then merged=true; break; fi
-                sleep 5
+                merge_output=""
+                set +e
+                merge_output="$(gh pr merge "$number" --squash 2>&1)"
+                merge_code=$?
+                set -e
+                if [ "$merge_code" -ne 0 ]; then
+                  echo "::notice title=Merge not accepted yet::attempt $attempt of 4: $(printf '%s' "$merge_output" | tail -n 1)"
+                  sleep 5
+                  continue
+                fi
+                # A zero exit from `gh pr merge` covers a merge that was only
+                # queued (branch protection, a required check on the way) as
+                # well as one that landed. Only the pull request's own state
+                # says which happened, and only a merged one may report merged.
+                # By number, not by branch: `gh pr view <branch>` resolves a
+                # branch to an OPEN pull request, and the one this run just
+                # merged is no longer open.
+                merge_state="unreadable"
+                set +e
+                merge_state="$(gh pr view "$number" --json state,mergedAt --jq 'if .state == "MERGED" and .mergedAt != null then "merged" else "not-merged" end' 2>&1)"
+                state_code=$?
+                set -e
+                if [ "$state_code" -eq 0 ] && [ "$merge_state" = "merged" ]; then
+                  merged=true
+                  merge_state="merged"
+                elif [ "$state_code" -eq 0 ]; then
+                  merge_state="queued"
+                else
+                  # The state could not be read, so this cannot say it merged:
+                  # `merged` stays false.
+                  echo "::warning title=Could not read the pull request state::gh pr view #$number failed (status $state_code); the run will not claim a merge it cannot see."
+                  merge_state="unreadable"
+                fi
+                break
               done
               if [ "$merged" = "true" ]; then
                 git push origin --delete "$branch" >/dev/null 2>&1 || true
+              elif [ "$merge_state" = "queued" ]; then
+                echo "::warning title=Not merged automatically::The merge of #$number was accepted but the pull request is not merged yet; it may be queued behind branch protection. The branch and the pull request were left in place."
               else
-                echo "::warning title=Not merged automatically::The pull request for $branch could not be merged by this run; it was left open. Merge it from the run summary."
+                echo "::warning title=Not merged automatically::The pull request #$number could not be merged by this run; it was left open. Merge it from the run summary."
               fi
             else
               echo "::warning title=Not merged automatically::This pull request changes $paths, which is more than limits-observed.json, so the run left it for a person."
@@ -294,7 +497,13 @@ jobs:
           fi
           echo "merged=$merged" >> "$GITHUB_OUTPUT"
       - name: Where the measurement is
-        if: steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
+        # `always()` is what makes this a summary of the publish attempt rather
+        # than of a successful publish: without a status function the implicit
+        # `success()` would skip this step when the step above failed, which is
+        # exactly the run where a reader needs to be told where the measurement
+        # did (or did not) go. The reached/changed conditions still decide
+        # whether there was anything to say at all.
+        if: always() && steps.reached.outputs.reached == 'true' && steps.diff.outputs.changed == 'true'
         # The step's own outputs are read from the environment rather than
         # spliced into the script: they are workflow-derived today, but a value
         # that reaches a shell through an interpolation is a value that can
@@ -302,6 +511,7 @@ jobs:
         env:
           MERGED: ${{ steps.open.outputs.merged }}
           OPENED: ${{ steps.open.outputs.opened }}
+          OUTCOME: ${{ steps.open.outcome }}
           BRANCH: ${{ steps.open.outputs.branch }}
           COMPARE: ${{ steps.open.outputs.compare }}
         run: |
@@ -310,12 +520,17 @@ jobs:
             echo "## Where the measurement is"
             echo
             if [ "$MERGED" = "true" ]; then
-              echo "This run measured something new and merged it to \`main\`: \`$BRANCH\`"
-              echo "was opened as a pull request, checked to be the snapshot and nothing else, squashed"
-              echo "and its branch deleted."
+              echo "This run measured something new and merged it to \`main\`: the rolling branch"
+              echo "\`$BRANCH\` was updated, its pull request checked to be the snapshot and nothing"
+              echo "else, squashed, and the branch deleted."
+            elif [ "$OUTCOME" != "success" ]; then
+              echo "Nothing was published: the step that pushes the measurement and opens its"
+              echo "pull request did not finish successfully (outcome: \`$OUTCOME\`). Read the"
+              echo "report above and the job log; \`limits-observed.json\` on \`main\` is unchanged."
             elif [ "$OPENED" = "true" ]; then
-              echo "A pull request was opened for \`$BRANCH\` and left for a person to"
-              echo "merge, either because \`WALLS_AUTOMERGE\` is \`off\` or because the run could not merge it."
+              echo "The rolling branch \`$BRANCH\` was updated and its pull request was left for a"
+              echo "person to merge, either because \`WALLS_AUTOMERGE\` is \`off\` or because the run"
+              echo "could not merge it."
             else
               echo "This repository does not let GitHub Actions open pull requests, so the branch"
               echo "\`$BRANCH\` was pushed and the pull request is a click:"

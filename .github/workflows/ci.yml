@@ -42,6 +42,65 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # The ignore rules only decide for paths git is not already tracking, so
+      # they cannot say that a credential file was never committed — and this
+      # repository is published to npm, where a committed `.git-credentials` or
+      # `.npmrc` would ship with the tarball's history. The rules are the first
+      # line of defence; this is the one that can still see a file that was
+      # added before the rule existed.
+      #
+      # It runs before `bun test`, and before every other step that executes
+      # repository code — the runtime assertion below runs a script from the
+      # branch too. On `pull_request` that code is PR-supplied, and a step that
+      # reads the index after any of it has run can be defeated by it (`git rm
+      # --cached`, rewriting `.git/index`) before it looks. The committed tree is
+      # read instead — `git ls-tree -r --name-only HEAD` — so the question asked
+      # is what is in the commit, which is what could be published, and not what
+      # the index has been left saying.
+      #
+      # The filename rule is not enough on its own. A live token pasted into a
+      # file whose name says nothing about credentials — a notes file, a README
+      # — would pass it, and the check existed because of exactly that file. So
+      # the committed contents are scanned for the shapes a live credential has:
+      # an npm publish token, a GitHub token, an OpenAI-style key, an AWS access
+      # key id. A match is a failure, not a warning: the value is public the
+      # moment it is pushed, and rotating it is the only repair.
+      - name: No credential file is tracked
+        run: |
+          set -euo pipefail
+          # A git failure is not "no matches". Under `set -e` a bare assignment
+          # would abort with a stack-shaped log, so both are said in one place:
+          # the scan could not run is a failure, and so is a match.
+          tree="$(git ls-tree -r --name-only HEAD)" || {
+            echo "::error::git ls-tree failed, so the tracked-file scan could not run"
+            exit 1
+          }
+          tracked="$(printf '%s\n' "$tree" | grep -Ei '(^|/)(\.env|\.env\.[^/]*|\.npmrc|npmrc|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|der))$' | grep -Ev '(^|/)\.env\.example$|(^|/)\.npmrc\.example$|\.pub$' || true)"
+          if [ -n "$tracked" ]; then
+            echo "::error::these tracked files hold a credential and must not be committed:"
+            echo "$tracked"
+            exit 1
+          fi
+          # `git grep <tree>` reads the committed blobs, not the working tree, so
+          # the scan is over the same tree the filename rule just read. Example
+          # files are where a documented variable shape lives, and they are the
+          # one place a placeholder may look like the real thing: they are the
+          # same exclusion the filename rule applies. `git grep` answers 1 for no
+          # match and something else for its own failure, and those must not be
+          # the same answer — the second is a scan that did not run.
+          credential_shapes='npm_[A-Za-z0-9]{30,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{30,}|AKIA[0-9A-Z]{16}'
+          set +e
+          leaked="$(git grep -InE "$credential_shapes" HEAD -- . ':!*.example')"
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::these committed lines contain what looks like a live credential:"
+            echo "$leaked"
+            exit 1
+          elif [ "$code" -ne 1 ]; then
+            echo "::error::git grep failed with status $code, so the content scan could not run"
+            exit 1
+          fi
       # The two places the runtime is pinned are linked here: this env value and
       # `packageManager` in package.json. Nothing else compares them, so an upgrade
       # on one side alone would leave the suite and the gate running on a Bun the
@@ -64,21 +123,47 @@ jobs:
         run: bun assert-bun-version.mjs "$BUN_VERSION"
       # These never touch the network: they are the plugin's own behaviour.
       - run: bun test
-      # The ignore rules only decide for paths git is not already tracking, so
-      # they cannot say that a credential file was never committed — and this
-      # repository is published to npm, where a committed `.git-credentials` or
-      # `.npmrc` would ship with the tarball's history. The rules are the first
-      # line of defence; this is the one that can still see a file that was
-      # added before the rule existed.
-      - name: No credential file is tracked
-        run: |
-          set -euo pipefail
-          tracked="$(git ls-files | grep -Ei '(^|/)(\.env|\.env\.[^/]*|\.npmrc|npmrc|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|der))$' | grep -Ev '(^|/)\.env\.example$|(^|/)\.npmrc\.example$|\.pub$' || true)"
-          if [ -n "$tracked" ]; then
-            echo "::error::these tracked files hold a credential and must not be committed:"
-            echo "$tracked"
-            exit 1
-          fi
+
+  # `engines.node >= 18.17.0` is a promise the suite cannot keep: the suite runs
+  # on Bun, and the `test` job only ever installs Bun. A Bun-only API — or a
+  # syntax or built-in the floor does not have — can enter a shipped module while
+  # every `bun test` stays green, and a host on the floor then fails at import.
+  # This job runs the repo-only `node-smoke.mjs`, which imports every shipped
+  # module by its own path and builds one request offline. The matrix is the floor
+  # `engines.node` names and the current LTS: the floor is the promise, and the
+  # LTS is what a host that just says `node` runs today.
+  #
+  # It needs no install step: there are no dependencies, and the smoke file uses
+  # Node built-ins and the repository's own modules. That is also why it can pin
+  # a Node version instead of a toolchain — the thing being tested is the runtime
+  # itself, so this job is one `node` and one file.
+  node-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Read-only like the rest of the workflow, and said again here so this job
+    # cannot inherit a wider default by accident.
+    permissions:
+      contents: read
+    strategy:
+      # Both ends of the matrix are evidence. A failure on the floor must not
+      # cancel the run that says whether the current release still works.
+      fail-fast: false
+      matrix:
+        node-version: ["18.17.0", "24.x"]
+    steps:
+      # Pinned to the commit its version names, as everywhere in this repository:
+      # a tag can be moved under a workflow that holds a token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here calls the GitHub API, and the step that follows runs
+          # repository code; the credential is dropped with the checkout.
+          persist-credentials: false
+      # v4.4.0, pinned by commit like the rest: the runtime this job judges the
+      # package against must not be whatever a moved tag resolves to.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: node node-smoke.mjs
 
   # The free tier moves. This is how a move is noticed rather than reported.
   # It reports, it does not block: Zen being down is not this repository's fault,
@@ -125,28 +210,53 @@ jobs:
       # The verdict text matters as much as the exit code here: the gate also
       # exits non-zero when the free tier could not be reached at all, and only
       # the lines it printed tell a stale fingerprint from an outage.
+      #
+      # It asks Zen on a push and only on a push. The request carries the shared
+      # public credential, so a run from a pull request would spend the free
+      # tier's shared quota from the runner's IP on PR-supplied code: the token
+      # is public and nothing leaks, but the quota is the repository's, and a
+      # fork should not be able to spend it. What is left on a pull request is
+      # the runtime assertion above, which is about this repository's own pin.
       - name: Ask Zen which generations it still serves
         id: gate
+        if: github.event_name == 'push'
         continue-on-error: true
         run: |
           set -o pipefail
           bun run check:gate 2>&1 | tee gate-report.txt
+      # The report is produced by this branch's own `tools-smoke.mjs` and quotes
+      # the route, so it is rendered as a four-space indented block rather than
+      # inside a ``` fence. A fence is closed by a ``` in the text, and a line of
+      # the report could therefore stop being code and start being markdown: a
+      # forged verdict, a link, anything the report author wants the reader of
+      # the summary to see. Indentation has no closing token; the worst a line can
+      # do is look like more code. The summary says where the text came from.
       - name: Publish the gate's report
         if: always()
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          EVENT: ${{ github.event_name }}
         run: |
           {
-            echo "## Zen gate — ${{ steps.gate.outcome }}"
+            echo "## Zen gate — $OUTCOME"
             echo
             if [ -s gate-report.txt ]; then
-              echo '```'
-              cat gate-report.txt
-              echo '```'
+              echo "The report below was produced by code in this branch at \`$GITHUB_SHA\`; it is quoted as text, not interpreted."
+              echo
+              sed 's/^/    /' gate-report.txt
+            elif [ "$OUTCOME" = "skipped" ] && [ "$EVENT" != "push" ]; then
+              echo 'The gate only asks Zen on a push, so this run did not ask it.'
+            elif [ "$OUTCOME" = "skipped" ]; then
+              echo 'The gate did not run: a step before it did not finish, so this run says nothing about Zen. Read the job log.'
             else
               echo 'The gate printed nothing, so it may never have asked. Read the job log.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+      # On a pull request the gate step is skipped by design, and a warning
+      # about the gate "not passing" would be a report of the skip as a fault.
+      # The note is for the push runs the gate exists for.
       - name: Note a gate that did not pass
-        if: steps.gate.outcome != 'success'
+        if: github.event_name == 'push' && steps.gate.outcome != 'success'
         # The one exit code covers several unrelated diagnoses — Zen has moved past
         # every generation, a `required` name has no tool behind it in
         # fingerprint.json, or the floor was rate-limited/5xx'd and never judged —
