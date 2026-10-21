@@ -2394,6 +2394,45 @@ test("chat: buffers names and arguments by choice/index, including arguments bef
   );
 });
 
+// R2 (opencode2api free-tier comparison): the guard buffers the same Chat name
+// fragments as the collapse path. Read as a blind append while the collapse
+// path merged prefix-wise, the guard answered `ReadRead` for a name the
+// collapsed reply had got right — a streamed reply and its own collapse
+// disagreeing about one upstream stream. Both now call stream.mjs's
+// `mergeFunctionName`.
+test("chat: repeated, grown and re-prefixed function names merge instead of appending twice", async () => {
+  const namesOf = async (fragments) => {
+    const frames = fragments.map((name) =>
+      event(
+        chat({
+          tool_calls: [
+            { index: 0, id: "call-0", type: "function", function: { name } },
+          ],
+        }),
+      ),
+    );
+    const result = await guardToolResponse(
+      sse(frames.join("") + event(chat({}, "tool_calls")) + terminal("chat"), { chunkSize: 1 }),
+      "chat",
+      policy,
+    );
+    const values = parse(await result.text()).map((frame) => frame.data);
+    assert.ok(!values.some((value) => value.error), "a name shape must not fail the reply");
+    return values
+      .flatMap((value) => value.choices ?? [])
+      .flatMap((choice) => choice.delta?.tool_calls ?? [])
+      .map((call) => call.function.name);
+  };
+
+  for (const [label, fragments] of [
+    ["a repeated full name", ["Read", "Read"]],
+    ["a growing prefix", ["Re", "Read"]],
+    ["true fragments", ["Re", "ad"]],
+    ["a shorter prefix after a longer name", ["Read", "Re"]],
+  ])
+    assert.deepEqual(await namesOf(fragments), ["Read"], label);
+});
+
 // Upstream zen-free 0.1.12 (#252): some OpenAI-compatible vendors send
 // `"name": null` or `"arguments": null` in a later delta of a call whose
 // fragments are already buffered. A null field carries no new bytes, so it

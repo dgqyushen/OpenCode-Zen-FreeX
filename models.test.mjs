@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 // `models()` reads the file the adaptive limits live in, and a test run may not
@@ -1418,4 +1421,239 @@ test("a catalogue row with a package in another shape does not end the discovery
   assert.ok(models["chat-free"], "the discovery answered");
   assert.ok(models["dirty-free"], "and the row with the dirty package is still offered");
   assert.equal(models["dirty-free"].api.npm, "@ai-sdk/openai-compatible");
+});
+
+// ---- discovery cache -------------------------------------------------------
+//
+// The cache is an input to discovery, not a source of truth. These cases pin
+// the two halves that make that safe: a file this build cannot read answers no
+// cache rather than failing discovery, and a file it can read is bounded to the
+// records and protocols this build can ask. The path cases use a temporary
+// directory only; the operator's own cache is never named here.
+
+const CACHED_AT = "2026-10-21T10:00:00.000Z";
+const cachedModel = {
+  id: "chat-free",
+  providerID: "opencode-zen-free",
+  name: "Chat Free",
+  api: {
+    id: "chat-free",
+    url: "https://opencode.ai/inference/v1",
+    npm: "@ai-sdk/openai-compatible",
+  },
+  limit: { context: 200000, output: 32000 },
+  capabilities: {
+    temperature: true,
+    reasoning: true,
+    attachment: false,
+    toolcall: true,
+    input: { text: true, image: false, audio: false, video: false, pdf: false },
+    output: { text: true, image: false, audio: false, video: false, pdf: false },
+    interleaved: false,
+  },
+  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+  variants: {},
+  options: {},
+  headers: {},
+  status: "active",
+  release_date: "",
+  free: true,
+};
+
+async function discoveryTempDir(t) {
+  const dir = await mkdtemp(join(tmpdir(), "opencode-zen-freex-discovery-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+test("the discovery cache path follows explicit, env, and platform rules", async () => {
+  const { DISCOVERY_CACHE_ENV, discoveryCachePath } = await subject;
+  assert.equal(discoveryCachePath("/tmp/explicit.json", {}), "/tmp/explicit.json");
+  assert.equal(discoveryCachePath("", {}), undefined, "an empty explicit path disables");
+  assert.equal(
+    discoveryCachePath(undefined, { [DISCOVERY_CACHE_ENV]: "/tmp/named.json" }),
+    "/tmp/named.json",
+  );
+  assert.equal(
+    discoveryCachePath(undefined, { [DISCOVERY_CACHE_ENV]: "" }),
+    undefined,
+    "an empty env value disables",
+  );
+  assert.equal(
+    discoveryCachePath(undefined, { LOCALAPPDATA: "/tmp/local", XDG_CACHE_HOME: "/tmp/xdg" }),
+    join("/tmp/local", "opencode-zen-freex", "discovery.json"),
+    "LOCALAPPDATA wins",
+  );
+  assert.equal(
+    discoveryCachePath(undefined, { XDG_CACHE_HOME: "/tmp/xdg" }),
+    join("/tmp/xdg", "opencode-zen-freex", "discovery.json"),
+  );
+});
+
+test("the discovery cache round-trips the models, protocols, and listed date", async (t) => {
+  const { readDiscoveryCache, writeDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  const models = { "chat-free": cachedModel };
+  const protocols = { "chat-free": "chat" };
+  assert.equal(await writeDiscoveryCache(file, { models, protocols, listedAt: CACHED_AT }), true);
+  assert.deepEqual(await readDiscoveryCache(file), { models, protocols, listedAt: CACHED_AT });
+  assert.deepEqual(await readdir(dir), ["discovery.json"], "no temporary is left behind");
+  if (process.platform !== "win32")
+    assert.equal((await stat(file)).mode & 0o777, 0o600, "the cache is private");
+});
+
+test("the discovery cache accepts a Date and stores it as ISO text", async (t) => {
+  const { readDiscoveryCache, writeDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  assert.equal(
+    await writeDiscoveryCache(file, {
+      models: { "chat-free": cachedModel },
+      protocols: { "chat-free": "chat" },
+      listedAt: new Date(CACHED_AT),
+    }),
+    true,
+  );
+  const cache = await readDiscoveryCache(file);
+  assert.equal(cache.listedAt, CACHED_AT);
+});
+
+test("a missing, bad-JSON, or foreign-version cache answers no cache", async (t) => {
+  const { readDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  assert.equal(await readDiscoveryCache(join(dir, "missing.json")), undefined);
+  await writeFile(file, "{ this is not json", "utf8");
+  assert.equal(await readDiscoveryCache(file), undefined);
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 2,
+      models: { "chat-free": cachedModel },
+      protocols: { "chat-free": "chat" },
+      listedAt: CACHED_AT,
+    }),
+    "utf8",
+  );
+  assert.equal(await readDiscoveryCache(file), undefined);
+});
+
+test("bad model rows are skipped and protocols are filtered", async (t) => {
+  const { readDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 1,
+      models: {
+        "chat-free": cachedModel,
+        "string-row": "not a model",
+        "array-row": [],
+        "null-row": null,
+        "partial-row": { id: "partial-row" },
+        "wrong-id-row": { ...cachedModel, id: "some-other-id" },
+      },
+      protocols: {
+        "chat-free": "chat",
+        "array-row": "systemone",
+        "bad-protocol": "not-a-protocol",
+      },
+      listedAt: CACHED_AT,
+    }),
+    "utf8",
+  );
+  assert.deepEqual(await readDiscoveryCache(file), {
+    models: { "chat-free": cachedModel },
+    protocols: { "chat-free": "chat" },
+    listedAt: CACHED_AT,
+  });
+});
+
+test("listedAt must be an ISO date, and a bad date is not written", async (t) => {
+  const { readDiscoveryCache, writeDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  assert.equal(
+    await writeDiscoveryCache(file, {
+      models: {},
+      protocols: {},
+      listedAt: "yesterday",
+    }),
+    false,
+  );
+  assert.equal(await readDiscoveryCache(file), undefined);
+  await writeFile(
+    file,
+    JSON.stringify({ version: 1, models: {}, protocols: {}, listedAt: 123 }),
+    "utf8",
+  );
+  assert.equal(await readDiscoveryCache(file), undefined);
+});
+
+test("empty paths disable reads and writes without touching the disk", async () => {
+  const { DISCOVERY_CACHE_ENV, discoveryCachePath, readDiscoveryCache, writeDiscoveryCache } =
+    await subject;
+  assert.equal(discoveryCachePath("", {}), undefined);
+  assert.equal(discoveryCachePath(undefined, { [DISCOVERY_CACHE_ENV]: "" }), undefined);
+  assert.equal(await readDiscoveryCache(undefined), undefined);
+  assert.equal(await readDiscoveryCache(""), undefined);
+  assert.equal(
+    await writeDiscoveryCache("", {
+      models: {},
+      protocols: {},
+      listedAt: CACHED_AT,
+    }),
+    false,
+  );
+  assert.equal(
+    await writeDiscoveryCache(undefined, {
+      models: {},
+      protocols: {},
+      listedAt: CACHED_AT,
+    }),
+    false,
+  );
+});
+
+test("a failed atomic write leaves no temporary behind", async (t) => {
+  const { writeDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  // A directory at the target path makes rename fail after the temporary has
+  // been written. What must not survive is that temporary.
+  const target = join(dir, "discovery.json");
+  await mkdir(target);
+  assert.equal(
+    await writeDiscoveryCache(target, {
+      models: {},
+      protocols: {},
+      listedAt: CACHED_AT,
+    }),
+    false,
+  );
+  assert.deepEqual(await readdir(dir), ["discovery.json"]);
+});
+
+test("the discovery cache writer ignores inputs that are not object maps", async (t) => {
+  const { readDiscoveryCache, writeDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  assert.equal(await writeDiscoveryCache(file, null), false);
+  assert.equal(await writeDiscoveryCache(file, {}), false);
+  assert.equal(
+    await writeDiscoveryCache(file, { models: null, protocols: {}, listedAt: CACHED_AT }),
+    false,
+  );
+  assert.equal(
+    await writeDiscoveryCache(file, { models: {}, protocols: [], listedAt: CACHED_AT }),
+    false,
+  );
+  assert.equal(await readDiscoveryCache(file), undefined);
+  await writeFile(
+    file,
+    JSON.stringify({ version: 1, models: {}, protocols: [], listedAt: CACHED_AT }),
+    "utf8",
+  );
+  assert.equal(await readDiscoveryCache(file), undefined);
 });

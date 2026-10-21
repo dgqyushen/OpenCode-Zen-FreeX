@@ -1,4 +1,4 @@
-import { MAX_BYTES, MAX_STREAM_INDEX, STALE_BODY_HEADERS } from "./stream.mjs";
+import { MAX_BYTES, MAX_STREAM_INDEX, STALE_BODY_HEADERS, mergeFunctionName } from "./stream.mjs";
 
 // The limit as a failure's message names it, from the one place it is set:
 // stream.mjs owns the number, and this guard reads the same bytes through it.
@@ -793,12 +793,23 @@ function position(value) {
 // an object carries no field at all. Both are skipped, as the collapse path
 // skips them (it appends a field only when it is a string): a malformed shape
 // is not a reason to refuse a reply whose other frames are sound.
+//
+// The name is merged by stream.mjs's `mergeFunctionName`, the same rule the
+// collapse path reads: a name fragment may be the next piece of the name, the
+// name grown further, or the whole name sent again, and only the first of
+// those is an append. Read as a blind append here while the collapse path used
+// the prefix rule, the guard would fold a name the collapsed reply had got
+// right — one upstream reply answered two different ways. The arguments keep
+// the blind append both paths use for them.
 function appendFunction(target, fragment) {
   if (!object(fragment)) return;
   for (const [key, value] of Object.entries(fragment)) {
-    if (key === "name" || key === "arguments") {
+    if (key === "name") {
       if (typeof value !== "string") continue;
-      target[key] = (target[key] ?? "") + value;
+      target.name = mergeFunctionName(target.name, value);
+    } else if (key === "arguments") {
+      if (typeof value !== "string") continue;
+      target.arguments = (target.arguments ?? "") + value;
     } else {
       Object.defineProperty(target, key, {
         value,

@@ -556,11 +556,12 @@ test("chat places an index-less tool-call fragment by the id it carries, not by 
     );
   }
 
-  // A repeated `function.name` is not a second call: a name may be fragmented
-  // across the frames of one call, so a fragment with no index, no id and a
-  // name that has been read before still continues the first slot. The name the
-  // fragments carry is appended like any other streamed text ("bashbash") — the
-  // very shape a rule that split on a repeated name would answer as two calls.
+  // A repeated `function.name` is not a second call: a name may be sent whole
+  // again on a later frame, so a fragment with no index, no id and a name that
+  // has been read before still continues the first slot. The name rule keeps
+  // the one name ("bash") rather than appending a second copy — a blind append
+  // answered "bashbash", a name no declaration folds to, while a rule that
+  // split on a repeated name would answer two calls.
   const repeated = await json(
     fragment({ index: 0, ...opens("call_A", "bash", '{"a":') }) +
       fragment({ function: { name: "bash", arguments: "1}" } }) +
@@ -569,9 +570,71 @@ test("chat places an index-less tool-call fragment by the id it carries, not by 
   );
   assert.deepEqual(
     callsOf(repeated),
-    [["call_A", "bashbash", '{"a":1}']],
+    [["call_A", "bash", '{"a":1}']],
     "a repeated function name was read as a call of its own",
   );
+});
+
+// R2 (opencode2api free-tier comparison): a Chat `function.name` is not always
+// streamed as consecutive pieces. A vendor may re-send the whole name on the
+// frame that carries the arguments, or send a name that has grown since the
+// previous frame. Appended blindly, `Read` + `Read` became `ReadRead` — a name
+// the guard cannot fold to a declared tool. The name is merged prefix-wise on
+// both paths (stream.mjs's `mergeFunctionName`, called by the guard too);
+// `arguments` keep the blind append both paths have always given them.
+test("chat merges repeated and grown function names, while arguments keep the blind append", async () => {
+  const collapsed = async (names, { legacy = false, arguments: args } = {}) => {
+    const frames = names.map((name) =>
+      event({
+        choices: [
+          {
+            index: 0,
+            delta: legacy
+              ? { function_call: { name, ...(args ? { arguments: args } : {}) } }
+              : {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_0",
+                      type: "function",
+                      function: { name, ...(args ? { arguments: args } : {}) },
+                    },
+                  ],
+                },
+          },
+        ],
+      }),
+    );
+    const body = await json(
+      frames.join("") +
+        event({
+          choices: [
+            { index: 0, delta: {}, finish_reason: legacy ? "function_call" : "tool_calls" },
+          ],
+        }) +
+        event("[DONE]"),
+      "chat",
+    );
+    return legacy
+      ? body.choices[0].message.function_call
+      : body.choices[0].message.tool_calls[0].function;
+  };
+
+  for (const [label, names] of [
+    ["a repeated full name", ["Read", "Read"]],
+    ["a growing prefix", ["Re", "Read"]],
+    ["true fragments", ["Re", "ad"]],
+    ["a shorter prefix after a longer name", ["Read", "Re"]],
+  ]) {
+    assert.equal((await collapsed(names)).name, "Read", `tool_calls: ${label}`);
+    assert.equal((await collapsed(names, { legacy: true })).name, "Read", `function_call: ${label}`);
+  }
+
+  // The other half of the rule, pinned so a later change cannot quietly make
+  // the arguments prefix-aware too: a repeated whole payload is still two
+  // payloads, which is what both paths have always answered.
+  const repeated = await collapsed(["Read", "Read"], { arguments: '{"x":1}' });
+  assert.equal(repeated.arguments, '{"x":1}{"x":1}', "arguments keep the blind append");
 });
 
 test("chat merges logprobs as own properties, so an upstream __proto__ neither throws nor re-parents", async () => {

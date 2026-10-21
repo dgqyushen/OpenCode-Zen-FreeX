@@ -363,3 +363,219 @@ test("a signal that spells a JSON opening is not that opening's conversation", (
   );
   assert.equal(sessionID(new Headers(), opening), byOpening, "the opening stopped naming its own");
 });
+
+// The aliases a host may name its conversation by, in the order provider.mjs
+// reads them. The header spellings are the ones Claude Code, Codex and the
+// OpenCode-shaped clients send; each is a name of the same kind, so each is
+// read with the same rule: the first non-empty one wins, and two requests that
+// carry it answer one session however differently they open.
+test("every session header and body alias names the conversation it carries", () => {
+  const first = { messages: [{ role: "user", content: "first opening" }] };
+  const second = { messages: [{ role: "user", content: "a shortened history" }] };
+  const plain = sessionID(new Headers(), first);
+  const headersOf = (name) => [
+    (value) => sessionID(new Headers({ [name]: value }), first),
+    (value) => sessionID(new Headers({ [name]: value }), second),
+  ];
+  const sources = [
+    ...[
+      "x-opencode-session",
+      "x-opencode-session-id",
+      "x-session-affinity",
+      "x-session-id",
+      "session_id",
+      "conversation-id",
+      "conversation_id",
+    ].map((name) => ({ label: `header ${name}`, of: headersOf(name) })),
+    {
+      label: "body conversation_id",
+      of: [
+        (value) => sessionID(new Headers(), { conversation_id: value, ...first }),
+        (value) => sessionID(new Headers(), { conversation_id: value, ...second }),
+      ],
+    },
+    {
+      label: "metadata.session_id",
+      of: [
+        (value) => sessionID(new Headers(), { metadata: { session_id: value }, ...first }),
+        (value) => sessionID(new Headers(), { metadata: { session_id: value }, ...second }),
+      ],
+    },
+  ];
+  for (const { label, of: [oneOf, againOf] } of sources) {
+    const value = `conversation-${label.replace(/\W+/g, "-")}`;
+    const one = oneOf(value);
+    assert.ok(realSessionID(one), `${label}: ${one}`);
+    assert.equal(one, againOf(value), `${label}: one name, two openings, two sessions`);
+    assert.notEqual(one, plain, `${label}: the alias was not read, the opening was`);
+    assert.notEqual(
+      oneOf(`${value}-other`),
+      one,
+      `${label}: two names answered one session`,
+    );
+  }
+});
+
+// Claude Code puts the per-conversation name in the tail of metadata.user_id —
+// `user_<hash>_account_<uuid>_session_<uuid>` — and the rest of that string is
+// per user, not per conversation. A JSON user id carries the name as
+// `session_id`. Both forms are read; a user id with neither is no name, and the
+// request falls back to its opening rather than being keyed by a hash of a
+// per-user value that would then fold every conversation of that user together.
+test("Claude Code's metadata.user_id names a conversation in both of its forms", () => {
+  const first = { messages: [{ role: "user", content: "hi" }] };
+  const second = { messages: [{ role: "user", content: "hi, again" }] };
+  const session = "123e4567-e89b-12d3-a456-426614174001";
+  const ids = (userID) => [
+    sessionID(new Headers(), { ...first, metadata: { user_id: userID } }),
+    sessionID(new Headers(), { ...second, metadata: { user_id: userID } }),
+  ];
+  const underscored = `user_abcdef_account_123e4567-e89b-12d3-a456-426614174000_session_${session}`;
+  const [one, again] = ids(underscored);
+  assert.ok(realSessionID(one), one);
+  assert.equal(one, again, "one user id, two openings, two sessions");
+  assert.notEqual(
+    one,
+    ids(underscored.replace(session, "123e4567-e89b-12d3-a456-426614174002"))[0],
+    "two user ids answered one session",
+  );
+  // The JSON string form, and the same value as an object: one name either way.
+  const asJSON = JSON.stringify({ session_id: `json-${session}` });
+  const byJSON = ids(asJSON)[0];
+  assert.equal(byJSON, ids(asJSON)[1], "the JSON user id was not read as a name");
+  assert.equal(
+    byJSON,
+    sessionID(new Headers(), { ...first, metadata: { user_id: { session_id: `json-${session}` } } }),
+    "the JSON object and its string are one name",
+  );
+  // A user id that carries neither form is no name: the opening still keys it,
+  // exactly as if the field had not been sent.
+  assert.equal(
+    ids("user_abcdef_account_123e4567-e89b-12d3-a456-426614174000")[0],
+    sessionID(new Headers(), first),
+    "a per-user value with no session part named the conversation",
+  );
+});
+
+// The opening is the system prompt and the first user turn, not the user turn
+// alone. Agent clients open with a boilerplate environment turn, so the user
+// turn alone collides across unrelated conversations while the system prompts
+// do not; and for one host, a changed system prompt is a changed conversation
+// even where the user turn is identical.
+test("a system prompt separates conversations that open with the same words", () => {
+  const withSystem = (system, opening = "hi") => ({
+    messages: [{ role: "system", content: system }, { role: "user", content: opening }],
+  });
+  const one = sessionID(new Headers(), withSystem("You are one."));
+  const same = sessionID(new Headers(), withSystem("You are one."));
+  const other = sessionID(new Headers(), withSystem("You are another."));
+  assert.ok(realSessionID(one), one);
+  assert.equal(one, same, "the same system prompt answered two sessions");
+  assert.notEqual(one, other, "two system prompts answered one session");
+  // A developer message is the same fact in the other role.
+  const developer = {
+    messages: [{ role: "developer", content: "You are one." }, { role: "user", content: "hi" }],
+  };
+  assert.equal(
+    sessionID(new Headers(), developer),
+    one,
+    "a developer message and a system message were different conversations",
+  );
+  // A system message after the first user turn is not part of the opening: the
+  // prelude is what the conversation started under, and later instructions do
+  // not re-key it.
+  const after = {
+    messages: [{ role: "user", content: "hi" }, { role: "system", content: "later" }],
+  };
+  assert.equal(
+    sessionID(new Headers(), after),
+    sessionID(new Headers(), { messages: [{ role: "user", content: "hi" }] }),
+    "a system message after the opening changed the key",
+  );
+  // The two protocol-specific shapes of the same fact.
+  const byInstructions = (instructions) => ({
+    instructions,
+    input: [{ role: "user", content: "hi" }],
+  });
+  assert.notEqual(
+    sessionID(new Headers(), byInstructions("You are one.")),
+    sessionID(new Headers(), byInstructions("You are another.")),
+    "Responses instructions did not key the conversation",
+  );
+  const byTopLevelSystem = (system) => ({ system, messages: [{ role: "user", content: "hi" }] });
+  assert.notEqual(
+    sessionID(new Headers(), byTopLevelSystem("You are one.")),
+    sessionID(new Headers(), byTopLevelSystem("You are another.")),
+    "Anthropic's top-level system did not key the conversation",
+  );
+});
+
+// A Responses continuation carries `previous_response_id` instead of the
+// history, and the turn after it must answer the session the reply it continues
+// was made in. It is the id of last resort: read only where no header or body
+// signal named the conversation and no opening can key it. An empty id is no
+// id, like every other empty name.
+test("previous_response_id keeps a continuation on the session it continues", () => {
+  const response = { previous_response_id: "resp_01JABC" };
+  const one = sessionID(new Headers(), response);
+  assert.ok(realSessionID(one), one);
+  assert.equal(sessionID(new Headers(), { previous_response_id: "resp_01JABC" }), one, "one reply, two sessions");
+  assert.notEqual(
+    sessionID(new Headers(), { previous_response_id: "resp_01JDEF" }),
+    one,
+    "two replies answered one session",
+  );
+  // It does not outrank an opening: a body that carries its first user turn is
+  // keyed by that, whether or not a previous reply is named.
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  assert.equal(
+    sessionID(new Headers(), { ...opening, previous_response_id: "resp_01JABC" }),
+    sessionID(new Headers(), opening),
+    "previous_response_id replaced the opening as the key",
+  );
+  // Nor a host signal: the host's own name is the conversation's name.
+  const named = sessionID(new Headers({ "x-opencode-session": "conversation-p" }), response);
+  assert.equal(
+    sessionID(new Headers({ "x-opencode-session": "conversation-p" }), {
+      ...response,
+      previous_response_id: "resp_01JDEF",
+    }),
+    named,
+    "previous_response_id outranked the host's own name",
+  );
+  // An empty id names nothing: the body with no opening still gets an id of
+  // its own per call, as the unnamed case always has.
+  const blank = () => sessionID(new Headers(), { previous_response_id: "" });
+  assert.notEqual(blank(), blank(), "an empty previous_response_id was read as a name");
+});
+
+// Empty values are no names wherever a new alias sits, exactly as an empty
+// metadata.session_id is none: the request falls back to the opening it would
+// have used had the field not been sent at all.
+test("an empty alias changes nothing about how a request is keyed", () => {
+  const opening = { messages: [{ role: "user", content: "hi" }] };
+  const plain = sessionID(new Headers(), opening);
+  for (const [label, body] of [
+    ["conversation_id", { ...opening, conversation_id: "" }],
+    ["metadata.user_id", { ...opening, metadata: { user_id: "" } }],
+  ])
+    assert.equal(sessionID(new Headers(), body), plain, `${label}: an empty name changed the key`);
+  assert.equal(
+    sessionID(new Headers({ session_id: "", "conversation-id": "" }), opening),
+    plain,
+    "an empty header named a conversation",
+  );
+  // And an id OpenCode itself minted is still passed through whole — the rule
+  // every signal source keeps, not just the old five headers.
+  const official = opencodeID("ses", true);
+  assert.equal(
+    sessionID(new Headers({ "x-opencode-session": official }), opening),
+    official,
+    "an official id in a header was hashed",
+  );
+  assert.equal(
+    sessionID(new Headers(), { ...opening, conversation_id: official }),
+    official,
+    "an official id in the body was hashed",
+  );
+});

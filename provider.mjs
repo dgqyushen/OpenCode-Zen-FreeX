@@ -7,7 +7,10 @@ import {
   bootstrapProvider,
   buildModels,
   configModels,
+  discoveryCachePath,
   parseProtocolDocs,
+  readDiscoveryCache,
+  writeDiscoveryCache,
 } from "./models.mjs";
 import {
   anyAbortSignals,
@@ -32,6 +35,12 @@ export const MODELS_DEV_URL = "https://models.dev/api.json";
 const DOCS =
   "https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx";
 const PATHS = { chat: "/chat/completions", responses: "/responses", anthropic: "/messages" };
+// The age of the maps a listing-failure fallback hands back, read by a host with
+// `Symbol.for` so the two processes need no shared module. It describes the map
+// and not any one model — a note on a model record would make the cache a second
+// source of truth about that model — so it is non-enumerable and lives beside
+// `magpie.fellBack` on the map the host is given.
+const DISCOVERY_AGE = Symbol.for("magpie.discoveryAgeMs");
 // Which generation to present when the host's tools name neither one: a floor,
 // and not a claim about what opencode-ai publishes as latest. What it publishes
 // as latest is 2.x, and `fingerprint.json` captures it — the profile whose
@@ -427,6 +436,25 @@ function shapeOf(definition, protocol) {
 // shape of the User-Agent, both session headers — so a refusal this far in is
 // about the wording, and this says so, and says which wording went out.
 //
+// The free tier's wording for a network it has blocked. This is a fact about
+// the egress IP, not about the request: the wording names traffic it considers
+// abusive, or says its free models are not available from the caller's current
+// network. Both forms are read by the same rule, and only the full pair is:
+// "free models aren't available" alone is a retirement notice, not a block.
+const ABUSE_TRAFFIC = [/abusive traffic/i, /abuse traffic/i, /abuse of traffic/i];
+const ABUSE_NETWORK = /free models aren['’]t available/i;
+const ABUSE_CURRENT_NETWORK = /from your current network/i;
+
+// Whether a refusal body is the free tier saying the egress IP is blocked.
+// Case-insensitive, because the upstream writes the sentence as prose and has
+// changed its capitalisation before.
+function isIPAbuseRefusal(text) {
+  return (
+    ABUSE_TRAFFIC.some((pattern) => pattern.test(text)) ||
+    (ABUSE_NETWORK.test(text) && ABUSE_CURRENT_NETWORK.test(text))
+  );
+}
+
 // The body arrives already read: on this path the refusal has to be read for
 // the window it may name before the message that replaces it is built (see
 // limits.mjs), and a response body can only be read once. So what the reader
@@ -454,6 +482,25 @@ function explain(observed, source, toolPolicy) {
   // the only thing here that decides between two answers: the same 403 read to
   // its end is explained, and the same 403 read to half of it is relayed.
   if (observed.ended === false) return source;
+  // An IP-abuse refusal is the free tier's too, but it is not about anything
+  // this package sends: the egress IP itself is blocked, and no rewrite of this
+  // request — the wording, the session, another retry — can change that. It is
+  // diagnosed before the FreeTierError branch, because the wording of that
+  // branch would send the caller off to update the capture for a refusal that
+  // has nothing to do with tools. Only the diagnosis is added: the plugin has
+  // no exit pool to cool down, and a local cooldown would refuse every other
+  // request from a network that may already have been unblocked.
+  if (source.status === 403 && isIPAbuseRefusal(text)) {
+    const message = [
+      "OpenCode Zen's free tier is blocking the egress IP this request came from: the upstream reports abuse of traffic from the current network.",
+      "No rewrite of this request can help: retrying the same request from the same IP cannot succeed.",
+      "Switch networks or the VPN exit, or wait for the block to lift, and try again. This plugin keeps no local cooldown — the block is the upstream's.",
+    ].join(" ");
+    return new Response(
+      JSON.stringify({ type: "error", error: { type: "FreeTierError", message } }),
+      { status: source.status, statusText: source.statusText, headers: rewrittenHeaders(source) },
+    );
+  }
   // A 403 that is not Zen's free tier is somebody else's; it is left as sent —
   // its bytes are what arrived, and so are the headers describing them.
   if (source.status === 403 && !text.includes("FreeTierError")) return source;
@@ -540,6 +587,75 @@ export function realSessionID(value) {
 const SESSIONS = new Map();
 const KEEP_SESSIONS = 1000;
 
+// Claude Code names its conversation in the tail of `metadata.user_id`:
+// `user_<hash>_account_<uuid>_session_<uuid>`, and only the last part is per
+// conversation — the rest is per user, so it cannot name one. The same field
+// has been seen as a JSON object carrying `session_id`. Both are read; a field
+// that is neither is no name, the rule every other signal follows.
+const CLAUDE_SESSION = /_session_([0-9A-Fa-f-]{36})$/;
+function claudeSessionID(userID) {
+  if (typeof userID === "string" && userID !== "") {
+    const match = CLAUDE_SESSION.exec(userID);
+    if (match) return match[1];
+    try {
+      const parsed = JSON.parse(userID);
+      if (parsed && typeof parsed === "object") {
+        const named = parsed.session_id;
+        if (typeof named === "string" && named !== "") return named;
+      }
+    } catch {
+      /* not JSON, and the underscore form above was its only other chance */
+    }
+    return undefined;
+  }
+  if (userID && typeof userID === "object") {
+    const named = userID.session_id;
+    if (typeof named === "string" && named !== "") return named;
+  }
+  return undefined;
+}
+
+// The opening a conversation is known by when its host sends no name: the
+// system prompt it started under and its first user turn. The host's first
+// user turn alone is not enough — agent clients open with a boilerplate
+// environment turn, so two unrelated conversations collide on it while their
+// system prompts do not, and a system prompt that changed is a different
+// conversation to the tier's affinity even where the user turn is identical.
+//
+// The system prompt arrives in whichever shape its protocol has for it:
+// Anthropic's top-level `system`, Responses' `instructions`, or system and
+// developer messages ahead of the first user turn. All of them are collected,
+// in that fixed order, into one prelude; the seed is the pair, JSON-encoded as
+// an object so its shape cannot be confused with an opening that happens to be
+// an array of content blocks.
+function conversationSeed(body) {
+  const system = [];
+  for (const field of ["system", "instructions"]) {
+    if (body?.[field] !== undefined && body[field] !== null) system.push(body[field]);
+  }
+  const opening = body?.messages ?? body?.input;
+  let first;
+  if (Array.isArray(opening)) {
+    for (const message of opening) {
+      if (message?.role === "system" || message?.role === "developer") {
+        system.push(message.content);
+        continue;
+      }
+      if (message?.role === "user") {
+        first = message.content;
+        break;
+      }
+    }
+  } else {
+    first = opening;
+  }
+  // An empty opening is no opening, exactly as an empty name is no name: there
+  // is nothing in it to key by, so the caller falls to `previous_response_id`
+  // (or to an id of its own) rather than to a key every such body would share.
+  if (first === "" || first === undefined) return undefined;
+  return JSON.stringify({ system, first });
+}
+
 export function sessionID(headers, body) {
   let signal;
   for (const name of [
@@ -547,7 +663,9 @@ export function sessionID(headers, body) {
     "x-opencode-session-id",
     "x-session-affinity",
     "x-session-id",
+    "session_id",
     "conversation-id",
+    "conversation_id",
   ]) {
     if (headers.get(name)) {
       signal = headers.get(name);
@@ -568,21 +686,33 @@ export function sessionID(headers, body) {
   // is — by its opening, or by an id of its own when it has none — and not by a
   // key every host that sends an empty name shares. The name is taken whole,
   // not trimmed: a host that spells its conversations differently is naming
-  // them differently, and only a name with nothing in it is no name.
+  // them differently, and only a name with nothing in it is no name. The
+  // conversation id and the Claude Code user id below are names by the same
+  // rule: their empty strings are no name either.
+  //
+  // The body sources are read in the order the free tier's own identity rule
+  // reads them — the host's conversation id first, then the metadata name,
+  // then the Claude Code user id — and each only where nothing ahead of it
+  // named the conversation. A host that sends one of these says it once, so a
+  // later turn with a shortened history keeps the session it already has.
   //
   // The body is the host's to fill in, and the rest of this file reads every
-  // value it takes from the host through an optional chain. These two did not:
+  // value it takes from the host through an optional chain. These did not:
   // `body` itself can be absent or null, and a history can hold an entry that
-  // is not a message, so both threw a TypeError before a request was sent —
+  // is not a message, so they threw a TypeError before a request was sent —
   // an opaque internal error where a request keyed by no signal belongs. The
   // same reading as every other host value in the file.
+  if (typeof body?.conversation_id === "string" && body.conversation_id !== "")
+    signal ??= body.conversation_id;
   if (typeof body?.metadata?.session_id === "string" && body.metadata.session_id !== "")
     signal ??= body.metadata.session_id;
+  signal ??= claudeSessionID(body?.metadata?.user_id);
+  // An id OpenCode itself minted is the conversation's name as it stands: it
+  // is already the shape the tier reads, so it is passed through rather than
+  // hashed. This was true of the header and metadata sources, and it is true
+  // of every body source added beside them.
   if (realSessionID(signal)) return signal;
-  const messages = body?.messages ?? body?.input;
-  const first = Array.isArray(messages)
-    ? messages.find((message) => message?.role === "user")?.content
-    : messages;
+  const seed = conversationSeed(body);
   // A host signal is the conversation's own name for itself, so it is the key
   // on its own and nothing else is folded in beside it: a host that carries a
   // signal may open a later turn with a shortened history, and keyed by the
@@ -592,12 +722,6 @@ export function sessionID(headers, body) {
   // sessions rather than one, and the only thing that can: a host that sends no
   // signal at all is keyed by its opening below, and two such hosts with one
   // opening are one key. That limit is pinned in session.test.mjs.
-  //
-  // `first === ""` is separated from `first === undefined` because an empty
-  // opening is a conversation with nothing to key by, which a host signal still
-  // names, while no user message at all is a body with nothing to key by. Read
-  // by truthiness — as `!first` read both — the two are one branch, and the
-  // signal is spent before either can be told from the other.
   //
   // The two key spaces below are separate domains, not two spellings of one:
   // a signal and an opening carry different kinds of fact, and hashing them
@@ -611,21 +735,26 @@ export function sessionID(headers, body) {
     const named = createHash("sha256").update(`sig\0${signal}`).digest("hex");
     return kept(named);
   }
-  // An empty opening has nothing to key a conversation by, and one cannot be
-  // invented: two of them are indistinguishable from a single one, so any key
-  // derived here would either be shared by unrelated conversations — one Zen
-  // session, with its affinity and its quota — or differ again on the next
-  // turn. Not sharing is the half worth keeping, so this answer is minted per
-  // call exactly as the unnamed case below is.
-  if (first === "" || first === undefined) {
-    // Nothing names this conversation: no session header, no metadata, and no
-    // user message to key one by. There is no identity to keep for the next
-    // turn, so this one gets an id of its own rather than being folded into
-    // whichever conversation happened to arrive first — but it is still an id
-    // of OpenCode's shape, because that shape is what the tier checks.
-    return opencodeID("ses", true);
-  }
-  return kept(createHash("sha256").update(`open\0${JSON.stringify(first)}`).digest("hex"));
+  if (seed !== undefined)
+    return kept(createHash("sha256").update(`open\0${seed}`).digest("hex"));
+  // A Responses continuation names its conversation by the reply it continues:
+  // the host can drop the history and send only `previous_response_id`, and a
+  // new session on every such turn would lose the affinity the tier keeps for
+  // it. It is the last explicit signal, read only after the sources above have
+  // said nothing and there is no opening to key by; it gets a key space of its
+  // own for the same reason a signal and an opening do, since a response id is
+  // neither.
+  if (typeof body?.previous_response_id === "string" && body.previous_response_id !== "")
+    return kept(
+      createHash("sha256").update(`prev\0${body.previous_response_id}`).digest("hex"),
+    );
+  // Nothing names this conversation: no session header, no metadata, no
+  // conversation id, no user message and no previous response. There is no
+  // identity to keep for the next turn, so this one gets an id of its own
+  // rather than being folded into whichever conversation happened to arrive
+  // first — but it is still an id of OpenCode's shape, because that shape is
+  // what the tier checks.
+  return opencodeID("ses", true);
 }
 
 // The id kept for a key, minted on first sight and reused while the key stays
@@ -659,6 +788,19 @@ async function server(_input, options = {}) {
       : options.modelsDevURL === undefined
         ? httpURL(MODELS_DEV_URL)
         : httpURL(options.modelsDevURL);
+  // What the last process learned, read once at startup and before the first
+  // answer. A restart otherwise begins with the bootstrap table, and the first
+  // request after it pays for a listing a previous process already read. The
+  // cache is an input to discovery, not a second source of truth (see
+  // models.mjs's readDiscoveryCache): a missing, unreadable or malformed file
+  // answers undefined, and discovery then asks the route exactly as it did
+  // before the cache existed. Nothing here may fail a start or a request.
+  //
+  // `options.discoveryCachePath` is the explicit seam; `undefined` is the
+  // operator's path — the environment variable, then the platform's cache
+  // directory — and an empty string turns the cache off.
+  const discoveryPath = discoveryCachePath(options.discoveryCachePath);
+  const cachedDiscovery = await readDiscoveryCache(discoveryPath);
   let known = buildModels(
     Object.keys(bootstrapProvider.models),
     bootstrapProvider,
@@ -667,11 +809,27 @@ async function server(_input, options = {}) {
   );
   let metadata = bootstrapProvider;
   let protocols = { ...bootstrapProtocols };
-  // When the list was last read, or last asked for: 0 until the first ask. A
-  // failed ask sets it too, so a host whose listing can't be read waits out the
-  // same interval as one whose listing can, instead of asking three times with
-  // a 15 s timeout each on every request that names a model it doesn't know.
-  let listedAt = 0;
+  // How old the data in `known` is: 0 while it is the bootstrap table, the
+  // cache's own date once it was read, and the live read's time after a
+  // discovery. It is what a listing-failure fallback reports, so a host can
+  // tell a cached answer from a read made a moment ago.
+  let knownAt = 0;
+  if (cachedDiscovery) {
+    // Per id, the cache wins and the bootstrap table keeps the ids it alone
+    // knows. Both are floors, not rivals: the cache is what the route said the
+    // last time a process asked, the bootstrap table is what this build shipped
+    // with, and a later live discovery overwrites both. No row either source
+    // lacks is invented here.
+    known = { ...known, ...cachedDiscovery.models };
+    protocols = { ...protocols, ...cachedDiscovery.protocols };
+    knownAt = Date.parse(cachedDiscovery.listedAt) || 0;
+  }
+  // When the list was last read, or last asked for: the cache's date when one
+  // was read, 0 until the first ask otherwise. A failed ask sets it too, so a
+  // host whose listing can't be read waits out the same interval as one whose
+  // listing can, instead of asking three times with a 15 s timeout each on
+  // every request that names a model it doesn't know.
+  let listedAt = knownAt;
 
   // The discovery in flight, and who is waiting for it. Nineteen of the twenty
   // requests a host makes name a model already known, so this exists for the
@@ -867,6 +1025,17 @@ async function server(_input, options = {}) {
       listedAt = Date.now();
       const fallback = { ...known };
       fallback[Symbol.for("magpie.fellBack")] = true;
+      // The models the fallback carries are the ones this process already had:
+      // the cache's, when no live read has succeeded, or the last live read's.
+      // How old that data is travels beside the flag as a non-enumerable symbol
+      // — a fact about the map, not about any model, so nothing a host iterates
+      // over changes and no model record is rewritten. With no cache and no
+      // successful read there is no age to state, and the symbol is absent.
+      if (knownAt)
+        Object.defineProperty(fallback, DISCOVERY_AGE, {
+          value: Math.max(0, Date.now() - knownAt),
+          enumerable: false,
+        });
       return fallback;
     }
     const ids = listing.value.data.map((item) => item.id);
@@ -936,7 +1105,19 @@ async function server(_input, options = {}) {
       // list there was.
     }
     known = discovered;
-    listedAt = Date.now();
+    knownAt = Date.now();
+    listedAt = knownAt;
+    // Best effort, and not awaited: a slow disk must not delay the answer a
+    // host is waiting for, and a cache that cannot be written is a cache that
+    // is not remembered, nothing more. writeDiscoveryCache already answers
+    // false instead of throwing for everything it can; the trailing catch is
+    // the last guard against a promise nothing awaits.
+    if (discoveryPath !== undefined)
+      void writeDiscoveryCache(discoveryPath, {
+        models: known,
+        protocols,
+        listedAt: knownAt,
+      }).catch(() => {});
     return discovered;
   }
 

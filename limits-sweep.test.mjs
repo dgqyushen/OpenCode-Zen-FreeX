@@ -4,10 +4,11 @@
 // `limits-sweep.mjs` asks the route questions that cost megabytes and, when it
 // overshoots, a refused turn that somebody pays for. That makes the rules it
 // applies — what counts as a bound, when a refusal is void, which failures are
-// asked again — the part most worth pinning, and the part a live run cannot
-// check cheaply or repeatably. `tally` is the reduction most of them pass
-// through, and `sweep`/`ask` take an injected request, so the rules that spend
-// the budget and confirm a refusal can be run without a route at all.
+// asked again, when a model may be called gone — the part most worth pinning,
+// and the part a live run cannot check cheaply or repeatably. `tally` is the
+// reduction most of them pass through, and `sweep`/`ask` take an injected
+// request, so the rules that spend the budget, confirm a refusal and classify a
+// liveness answer can be run without a route at all.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -17,6 +18,22 @@ const subject = import("./limits-sweep.mjs").catch((error) => {
 
 const served = (chars, tokens) => ({ chars, kind: "served", tokens });
 const refused = (chars, status = 400) => ({ chars, kind: "refused", status, says: "context_length_exceeded" });
+const failure = (status, says) => ({ kind: "error", status, says });
+
+// Drive one sweep against a scripted route: `answers` is one entry per ask, and
+// the last entry is repeated when the ladder asks more times than the script has
+// answers. `ask` is bypassed, so each entry is exactly one ask — the unit the
+// liveness rule reads — and nothing leaves the process.
+const sweepAnswers = async (answers, model = "scripted-free") => {
+  const { sweep } = await subject;
+  let calls = 0;
+  const request = (id, chars) => {
+    const answer = answers[Math.min(calls, answers.length - 1)];
+    calls += 1;
+    return { chars, ...(typeof answer === "function" ? answer(chars) : answer) };
+  };
+  return sweep(model, () => {}, { request, pause: async () => {} });
+};
 
 test("a served size is a floor and a larger refused size is the bound", async () => {
   const { tally } = await subject;
@@ -450,6 +467,99 @@ test("a run of transient failures cannot spend past the budget", async () => {
   assert.equal(result.spent, calls, "and it reports every request it sent");
   assert.ok(calls > LADDER.length, "the retries were charged, not counted as one per question");
   assert.equal(result.wall, "openEnded");
+});
+
+// Liveness. The sweep already asks the route, so whether the model still exists
+// is a question it can answer without one more request — but only when the route
+// itself said the model is gone and nothing answered for it. A model is not
+// retired by a bad hour at the upstream, and the mark is an observation, not a
+// switch: nothing here hides or disables a model.
+test("a run whose every answer is a 404 names the model unavailable", async () => {
+  const { LADDER } = await subject;
+  const result = await sweepAnswers([failure(404, '{"error":{"message":"model scripted-free not found"}}')]);
+  assert.equal(result.unavailable, true, "the route reached the model endpoint and said the model is not there");
+  assert.equal(result.unavailableSays, '{"error":{"message":"model scripted-free not found"}}', "with the words it used");
+  assert.equal(result.asked.length, LADDER.length, "every rung was attempted and every one failed the same way");
+  assert.deepEqual(result.refusedSizes, [], "and a 404 is not a wall");
+  assert.equal(result.wall, "openEnded");
+});
+
+test("a 500 among the answers is not a liveness verdict", async () => {
+  const result = await sweepAnswers([failure(404, "model not found"), failure(500, "upstream failed")]);
+  assert.equal(result.unavailable, undefined, "one bad hour at the upstream keeps the model alive");
+  assert.ok(!Object.hasOwn(result, "unavailable"), "and the field is absent, not false");
+});
+
+test("a 410, or wording that names the model, is unavailable with the sentence it used", async () => {
+  const long = `The model scripted-free was retired on 2026-10-01 ${"and ".repeat(80)}it is not coming back.`;
+  const result = await sweepAnswers([failure(410, long)]);
+  assert.equal(result.unavailable, true, "410 is the route saying the model is gone");
+  assert.match(result.unavailableSays, /retired/, "the sentence the route used is reported");
+  assert.ok(result.unavailableSays.length <= 160, "and truncated for a snapshot row");
+  // A 400 that says the model is gone is the same answer in the route's other
+  // words: 404/410 are not the only way an upstream retires a model.
+  const worded = await sweepAnswers([failure(400, "This model is no longer available; contact support.")]);
+  assert.equal(worded.unavailable, true);
+  assert.match(worded.unavailableSays, /no longer available/);
+});
+
+test("a run that was served is never unavailable", async () => {
+  const result = await sweepAnswers([{ kind: "served", tokens: 50_000 }]);
+  assert.equal(result.unavailable, undefined);
+  assert.ok(!Object.hasOwn(result, "unavailable"), "the result keeps its old shape when the model is alive");
+  assert.equal(result.wall, "openEnded");
+});
+
+test("a rate limit, a timeout, an auth failure or a malformed answer is not a liveness verdict", async () => {
+  // Each of these bodies matches the model-gone wording on purpose: the status
+  // decides first, and none of these statuses says the model itself is gone.
+  const limited = await sweepAnswers([failure(429, "the model is temporarily unavailable; try again")]);
+  assert.equal(limited.unavailable, undefined, "a 429 is the run, not the model");
+  const fault = await sweepAnswers([failure(503, "model backend unavailable")]);
+  assert.equal(fault.unavailable, undefined, "a 5xx is the run, not the model");
+  const timeout = await sweepAnswers([{ kind: "error", says: "model backend unavailable: fetch failed" }]);
+  assert.equal(timeout.unavailable, undefined, "a transport failure carries no status and says nothing about the model");
+  const auth = await sweepAnswers([failure(403, "model unavailable for this key")]);
+  assert.equal(auth.unavailable, undefined, "a key that cannot ask is not a retired model");
+  const shape = await sweepAnswers([failure(400, "invalid request: bad parameter")]);
+  assert.equal(shape.unavailable, undefined, "a malformed answer names no model at all");
+});
+
+test("one concrete answer about the model is not unavailable, whatever else failed", async () => {
+  // A 404 first, then a refusal the route reproduced: the refusal is the route
+  // answering about the size, so the model exists and the run also has a wall.
+  const result = await sweepAnswers([
+    failure(404, "model not found"),
+    { kind: "refused", status: 400, says: "context_length_exceeded" },
+    { kind: "refused", status: 400, says: "context_length_exceeded" },
+  ]);
+  assert.equal(result.unavailable, undefined);
+  assert.equal(result.wall, "single-refusal", "the refusal still counts as what it is");
+});
+
+test("unavailability needs an answer, and every answer to agree", async () => {
+  const { unavailabilityOf } = await subject;
+  assert.equal(unavailabilityOf([]), undefined, "not asking is not the route saying the model is gone");
+  assert.equal(unavailabilityOf([{ kind: "unconfirmed", status: 400 }]), undefined, "an unconfirmed refusal is an answer");
+  assert.equal(unavailabilityOf([{ kind: "served" }, { kind: "error", status: 404 }]), undefined);
+  assert.equal(
+    unavailabilityOf([
+      { kind: "error", status: 404 },
+      { kind: "error", status: 410 },
+    ]).unavailable,
+    true,
+  );
+  // A pure 404 with a body that names no model is still the model being gone, but
+  // there is no matching sentence to report.
+  const bare = unavailabilityOf([{ kind: "error", status: 404, says: "not here" }]);
+  assert.equal(bare.unavailable, true);
+  assert.ok(!Object.hasOwn(bare, "unavailableSays"));
+  // The sentence reported is the first one that names the model, not the first
+  // sentence of the body.
+  const sentences = unavailabilityOf([
+    { kind: "error", status: 404, says: "the gateway answered. The model has retired. model unavailable." },
+  ]);
+  assert.equal(sentences.unavailableSays, "The model has retired.", "the first matching sentence is the one reported");
 });
 
 // The rule, enforced where the requests are made: an id the catalogue declares

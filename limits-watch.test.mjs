@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -505,6 +505,7 @@ test("the snapshot says what unit each of its numbers is in", async () => {
     assert.equal(written._units.named, "tokens", "the window the route named is a number of tokens");
     assert.equal(written._units.servedChars, "characters", "and what was served is a number of characters");
     assert.equal(written._units.refusedSizes, "characters", "and so is every size that was refused");
+    assert.equal(written._units.unavailable, "date, YYYY-MM-DD", "and the liveness day is a date");
     assert.equal(written.version, 1, "the version is still the one the readers know");
     assert.deepEqual(Object.keys(written.models), ["a-free"], "the rows are where they were");
     const read = await readSnapshot(file);
@@ -619,7 +620,7 @@ test("a row with a wall nobody knows is refused, and the row is named", async ()
   const { checkSnapshot } = await subject;
   const problems = checkSnapshot({
     version: 1,
-    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD", unavailable: "date, YYYY-MM-DD" },
     models: { "a-free": { ...goodRow, wall: "bracketedt" } },
   });
   assert.equal(problems.length, 1, "the row is the only thing wrong");
@@ -631,7 +632,7 @@ test("a row that names two different refused sizes is refused", async () => {
   const { checkSnapshot } = await subject;
   const problems = checkSnapshot({
     version: 1,
-    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD", unavailable: "date, YYYY-MM-DD" },
     models: { "a-free": { ...goodRow, refusedChars: 1787501 } },
   });
   assert.equal(problems.length, 1, "the row is the only thing wrong");
@@ -642,7 +643,7 @@ test("a row whose date is not a date is refused", async () => {
   const { checkSnapshot } = await subject;
   const problems = checkSnapshot({
     version: 1,
-    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD", unavailable: "date, YYYY-MM-DD" },
     models: { "a-free": { ...goodRow, at: "2026-13-40" } },
   });
   assert.equal(problems.length, 1, "the row is the only thing wrong");
@@ -653,7 +654,7 @@ test("a row whose number is not a whole number is refused", async () => {
   const { checkSnapshot } = await subject;
   const problems = checkSnapshot({
     version: 1,
-    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    _units: { servedTokens: "tokens", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD", unavailable: "date, YYYY-MM-DD" },
     models: { "a-free": { ...goodRow, servedTokens: 375142.5 } },
   });
   assert.equal(problems.length, 1, "the row is the only thing wrong");
@@ -671,7 +672,7 @@ test("a file that says the wrong unit for a number is refused", async () => {
   const { checkSnapshot } = await subject;
   const problems = checkSnapshot({
     version: 1,
-    _units: { servedTokens: "characters", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD" },
+    _units: { servedTokens: "characters", servedChars: "characters", refusedChars: "characters", refusedSizes: "characters", named: "tokens", at: "date, YYYY-MM-DD", unavailable: "date, YYYY-MM-DD" },
     models: { "a-free": goodRow },
   });
   assert.equal(problems.length, 1, "the file is the only thing wrong");
@@ -980,6 +981,7 @@ test("a row that carries the day it was tried passes the check, and a bad one do
     refusedSizes: "characters",
     named: "tokens",
     at: "date, YYYY-MM-DD",
+    unavailable: "date, YYYY-MM-DD",
   };
   assert.deepEqual(
     checkSnapshot({ version: 1, _units: units, models: { "a-free": { ...goodRow, tried: "2026-10-20" } } }),
@@ -992,6 +994,54 @@ test("a row that carries the day it was tried passes the check, and a bad one do
     models: { "a-free": { ...goodRow, tried: "2026-13-40" } },
   });
   assert.ok(bad.some((problem) => problem.includes("tried")), "a day that is not a day is refused: " + bad.join("\n"));
+  // The liveness day is read by the same rule: optional, but a value has to be
+  // a day, or a report would believe "no such day" is when the route said the
+  // model was gone.
+  assert.deepEqual(
+    checkSnapshot({ version: 1, _units: units, models: { "a-free": { ...goodRow, unavailable: "2026-10-20" } } }),
+    [],
+    "the optional liveness day is part of the shape too",
+  );
+  const badUnavailable = checkSnapshot({
+    version: 1,
+    _units: units,
+    models: { "a-free": { ...goodRow, unavailable: "2026-13-40" } },
+  });
+  assert.ok(
+    badUnavailable.some((problem) => problem.includes("unavailable")),
+    "a liveness day that is not a day is refused: " + badUnavailable.join("\n"),
+  );
+});
+
+test("a snapshot written before the liveness unit existed is still readable", async () => {
+  const { checkSnapshot } = await subject;
+  // The previous version wrote no `_units.unavailable` because it had no such
+  // row field. Requiring the unit would make every repository snapshot fail
+  // --check until a sweep rewrote it, which is a schema gate on a file that is
+  // otherwise exactly what this version reads. The unit is required only when
+  // the file names it.
+  const oldUnits = {
+    servedTokens: "tokens",
+    servedChars: "characters",
+    refusedChars: "characters",
+    refusedSizes: "characters",
+    named: "tokens",
+    at: "date, YYYY-MM-DD",
+  };
+  assert.deepEqual(
+    checkSnapshot({ version: 1, _units: oldUnits, models: { "a-free": goodRow } }),
+    [],
+    "a file from before the field existed passes",
+  );
+  const wrong = checkSnapshot({
+    version: 1,
+    _units: { ...oldUnits, unavailable: "tokens" },
+    models: { "a-free": goodRow },
+  });
+  assert.ok(
+    wrong.some((problem) => problem.includes("unavailable") && problem.includes("date")),
+    "but a file that names the field still has to name the right unit: " + wrong.join("\n"),
+  );
 });
 
 // `--check` is the gate on the unattended merge, and a positive safe integer is
@@ -1006,6 +1056,7 @@ test("a measurement too large to be one is refused, and the units have to agree"
     refusedSizes: "characters",
     named: "tokens",
     at: "date, YYYY-MM-DD",
+    unavailable: "date, YYYY-MM-DD",
   };
   const over = (patch) =>
     checkSnapshot({ version: 1, _units: units, models: { "a-free": { ...goodRow, ...patch } } });
@@ -1089,3 +1140,418 @@ test(
     }
   },
 );
+
+// `--status` is the read-only freshness view: it stats the snapshot, validates
+// it with `--check`'s rules, and reports what a scheduler would see. Its own
+// exits are 0 healthy / 1 unreadable / 2 readable-but-degraded, so the cases
+// below pin both the report and the code.
+const STATUS_NOW = Date.parse("2026-10-20T12:00:00Z");
+
+test("--status reports a fresh snapshot as healthy, and reads without writing", async () => {
+  const { writeSnapshot, statusSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-status-${process.pid}-healthy-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": { ...goodRow, tried: "2026-10-20" } } }, file);
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    const before = readFileSync(file, "utf8");
+    const beforeMtime = statSync(file).mtimeMs;
+    const { report, exitCode } = await statusSnapshot(file, { now: STATUS_NOW });
+    assert.equal(exitCode, 0, "a readable, valid, fresh snapshot is healthy");
+    assert.deepEqual(report.issues, []);
+    assert.equal(report.snapshotPath, file);
+    assert.equal(report.generatedAt, new Date(STATUS_NOW).toISOString(), "the date is the file's own mtime");
+    assert.equal(report.ageSeconds, 0);
+    assert.equal(report.staleAfterSeconds, 7200, "the default bound is two hours");
+    assert.equal(report.stale, false);
+    assert.equal(report.models, 1);
+    assert.deepEqual(report.rows, [
+      {
+        id: "a-free",
+        wall: "bracketed",
+        at: "2026-10-20",
+        tried: "2026-10-20",
+        ageDays: 0,
+        stale: false,
+      },
+    ]);
+    assert.equal(readFileSync(file, "utf8"), before, "the status run does not rewrite the snapshot");
+    assert.equal(statSync(file).mtimeMs, beforeMtime, "and it does not touch the file's mtime");
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test(
+  "--status prints one JSON line with --json, and a human summary without it",
+  { skip: needsBun },
+  async () => {
+    const { writeSnapshot } = await subject;
+    const file = join(tmpdir(), `zen-status-${process.pid}-cli-${Date.now()}.json`);
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      await writeSnapshot({ models: { "a-free": { ...goodRow, at: today } } }, file);
+      utimesSync(file, new Date(), new Date());
+      const json = spawnSync(process.execPath, [script, "--status", "--json", file], {
+        encoding: "utf8",
+        timeout: 60000,
+      });
+      assert.equal(json.status, 0, `a healthy snapshot exits 0: ${json.stdout}${json.stderr}`);
+      const report = JSON.parse(json.stdout);
+      assert.equal(report.snapshotPath, file);
+      assert.equal(report.stale, false);
+      assert.equal(report.models, 1);
+      assert.equal(report.rows[0].id, "a-free");
+      const human = spawnSync(process.execPath, [script, "--status", file], {
+        encoding: "utf8",
+        timeout: 60000,
+      });
+      assert.equal(human.status, 0, `the human mode exits 0 too: ${human.stdout}${human.stderr}`);
+      assert.ok(human.stdout.includes("snapshot is healthy"), "the summary says what it found: " + human.stdout);
+      assert.ok(human.stdout.includes("a-free"), "and it names the row");
+    } finally {
+      rmSync(file, { force: true });
+    }
+  },
+);
+
+test(
+  "--status calls a snapshot older than the bound stale and exits 2, and honours --stale-after",
+  { skip: needsBun },
+  async () => {
+    const { writeSnapshot } = await subject;
+    const file = join(tmpdir(), `zen-status-${process.pid}-stale-${Date.now()}.json`);
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    try {
+      await writeSnapshot({ models: { "a-free": goodRow } }, file);
+      const past = new Date(Date.now() - 180_000);
+      utimesSync(file, past, past);
+      const run = spawnSync(process.execPath, [script, "--status", "--json", "--stale-after", "60", file], {
+        encoding: "utf8",
+        timeout: 60000,
+      });
+      // A run that mistook the bound's value for the file would exit 1 with
+      // `snapshot_missing`; 2 with a stale issue is the proof that it did not.
+      assert.equal(run.status, 2, `a stale snapshot is readable but degraded: ${run.stdout}${run.stderr}`);
+      const report = JSON.parse(run.stdout);
+      assert.equal(report.staleAfterSeconds, 60, "the named bound is the one used");
+      assert.equal(report.stale, true, "three minutes is older than one");
+      assert.ok(report.ageSeconds >= 60, `the age is the file's: ${report.ageSeconds}`);
+      assert.ok(
+        report.issues.some((issue) => issue.code === "snapshot_stale"),
+        "the issue names the staleness: " + JSON.stringify(report.issues),
+      );
+      // The default bound is two hours, so the same three-minute file is fresh
+      // to a run that named nothing.
+      const fresh = spawnSync(process.execPath, [script, "--status", "--json", file], {
+        encoding: "utf8",
+        timeout: 60000,
+      });
+      assert.equal(fresh.status, 0, `two hours is the default: ${fresh.stdout}${fresh.stderr}`);
+      assert.equal(JSON.parse(fresh.stdout).stale, false);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  },
+);
+
+test("--status exits 1 when the snapshot is missing, and says which file", async () => {
+  const { statusSnapshot } = await subject;
+  const missing = join(tmpdir(), `zen-status-${process.pid}-missing-${Date.now()}.json`);
+  const { report, exitCode } = await statusSnapshot(missing);
+  assert.equal(exitCode, 1, "a file that is not there is not a degraded snapshot");
+  assert.equal(report.generatedAt, null);
+  assert.equal(report.ageSeconds, null);
+  assert.deepEqual(report.rows, []);
+  assert.equal(report.models, 0);
+  assert.deepEqual(
+    report.issues.map((issue) => issue.code),
+    ["snapshot_missing"],
+    "and the report names what is missing",
+  );
+  assert.ok(report.issues[0].message.includes(missing), "with the path a reader needs: " + report.issues[0].message);
+});
+
+test("--status exits 1 when the file is not JSON", async () => {
+  const { statusSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-status-${process.pid}-invalid-${Date.now()}.json`);
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, "not json at all", "utf8");
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    const notJson = await statusSnapshot(file, { now: STATUS_NOW });
+    assert.equal(notJson.exitCode, 1, "one unreadable answer and one malformed answer are both exit 1");
+    assert.deepEqual(notJson.report.issues.map((issue) => issue.code), ["snapshot_not_json"]);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("--status reports an invalid snapshot with issues and exit 2", async () => {
+  const { writeSnapshot, statusSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-status-${process.pid}-bad-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": { ...goodRow, wall: "bracketedt" } } }, file);
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    const { report, exitCode } = await statusSnapshot(file, { now: STATUS_NOW });
+    assert.equal(exitCode, 2, "readable but wrong is degraded, not unreadable");
+    assert.ok(
+      report.issues.some((issue) => issue.code === "snapshot_invalid" && issue.message.includes("bracketedt")),
+      "the row's wall is quoted: " + JSON.stringify(report.issues),
+    );
+    assert.equal(report.models, 1, "the report still says how many rows the file holds");
+    assert.equal(report.rows[0].wall, "bracketedt", "and surfaces the label it found");
+    // An empty snapshot is readable and valid, and still degraded: it measures
+    // nothing, which is the one thing a snapshot exists to do.
+    await writeSnapshot({ models: {} }, file);
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    const empty = await statusSnapshot(file, { now: STATUS_NOW });
+    assert.equal(empty.exitCode, 2);
+    assert.equal(empty.report.models, 0);
+    assert.deepEqual(empty.report.rows, []);
+    assert.deepEqual(empty.report.issues.map((issue) => issue.code), ["no_measurements"]);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("--status surfaces an unavailable row, tolerates a malformed day, and only calls a recent one an outage", async () => {
+  const { writeSnapshot, statusSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-status-${process.pid}-unavailable-${Date.now()}.json`);
+  const write = async (row) => {
+    await writeSnapshot({ models: { "a-free": row } }, file);
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    return statusSnapshot(file, { now: STATUS_NOW });
+  };
+  try {
+    const recent = await write({ ...goodRow, unavailable: "2026-10-19" });
+    assert.equal(recent.exitCode, 2, "a recent unavailable day is degraded");
+    assert.equal(recent.report.rows[0].unavailableAt, "2026-10-19", "the field is surfaced under its report name");
+    assert.ok(
+      recent.report.issues.some((issue) => issue.code === "model_unavailable" && issue.message.includes("2026-10-19")),
+      "and the report says the route refused it as gone: " + JSON.stringify(recent.report.issues),
+    );
+    // A hand-edited row is not a reason to throw, but a value that is not a day
+    // is now a validation problem: the row says it is unavailable on a day that
+    // does not exist, so the snapshot is invalid even though the report still
+    // runs and does not read the value as an outage.
+    const malformed = await write({ ...goodRow, unavailable: "not-a-day" });
+    assert.equal(malformed.exitCode, 2, "a liveness day that is not a day is refused by the check");
+    assert.equal(malformed.report.rows[0].unavailableAt, undefined);
+    assert.ok(
+      malformed.report.issues.some(
+        (issue) => issue.code === "snapshot_invalid" && issue.message.includes("unavailable"),
+      ),
+      "the problem names the field: " + JSON.stringify(malformed.report.issues),
+    );
+    assert.ok(
+      !malformed.report.issues.some((issue) => issue.code === "model_unavailable"),
+      "and a value nobody can read is not an outage",
+    );
+    // An old day is history: it is still surfaced, but it does not claim the
+    // model is unavailable now.
+    const old = await write({ ...goodRow, unavailable: "2026-01-01" });
+    assert.equal(old.exitCode, 0, "an answer from last winter is not a current outage");
+    assert.equal(old.report.rows[0].unavailableAt, "2026-01-01");
+    assert.deepEqual(old.report.issues, []);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+test("--status marks a measurement older than the watcher's week, and a later attempt resets it", async () => {
+  const { writeSnapshot, statusSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-status-${process.pid}-row-age-${Date.now()}.json`);
+  const write = async (row) => {
+    await writeSnapshot({ models: { "a-free": row } }, file);
+    utimesSync(file, new Date(STATUS_NOW), new Date(STATUS_NOW));
+    return statusSnapshot(file, { now: STATUS_NOW });
+  };
+  try {
+    const old = await write({ ...goodRow, at: "2026-10-01" });
+    assert.equal(old.exitCode, 2, "a measurement older than a week is degraded");
+    assert.equal(old.report.rows[0].ageDays, 19);
+    assert.equal(old.report.rows[0].stale, true);
+    assert.ok(
+      old.report.issues.some((issue) => issue.code === "row_stale"),
+      "the issue names the row: " + JSON.stringify(old.report.issues),
+    );
+    // `tried` is when the id was last asked about and learned nothing, and it is
+    // the later of the two days the age is counted from — the same rule the
+    // suspicion bound uses.
+    const retried = await write({ ...goodRow, at: "2026-10-01", tried: "2026-10-19" });
+    assert.equal(retried.exitCode, 0, "an attempt a day ago is not a stale measurement");
+    assert.equal(retried.report.rows[0].ageDays, 1);
+    assert.equal(retried.report.rows[0].stale, false);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// The snapshot's second half is liveness: when every answer of a run said the
+// model itself is gone, the row keeps the day it was said, beside the day the
+// id was last asked about. It is an observation and never a switch — the tests
+// below assert the row and the report, and nothing here hides a model.
+test("an unavailable result dates the existing row with tried and unavailable, and says why", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    log: (line) => lines.push(line),
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-13" } }),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+        unavailable: true,
+        unavailableSays: '{"error":{"message":"model small-free not found"}}',
+      },
+    ],
+  });
+  assert.deepEqual(state.unlearned, ["small-free"], "the run still learned no measurement");
+  const row = state.snapshot.models["small-free"];
+  assert.equal(row.at, "2026-10-13", "the measurement's own day is not rewritten");
+  assert.equal(row.servedTokens, 100_000, "and the measurement stands");
+  assert.equal(row.tried, "2026-10-20", "the attempt is dated, so the week starts again");
+  assert.equal(row.unavailable, "2026-10-20", "and the route's own answer is dated beside it");
+  const said = lines.join("\n");
+  assert.ok(
+    said.includes('unavailable: small-free — {"error":{"message":"model small-free not found"}}'),
+    "the report repeats the sentence the route used: " + said,
+  );
+});
+
+test("a transient unlearned attempt dates the row but does not call the model unavailable", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    log: (line) => lines.push(line),
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({ "small-free": { servedTokens: 100_000, at: "2026-10-13" } }),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+        // A 429/timeout run has no `unavailable` key at all; the sweep only adds
+        // it when every answer named the model as gone.
+      },
+    ],
+  });
+  const row = state.snapshot.models["small-free"];
+  assert.equal(row.tried, "2026-10-20", "the attempt still moves the age bound");
+  assert.ok(!Object.hasOwn(row, "unavailable"), "a bad hour does not mark a model unavailable");
+  assert.ok(!lines.join("\n").includes("unavailable:"), "and the report does not claim it did");
+});
+
+test("an unavailable new id gets no measurement row, and is said", async () => {
+  const { watch } = await subject;
+  const lines = [];
+  const state = await watch({
+    sweep: true,
+    log: (line) => lines.push(line),
+    fetchJSON: route(["fresh-free"]),
+    read: async () => ({ models: {} }),
+    sweepModels: async () => [
+      {
+        model: "fresh-free",
+        servedTokens: null,
+        servedChars: null,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+        unavailable: true,
+        unavailableSays: "model has been retired",
+      },
+    ],
+  });
+  assert.deepEqual(state.added, ["fresh-free"], "the id was never measured");
+  assert.ok(!Object.hasOwn(state.snapshot.models, "fresh-free"), "and no measurement is invented for it");
+  assert.ok(
+    lines.join("\n").includes("unavailable: fresh-free — model has been retired"),
+    "but the report says the route called it gone: " + lines.join("\n"),
+  );
+});
+
+test("a later measurement clears the unavailable day", async () => {
+  const { watch } = await subject;
+  const state = await watch({
+    at: "2026-10-20",
+    sweep: true,
+    all: true,
+    fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+    read: measuredWith({
+      "small-free": { servedTokens: 100_000, at: "2026-10-13", tried: "2026-10-18", unavailable: "2026-10-18" },
+    }),
+    sweepModels: async () => [
+      {
+        model: "small-free",
+        servedTokens: 200_000,
+        servedChars: 800_000,
+        refusedChars: null,
+        refusedSizes: [],
+        wall: "openEnded",
+        says: [],
+      },
+    ],
+  });
+  const row = state.snapshot.models["small-free"];
+  assert.equal(row.at, "2026-10-20", "the row is the new measurement");
+  assert.equal(row.servedTokens, 200_000);
+  assert.ok(!Object.hasOwn(row, "unavailable"), "a model the route answered is not still marked gone");
+  assert.ok(!Object.hasOwn(row, "tried"), "and the failed attempt's day goes with the old row");
+});
+
+test("--status surfaces the unavailable day the watch wrote", async () => {
+  const { watch, writeSnapshot, readSnapshot, statusSnapshot } = await subject;
+  const today = new Date().toISOString().slice(0, 10);
+  const file = join(tmpdir(), `zen-status-${process.pid}-written-unavailable-${Date.now()}.json`);
+  try {
+    const state = await watch({
+      at: today,
+      sweep: true,
+      all: true,
+      fetchJSON: catalogued(["small-free"], { "small-free": 262_144 }),
+      read: measuredWith({ "small-free": { servedTokens: 100_000, at: today } }),
+      sweepModels: async () => [
+        {
+          model: "small-free",
+          servedTokens: null,
+          servedChars: null,
+          refusedChars: null,
+          refusedSizes: [],
+          wall: "openEnded",
+          says: [],
+          unavailable: true,
+          unavailableSays: "model not found",
+        },
+      ],
+    });
+    await writeSnapshot(state.snapshot, file);
+    const read = await readSnapshot(file);
+    assert.equal(read.models["small-free"].unavailable, today, "a reader passes the liveness day through");
+    const { report, exitCode } = await statusSnapshot(file, { now: Date.now() });
+    assert.equal(exitCode, 2, "the status view degrades on an unavailable model");
+    assert.equal(report.rows[0].unavailableAt, today, "and surfaces the day under its report name");
+    assert.ok(
+      report.issues.some((issue) => issue.code === "model_unavailable"),
+      "with the issue that says the route called it gone: " + JSON.stringify(report.issues),
+    );
+  } finally {
+    rmSync(file, { force: true });
+  }
+});

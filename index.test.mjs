@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
+import { readDiscoveryCache, writeDiscoveryCache } from "./models.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
 import { requestFor } from "./tools-smoke.mjs";
 
@@ -18,6 +19,10 @@ import { requestFor } from "./tools-smoke.mjs";
 // the documented way to keep the state in memory, and the case that tests the
 // file itself names a path of its own.
 process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
+// The discovery cache is a file in the operator's cache directory too, and a
+// test run may not read what the last run left behind. The cases about the
+// cache name a temporary file of their own below.
+process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = "";
 
 // The names the discovery reads are counted by. Zen's own list is also the
 // endpoint the fixture's `models` handler answers, so the three are named here
@@ -943,6 +948,212 @@ test("a failed discovery is shared by concurrent callers and still spends the bu
   assert.deepEqual(reads(state), { rounds: 1, discovery: 3, inference: 0 });
 });
 
+// ---- discovery cache wiring ------------------------------------------------
+//
+// models.mjs owns the file format (its own cases pin the parse); these cases pin
+// what the provider does with it: the cache is the first `known`/`protocols`
+// map, a live discovery replaces and remembers it, and a listing failure hands
+// the map back with its age beside `magpie.fellBack`. Every case names a
+// temporary file through OPENCODE_ZEN_FREE_DISCOVERY_CACHE, so the operator's
+// own cache is never read or written.
+
+// The shape buildModels writes and configModels reads: a cache row is a model
+// record, not a listing entry, because that is what the previous process kept.
+function cachedModel(id) {
+  return {
+    id,
+    providerID: "opencode-zen-free",
+    name: "Cached Free",
+    api: { id, url: "https://opencode.ai/inference/v1", npm: "@ai-sdk/openai-compatible" },
+    limit: { context: 123456, output: 7890 },
+    capabilities: {
+      temperature: true,
+      reasoning: false,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, image: false, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    variants: {},
+    options: {},
+    headers: {},
+    status: "active",
+    release_date: "",
+    free: true,
+  };
+}
+
+// A fresh directory per case, removed with the test that made it.
+function discoveryTempDir(t) {
+  const dir = mkdtempSync(join(tmpdir(), "zenfree-discovery-cache-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+// Point the provider at this case's file for the length of this case. The value
+// is read when `server()` starts, so it has to be set before `fixture()`.
+function useCacheFile(t, file) {
+  const previous = process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE;
+  process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = file;
+  t.after(() => {
+    if (previous === undefined) delete process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE;
+    else process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = previous;
+  });
+}
+
+// The write after a successful discovery is deliberately not awaited (a disk
+// must not delay the answer), so a case that wants to read it waits for it.
+async function waitForCache(file) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const cache = await readDiscoveryCache(file);
+    if (cache !== undefined) return cache;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return undefined;
+}
+
+test("a cold start reads the discovery cache and answers from it without asking the route", async (t) => {
+  const file = join(discoveryTempDir(t), "discovery.json");
+  const cached = cachedModel("cached-free");
+  // Fresh enough that discovery's RELIST_AFTER budget is spent: this is the
+  // "restart, previous process read the list a moment ago" shape, and the whole
+  // point is that the process answers without a round of upstream reads.
+  assert.equal(
+    await writeDiscoveryCache(file, {
+      models: { "cached-free": cached },
+      protocols: { "cached-free": "chat" },
+      listedAt: new Date().toISOString(),
+    }),
+    true,
+  );
+  useCacheFile(t, file);
+  const { plugin, state } = await fixture(t);
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(
+    models["cached-free"],
+    cached,
+    "the model the cache remembered is not the one the host was offered",
+  );
+  assert.deepEqual(state.calls, [], "a cold start with a fresh cache went to the route");
+});
+
+test("a listing failure falls back to the cache, flagged and aged", async (t) => {
+  const file = join(discoveryTempDir(t), "discovery.json");
+  const cached = cachedModel("cached-free");
+  const cachedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  assert.equal(
+    await writeDiscoveryCache(file, {
+      models: { "cached-free": cached },
+      protocols: { "cached-free": "chat" },
+      listedAt: cachedAt,
+    }),
+    true,
+  );
+  useCacheFile(t, file);
+  const { plugin, state } = await fixture(t);
+  state.modelsStatus = 503;
+  const fallback = await plugin.refresh();
+  assert.equal(fallback[Symbol.for("magpie.fellBack")], true, "the answer is not said as a fallback");
+  assert.deepEqual(fallback["cached-free"], cached, "the cache row was dropped by the fallback");
+  // The age is the cache's own date, within a minute of the two hours it was
+  // written back. It is a fact about the map, non-enumerable, so a host that
+  // keys models by `Object.keys` or serializes the map does not see it.
+  const age = fallback[Symbol.for("magpie.discoveryAgeMs")];
+  assert.ok(
+    Number.isFinite(age) && age > 2 * 60 * 60 * 1000 - 60_000 && age < 2 * 60 * 60 * 1000 + 60_000,
+    `the fallback's age is ${age}`,
+  );
+  const descriptor = Object.getOwnPropertyDescriptor(fallback, Symbol.for("magpie.discoveryAgeMs"));
+  assert.equal(descriptor.enumerable, false, "the age is enumerable");
+  assert.equal(Object.keys(fallback).includes("magpie.discoveryAgeMs"), false);
+});
+
+test("a missing or invalid discovery cache is no cache, and the bootstrap table stands", async (t) => {
+  const dir = discoveryTempDir(t);
+  const cases = [
+    ["missing", async () => {}],
+    [
+      "bad JSON",
+      async (file) => writeFileSync(file, "{ this is not json", "utf8"),
+    ],
+    [
+      "a foreign version",
+      async (file) =>
+        writeFileSync(
+          file,
+          JSON.stringify({
+            version: 99,
+            models: { "poison-free": cachedModel("poison-free") },
+            protocols: { "poison-free": "chat" },
+            listedAt: new Date().toISOString(),
+          }),
+          "utf8",
+        ),
+    ],
+  ];
+  const previous = process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE;
+  let bootstrapKeys;
+  try {
+    for (const [label, prepare] of cases) {
+      const file = join(dir, `${label.replace(/\W+/g, "-")}.json`);
+      await prepare(file);
+      // Set directly rather than through `useCacheFile`: this case names a file
+      // per iteration, and one restore at the end is what leaves the variable
+      // where it started.
+      process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = file;
+      const { plugin, state } = await fixture(t);
+      state.modelsStatus = 503;
+      const fallback = await plugin.refresh();
+      assert.equal(fallback[Symbol.for("magpie.fellBack")], true, `${label}: not a fallback`);
+      assert.equal(
+        Object.hasOwn(fallback, "poison-free"),
+        false,
+        `${label}: a cache this build cannot read was used`,
+      );
+      // With no cache and no successful read there is no age to state: the maps
+      // are the bootstrap table, not something remembered from a process.
+      assert.equal(
+        fallback[Symbol.for("magpie.discoveryAgeMs")],
+        undefined,
+        `${label}: an age was stated for maps nobody remembered`,
+      );
+      const keys = Object.keys(fallback).sort();
+      if (bootstrapKeys === undefined) {
+        bootstrapKeys = keys;
+        assert.ok(bootstrapKeys.length > 0, "the bootstrap table is empty");
+      } else {
+        assert.deepEqual(keys, bootstrapKeys, `${label}: the bootstrap table changed`);
+      }
+    }
+  } finally {
+    process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = previous;
+  }
+});
+
+test("a successful discovery writes the cache for the next process", async (t) => {
+  const file = join(discoveryTempDir(t), "discovery.json");
+  useCacheFile(t, file);
+  const { plugin } = await fixture(t);
+  const models = await plugin.refresh();
+  const cache = await waitForCache(file);
+  assert.ok(cache, "the successful discovery was not remembered");
+  assert.deepEqual(
+    Object.keys(cache.models).sort(),
+    Object.keys(models)
+      .filter((id) => id !== Symbol.for("magpie.fellBack"))
+      .sort(),
+    "the cache holds a different list than the discovery answered with",
+  );
+  assert.deepEqual(cache.models["chat-free"], models["chat-free"]);
+  // The protocol map travels beside the models: the docs table in the fixture
+  // names chat-free at the chat endpoint.
+  assert.equal(cache.protocols["chat-free"], "chat");
+  const age = Date.now() - Date.parse(cache.listedAt);
+  assert.ok(Number.isFinite(age) && age >= 0 && age < 60_000, `the cache states an old read: ${age}`);
+});
+
 test("registers without overwriting user config and enables public access without a secret", async (t) => {
   const { plugin } = await fixture(t);
   const cfg = {};
@@ -1662,6 +1873,82 @@ test("a 403 that is not the free tier's keeps its message, under headers for the
     );
   }
   assert.match(await response.text(), /quota exhausted for this account/);
+});
+
+// The free tier blocks an egress IP in its own words: it reports abusive
+// traffic, or says its free models are not available from the caller's current
+// network. That is not a refusal of anything this package sends — no wording,
+// session or retry changes the IP — so explain() diagnoses it before the
+// FreeTierError branch. Left in that branch instead, the caller would be sent
+// to capture tool wording again for a block that has nothing to do with tools.
+test("an IP-abuse 403 is diagnosed as a blocked network, not a wording refusal", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const ask = () =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+    });
+  // The three wordings the upstream has been seen to use, mixed case: the rule
+  // is case-insensitive prose, and the third pairs two phrases — only both of
+  // them together are a block, which the next case pins from the other side.
+  for (const message of [
+    "We detected ABUSIVE TRAFFIC from this network.",
+    "Free models aren't available from your current network.",
+    "Access is limited because of abuse of traffic from your current network.",
+  ]) {
+    state.status = 403;
+    state.body = JSON.stringify({ error: { type: "upstream_error", message } });
+    state.responseHeaders = { etag: '"abuse"', "content-length": String(state.body.length) };
+    const response = await ask();
+    assert.equal(response.status, 403, "the upstream's status is the answer's status");
+    const { type, error } = await response.json();
+    assert.equal(type, "error");
+    assert.equal(error.type, "FreeTierError", `${message}: the block was not named`);
+    assert.match(error.message, /egress IP/i, `${message}: the blocked IP is not named`);
+    assert.match(error.message, /abuse of traffic/i, message);
+    assert.match(error.message, /switch networks|VPN exit/i, `${message}: no way out is named`);
+    assert.match(error.message, /wait/i, `${message}: waiting is not named`);
+    assert.match(error.message, /cannot succeed/i, `${message}: a retry is not ruled out`);
+    assert.match(error.message, /no local cooldown/i, `${message}: a local cooldown is implied`);
+    assert.doesNotMatch(
+      error.message,
+      /wording/i,
+      `${message}: the abuse refusal was read as a tool-wording refusal`,
+    );
+    // The body is this package's, so the upstream's validators are gone and
+    // the content type is the one the new bytes are written as.
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.equal(response.headers.get("etag"), null, "the new body kept the upstream's validator");
+  }
+});
+
+// The two halves of the network phrase are a block together and a retirement
+// notice apart. A body that carries one of them, or nothing that names the
+// free tier, is somebody else's 403 and is relayed exactly as it arrived —
+// the diagnosis must not be invented from a partial match.
+test("a 403 that only looks like a network block is relayed unchanged", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 403;
+  for (const body of [
+    JSON.stringify({ error: { message: "free models aren't available for this account" } }),
+    JSON.stringify({ error: { message: "forbidden: blocked by upstream policy" } }),
+    JSON.stringify({ error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." } }),
+  ]) {
+    state.body = body;
+    const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 403, body);
+    const text = await response.text();
+    if (body.includes("FreeTierError"))
+      assert.doesNotMatch(text, /egress IP/i, "a tool-wording refusal was read as a network block");
+    else assert.equal(text, body, "a 403 that is not a block was rewritten");
+  }
 });
 
 // What is read of a refusal is bounded, and a body past that budget is not the

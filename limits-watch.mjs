@@ -5,6 +5,7 @@
 //   bun limits-watch.mjs --sweep    also measure every id that needs it
 //   bun limits-watch.mjs --write    fold what was measured into the snapshot
 //   bun limits-watch.mjs --check    say whether a snapshot is one the plugin can read
+//   bun limits-watch.mjs --status   report the snapshot's freshness and health, ask nothing
 //
 // Exit codes, which are how the workflow tells the three answers apart:
 //   0  the route was reached and offered at least one free id
@@ -15,6 +16,13 @@
 // listing is not an outage, so 2 may be reported as reached with nothing to
 // publish rather than as a dead route. `--check` keeps its own 0/1 — it asks
 // nothing, so "not reached" is not one of its answers.
+//
+// `--status` is the third read-only mode, and its codes are its own because the
+// question is different: 0 when the snapshot is readable, valid and fresh, 1
+// when it cannot be read at all (missing, unreadable, not JSON), and 2 when it
+// was read and is degraded (invalid, stale, empty, or a measurement says a model
+// is unavailable). It stats the file, never asks the network and never writes;
+// `--json` makes the report one machine-readable line.
 //
 // This is the scheduled half of the survey `limits-sweep.mjs` performs. The
 // sweep answers "how big is this model's prompt wall"; this answers the questions
@@ -40,7 +48,7 @@
 // row, so a wall that has not moved is not paid for again every hour, and by
 // the catalogue, so an id models.dev answers is not asked about at all.
 
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { CATALOG } from "./provider.mjs";
 import { baseFrom, offeredIds } from "./limits-audit.mjs";
@@ -95,6 +103,10 @@ const UNITS = {
   refusedSizes: "characters",
   named: "tokens",
   at: "date, YYYY-MM-DD",
+  // The day the sweep last heard the route call the model gone. Optional like
+  // the row field itself, but a file that carries it has to say what it is: a
+  // date read as a number is a measurement nobody can read.
+  unavailable: "date, YYYY-MM-DD",
 };
 
 // What the file has to say its numbers are, for the check below to accept.
@@ -112,6 +124,14 @@ const EXPECTED_UNITS = {
   refusedSizes: "characters",
   named: "tokens",
   at: "date, YYYY-MM-DD",
+};
+// A unit for a field the file may carry but does not have to: `unavailable` is
+// written only when the sweep has seen a model gone, and a snapshot made before
+// the field existed must still be readable by this version. It is checked when
+// the file names it, and a file that carries the row field without the unit is
+// not made to fail for a field the previous version could not write.
+const OPTIONAL_UNITS = {
+  unavailable: "date, YYYY-MM-DD",
 };
 
 // The walls a row may say, which are the sweep's own labels: `limits-sweep.mjs`
@@ -159,6 +179,23 @@ const TOKEN_CHAR_SLACK = 4096;
 // enough for either to have happened and short enough that a wall which moved
 // is still noticed inside the same month.
 export const SUSPECT_AFTER_DAYS = 7;
+
+// How old the snapshot file itself may be before `--status` calls it stale, in
+// seconds. Two hours: the scheduled run is hourly and a snapshot that missed one
+// tick is worth saying out loud, while a run that is a few minutes late (a busy
+// runner, a retried job) is not. `--stale-after <seconds>` overrides it.
+//
+// Exported so a test and a workflow read the same default rather than each
+// pinning its own copy of the number.
+export const STATUS_STALE_AFTER_SECONDS = 7200;
+
+// How recently a row's `unavailable` day has to have been written for `--status`
+// to report the model as unavailable. The field is a day the route was last seen
+// refusing the model as gone; an old day is history rather than a current
+// outage, and treating it as current forever would make a single bad hour
+// permanent. A week, the same bound the suspicion rule uses for a measurement:
+// the two answers are about the same kind of staleness.
+const UNAVAILABLE_RECENT_DAYS = SUSPECT_AFTER_DAYS;
 
 // How old a row is, in whole days, from the last day it was asked about to the
 // day of this run. Both are the run's own dates — the row carries the day it was
@@ -401,14 +438,43 @@ export async function watch({
   // `ageInDays` prefers over `at`. A new id with no row cannot carry one without
   // also being marked as measured for ever, so it gets none: it is retried every
   // run until the route answers it, which is what `added` means.
+  //
+  // A result the sweep could positively say is gone adds a second day,
+  // `unavailable`: every answer of that run was an error and every one of them
+  // named the model as missing, retired or no longer there (the sweep's own
+  // `unavailabilityOf` rule, so this is not a second opinion about the route).
+  // It is written only onto a row that already exists — a new id still gets no
+  // measurement — and it is history, not a switch: nothing here hides, disables
+  // or reroutes the model, and a later served or refused answer replaces the row
+  // with one that no longer carries it. `tried` stays beside it because the
+  // attempt is still the day the age is counted from.
+  //
+  // The sentence the route used is reported on its own line: a pull request body
+  // is built from this report, and "the route says the model is gone, in these
+  // words" is the thing a person needs to see before believing a row without a
+  // measurement.
   const unlearned = [];
   for (const result of results) {
     if (!learnedAbout(result)) {
       unlearned.push(result.model);
       const held = next[result.model];
-      if (held) next[result.model] = { ...held, tried: at };
+      if (held)
+        next[result.model] = {
+          ...held,
+          tried: at,
+          ...(result.unavailable === true ? { unavailable: at } : {}),
+        };
+      if (result.unavailable === true) {
+        const said = typeof result.unavailableSays === "string" ? result.unavailableSays.trim() : "";
+        log(`  unavailable: ${result.model}${said === "" ? "" : ` — ${said}`}`);
+      }
       continue;
     }
+    // A measurement that answered is a row about a route that is serving the
+    // model now. `kept` builds the row from scratch, so a stale `unavailable`
+    // from an earlier failed run cannot survive it — the model is no longer
+    // known to be gone, and saying otherwise would keep a recovered id marked
+    // for ever.
     next[result.model] = { ...kept(result), at };
   }
   if (unlearned.length > 0)
@@ -626,6 +692,24 @@ function rowProblems(id, row) {
       say(`\`tried\` is ${JSON.stringify(tried)}, and there is no such day`);
     }
   }
+  // The day the route last said the model itself is gone, when the sweep heard
+  // it. Optional like `tried` — a row the route answered has no reason for one —
+  // but a value the file does carry is a day of the same shape: it is history a
+  // report reads, and a date nobody can read is not one.
+  if (row.unavailable !== undefined) {
+    const unavailable = row.unavailable;
+    const unavailableRead =
+      typeof unavailable === "string" ? Date.parse(`${unavailable}T00:00:00Z`) : Number.NaN;
+    if (
+      typeof unavailable !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(unavailable) ||
+      Number.isNaN(unavailableRead)
+    ) {
+      say(`\`unavailable\` is ${JSON.stringify(unavailable)}, and it is the day the route last called the model gone, as YYYY-MM-DD`);
+    } else if (new Date(unavailableRead).toISOString().slice(0, 10) !== unavailable) {
+      say(`\`unavailable\` is ${JSON.stringify(unavailable)}, and there is no such day`);
+    }
+  }
   return problems;
 }
 
@@ -661,6 +745,11 @@ export function checkSnapshot(snapshot) {
         problems.push(`the file says \`${key}\` is ${JSON.stringify(units[key])}, and it is ${unit}`);
       }
     }
+    for (const [key, unit] of Object.entries(OPTIONAL_UNITS)) {
+      if (units[key] !== undefined && units[key] !== unit) {
+        problems.push(`the file says \`${key}\` is ${JSON.stringify(units[key])}, and it is ${unit}`);
+      }
+    }
   }
   for (const [id, row] of Object.entries(models)) problems.push(...rowProblems(id, row));
   return problems;
@@ -692,6 +781,197 @@ export async function checkSnapshotFile(file = SNAPSHOT) {
   return { ok: problems.length === 0, why: problems.length === 0 ? "ok" : "bad", problems };
 }
 
+// A day a row names, or undefined when what it says is not a day. `--status`
+// reads R4b's optional `unavailable` field and must not throw on a hand-edited
+// row: a value that is not a day is no evidence that the model is unavailable,
+// so it is ignored rather than reported. The round-trip is the same real-day
+// rule `rowProblems` applies to `at`, and the reason is the same: `Date.parse`
+// accepts a string that ISO then rewrites, and a row edited into `2026-13-40`
+// must not read as a day.
+function unavailableDay(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
+  const parsed = dayNumber(value);
+  if (parsed === undefined) return undefined;
+  return new Date(parsed).toISOString().slice(0, 10) === value ? value : undefined;
+}
+
+// The snapshot's freshness and health, as one answer a person or a workflow can
+// read. This is a read-only question: `stat` and `readFile` are the only things
+// it touches, never the network and never the file's contents; `now` is an
+// argument so a case can age a file without waiting, and `staleAfter` is the
+// same kind of argument because the right bound belongs to whoever is watching.
+//
+// The report is the JSON shape the workflow reads, and `exitCode` is the code
+// the entry point sets: 1 when the file cannot be read at all (missing,
+// unreadable, not JSON), 2 when it was read and is degraded, 0 when it is
+// healthy. The distinction is the same one the watch run draws — "could not
+// ask" and "asked, and the answer was nothing" are different answers — and 2 is
+// the degraded answer here rather than the watch run's "no free ids".
+export async function statusSnapshot(
+  file = SNAPSHOT,
+  { staleAfter = STATUS_STALE_AFTER_SECONDS, now = Date.now() } = {},
+) {
+  const at = Number.isFinite(now) ? now : Date.now();
+  const report = {
+    snapshotPath: file,
+    generatedAt: null,
+    ageSeconds: null,
+    staleAfterSeconds: staleAfter,
+    stale: false,
+    models: 0,
+    rows: [],
+    issues: [],
+  };
+  const fatal = (code, message) => {
+    report.issues.push({ code, message });
+    return { report, exitCode: 1 };
+  };
+  let info;
+  try {
+    info = await stat(file);
+  } catch (error) {
+    // A file that is not there and one that cannot be stat'ed are both "could
+    // not read", but they are not the same sentence to the person who has to
+    // fix it: a first run expects the first and needs no alarm, an EACCES on a
+    // file that exists is a permissions problem.
+    return error?.code === "ENOENT"
+      ? fatal("snapshot_missing", `the snapshot does not exist: ${file}`)
+      : fatal("snapshot_unreadable", `the snapshot could not be read: ${error?.message ?? error}`);
+  }
+  report.generatedAt = new Date(info.mtimeMs).toISOString();
+  report.ageSeconds = Math.max(0, Math.floor((at - info.mtimeMs) / 1000));
+  report.stale = report.ageSeconds > staleAfter;
+  // The validation is `--check`'s own, so a file `--status` calls readable is a
+  // file the gate would have published: one reader for "what the plugin reads".
+  const check = await checkSnapshotFile(file);
+  if (check.why === "unreadable") return fatal("snapshot_unreadable", check.problems.join("; "));
+  if (check.why === "not-json") return fatal("snapshot_not_json", check.problems.join("; "));
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    // The file changed between the check and this read, or it was readable to
+    // one call and not the other: the same two answers as above, named the same
+    // way, rather than a stack trace out of a report.
+    return fatal("snapshot_unreadable", `the snapshot could not be read a second time: ${error?.message ?? error}`);
+  }
+  if (report.stale)
+    report.issues.push({
+      code: "snapshot_stale",
+      message: `the snapshot was written ${report.ageSeconds}s ago, and the bound is ${staleAfter}s`,
+    });
+  if (check.why === "bad")
+    for (const problem of check.problems)
+      report.issues.push({ code: "snapshot_invalid", message: problem });
+  const models =
+    parsed?.models && typeof parsed.models === "object" && !Array.isArray(parsed.models)
+      ? parsed.models
+      : {};
+  const ids = Object.keys(models).sort();
+  report.models = ids.length;
+  if (ids.length === 0)
+    report.issues.push({
+      code: "no_measurements",
+      message: "the snapshot holds no model rows, so it measures nothing",
+    });
+  // The day the age of a row is counted against. It is the run's own date, the
+  // same clock `watch()` uses, so a status report and a scheduled run agree on
+  // what "seven days old" means.
+  const today = dayNumber(new Date(at).toISOString().slice(0, 10));
+  for (const id of ids) {
+    const row = models[id];
+    // A row that is not a row is already a `snapshot_invalid` problem; there is
+    // nothing here to report about it without inventing a shape.
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const ageDays = ageInDays(row, today);
+    const staleRow = Number.isSafeInteger(ageDays) && ageDays > SUSPECT_AFTER_DAYS;
+    const unavailableAt = unavailableDay(row.unavailable);
+    const entry = {
+      id,
+      wall: typeof row.wall === "string" ? row.wall : null,
+      at: typeof row.at === "string" ? row.at : null,
+      tried: typeof row.tried === "string" ? row.tried : null,
+      ageDays: Number.isSafeInteger(ageDays) ? ageDays : null,
+      stale: staleRow,
+    };
+    if (unavailableAt !== undefined) {
+      // The field is surfaced whether or not it is recent; only a recent day is
+      // an outage to report. An old one is the history of a model that came
+      // back, and the row's own measurement is what says it is being served now.
+      entry.unavailableAt = unavailableAt;
+      const unavailableDays = Math.floor((today - dayNumber(unavailableAt)) / DAY);
+      if (unavailableDays >= 0 && unavailableDays <= UNAVAILABLE_RECENT_DAYS)
+        report.issues.push({
+          code: "model_unavailable",
+          message: `${id}: the route last refused it as gone on ${unavailableAt}`,
+        });
+    }
+    if (staleRow)
+      report.issues.push({
+        code: "row_stale",
+        message: `${id}: the measurement is ${ageDays} days old, older than ${SUSPECT_AFTER_DAYS}`,
+      });
+    report.rows.push(entry);
+  }
+  return { report, exitCode: report.issues.length === 0 ? 0 : 2 };
+}
+
+// The file and the freshness bound `--status` was asked for. It is a separate
+// reader from `--check`'s because `--stale-after` takes a value, and the first
+// non-flag argument cannot be taken for the file without knowing that: the
+// number after the flag is not a snapshot path. `--stale-after=SECONDS` is read
+// too, and a value that is not a whole number of seconds leaves the default in
+// place rather than turning the status run into an argument error.
+function statusArguments(args) {
+  let staleAfter = STATUS_STALE_AFTER_SECONDS;
+  const positional = [];
+  for (let at = 0; at < args.length; at += 1) {
+    const arg = args[at];
+    if (arg === "--stale-after") {
+      const value = Number.parseInt(args[at + 1] ?? "", 10);
+      if (Number.isSafeInteger(value) && value >= 0) staleAfter = value;
+      at += 1;
+      continue;
+    }
+    if (arg.startsWith("--stale-after=")) {
+      const value = Number.parseInt(arg.slice("--stale-after=".length), 10);
+      if (Number.isSafeInteger(value) && value >= 0) staleAfter = value;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    positional.push(arg);
+  }
+  return { file: positional[0] ?? SNAPSHOT, staleAfter };
+}
+
+// The human half of `--status`: what a person reading a terminal needs, in the
+// same voice as the rest of this file's log lines. The JSON half is the report
+// itself, printed by the entry point.
+function printStatus(report) {
+  console.log(`limits watch — ${report.snapshotPath}`);
+  if (report.generatedAt === null) {
+    console.log("  no snapshot to date, so there is nothing to age or bound");
+  } else {
+    console.log(
+      `  written ${report.generatedAt} (${report.ageSeconds}s old); ${report.stale ? "STALE" : "fresh"} against a bound of ${report.staleAfterSeconds}s`,
+    );
+  }
+  console.log(`  ${report.models} model row(s)`);
+  for (const row of report.rows) {
+    const facts = [row.wall ?? "no wall", row.at === null ? "undated" : `measured ${row.at}`];
+    if (row.ageDays !== null) facts.push(`${row.ageDays} day(s) ago`);
+    if (row.unavailableAt !== undefined) facts.push(`unavailable since ${row.unavailableAt}`);
+    if (row.stale) facts.push("stale");
+    console.log(`    ${row.id}: ${facts.join(", ")}`);
+  }
+  if (report.issues.length === 0) {
+    console.log("  snapshot is healthy");
+    return;
+  }
+  console.log(`  ${report.issues.length} issue(s):`);
+  for (const issue of report.issues) console.log(`    ${issue.code}: ${issue.message}`);
+}
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
   // `--check` is a gate on a file that is about to be published, so it asks
@@ -721,6 +1001,24 @@ if (import.meta.main) {
       console.error("Fix the file, or let a run write it again with `bun limits-watch.mjs --write`.");
       process.exitCode = 1;
     }
+  } else if (args.includes("--status")) {
+    // The other read-only mode: a report about the snapshot rather than a gate
+    // on it. It asks nothing and writes nothing, so a host or a workflow can run
+    // it against the operator's own file without a route or a publisher.
+    //
+    //   bun limits-watch.mjs --status [--json] [--stale-after SECONDS] [file]
+    //
+    // The file follows `--check`'s rule — the first argument that is not a flag
+    // — with the one difference `--stale-after` forces: its value is skipped, so
+    // a bound of 60 is not mistaken for a path.
+    const { file, staleAfter } = statusArguments(args);
+    const { report, exitCode } = await statusSnapshot(file, { staleAfter });
+    if (args.includes("--json")) console.log(JSON.stringify(report));
+    else printStatus(report);
+    // The code is set rather than exited on for the same reason the watch run's
+    // is: a report written to a pipe must be out before the process ends, or the
+    // consumer sees an empty line and the wrong exit code's worth of nothing.
+    process.exitCode = exitCode;
   } else {
     try {
       const state = await watch({

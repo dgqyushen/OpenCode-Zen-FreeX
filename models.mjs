@@ -1,3 +1,6 @@
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { LIMITS, limitOverrides } from "./limits.mjs";
 
 export const PROVIDER = "opencode-zen-free";
@@ -632,4 +635,171 @@ export function configModels(models) {
       },
     ]),
   );
+}
+
+// ---- what a discovery read leaves for the next process ---------------------
+//
+// A discovery round that reached the route is worth remembering: the free tier
+// moves, a restart otherwise begins with the bootstrap table, and the first
+// request after it pays for a listing the previous process already read. The
+// cache is an input to discovery, not a second source of truth: a missing,
+// unreadable or malformed file answers no measurement, and discovery asks the
+// route exactly as it did before this file existed.
+//
+// Nothing here may fail a request. A file that cannot be written is a cache that
+// is not remembered; a file that cannot be read is a listing that has to be
+// fetched again. Both are silent by design, and both are bounded: the file is
+// read under one ceiling and written through a temporary beside it, so a crash
+// between the write and the rename leaves the old file whole rather than a
+// half-written listing.
+export const DISCOVERY_CACHE_ENV = "OPENCODE_ZEN_FREE_DISCOVERY_CACHE";
+const DISCOVERY_CACHE_VERSION = 1;
+// A cache is a listing, not a measurement, so the limit is larger than the
+// state file's: what it bounds is how much a request path can be asked to read
+// from a file it did not write.
+const DISCOVERY_CACHE_LIMIT = 8 * 1024 * 1024;
+const DISCOVERY_PROTOCOLS = new Set(["chat", "responses", "anthropic"]);
+// An ISO date or date-time. `Date.parse` accepts shapes that are not ISO, so
+// the pattern is what decides that the value is the kind of string the cache
+// writes; the parse is what rejects a date the calendar cannot hold.
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2}))?$/;
+
+// Where the last discovery is remembered. The explicit path wins; the
+// environment names one next; an empty string is the documented way to keep
+// discovery in memory only. Otherwise the platform's cache directory, which is
+// the same rule limits.mjs states for its own state, under this plugin's
+// directory and a file of its own.
+export function discoveryCachePath(explicit, env = globalThis.process?.env) {
+  if (explicit !== undefined) return explicit === "" ? undefined : explicit;
+  const named = env?.[DISCOVERY_CACHE_ENV];
+  if (typeof named === "string") return named === "" ? undefined : named;
+  const home = homedir();
+  const base = env?.LOCALAPPDATA || env?.XDG_CACHE_HOME || (home ? join(home, ".cache") : "");
+  return base ? join(base, "opencode-zen-freex", "discovery.json") : undefined;
+}
+
+function isIsoDate(value) {
+  return (
+    typeof value === "string" &&
+    ISO_DATE.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+// The date the cache states is stored as ISO text. A caller that already has a
+// `Date` (or the millisecond number discovery keeps today) is accepted and
+// normalized, so the file has one spelling of the time whatever the caller
+// started with.
+function listedAtISO(value) {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : undefined;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+  }
+  return isIsoDate(value) ? value : undefined;
+}
+
+// The model records this file wrote. A row that is not a description is not a
+// model (the same rule buildModels reads a catalogue row by), and `__proto__`
+// can never be an id a listing names because the write side of it is the
+// prototype. Everything else is kept as it was written: the cache is a copy of
+// the provider's own records, not a second reading of them.
+//
+// An object is not yet a model record. `provider.mjs` reads `api.npm` off every
+// row before a request can be sent, and `limit`/`capabilities` off the same row
+// while listing; a hand-edited or truncated row that keeps `{ id }` and loses
+// those would turn a bad cache into a runtime TypeError on the request path.
+// The fields required here are the ones the record cannot be served without;
+// everything else stays as written.
+function cachedModel(id, row) {
+  return (
+    isDescription(row) &&
+    row.id === id &&
+    isDescription(row.api) &&
+    typeof row.api.npm === "string" &&
+    typeof row.api.url === "string" &&
+    isDescription(row.limit)
+  );
+}
+
+function cachedModels(models) {
+  const out = {};
+  for (const [id, row] of Object.entries(models)) {
+    if (typeof id !== "string" || !id || id === "__proto__") continue;
+    if (!cachedModel(id, row)) continue;
+    out[id] = row;
+  }
+  return out;
+}
+
+// The protocol map is filtered, not trusted: a protocol this build cannot ask
+// is not made true by being in a cache. A valid entry is kept even when the
+// model map has no row for it — the provider's protocol map also carries the
+// bootstrap entries for ids the last listing did not offer, and dropping those
+// here would make the cache a narrower map than the one it is a copy of.
+function cachedProtocols(protocols) {
+  const out = {};
+  for (const [id, protocol] of Object.entries(protocols)) {
+    if (id === "__proto__") continue;
+    if (!DISCOVERY_PROTOCOLS.has(protocol)) continue;
+    out[id] = protocol;
+  }
+  return out;
+}
+
+// Read the last discovery. A missing file, a bad JSON document, a foreign
+// version, a date that is not one, and a map that is not a map all answer the
+// same way: no cache. The call never throws; discovery can always ask the
+// route.
+export async function readDiscoveryCache(file) {
+  if (!file) return undefined;
+  try {
+    const text = await readFile(file, { encoding: "utf8" });
+    if (typeof text !== "string" || text.length > DISCOVERY_CACHE_LIMIT) return undefined;
+    const parsed = JSON.parse(text);
+    if (!isDescription(parsed) || parsed.version !== DISCOVERY_CACHE_VERSION) return undefined;
+    if (!isDescription(parsed.models) || !isDescription(parsed.protocols)) return undefined;
+    if (!isIsoDate(parsed.listedAt)) return undefined;
+    const models = cachedModels(parsed.models);
+    return {
+      models,
+      protocols: cachedProtocols(parsed.protocols),
+      listedAt: parsed.listedAt,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+// Remember a discovery. The write is best-effort: a caller that cannot write
+// the cache is told so, and discovery carries on. The temporary is named per
+// write (this process's pid plus a counter), so two writes inside one process
+// cannot truncate each other's file, and it is removed when the rename fails so
+// a failed write leaves no `.tmp` for the next run to mistake for state.
+let discoverySaveSequence = 0;
+
+export async function writeDiscoveryCache(file, cache) {
+  if (!file || !isDescription(cache)) return false;
+  const { models, protocols } = cache;
+  if (!isDescription(models) || !isDescription(protocols)) return false;
+  const listedAt = listedAtISO(cache.listedAt);
+  if (!listedAt) return false;
+  let temporary;
+  try {
+    const body = `${JSON.stringify(
+      { version: DISCOVERY_CACHE_VERSION, models, protocols, listedAt },
+      null,
+      2,
+    )}\n`;
+    await mkdir(dirname(file), { recursive: true });
+    temporary = `${file}.${globalThis.process?.pid ?? 0}.${discoverySaveSequence++}.tmp`;
+    await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, file);
+    return true;
+  } catch {
+    if (temporary !== undefined) await rm(temporary, { force: true }).catch(() => {});
+    return false;
+  }
 }

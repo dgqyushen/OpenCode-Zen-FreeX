@@ -51,6 +51,16 @@
 //     it, so a reader treats both the same way — only `bracketed` settles an
 //     axis.
 //
+//   * A model is not gone because a request failed. When nothing was served and
+//     nothing was refused, one more question is whether the route said the MODEL
+//     itself is gone: a 404 or a 410, or an answer whose own wording names the
+//     model as not found, unavailable, retired or no longer there. Only then is
+//     the result marked `unavailable`, and the mark is an observation rather than
+//     a switch — nothing in this file hides, disables or drops a model. A 429, a
+//     5xx, a timeout, a transport failure, an auth rejection or a malformed
+//     answer is not a liveness verdict at all: it says the run could not ask,
+//     which is a question for the next run, not a finding about the model.
+//
 //   * The budget is fourteen requests per model, first pass included. It is
 //     counted in REQUESTS rather than in questions: an answer that had to be
 //     retried twice spent three of them, and the budget is what the shared free
@@ -159,6 +169,21 @@ export const NARROW_TO = 0.02;
 const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
 export const RETRIES = 2;
 const RETRY_WAIT_MS = 10000;
+// A status that says the MODEL is gone: the route was reached and the model it
+// was asked about is not there. These are the only statuses that are a liveness
+// verdict on their own — a 400 about a bad parameter is not, and no 5xx is.
+const GONE_STATUS = new Set([404, 410]);
+// A status that says the RUN could not ask rather than that the model is gone:
+// a rate limit, a server fault, a timeout, an auth rejection. None of these is a
+// liveness verdict whatever its body happens to say, because the next run may
+// well be answered — and calling a model gone over one is the mistake this
+// classification exists to avoid.
+const NEVER_A_LIVENESS_VERDICT = (status) =>
+  status === undefined || status === 401 || status === 403 || status === 408 || status === 429 || (status >= 500 && status <= 599);
+// The wording an answer uses when it names the MODEL as gone itself. It is the
+// second way a route says a model is unavailable, for the upstreams that answer
+// 400 with a sentence rather than a 404.
+const MODEL_GONE = /model.*(?:not found|unavailable|retired|no longer)/i;
 
 const SENTENCE = "The quick brown fox jumps over the lazy dog while the calm river runs past the old mill. ";
 const promptOf = (chars) => SENTENCE.repeat(Math.ceil(chars / SENTENCE.length)).slice(0, chars);
@@ -466,6 +491,64 @@ export function exitCodeFor(results) {
   return list.some(learnedAbout) ? 0 : 1;
 }
 
+// The sentence an answer used to say the model is gone, or undefined.
+//
+// It is kept as a sentence rather than as the whole body because it is reported
+// on a snapshot row and read by a person: the first sentence that matches is the
+// one that says why, and 160 characters is enough for it.
+function goneSentence(text) {
+  const said = String(text ?? "");
+  const sentence = said.split(/(?<=[.!?])\s+|\r?\n+/).find((one) => MODEL_GONE.test(one));
+  return (sentence ?? said).trim().slice(0, 160);
+}
+
+// Whether the answers of one run prove that the MODEL itself is gone, and in
+// what words the route said so.
+//
+// The rule, and only this rule, makes a result `unavailable`:
+//
+//   * at least one answer was asked for, and every answer is an error. One serve
+//     or one refusal is an answer about the model and settles that it exists,
+//     whatever else failed — `learnedAbout` is the same rule, and this is not a
+//     second opinion about it.
+//   * every error is about the model being gone rather than about the run: a 404
+//     or a 410 says it by status, and any other status says it by wording
+//     (`MODEL_GONE`). The transient, transport and auth statuses never say it: a
+//     429, a 5xx, a timeout or a rejected key is the route or the run failing,
+//     and the next run may be answered. A malformed answer names no model at all,
+//     so it cannot claim one is gone either.
+//
+// Returns `{ unavailable: true }` plus `unavailableSays` when a body matched the
+// wording, and undefined otherwise. Exported so the rule can be pinned without a
+// single request, the way `tally` and `learnedAbout` are.
+export function unavailabilityOf(asked) {
+  const list = Array.isArray(asked) ? asked : [];
+  // A run that asked nothing learned nothing about liveness either: not asking
+  // is not the route saying the model is gone.
+  if (list.length === 0) return undefined;
+  // One serve or one refusal is an answer about the model itself, so the model is
+  // there and whatever else failed cannot make it unavailable.
+  if (list.some((one) => one?.kind !== "error")) return undefined;
+  let says;
+  for (const one of list) {
+    const status = one?.status;
+    const said = typeof one?.says === "string" ? one.says : "";
+    if (GONE_STATUS.has(status)) {
+      // A 404/410 is the route naming the model itself; its wording is kept when
+      // it also names the model, so the result can say why.
+      if (says === undefined && MODEL_GONE.test(said)) says = said;
+      continue;
+    }
+    // The run could not ask, so it cannot call the model gone — whatever the body
+    // happens to contain. This is the case the classification exists to exclude:
+    // a rate limit or a bad hour at the upstream is not a retired model.
+    if (NEVER_A_LIVENESS_VERDICT(status)) return undefined;
+    if (!MODEL_GONE.test(said)) return undefined;
+    if (says === undefined) says = said;
+  }
+  return says === undefined ? { unavailable: true } : { unavailable: true, unavailableSays: goneSentence(says) };
+}
+
 // The bracket for one model. `spent` and `asked` are reported so a reader can see
 // how much of the budget a result cost, and what it was spent on.
 //
@@ -586,6 +669,13 @@ export async function sweep(
   return {
     model,
     spent,
+    // Liveness, only when the run can tell it: every answer was an error and every
+    // one of them said the MODEL itself is gone. The keys are omitted otherwise,
+    // so a result with a serve, a refusal, a transient failure or no ask at all
+    // keeps exactly the shape it had — a reader that does not know this field
+    // cannot be told a model is gone by a rate limit. It is an observation, not a
+    // switch: nothing here hides, disables or drops a model.
+    ...(unavailabilityOf(asked) ?? {}),
     servedTokens: now.servedTokens ?? null,
     servedChars: now.servedChars ?? null,
     refusedChars: now.refusedSizes[0] ?? null,

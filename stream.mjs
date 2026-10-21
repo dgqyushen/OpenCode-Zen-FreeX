@@ -132,10 +132,42 @@ function sorted(map) {
   return [...map].sort(([a], [b]) => a - b).map(([, value]) => value);
 }
 
+// How one streamed `function.name` fragment joins what came before it. Chat
+// vendors disagree about what a name fragment is: some send the next piece of
+// the name, some re-send the name whole on the frame that carries the
+// arguments, and some send a name that has grown since the last frame. Appended
+// blindly, `Read` followed by `Read` became `ReadRead`, which no declaration
+// folds to and which the guard consequently treated as an unknown tool.
+//
+// The rules, in order:
+//
+//   * the same bytes again        — the name has already been stated; keep it.
+//   * the fragment starts with it — the name has grown (a growing prefix); the
+//                                   fragment is the name as far as it is known.
+//   * it starts with the fragment — a shorter prefix re-sent; keep the longer
+//                                   name that has already been read.
+//   * anything else                — a true fragment; append it.
+//
+// Exported because `tool-response.mjs`'s guard buffers the same Chat fragments
+// and has to answer the same name — one rule, not a second copy that could
+// drift from this one. `arguments` do not follow this rule: they keep the
+// blind append both paths have always given them (see `appendFunction` in each
+// file), because a JSON payload is bytes in order, not a name being re-stated.
+export function mergeFunctionName(current, fragment) {
+  const name = current ?? "";
+  if (fragment === name) return name;
+  if (fragment.startsWith(name)) return fragment;
+  if (name.startsWith(fragment)) return name;
+  return name + fragment;
+}
+
 function appendFunction(target, delta) {
-  for (const key of ["name", "arguments"]) {
-    if (typeof delta[key] === "string") target[key] = (target[key] ?? "") + delta[key];
-  }
+  // The name is merged by the shared rule; the arguments stay a blind append:
+  // an argument fragment is the next bytes of one JSON document, and a repeat
+  // of the whole document is not a shape this route has measured.
+  if (typeof delta.name === "string") target.name = mergeFunctionName(target.name, delta.name);
+  if (typeof delta.arguments === "string")
+    target.arguments = (target.arguments ?? "") + delta.arguments;
 }
 
 // The rule every streamed text field follows: a .delta appends to what came
