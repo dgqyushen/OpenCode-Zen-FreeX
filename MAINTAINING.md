@@ -42,8 +42,21 @@ reads like the model's own decision; the `input` axis is the size a
 window-showing host displays. A window that is too small is never refused, it is
 just quietly never used, which is why this stayed invisible for so long.
 
+**The output cap is not measured any more.** A sweep brackets prompts, because a
+prompt is what a host plans from and what a refusal can prove; it asks for
+sixteen completion tokens and stops. The completion ceiling now follows
+models.dev: for every model with a `canonical_model_id`, the largest
+`limit.output` among the entries for that canonical model is used as-is, in both
+directions (it may raise a stale catalogue figure and lower one). The table's
+output entries are historical fallback only, for an id models.dev does not
+describe; the runtime tiers below that mention output apply only in that
+fallback.
+
 `limits.mjs` holds what was measured, per axis, with the catalogue value it was
-measured against. Each axis carries `samples` and `how`; the short of it:
+measured against. Each axis carries `samples` and `how`; the short of it. The
+`output` rows below are historical fallback only: when models.dev describes the
+canonical model, its largest `limit.output` is what the plugin uses, and the
+table's number is not consulted.
 
 | id | axis | value | from |
 | --- | --- | --- | --- |
@@ -52,7 +65,7 @@ measured against. Each axis carries `samples` and `how`; the short of it:
 | `mimo-v2.6-flash-free` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 tokens served, 1,750,000 characters; the nearest reproduced refusal is 1,787,500 characters, and an earlier probe was refused at 2,800,000), not the 1048576 the route used to state |
 | `mimo-v2.6-flash-free` | output | 131072 | the vendor's own catalogue entry |
 | `big-pickle` | context | 375000 | the route's own enforcement, found by bracketing on 2026-10-20 (375,142 served, 1,750,000 characters; the nearest reproduced refusal is 1,787,500 characters, and an earlier probe was refused at 2,800,000), an axis an earlier sweep had left to the catalogue |
-| `big-pickle` | output | 131072 | the ceiling the route names when it is asked for too much, named again on a 2026-10-19 re-ask |
+| `big-pickle` | output | 131072 | historical fallback: models.dev has no canonical entry for this Zen-only id; the route names this ceiling when asked for too much |
 | `big-pickle` | input | 375000 | the window, not the sample: the catalogue's 160000 was falsified by a served prompt of 343,131 tokens, and this route names no input cap of its own, so the axis is declared at the window |
 | `nemotron-3.5-lightning-free` | context | 1000000 | the route's own refusal, in its own words |
 | `longcat-2.5-preview-free` | output | 262144 | the ceiling the route names when it is asked for too much |
@@ -73,16 +86,12 @@ This model's maximum context length is 1048576 tokens. However, you requested
 ```
 
 which is the route stating its own window, and better evidence than any vendor
-page. The output figure is the paid twin's declaration, so the route has already
-published what that model does; a single reply of 306,880 completion tokens
-(`finish_reason: stop`) was watched and is recorded as the witness. The route
-states that ceiling on some endpoints and not others: on 2026-10-19 an ask above
-it was refused with `Invalid max_tokens value, the valid range of max_tokens is
-[1, 393216]`, and a later ask that day for `max_tokens` 1000000 was answered 200
-instead. So 384000 stands — nothing on this route has contradicted it — and
-nothing confirms it either. Where the range sentence does appear, the live
-statement is applied as it stands for the rest of the process, so it outranks the
-twin-derived figure this table carries.
+page. The output figure is not read from this route any more: models.dev's
+largest `limit.output` for the canonical model is the declaration, and the
+hand-watched 384000 is historical fallback only. A single reply of 306,880
+completion tokens (`finish_reason: stop`) was the old witness; the route states a
+ceiling on some endpoints and not others, which is exactly why the completion
+axis no longer asks it.
 
 The DeepSeek id was the first entry measured this way and is no longer one: its
 1,048,576-token window was withdrawn on 2026-10-19, when the route began
@@ -174,14 +183,14 @@ unread; the two older wordings end on their number, and those depend on the
 reader noticing where the read stopped (`digitsEnd`) before it trusts what it
 read.
 
-The output: a paid twin's `limit` in `https://models.opencode.ai/api.json` is
-the stronger source, and re-reading it is the whole job. With no twin — `mimo`
-has none — the figure rests on the vendor's own entry, which is weaker evidence
-and has to say so in `samples`: what is declared is what a vendor publishes, not
-something watched. A value Zen accepts is not evidence — `max_tokens: 2000000`
-under a short prompt answers 200 and writes nothing like it, and `mimo`'s refusal
-came back with the 200000 it was asked for rather than with a ceiling — and
-neither is a generation nobody watched finish.
+The output is no longer read from any of these sources. It is the largest
+`limit.output` models.dev publishes for the canonical model, applied as-is in
+both directions; the table's output entries and the old twin/vendor/witnessed
+tiers are historical fallback only for an id models.dev does not describe. A
+value Zen accepts is still not evidence — `max_tokens: 2000000` under a short
+prompt answers 200 and writes nothing like it — and neither is a generation
+nobody watched finish, which is why the completion axis stopped being measured
+rather than gaining another tier.
 
 The evidence tiers are `route`, `route-twin`, `route-sweep`, `models.dev` (the
 same records republished across providers, which says what scale a round million
@@ -359,12 +368,14 @@ sweep's where it does not, while the bracket the route teaches keeps the last
 word either way. The bracket is route evidence by construction and is not bound
 by the raise-only rule the weaker tiers obey, which is the point of it: it may
 lower a declaration as well as raise it, and what it lowers to is the largest
-size the route is known to have served. The output axis keeps its own tiers and
-gains a third wording: besides the completion ceiling an upstream names when it
-refuses the ask — `supports at most N completion tokens` — and LongCat's `is not
-less or equal to` form, it now reads the range this route answers an oversized
-`max_tokens` with, `the valid range of max_tokens is [1, 393216]`, and takes the
-upper end of it, which is the ceiling the route says it accepts up to. The
+size the route is known to have served. The output axis is no longer measured:
+when models.dev describes the canonical model, its largest `limit.output` is
+taken as-is and the table/live tiers below are not consulted. The old live
+output tiers still exist only as the fallback for an id models.dev does not
+describe — the completion ceiling an upstream names when it refuses the ask
+(`supports at most N completion tokens`), LongCat's `is not less or equal to`
+form, and the range this route answers an oversized `max_tokens` with, whose
+upper end is the ceiling it says it accepts up to. The
 `input` axis still has no refusal form - no refusal this route sends names an
 input cap - but it is not static any more: it follows the window, and the window
 may be answered by the table's entry while that entry still applies, by the
@@ -524,9 +535,10 @@ sweep's other two labels, `openEnded` and `single-refusal`, are that same floor
 when the row has a served sample; a row with none, which is what a sweep that was
 refused everything leaves behind, is no measurement at all. The sweep asks
 for sixteen completion tokens and measures a prompt, so it answers the context
-axis only: the output axis is still the table and the catalogue, and `input` is
-still measured by nothing here, though the window that axis follows may be the
-one the sweep settled rather than the table's (above).
+axis only: the output axis is not measured at all and follows models.dev's
+largest entry (or the catalogue/table fallback for an id models.dev does not
+describe), and `input` is still measured by nothing here, though the window that
+axis follows may be the one the sweep settled rather than the table's (above).
 
 A row may also carry `unavailable`, the day the sweep last heard the route call
 the model itself gone. Only an explicit answer counts: a 404 or 410, or wording
@@ -673,13 +685,11 @@ a prompt of about 408,000 tokens was refused — less than half of it — so the
 is the route's own enforcement found by bracketing (375,142 tokens served on
 2026-10-20, the nearest reproduced refusal at 1,787,500 characters, after an
 earlier probe was refused at 2,800,000) rather than the number the route
-stated, the same way the DeepSeek id's stated million went. Its output is the
-first figure in this
-file resting on a vendor page: that same refusal came back with the 200000 it was
-asked for, unclamped, so this route states no completion ceiling of its own, and
-131072 is Xiaomi's entry for `mimo-v2.6-flash` (`api.xiaomimimo.com`, and its
-China token plan). Nothing above 32000 has been watched on this route, and
-`samples` says that rather than implying a witness.
+stated, the same way the DeepSeek id's stated million went. Its output is now
+models.dev's largest `limit.output` for `xiaomi/mimo-v2.6-flash`; the old
+vendor-derived 131072 is fallback only. That same refusal came back with the
+200000 it was asked for, unclamped, so this route states no completion ceiling of
+its own — the reason the completion axis is no longer measured here.
 
 **Looking for the next one, instead of waiting to notice it.** `bun run
 limits:audit` asks the route which free models it still offers — the listing's
