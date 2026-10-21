@@ -404,12 +404,83 @@ everything that may be measured - the ids models.dev answers are not among them.
 That file is an input at run time
 now rather than only a workflow artifact: `measuredWalls()` reads it once per path
 and keeps the answer, taking the path from its argument, else
-`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the file beside the module, with an empty
-value of that variable meaning no snapshot at all. A missing file, an unreadable
+`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT`, else the installed remote answer when there
+is one, else the file beside the module, with an empty
+value of that variable meaning no snapshot at all (and no remote either - a
+named source is a decision). A missing file, an unreadable
 one, one that is not JSON, one whose `models` is not an object, one whose
 `version` this build does not know and one past 256 KiB answer the same way - no
 measurement - because a build that cannot read a measurement declares what its
 table and its catalogue say, and nothing here may fail a request.
+
+**The snapshot from `main`.** A checkout reads the bundled file, and a tarball
+waits for the next release for a measurement; since 0.4.0 the same document is
+also fetched from
+`https://raw.githubusercontent.com/tkhs101/OpenCode-Zen-FreeX/main/limits-observed.json`,
+which is where the scheduled workflow's merged pull request already puts it. It
+is the same committed file, not a new artifact: the workflow needs no change,
+and a measurement reaches hosts without an npm release. 0.3.x does not read the
+remote at all; one upgrade to 0.4.0 is what turns it on.
+
+Where a snapshot comes from is a precedence, not a merge: an explicit file
+argument (a host's or a test's) wins first; then
+`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` (a path, with `""` meaning no snapshot);
+then the installed remote answer - the startup cache, then a background fetch;
+then the bundled file beside `limits.mjs`. Naming that variable at all, even
+empty, disables the remote rather than racing it, because an operator who names
+a source has chosen one; `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL=""` turns off
+the remote layer alone. `limits-watch.mjs --check` and `--status` keep their own
+positional file and never read the remote.
+
+The cache is read synchronously at startup, before the first model-list answer
+is built, and installed before any refresh is started; its mtime is the
+answer's age, so a restart with a fresh cache spends no request. The default
+path is `%LOCALAPPDATA%`, else `$XDG_CACHE_HOME`, else `~/.cache`, then
+`/opencode-zen-freex/limits-observed.remote.json`;
+`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_CACHE` names another, and `""` disables the
+cache - a supported deployment, since the snapshot is an optimisation. The
+write is atomic (a temporary beside the file, then a rename) and 0600, and a
+cache that cannot be written is a next start that fetches, not a refresh that
+fails.
+
+The refresh is background: `models()` starts it and never awaits it, so no
+request waits on GitHub. One flight per process, and an attempt - successful or
+not - sets the attempt time, so a dead URL is not a request per model-list open.
+The TTL is an hour (`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_REFRESH_MS`, default
+3600000 ms), measured from the cache's mtime when one was installed and from
+the last attempt otherwise; each fetch has a five-second deadline
+(`OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_TIMEOUT_MS`, default 5000, bounded to
+100..60000). A failed fetch leaves whatever was installed - the cache, or the
+bundled file when there is none - and the next attempt is the next TTL. A host
+that wants to see what answered asks the model map for
+`Symbol.for("magpie.limitsSnapshot")`: `{source, fetchedAt, url, ageMs}` as of
+the moment it asks. `url` is present only when the answer came from a fetch; a
+cache file does not record which URL wrote it, so a cache-loaded answer reports
+no URL rather than claiming the currently configured one.
+
+The network cost is at most one small request per process per hour to
+`raw.githubusercontent.com`. That host is not reachable everywhere - mainland
+China is the case this was built with - and its absence changes nothing a
+request does: the cache and then the bundled table answer, and nothing waits on
+the fetch. `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL` takes a mirror URL (any
+`http:` or `https:`), which is the supported way to read the same document from
+somewhere else; an empty value disables the remote.
+
+A downloaded document is data, never code: JSON parsed, not evaluated. It is
+rejected whole when it is not text, larger than 256 KiB, not version 1, not an
+object of rows, or holds more than 1,000 rows - and also when no row survives,
+so an empty or wholly invalid download cannot wipe the table a build shipped
+with. Individual rows are skipped instead: an unusable id, a row that disagrees
+with itself about its refused size, a wall this build does not know, and
+numbers outside the sweep's own bounds (a named window or served token count above
+4,000,000, a character count above 32,000,000, a token count above twice its
+character count plus 4096) are not measurements. A body without a
+`content-length` is read in chunks and cancelled as soon as the running total
+passes 256 KiB, so the bound is bytes read rather than bytes remembered.
+Only a whole valid document is installed, and the installed Map is replaced as
+a whole. `unavailable` is history here as everywhere: the remote reader ignores
+it, and no snapshot - bundled or downloaded - can hide, disable or reroute a
+model.
 
 `limits:sweep` says what a run learned in its exit code: a run that asked about
 models and learned nothing about any of them exits 1, and a run that asked
@@ -488,7 +559,8 @@ wrong by a factor of four. `bun limits-watch.mjs --check` reads the
 wrong with it; it asks nothing and writes nothing, so it can be a gate on the
 file a run is about to publish. It does not follow
 `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` - the default path is that repository file
-- so name another path on the command line to check one.
+- so name another path on the command line to check one; neither it nor
+`--status` reads the remote snapshot.
 
 `bun limits-watch.mjs --status [--json] [--stale-after N]` asks a different
 question about the same file: whether it is fresh and healthy rather than
@@ -1009,9 +1081,10 @@ defaults are wrong: `ZEN_BASE_URL`, `ZEN_CHECK_MODEL` (gate), `ZEN_CATALOG_URL`,
 `ZEN_GENERATION` (audit) and `CAPTURE_PORT` (capture). `.env.example` lists them
 with their defaults; it is in a repository checkout only, because it is not in
 `package.json`'s `files`. Nothing loads a file by itself, so export them or, in a
-checkout, copy that file to `.env` and export from it. Two file knobs belong to
-the runtime rather than to a script: `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` (above)
-and `OPENCODE_ZEN_FREE_DISCOVERY_CACHE`, unset leaving the discovery cache
+checkout, copy that file to `.env` and export from it. Several knobs belong to
+the runtime rather than to a script: `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` and the
+remote layer's four (URL, cache path, refresh interval, timeout - above), plus
+`OPENCODE_ZEN_FREE_DISCOVERY_CACHE`, unset leaving the discovery cache
 beside the limits state under the platform cache directory and an empty value
 keeping discovery in memory only.
 
