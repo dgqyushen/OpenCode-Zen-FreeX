@@ -2756,7 +2756,7 @@ test("models.dev is read as the largest claim, never as a vote", async () => {
   );
 });
 
-test("models.dev output is the largest completion ceiling for the canonical model", async () => {
+test("models.dev output uses the first-party entry, then the most common claim", async () => {
   const { modelsDevClaims, modelsDevOutput, modelsDevOutputSource, limitOverrides } = await import("./limits.mjs");
   try {
     modelsDevClaims({
@@ -2767,7 +2767,7 @@ test("models.dev output is the largest completion ceiling for the canonical mode
         c: { models: { three: { canonical_model_id: "v/m", limit: { output: 100_000 } } } },
       },
     });
-    assert.equal(modelsDevOutput("v/m"), 262_144, "the largest output wins, not a vote");
+    assert.equal(modelsDevOutput("v/m"), 262_144, "a three-way tie takes the larger value");
     assert.equal(modelsDevOutputSource("v/m"), "b/two");
     const blank = { table: {}, observed: new Map(), observedOutput: new Map(), brackets: new Map(), walls: new Map() };
     const args = (declared, table = blank.table, observedOutput = blank.observedOutput) => [
@@ -2780,17 +2780,114 @@ test("models.dev output is the largest completion ceiling for the canonical mode
       blank.walls,
       "v/m",
     ];
-    // The models.dev maximum is authoritative in both directions.
+    // The chosen models.dev claim is authoritative in both directions.
     assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 })), { output: 262_144 });
     assert.deepEqual(
       limitOverrides(...args({ context: 200_000, output: 500_000 })),
       { output: 262_144 },
-      "following the largest entry also lowers a stale catalogue ceiling",
+      "following models.dev also lowers a stale catalogue ceiling",
     );
     // Table and live output are fallback only: neither outranks a claim.
     const table = { id: { output: { value: 999_999, source: "route", declaredAt: 32_000 } } };
     const live = new Map([["id", 888_888]]);
     assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 262_144 }, table, live)), {});
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
+test("a minority that copies context into output cannot raise the ceiling", async () => {
+  const { modelsDevClaims, modelsDevOutput, modelsDevOutputSource } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({
+      providers: {
+        a: { models: { one: { canonical_model_id: "deepseek/v4", limit: { context: 1_048_576, output: 384_000 } } } },
+        b: { models: { two: { canonical_model_id: "deepseek/v4", limit: { context: 1_000_000, output: 384_000 } } } },
+        c: { models: { three: { canonical_model_id: "deepseek/v4", limit: { context: 1_048_576, output: 384_000 } } } },
+        // These are the shape the user caught: output copied from context.
+        d: { models: { four: { canonical_model_id: "deepseek/v4", limit: { context: 1_048_576, output: 1_048_576 } } } },
+        e: { models: { five: { canonical_model_id: "deepseek/v4", limit: { context: 1_048_576, output: 1_048_576 } } } },
+      },
+    });
+    assert.equal(modelsDevOutput("deepseek/v4"), 384_000, "three 384000 claims beat two context-sized outliers");
+    assert.equal(modelsDevOutputSource("deepseek/v4"), "a/one");
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
+test("the canonical model's own provider outranks resellers, even when resellers are louder", async () => {
+  const { modelsDevClaims, modelsDevOutput, modelsDevOutputSource } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({
+      providers: {
+        nvidia: { models: { official: { canonical_model_id: "nvidia/x", limit: { context: 1_048_576, output: 8_192 } } } },
+        a: { models: { one: { canonical_model_id: "nvidia/x", limit: { context: 1_048_576, output: 1_048_576 } } } },
+        b: { models: { two: { canonical_model_id: "nvidia/x", limit: { context: 1_048_576, output: 1_048_576 } } } },
+        c: { models: { three: { canonical_model_id: "nvidia/x", limit: { context: 1_048_576, output: 1_048_576 } } } },
+      },
+    });
+    assert.equal(modelsDevOutput("nvidia/x"), 8_192, "the first-party entry wins over three copied-context entries");
+    assert.equal(modelsDevOutputSource("nvidia/x"), "nvidia/official");
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
+test("a '-free' route id is looked up as its paid twin in models.dev", async () => {
+  const { modelsDevClaims, modelsDevOutputFor, modelsDevOutputSourceFor, modelsDevOutput } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({
+      providers: {
+        opencode: {
+          models: {
+            "deepseek-v4.1-flash-free": { canonical_model_id: "deepseek/v4", limit: { output: 32_000 } },
+            "deepseek-v4.1-flash": { canonical_model_id: "deepseek/v4", limit: { output: 384_000 } },
+            // A paid twin is not required to have a canonical id; big-pickle is
+            // the route's own id and models.dev describes it directly.
+            "big-pickle": { limit: { output: 32_000 } },
+          },
+        },
+        // The canonical aggregate would otherwise see these context-sized ones.
+        a: { models: { one: { canonical_model_id: "deepseek/v4", limit: { output: 1_048_576 } } } },
+        b: { models: { two: { canonical_model_id: "deepseek/v4", limit: { output: 1_048_576 } } } },
+      },
+    });
+    assert.equal(
+      modelsDevOutputFor("deepseek-v4.1-flash-free", "deepseek/v4"),
+      384_000,
+      "the suffix is removed and the paid twin's 384000 wins over the free entry and the copied-context entries",
+    );
+    assert.equal(modelsDevOutputFor("deepseek-v4.1-flash", "deepseek/v4"), 384_000);
+    assert.equal(modelsDevOutputSourceFor("deepseek-v4.1-flash-free", "deepseek/v4"), "opencode/deepseek-v4.1-flash");
+    assert.equal(modelsDevOutputFor("big-pickle", undefined), 32_000, "big-pickle has no suffix and is read directly");
+    // The canonical accessor stays canonical-only; it is the fallback, not a
+    // second spelling of the paid-twin lookup.
+    assert.equal(modelsDevOutput("deepseek/v4"), 1_048_576);
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
+test("a paid twin that models.dev does not list falls back to the canonical claim", async () => {
+  const { modelsDevClaims, modelsDevOutputFor } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({
+      providers: {
+        opencode: {
+          models: {
+            "mimo-v2.6-flash-free": { canonical_model_id: "xiaomi/mimo", limit: { output: 32_000 } },
+          },
+        },
+        a: { models: { one: { canonical_model_id: "xiaomi/mimo", limit: { output: 131_072 } } } },
+        b: { models: { two: { canonical_model_id: "xiaomi/mimo", limit: { output: 131_072 } } } },
+      },
+    });
+    assert.equal(
+      modelsDevOutputFor("mimo-v2.6-flash-free", "xiaomi/mimo"),
+      131_072,
+      "there is no paid twin, so the canonical consensus answers",
+    );
   } finally {
     modelsDevClaims({});
   }

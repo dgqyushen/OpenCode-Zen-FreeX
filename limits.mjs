@@ -42,10 +42,11 @@ import { fileURLToPath } from "node:url";
 // for the ids and axes it does not: a window nobody measured is a window every
 // host gets wrong, and waiting for somebody to write a table entry by hand is
 // how a new model stays wrong for a week. The output axis is not measured at
-// all: models.dev's largest `limit.output` for the canonical model is the
-// declaration, and the table's output entries are a historical fallback only
-// for an id models.dev does not describe. A sweep asks no completion for
-// anything; it brackets prompts.
+// all: models.dev is read with the route id's `-free` suffix removed, its paid
+// twin's `limit.output` is the declaration (canonical fallback when there is no
+// paid twin), and the table's output entries are a historical fallback only for
+// an id models.dev does not describe. A sweep asks no completion for anything;
+// it brackets prompts.
 //
 // Being accepted is not evidence. Zen answers 200 to max_tokens 2000000 under a
 // short prompt, so a value that is accepted says something about the request
@@ -2180,17 +2181,29 @@ export const MODELS_DEV_MIN = 1_000_000;
 // the network: a plugin that blocked a model list on a third party would be
 // slower for everybody and wrong for anybody behind a firewall.
 const MODELS_DEV = new Map();
-// The completion ceilings, by the same canonical id and the same maximum rule.
-// The output axis is not measured any more: a sweep brackets the prompt wall
-// because that is what a host plans from and what a refusal can prove, while a
-// completion ceiling is the provider's own figure and the largest entry for the
-// weights is the one that tries to use all of it. This map is therefore the
-// output authority; the table's output entries remain only for an id models.dev
-// does not describe.
+// The completion ceilings, by the same canonical id. The output axis is not
+// measured any more, but the largest entry is not its rule either: several
+// providers write their CONTEXT into `limit.output` (W&B and DigitalOcean both
+// said 1048576 for DeepSeek V4.1 Flash, whose completion ceiling is 384000), and
+// a plain maximum turns those outliers into a ceiling four times the model's.
+// The output map therefore prefers the canonical model's first-party provider
+// (the provider key matching the canonical prefix) and otherwise takes the most
+// commonly published output, with the larger value winning a tie. This is the
+// provider's own figure, not a hand sample; the table's output entries remain
+// only for an id models.dev does not describe.
 const MODELS_DEV_OUTPUT = new Map();
 // What a canonical id is claimed at, and by whom, for diagnostics.
 const MODELS_DEV_BY = new Map();
 const MODELS_DEV_OUTPUT_BY = new Map();
+// The paid twin's completion ceiling, by models.dev's own model id (no `-free`
+// suffix), from the repository's `opencode` provider. A route id is looked up
+// here after its `-free` suffix is removed: the free entry in models.dev often
+// declares the free tier's under-reported 32000 output, while the paid twin is
+// the same weights' real ceiling (DeepSeek V4.1 Flash: 384000, not 1048576 and
+// not the free entry's 32000). Other providers' ids are not mixed in here; their
+// declarations are used only through the canonical fallback.
+const MODELS_DEV_PAID_OUTPUT = new Map();
+const MODELS_DEV_PAID_OUTPUT_BY = new Map();
 // Who claimed each canonical id. The winning claim alone cannot say how many
 // providers described a model: only the largest is kept, so the count was a
 // count of models with a claim at all — every one of them — and the evidence
@@ -2214,17 +2227,38 @@ export function modelsDevClaims(document) {
   MODELS_DEV_OUTPUT.clear();
   MODELS_DEV_BY.clear();
   MODELS_DEV_OUTPUT_BY.clear();
+  MODELS_DEV_PAID_OUTPUT.clear();
+  MODELS_DEV_PAID_OUTPUT_BY.clear();
   MODELS_DEV_PROVIDERS.clear();
+  // Per canonical id: how often each output value is published, where it was
+  // published, and the first-party provider's own value when that provider
+  // describes the weights. Kept local to the read so a document does not leave
+  // aggregation state behind, unlike the two maps a caller asks about.
+  const outputCounts = new Map();
+  const outputSources = new Map();
+  const officialOutputs = new Map();
   for (const [provider, entry] of Object.entries(document?.providers ?? document ?? {})) {
     const models = entry?.models;
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
     for (const [modelId, model] of Object.entries(models)) {
       const canonical = typeof model?.canonical_model_id === "string" ? model.canonical_model_id : undefined;
-      // A row with no canonical id is about one provider's own alias and cannot
-      // be matched to the catalogue's id for the same weights, so it is not read.
-      if (!canonical) continue;
-      const context = model?.limit?.context;
       const output = model?.limit?.output;
+      // A row with no canonical id cannot join the canonical claims, but its id
+      // is still the route's own model name and models.dev's `opencode` provider
+      // is where the paid twin lives: `big-pickle` has no canonical at all and
+      // is still described there. Remember that direct output before giving up
+      // on the canonical maps.
+      if (!canonical) {
+        if (provider === "opencode" && usable(output) && !modelId.endsWith("-free")) {
+          const held = MODELS_DEV_PAID_OUTPUT.get(modelId);
+          if (held === undefined || output > held) {
+            MODELS_DEV_PAID_OUTPUT.set(modelId, output);
+            MODELS_DEV_PAID_OUTPUT_BY.set(modelId, `${provider}/${modelId}`);
+          }
+        }
+        continue;
+      }
+      const context = model?.limit?.context;
       const hasContext = usable(context);
       const hasOutput = usable(output);
       if (!hasContext && !hasOutput) continue;
@@ -2242,12 +2276,59 @@ export function modelsDevClaims(document) {
         }
       }
       if (hasOutput) {
-        const held = MODELS_DEV_OUTPUT.get(canonical);
-        if (held === undefined || output > held) {
-          MODELS_DEV_OUTPUT.set(canonical, output);
-          MODELS_DEV_OUTPUT_BY.set(canonical, `${provider}/${modelId}`);
+        let counts = outputCounts.get(canonical);
+        if (!counts) {
+          counts = new Map();
+          outputCounts.set(canonical, counts);
+        }
+        counts.set(output, (counts.get(output) ?? 0) + 1);
+        let sources = outputSources.get(canonical);
+        if (!sources) {
+          sources = new Map();
+          outputSources.set(canonical, sources);
+        }
+        if (!sources.has(output)) sources.set(output, `${provider}/${modelId}`);
+        // The opencode provider holds the route's own paid twin. Keep it by its
+        // own id so a route id can be looked up with `-free` stripped; the free
+        // entry itself is not a paid twin and is ignored here.
+        if (provider === "opencode" && !modelId.endsWith("-free")) {
+          const held = MODELS_DEV_PAID_OUTPUT.get(modelId);
+          if (held === undefined || output > held) {
+            MODELS_DEV_PAID_OUTPUT.set(modelId, output);
+            MODELS_DEV_PAID_OUTPUT_BY.set(modelId, `${provider}/${modelId}`);
+          }
+        }
+        // The canonical id's own provider is the first-party entry: `deepseek/…`
+        // in the `deepseek` provider, `nvidia/…` in `nvidia`, and so on. It is
+        // the vendor's declaration, not a reseller's copy of the context.
+        const prefix = canonical.includes("/") ? canonical.slice(0, canonical.indexOf("/")) : undefined;
+        if (prefix === provider) {
+          const held = officialOutputs.get(canonical);
+          if (held === undefined || output > held.value)
+            officialOutputs.set(canonical, { value: output, source: `${provider}/${modelId}` });
         }
       }
+    }
+  }
+  // Choose the output once per canonical id: the first-party entry when one
+  // exists, otherwise the most common published value (the larger value wins a
+  // tie, which keeps an even split from choosing the smaller ceiling).
+  for (const [canonical, counts] of outputCounts) {
+    let chosen = officialOutputs.get(canonical);
+    if (!chosen) {
+      let bestCount = -1;
+      let bestValue;
+      for (const [value, count] of counts) {
+        if (count > bestCount || (count === bestCount && value > bestValue)) {
+          bestCount = count;
+          bestValue = value;
+        }
+      }
+      chosen = { value: bestValue, source: outputSources.get(canonical)?.get(bestValue) };
+    }
+    if (usable(chosen?.value)) {
+      MODELS_DEV_OUTPUT.set(canonical, chosen.value);
+      if (typeof chosen.source === "string") MODELS_DEV_OUTPUT_BY.set(canonical, chosen.source);
     }
   }
   let contested = 0;
@@ -2270,6 +2351,28 @@ export function modelsDevOutput(canonical) {
 
 export function modelsDevOutputSource(canonical) {
   return typeof canonical === "string" ? MODELS_DEV_OUTPUT_BY.get(canonical) : undefined;
+}
+
+// The output a route model id should use. `-free` is stripped first, because
+// models.dev's free entry is the under-reported tier and its paid twin is the
+// same weights' real ceiling; that paid entry is read from the `opencode`
+// provider. With no paid twin, the canonical aggregate above answers. This is
+// the lookup the plugin's own route ids need; `modelsDevOutput(canonical)`
+// remains the canonical-only accessor.
+export function modelsDevOutputFor(id, canonical) {
+  const stripped =
+    typeof id === "string" && id.endsWith("-free") ? id.slice(0, -"-free".length) : id;
+  const paid = typeof stripped === "string" ? MODELS_DEV_PAID_OUTPUT.get(stripped) : undefined;
+  if (usable(paid)) return paid;
+  return modelsDevOutput(canonical);
+}
+
+export function modelsDevOutputSourceFor(id, canonical) {
+  const stripped =
+    typeof id === "string" && id.endsWith("-free") ? id.slice(0, -"-free".length) : id;
+  const paid = typeof stripped === "string" ? MODELS_DEV_PAID_OUTPUT.get(stripped) : undefined;
+  if (usable(paid)) return MODELS_DEV_PAID_OUTPUT_BY.get(stripped);
+  return modelsDevOutputSource(canonical);
 }
 
 // What this plugin declares for a model instead of what the catalogue says, as
@@ -2323,16 +2426,15 @@ export function limitOverrides(
     // catalogue never made, feeding the staleness compare and the raise-only
     // check with a number nobody declared.
     const declaredValue = declared && Object.hasOwn(declared, axis) ? declared[axis] : undefined;
-    // The completion ceiling is not a measured axis any more. models.dev's
-    // largest output for the same weights is the authority for every model it
-    // describes: it is the provider's own figure, not a hand sample, and a
-    // catalogue or table value that disagrees with it is the older opinion.
-    // This is deliberately not raise-only — following the largest entry means
-    // an entry below a stale catalogue figure lowers it too — and it bypasses
-    // the route/table tiers; those remain the fallback only for an id
-    // models.dev does not describe.
+    // The completion ceiling is not a measured axis any more. models.dev is
+    // read with this route id's `-free` suffix removed: its paid twin's output
+    // (when the `opencode` provider has one) is the same weights' real ceiling,
+    // and otherwise the canonical aggregate answers. The value is not
+    // raise-only — an entry below a stale catalogue figure lowers it too — and
+    // it bypasses the route/table tiers; those remain the fallback only for an
+    // id models.dev does not describe.
     if (axis === "output") {
-      const claimed = modelsDevOutput(canonical);
+      const claimed = modelsDevOutputFor(id, canonical);
       if (usable(claimed)) {
         if (claimed !== declaredValue) overrides.output = claimed;
         continue;
