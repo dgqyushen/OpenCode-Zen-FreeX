@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { LIMITS, limitOverrides } from "./limits.mjs";
@@ -346,7 +346,11 @@ export function limitFor(id, declared, canonical, table = LIMITS) {
   // models.dev publishes a row under: a free id is one provider's alias and the
   // second opinion is matched by weights, not by the name this route gave it.
   for (const [axis, value] of Object.entries(limitOverrides(id, axes, table, undefined, undefined, undefined, undefined, canonical)))
-    if (KNOWN_AXES.has(axis)) limit[axis] = value;
+    // The same rule the catalogue loop above states, asked of the second source
+    // as well: a table is data this file did not observe for itself, and a
+    // shipped or caller-supplied entry that says `null`, `0` or a negative for
+    // an axis states no window. Only a usable number becomes one.
+    if (KNOWN_AXES.has(axis) && usable(value)) limit[axis] = value;
   return limit;
 }
 
@@ -653,7 +657,12 @@ export function configModels(models) {
 // between the write and the rename leaves the old file whole rather than a
 // half-written listing.
 export const DISCOVERY_CACHE_ENV = "OPENCODE_ZEN_FREE_DISCOVERY_CACHE";
-const DISCOVERY_CACHE_VERSION = 1;
+// The version is bumped with any change to the rows this build accepts, not
+// only to the document's shape. A v1 cache can hold a row written before
+// `cachedModel` required `capabilities`, and a reader that filters such a row
+// out keeps a listing that silently lost a model — the version check is what
+// turns that into "fetch it again" instead.
+const DISCOVERY_CACHE_VERSION = 2;
 // A cache is a listing, not a measurement, so the limit is larger than the
 // state file's: what it bounds is how much a request path can be asked to read
 // from a file it did not write.
@@ -720,7 +729,15 @@ function cachedModel(id, row) {
     isDescription(row.api) &&
     typeof row.api.npm === "string" &&
     typeof row.api.url === "string" &&
-    isDescription(row.limit)
+    isDescription(row.limit) &&
+    // The same rule, for the fields `configModels` reads after discovery hands
+    // the record on: it takes `reasoning` and the two modality maps off
+    // `capabilities`, and `Object.keys(undefined)` on a row that kept only
+    // `{ id, api, limit }` is a TypeError on the listing path. A cache this
+    // build wrote may not become a throw where it is read.
+    isDescription(row.capabilities) &&
+    isDescription(row.capabilities.input) &&
+    isDescription(row.capabilities.output)
   );
 }
 
@@ -749,6 +766,28 @@ function cachedProtocols(protocols) {
   return out;
 }
 
+// One read of at most `buffer.length` bytes from the start of a file, and the
+// count it answered with. A file larger than the buffer is not read past it: the
+// caller allocates one byte more than its ceiling, so the extra byte is what
+// says "there was more" without asking how much. A `read` on a regular file may
+// answer with fewer bytes than asked for, so the loop is what makes the count
+// the file's rather than one system call's.
+// Exported so the bound is pinned by a test: the cache's stat refuses an oversized file first.
+export async function readAtMost(file, buffer) {
+  const handle = await open(file, "r");
+  try {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return offset;
+  } finally {
+    await handle.close();
+  }
+}
+
 // Read the last discovery. A missing file, a bad JSON document, a foreign
 // version, a date that is not one, and a map that is not a map all answer the
 // same way: no cache. The call never throws; discovery can always ask the
@@ -756,8 +795,24 @@ function cachedProtocols(protocols) {
 export async function readDiscoveryCache(file) {
   if (!file) return undefined;
   try {
-    const text = await readFile(file, { encoding: "utf8" });
-    if (typeof text !== "string" || text.length > DISCOVERY_CACHE_LIMIT) return undefined;
+    // What the ceiling bounds is how much a request path can be asked to read
+    // from a file it did not write, so it is a bound on the read and not on a
+    // size read before one. `stat` first is what refuses a path that is not a
+    // regular file, and its size is what avoids opening a file already known to
+    // be too large; neither is the guarantee — a file can grow between the stat
+    // and the read, and a procfs-style file reports a size of 0 whatever it
+    // holds. The read itself asks for one byte past the ceiling, so a file that
+    // grew is refused by the answer rather than buffered whole.
+    //
+    // `size` is bytes and the text length below is characters: the read is the
+    // I/O bound, the length after it is the parse bound, so both stay.
+    const info = await stat(file);
+    if (!info.isFile() || info.size > DISCOVERY_CACHE_LIMIT) return undefined;
+    const buffer = Buffer.allocUnsafe(DISCOVERY_CACHE_LIMIT + 1);
+    const read = await readAtMost(file, buffer);
+    if (read > DISCOVERY_CACHE_LIMIT) return undefined;
+    const text = buffer.subarray(0, read).toString("utf8");
+    if (text.length > DISCOVERY_CACHE_LIMIT) return undefined;
     const parsed = JSON.parse(text);
     if (!isDescription(parsed) || parsed.version !== DISCOVERY_CACHE_VERSION) return undefined;
     if (!isDescription(parsed.models) || !isDescription(parsed.protocols)) return undefined;

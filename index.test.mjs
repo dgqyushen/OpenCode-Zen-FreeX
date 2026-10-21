@@ -746,13 +746,33 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
     body: JSON.stringify({ model: "chat-free", stream: true }),
   });
   const rejected = assert.rejects(request, /abort/i);
-  // A run in which the discovery request is never sent is a failure of what
-  // this test is about, and waiting on the read alone would report it as a
-  // suite that never finishes: the wait below is raced, so the regression
-  // fails here instead.
-  await awaitReached(state, (now) => now.discoveryReads > 0);
-  controller.abort();
   let timer;
+  let settled = false;
+  // Released once. The read that was parked at the gate is what the abort has to
+  // reach, and letting it through before the cancellation is asserted is what
+  // would make this pass for the wrong reason: the discovery would finish while
+  // the abort was still propagating.
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    gate.settle();
+  };
+  try {
+    // A run in which the discovery request is never sent is a failure of what
+    // this test is about, and waiting on the read alone would report it as a
+    // suite that never finishes: the wait below is raced, so the regression
+    // fails here instead.
+    await awaitReached(state, (now) => now.discoveryReads > 0);
+  } catch (error) {
+    // The wait is what failed, and it is what this case reports: the reads are
+    // released so the failure does not also hang the run, and the abort is sent
+    // for the same reason. The error itself is rethrown rather than replaced by
+    // a promise that answered because the gate was opened.
+    controller.abort();
+    settle();
+    throw error;
+  }
+  controller.abort();
   try {
     await Promise.race([
       rejected,
@@ -762,10 +782,10 @@ test("aborts discovery immediately when the inference caller cancels", async (t)
     ]);
   } finally {
     clearTimeout(timer);
+    // After the assertion, which is about the caller's own promise: the release
+    // is what lets the reads that were still arriving finish being served.
+    settle();
   }
-  // Released after the abort so the reads that were still arriving can finish
-  // being served; the assertion above is about the caller's own promise.
-  gate.settle();
 });
 
 test("partial discovery never restores a model explicitly changed to SystemOne", async (t) => {
@@ -814,6 +834,30 @@ test("two conversations opening the same way keep separate Zen sessions", async 
   // own header set and is never sent (see outboundHeaders), so what separates
   // these two upstream is an id of this plugin's own making.
   assert.notEqual(first, "conversation-one");
+});
+
+// The opening that is absent and the opening that is empty are the same fact:
+// there is nothing in it to key by. `input: null` is how a Responses host writes
+// "no history", and while the seed guard read only the empty string and the
+// missing field, every such body keyed one shared session — two unrelated
+// conversations with its affinity and quota between them. Each one is now given
+// an id of its own, as any body with no opening is.
+test("two bodies that open with nothing keep separate Zen sessions", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const ask = async () => {
+    const response = await loader.fetch(`${origin}/v1/responses`, {
+      method: "POST",
+      body: JSON.stringify({ model: "responses-free", input: null, stream: true }),
+    });
+    await response.body?.cancel();
+    return lastCall(state).headers["x-opencode-session"];
+  };
+  const first = await ask();
+  const second = await ask();
+  assert.ok(first && second, "both requests have to reach upstream");
+  assert.notEqual(first, second, "no opening is no key to share");
 });
 
 // A cold instance, two requests for a model it has never heard of, arriving
@@ -1153,11 +1197,11 @@ test("a successful discovery writes the cache for the next process", async (t) =
   const models = await plugin.refresh();
   const cache = await waitForCache(file);
   assert.ok(cache, "the successful discovery was not remembered");
+  // `Object.keys` never yields a symbol, so the fallback flag the map may carry
+  // is already outside this list and there is nothing to filter out.
   assert.deepEqual(
     Object.keys(cache.models).sort(),
-    Object.keys(models)
-      .filter((id) => id !== Symbol.for("magpie.fellBack"))
-      .sort(),
+    Object.keys(models).sort(),
     "the cache holds a different list than the discovery answered with",
   );
   assert.deepEqual(cache.models["chat-free"], models["chat-free"]);
@@ -2110,13 +2154,25 @@ test("a rewritten refusal carries headers for the body it actually returns", asy
     "content-length": String(state.body.length),
     etag: '"stale-validator"',
     "last-modified": "Wed, 01 Oct 2026 00:00:00 GMT",
+    // Hop-by-hop framing the connection names rather than a header this file
+    // knows: a field the connection ends at is not reply data, so dropping the
+    // word that named it and forwarding the header is not dropping it.
+    connection: "x-hop",
+    "x-hop": "1",
   };
   const response = await loader.fetch(`${origin}/v1/chat/completions`, {
     method: "POST",
     body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
   });
   assert.equal(response.status, 403);
-  for (const name of ["content-length", "content-encoding", "transfer-encoding", "etag", "last-modified"]) {
+  for (const name of [
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "etag",
+    "last-modified",
+    "x-hop",
+  ]) {
     assert.equal(response.headers.get(name), null, `${name} still describes the old body`);
   }
   assert.equal(response.headers.get("content-type"), "application/json");
@@ -2176,6 +2232,8 @@ test("a 403 that is not the free tier's keeps its message, under headers for the
     etag: '"someone-elses"',
     "content-length": "999",
     "content-encoding": "identity",
+    connection: "x-hop",
+    "x-hop": "1",
   };
   state.body = JSON.stringify({ error: { message: "quota exhausted for this account" } });
   const response = await loader.fetch(`${origin}/v1/chat/completions`, {
@@ -2183,7 +2241,7 @@ test("a 403 that is not the free tier's keeps its message, under headers for the
     body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
   });
   assert.equal(response.status, 403);
-  for (const name of ["etag", "content-length", "content-encoding"]) {
+  for (const name of ["etag", "content-length", "content-encoding", "x-hop"]) {
     assert.equal(
       response.headers.get(name),
       null,

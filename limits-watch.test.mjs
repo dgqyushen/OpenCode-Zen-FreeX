@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -555,12 +555,14 @@ test("the catalogue comes from the environment when one is named", async () => {
 // about: the exit code is how the workflow tells "reached the route" from
 // "could not reach it", and a stack trace is not an answer.
 //
-// Run as a program, because that is the only way the entry point exists: the
-// file's own `import.meta.main` is Bun's, so a runtime without it has no entry
-// point to ask about.
+// Run as a program, because that is the only way the entry point exists. The
+// entry point is not Bun-only any more — it asks `import.meta.main` and falls
+// back to process.argv[1] — but these subprocess cases stay with the Bun suite
+// the repository pins; the case below runs the same file on whatever runtime the
+// suite itself is on.
 const needsBun = process.versions.bun
   ? undefined
-  : "the entry point is Bun's `import.meta.main`, so this needs Bun to run";
+  : "these subprocess cases are kept to the Bun suite";
 test(
   "a run that could not reach the route says so, and exits with the code the workflow reads",
   { skip: needsBun },
@@ -752,6 +754,99 @@ test("--check says which row is wrong, and exits with the code the workflow read
     assert.ok(said.includes("is not what the plugin will read"), `the child's own sentence is said: ${said}`);
     assert.ok(said.includes("a-free:"), "the row is named: " + said);
     assert.ok(said.includes("nonsense"), "and what is wrong with it is said: " + said);
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// The entry point used to be `import.meta.main`, which is Bun's: on a Node
+// before 22.18 the file evaluated nothing and exited 0, so a check that read no
+// snapshot looked exactly like a pass. `entryVerdict` settles the question from
+// process.argv[1], and this case runs the file with this process's own runtime.
+// It used to accept a visible failure naming the undetermined entry as one of
+// two answers, which is the regression it exists for: the file is spawned by
+// path, so argv[1] names it and the entry point has to resolve.
+test("the entry point resolves on whatever runtime ran it", async () => {
+  const { writeSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-node-entry-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": goodRow } }, file);
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [script, "--check", file], {
+      encoding: "utf8",
+      timeout: 60000,
+    });
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.notEqual(said.trim(), "", "a process that says nothing has not answered");
+    assert.equal(run.status, 0, `running the file by path has to resolve the entry point: ${said}`);
+    assert.ok(
+      said.includes("is a snapshot the plugin can read"),
+      `a zero exit has to be the check's own pass sentence: ${said}`,
+    );
+  } finally {
+    rmSync(file, { force: true });
+  }
+});
+
+// The suite runs under Bun, where `import.meta.main` answers the entry question
+// and the `process.argv[1]` fallback is never consulted. Bun is not the only
+// runtime these files run on, so the same file is asked by Node when one is on
+// PATH. A host without one is skipped rather than failed: there is no second
+// runtime to ask. The fallback itself is unit-tested in limits-audit.test.mjs,
+// where `entryVerdict({ main: undefined, ... })` can be called directly — this
+// case is what says the file still loads and answers on Node.
+const nodeBinary = (() => {
+  const probe = spawnSync("node", ["--version"], { encoding: "utf8" });
+  return probe.status === 0 ? "node" : undefined;
+})();
+test(
+  "the entry point resolves on Node too, where Bun's flag is not the answer",
+  { skip: nodeBinary === undefined ? "no node on PATH to ask" : false },
+  async () => {
+    const { writeSnapshot } = await subject;
+    const file = join(tmpdir(), `zen-observed-${process.pid}-node-runtime-${Date.now()}.json`);
+    try {
+      await writeSnapshot({ models: { "a-free": goodRow } }, file);
+      const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+      const run = spawnSync(nodeBinary, [script, "--check", file], {
+        encoding: "utf8",
+        timeout: 60000,
+      });
+      const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+      assert.equal(run.status, 0, `node has to load the file and resolve its entry: ${said}`);
+      assert.ok(
+        said.includes("is a snapshot the plugin can read"),
+        `and the check's own pass sentence is what it says: ${said}`,
+      );
+    } finally {
+      rmSync(file, { force: true });
+    }
+  },
+);
+
+// `ZEN_BASE_URL` is not read by `--check`: it asks nothing. The base used to be
+// parsed while the module was evaluated, so a malformed variable failed a check
+// of a file that was perfectly readable. It is parsed when a run asks for it
+// now, and this is the case that pins that.
+test("--check does not fail on a ZEN_BASE_URL it never uses", async () => {
+  const { writeSnapshot } = await subject;
+  const file = join(tmpdir(), `zen-observed-${process.pid}-lazy-base-${Date.now()}.json`);
+  try {
+    await writeSnapshot({ models: { "a-free": goodRow } }, file);
+    const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [script, "--check", file], {
+      encoding: "utf8",
+      timeout: 60000,
+      env: {
+        ...process.env,
+        // The form `base-url.mjs` refuses: it would have thrown during module
+        // evaluation, which `--check` never needs to reach.
+        ZEN_BASE_URL: "ftp://opencode.ai/inference/v1",
+      },
+    });
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 0, `--check asks nothing, so a base it never uses may not fail it: ${said}`);
+    assert.ok(said.includes("is a snapshot the plugin can read"), `the check's own pass sentence is said: ${said}`);
   } finally {
     rmSync(file, { force: true });
   }
@@ -1254,6 +1349,51 @@ test(
     }
   },
 );
+
+// `--stale-after` takes a value, and the parser used to step over the token
+// after it whether or not that token was a number. `--status --stale-after
+// file.json` therefore read the default snapshot and silently reported on a file
+// nobody named. A value that is not a whole number of seconds is now left in the
+// argument list, where it is read as the positional snapshot: a path that is not
+// one fails and says which file was asked for.
+test("--status does not eat a snapshot path as an invalid --stale-after value", { skip: needsBun }, () => {
+  const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+  const missing = join(tmpdir(), `zen-status-${process.pid}-positional-${Date.now()}.json`);
+  const run = spawnSync(process.execPath, [script, "--status", "--json", "--stale-after", missing], {
+    encoding: "utf8",
+    timeout: 60000,
+  });
+  const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+  assert.equal(run.status, 1, `the file after the flag has to be the one reported on: ${said}`);
+  assert.ok(said.includes(missing), `and the report names it: ${said}`);
+});
+
+// A path that begins with a number is the same failure the case above pins, and
+// `parseInt` read the `2026` out of `2026-10-21.json` and took it as the window.
+// The token has to be digits and nothing else. The name is relative because that
+// is the shape that puts a number first: a path under a temporary directory
+// begins with a `/`, and `parseInt` answers NaN for it — the case above already
+// covers that one, and it cannot see this parser rule.
+test("--stale-after does not read a number out of a path that begins with one", { skip: needsBun }, () => {
+  const script = fileURLToPath(new URL("./limits-watch.mjs", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "zen-status-"));
+  const name = "2026-10-21.json";
+  try {
+    const run = spawnSync(
+      process.execPath,
+      [script, "--status", "--json", "--stale-after", name],
+      { encoding: "utf8", timeout: 60000, cwd: dir },
+    );
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 1, `a leading number is not a whole number: ${said}`);
+    assert.ok(
+      said.includes(name),
+      `the run has to report on the file it was handed, not the default one: ${said}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("--status exits 1 when the snapshot is missing, and says which file", async () => {
   const { statusSnapshot } = await subject;

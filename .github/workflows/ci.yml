@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
 
-# Both jobs only read the repository, so the token is given nothing else.
+# Every job here only reads the repository, so the token is given nothing else.
 permissions:
   contents: read
 
@@ -75,10 +75,38 @@ jobs:
             echo "::error::git ls-tree failed, so the tracked-file scan could not run"
             exit 1
           }
-          tracked="$(printf '%s\n' "$tree" | grep -Ei '(^|/)(\.env|\.env\.[^/]*|\.npmrc|npmrc|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|der))$' | grep -Ev '(^|/)\.env\.example$|(^|/)\.npmrc\.example$|\.pub$' || true)"
-          if [ -n "$tracked" ]; then
+          # The exclusion is case-insensitive like the match it mirrors: the
+          # pattern admits `.ENV.EXAMPLE` and `ID_RSA.PUB`, so a case-sensitive
+          # exclusion would report exactly the spellings the mirror is for.
+          #
+          # Both stages are checked, not the pipeline's single status: under
+          # `pipefail` a pipeline answers with the *rightmost* non-zero status,
+          # so a first `grep` that could not run (2) followed by an exclusion
+          # `grep` that found no match (1) reads as 1 — a clean tree, which is
+          # the one answer this step must never give about a scan that did not
+          # happen. The list is written to a file so the statuses are read in
+          # this shell, where `PIPESTATUS` still exists.
+          set +e
+          printf '%s\n' "$tree" |
+            grep -Ei '(^|/)(\.env|\.env\.[^/]*|\.npmrc|npmrc|\.git-credentials|\.netrc|_netrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|jks|der))$' |
+            grep -Evi '(^|/)\.env\.example$|(^|/)\.npmrc\.example$|\.pub$' \
+            > "$RUNNER_TEMP/tracked-credentials.txt" 2>"$RUNNER_TEMP/tracked-credentials.err"
+          scan_codes=("${PIPESTATUS[@]}")
+          set -e
+          for scan_code in "${scan_codes[@]}"; do
+            if [ "$scan_code" -gt 1 ]; then
+              echo "::error::the tracked-file scan failed with status $scan_code, so it could not run"
+              if [ -s "$RUNNER_TEMP/tracked-credentials.err" ]; then
+                cat "$RUNNER_TEMP/tracked-credentials.err"
+              fi
+              exit 1
+            fi
+          done
+          if [ -s "$RUNNER_TEMP/tracked-credentials.txt" ]; then
             echo "::error::these tracked files hold a credential and must not be committed:"
-            echo "$tracked"
+            # Indented: a filename is a line this branch did not write, and a
+            # line that starts with `::` is read by the runner as a command.
+            sed 's/^/    /' "$RUNNER_TEMP/tracked-credentials.txt"
             exit 1
           fi
           # `git grep <tree>` reads the committed blobs, not the working tree, so
@@ -90,12 +118,15 @@ jobs:
           # the same answer — the second is a scan that did not run.
           credential_shapes='npm_[A-Za-z0-9]{30,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{30,}|AKIA[0-9A-Z]{16}'
           set +e
-          leaked="$(git grep -InE "$credential_shapes" HEAD -- . ':!*.example')"
+          leaked="$(git grep -InE "$credential_shapes" HEAD -- . ':!*.env.example' ':!*.npmrc.example')"
           code=$?
           set -e
           if [ "$code" -eq 0 ]; then
             echo "::error::these committed lines contain what looks like a live credential:"
-            echo "$leaked"
+            # `HEAD:path:line` only. The matched text is the credential itself,
+            # and a log is a copy of it that outlives the commit and travels to
+            # wherever logs are exported.
+            printf '%s\n' "$leaked" | cut -d: -f1-3
             exit 1
           elif [ "$code" -ne 1 ]; then
             echo "::error::git grep failed with status $code, so the content scan could not run"
@@ -223,7 +254,12 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          bun run check:gate 2>&1 | tee gate-report.txt
+          # The report is written outside the workspace, so a pull request that
+          # commits a file of the same name cannot have it rendered as this
+          # run's verdict. The copy on stdout is indented: the runner reads a
+          # line that starts with `::` as a workflow command, and a report line
+          # is upstream text this branch did not write.
+          bun run check:gate 2>&1 | tee "$RUNNER_TEMP/gate-report.txt" | sed 's/^/    /'
       # The report is produced by this branch's own `tools-smoke.mjs` and quotes
       # the route, so it is rendered as a four-space indented block rather than
       # inside a ``` fence. A fence is closed by a ``` in the text, and a line of
@@ -240,10 +276,10 @@ jobs:
           {
             echo "## Zen gate — $OUTCOME"
             echo
-            if [ -s gate-report.txt ]; then
+            if [ -s "$RUNNER_TEMP/gate-report.txt" ]; then
               echo "The report below was produced by code in this branch at \`$GITHUB_SHA\`; it is quoted as text, not interpreted."
               echo
-              sed 's/^/    /' gate-report.txt
+              sed 's/^/    /' "$RUNNER_TEMP/gate-report.txt"
             elif [ "$OUTCOME" = "skipped" ] && [ "$EVENT" != "push" ]; then
               echo 'The gate only asks Zen on a push, so this run did not ask it.'
             elif [ "$OUTCOME" = "skipped" ]; then
@@ -256,7 +292,10 @@ jobs:
       # about the gate "not passing" would be a report of the skip as a fault.
       # The note is for the push runs the gate exists for.
       - name: Note a gate that did not pass
-        if: github.event_name == 'push' && steps.gate.outcome != 'success'
+        # `always()` is what makes the note reachable after a step before the
+        # gate failed: without a status function the implicit `success()`
+        # skips this step, which is exactly the skipped-gate case below.
+        if: ${{ always() && github.event_name == 'push' && steps.gate.outcome != 'success' }}
         # The one exit code covers several unrelated diagnoses — Zen has moved past
         # every generation, a `required` name has no tool behind it in
         # fingerprint.json, or the floor was rate-limited/5xx'd and never judged —

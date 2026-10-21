@@ -10,6 +10,13 @@ import test from "node:test";
 // are in limits.test.mjs, against a path of their own.
 process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
 
+// The discovery cache is a file in the operator's cache directory too, and it is
+// not only read there: a successful discovery writes it, and a cache younger
+// than provider.mjs's RELIST_AFTER answers the next `models()` call without
+// reading anything at all. Left on, this suite would be a test of whatever the
+// previous case — or the previous run — happened to leave behind.
+process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = "";
+
 // Not caught: a syntax error, a renamed file or a failure while models.mjs (or
 // limits.mjs, which it imports) is evaluated has to surface as itself. Swallowed
 // into an empty module it reads as "model discovery must be implemented" or
@@ -534,6 +541,25 @@ test("a limit axis nobody named is not handed to the host", async () => {
         ["context", "input", "output"].includes(axis),
         `${id}.${axis} is an axis a host reads`,
       );
+});
+
+// The second source for the same map is the override table, and it is data too:
+// a shipped entry or a caller-supplied one that states `null`, `0` or a negative
+// for an axis states no window. `limitOverrides` refuses those as well, and the
+// rule is stated here so a change on either side of the seam cannot hand a host
+// a limit it has no number to plan from.
+test("a table axis that is not a usable number is not handed to the host", async () => {
+  const { limitFor } = await subject;
+  const limit = limitFor("table-free", { context: 1000, input: 500, output: 100 }, undefined, {
+    "table-free": {
+      context: { value: null, source: "models.dev" },
+      input: { value: 0, source: "models.dev" },
+      output: { value: -1, source: "models.dev" },
+    },
+  });
+  assert.deepEqual(limit, { context: 1000, input: 500, output: 100 });
+  for (const [axis, value] of Object.entries(limit))
+    assert.ok(Number.isSafeInteger(value) && value > 0, `${axis} is a usable window`);
 });
 
 test("an unknown id is offered on its own free name, never on a guessed endpoint", async () => {
@@ -1094,8 +1120,19 @@ const zenDocs = "https://zen.test/docs";
 const publicAuth = async () => ({ type: "api", key: "public" });
 // `modelsDevURL: null` is the third-party read switched off, as in index.test.mjs:
 // these cases are about what the catalogue says, and a suite that reached
-// models.dev per case would be a network suite.
-const zenURLs = { baseURL: zenBase, catalogURL: zenCatalog, docsURL: zenDocs, modelsDevURL: null };
+// models.dev per case would be a network suite. `limitsSnapshotURL: ""` switches
+// off the other third-party read for the same reason, and for one more of its
+// own: a cold process reads the snapshot once per server, which made a discovery
+// four reads where these cases assert three. The count they pin is how a flight
+// ends, and it must not depend on whether an earlier file happened to warm a
+// cache or on whether the network answered.
+const zenURLs = {
+  baseURL: zenBase,
+  catalogURL: zenCatalog,
+  docsURL: zenDocs,
+  modelsDevURL: null,
+  limitsSnapshotURL: "",
+};
 
 // A macrotask boundary. The loader reaches its discovery through microtasks —
 // the auth lookup, the request body — so by the time a timer callback runs, a
@@ -1423,6 +1460,101 @@ test("a catalogue row with a package in another shape does not end the discovery
   assert.equal(models["dirty-free"].api.npm, "@ai-sdk/openai-compatible");
 });
 
+// The route's listing is a document this plugin reads, and an entry that is not
+// a model is a fact about that entry: `item.id` on a `null` entry threw out of
+// `reading`, and that throw was the whole discovery's, so one dirty row upstream
+// took every free model with it. The entry is skipped and the rest of the
+// listing — in the order the route sent it — is still offered.
+test("a listing entry that is not a model does not end the discovery", async (t) => {
+  const upstream = discoveryUpstream({
+    listing: { data: [{ id: "chat-free" }, null, 7, "junk", { id: "late-free" }] },
+  });
+  t.after(() => upstream.restore());
+  const { server } = (await providerModule).default;
+  const plugin = await server({}, zenURLs);
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(models), ["chat-free", "late-free"]);
+});
+
+// The body of a discovery read is part of the read. `readRemote` disposed its
+// combined signal in a `finally` that ran as soon as the fetch promise was
+// handed back — before `response.json()`/`text()` had read anything — so on a
+// runtime without `AbortSignal.any` the caller's abort and the read's own
+// timeout were detached from a body still being waited on. Pinned on the
+// hand-made combination, which is the one with a listener to let go of.
+test("a caller that aborts ends the discovery bodies it is waiting on", async (t) => {
+  const any = AbortSignal.any;
+  AbortSignal.any = undefined;
+  t.after(() => {
+    AbortSignal.any = any;
+  });
+  const reads = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const read = { url: String(url), aborted: false };
+    reads.push(read);
+    // Headers now, body when the read's signal ends it: what a real fetch does
+    // with a body it is holding, and the only thing that ends this one.
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              read.aborted = true;
+              controller.error(init.signal.reason);
+            },
+            { once: true },
+          );
+        },
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { server } = (await providerModule).default;
+  const plugin = await server({}, {
+    ...zenURLs,
+    discoveryCachePath: "",
+    limitsSnapshotURL: "",
+  });
+  const loader = await plugin.auth.loader(publicAuth);
+  const controller = new AbortController();
+  const pending = askForUnknown(loader, controller.signal).catch((error) => error);
+  // The reads are waited for rather than assumed: how many discovery issues and
+  // in which order is not what this case is about, and `await tick()` happened
+  // to be enough for exactly three. The wait is bounded, so a discovery that
+  // stopped issuing them fails here as a count instead of hanging until the
+  // runner's own timeout says nothing.
+  const deadline = Date.now() + 5_000;
+  while (reads.length < 3) {
+    if (Date.now() > deadline)
+      throw new Error(`only ${reads.length} of the discovery's three reads started`);
+    await tick();
+  }
+  assert.equal(reads.length, 3, "the discovery's three reads are in flight");
+  controller.abort();
+  // The abort is what ends the mocked bodies, so a propagation regression is a
+  // wait that never settles: raced, it fails with the reason instead of hanging.
+  const heard = await Promise.race([
+    pending,
+    new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("the abort never reached the discovery's bodies")),
+        5_000,
+      ).unref?.();
+    }),
+  ]);
+  assert.equal(heard.name, "AbortError", "the caller hears its own signal");
+  assert.deepEqual(
+    reads.map((read) => read.aborted),
+    [true, true, true],
+    "the reads' bodies end with the caller that asked for them",
+  );
+});
+
 // ---- discovery cache -------------------------------------------------------
 //
 // The cache is an input to discovery, not a source of truth. These cases pin
@@ -1526,17 +1658,22 @@ test("a missing, bad-JSON, or foreign-version cache answers no cache", async (t)
   assert.equal(await readDiscoveryCache(join(dir, "missing.json")), undefined);
   await writeFile(file, "{ this is not json", "utf8");
   assert.equal(await readDiscoveryCache(file), undefined);
-  await writeFile(
-    file,
-    JSON.stringify({
-      version: 2,
-      models: { "chat-free": cachedModel },
-      protocols: { "chat-free": "chat" },
-      listedAt: CACHED_AT,
-    }),
-    "utf8",
-  );
-  assert.equal(await readDiscoveryCache(file), undefined);
+  // A v1 cache is the one this build must not read: the record rule got
+  // stricter, and a reader that filtered the rows it cannot serve would answer
+  // a listing that lost a model instead of one that is fetched again.
+  for (const version of [1, 3]) {
+    await writeFile(
+      file,
+      JSON.stringify({
+        version,
+        models: { "chat-free": cachedModel },
+        protocols: { "chat-free": "chat" },
+        listedAt: CACHED_AT,
+      }),
+      "utf8",
+    );
+    assert.equal(await readDiscoveryCache(file), undefined, `version ${version} is not this build's`);
+  }
 });
 
 test("bad model rows are skipped and protocols are filtered", async (t) => {
@@ -1546,7 +1683,7 @@ test("bad model rows are skipped and protocols are filtered", async (t) => {
   await writeFile(
     file,
     JSON.stringify({
-      version: 1,
+      version: 2,
       models: {
         "chat-free": cachedModel,
         "string-row": "not a model",
@@ -1571,6 +1708,115 @@ test("bad model rows are skipped and protocols are filtered", async (t) => {
   });
 });
 
+// `configModels` reads `reasoning`/`toolcall`/`attachment` and the two modality
+// maps off `capabilities`, so a row that kept `{ id, api, limit }` and lost
+// `capabilities` — a hand-edited or truncated cache — turned into
+// `Object.keys(undefined)` on the listing path. A row without the maps is not a
+// model this build can hand on, and it is skipped like any other bad row.
+test("a cached row without capabilities is skipped, not read as a model", async (t) => {
+  const { configModels, readDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 2,
+      models: {
+        "chat-free": cachedModel,
+        "missing-capabilities-free": {
+          ...cachedModel,
+          id: "missing-capabilities-free",
+          capabilities: undefined,
+        },
+        "null-capabilities-free": {
+          ...cachedModel,
+          id: "null-capabilities-free",
+          capabilities: null,
+        },
+        "flat-capabilities-free": {
+          ...cachedModel,
+          id: "flat-capabilities-free",
+          capabilities: { reasoning: true },
+        },
+      },
+      protocols: { "chat-free": "chat" },
+      listedAt: CACHED_AT,
+    }),
+    "utf8",
+  );
+  const cache = await readDiscoveryCache(file);
+  assert.deepEqual(Object.keys(cache.models), ["chat-free"]);
+  // The throw the row would otherwise have caused, at the place that reads it.
+  assert.doesNotThrow(() => configModels(cache.models));
+});
+
+// The cache's ceiling bounds the bytes a request path can be asked to read from
+// a file it did not write, and it has to be checked before the file is buffered.
+// Three-byte characters are how the two lengths come apart: this document's text
+// is under the ceiling while its bytes are over it, and it is otherwise a cache
+// this build can read, so only the size guard can refuse it.
+test("a cache file over the byte ceiling is not read", async (t) => {
+  const { readDiscoveryCache } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "discovery.json");
+  const body = JSON.stringify({
+    version: 2,
+    models: {},
+    protocols: {},
+    listedAt: CACHED_AT,
+    pad: "语".repeat(2_800_000),
+  });
+  assert.ok(body.length < 8 * 1024 * 1024, "the text is under the 8 MiB ceiling");
+  await writeFile(file, body, "utf8");
+  assert.ok((await stat(file)).size > 8 * 1024 * 1024, "the file is over it");
+  assert.equal(await readDiscoveryCache(file), undefined);
+  // The same document with the padding taken out is read, so the refusal above
+  // is the ceiling and not the field it was padded with: an unknown key is not
+  // what makes a cache unreadable.
+  await writeFile(file, JSON.stringify({ ...JSON.parse(body), pad: "语" }), "utf8");
+  assert.ok((await stat(file)).size < 8 * 1024 * 1024, "the control is under the ceiling");
+  assert.deepEqual(await readDiscoveryCache(file), {
+    models: {},
+    protocols: {},
+    listedAt: CACHED_AT,
+  });
+});
+
+// The read is the other half of the ceiling: `stat` refuses a file already over
+// it, but a file can grow between the stat and the read, and a procfs-style file
+// reports a size of 0 whatever it holds. `readDiscoveryCache`'s tests cannot show
+// that, because its stat refuses those files before the read; the read is called
+// directly here, on a file larger than the buffer, which is the shape a file that
+// grew takes. A read bounded only by the file would buffer all of it.
+test("a bounded read answers the buffer's length, not the file's", async (t) => {
+  const { readAtMost } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "grown.json");
+  await writeFile(file, "0123456789", "utf8");
+  const buffer = Buffer.alloc(4);
+  assert.equal(await readAtMost(file, buffer), 4, "the answer is the buffer, not the file");
+  assert.equal(buffer.toString("utf8"), "0123", "and its bytes are the file's first bytes");
+});
+
+// The bound has to let a file smaller than the buffer through whole, and the
+// count has to be bytes rather than characters: three-byte characters are how
+// the two lengths come apart, and a count taken from the decoded text would cut
+// the last character off. It is also the loop's short-answer path: the first
+// read answers fewer bytes than the buffer asked for, and the next answers 0,
+// which is the branch that ends the read at the file rather than at the buffer.
+test("a file smaller than the buffer is read whole and counted in bytes", async (t) => {
+  const { readAtMost } = await subject;
+  const dir = await discoveryTempDir(t);
+  const file = join(dir, "small.json");
+  const text = '{"pad":"语"}';
+  await writeFile(file, text, "utf8");
+  const size = (await stat(file)).size;
+  const buffer = Buffer.alloc(size + 16);
+  const read = await readAtMost(file, buffer);
+  assert.equal(read, size, "the count is the file's bytes, short of the buffer");
+  assert.equal(buffer.subarray(0, read).toString("utf8"), text, "and the bytes decode as written");
+});
+
 test("listedAt must be an ISO date, and a bad date is not written", async (t) => {
   const { readDiscoveryCache, writeDiscoveryCache } = await subject;
   const dir = await discoveryTempDir(t);
@@ -1586,7 +1832,7 @@ test("listedAt must be an ISO date, and a bad date is not written", async (t) =>
   assert.equal(await readDiscoveryCache(file), undefined);
   await writeFile(
     file,
-    JSON.stringify({ version: 1, models: {}, protocols: {}, listedAt: 123 }),
+    JSON.stringify({ version: 2, models: {}, protocols: {}, listedAt: 123 }),
     "utf8",
   );
   assert.equal(await readDiscoveryCache(file), undefined);
@@ -1652,7 +1898,7 @@ test("the discovery cache writer ignores inputs that are not object maps", async
   assert.equal(await readDiscoveryCache(file), undefined);
   await writeFile(
     file,
-    JSON.stringify({ version: 1, models: {}, protocols: [], listedAt: CACHED_AT }),
+    JSON.stringify({ version: 2, models: {}, protocols: [], listedAt: CACHED_AT }),
     "utf8",
   );
   assert.equal(await readDiscoveryCache(file), undefined);

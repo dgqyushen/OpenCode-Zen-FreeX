@@ -2145,6 +2145,98 @@ test("Responses keeps the items a terminal named fewer of than the stream carrie
   assert.deepEqual(all.output.map((item) => item.id), ["a", "b"]);
 });
 
+// A terminal that carries MORE items than the stream accumulated wins because
+// the extra items are what it exists for — but the items it names again are
+// still snapshots of what the stream delivered. Skipping the weight test for
+// every item of a longer terminal let a gateway that adds an item and re-emits
+// an earlier one truncated replace the streamed text with the shorter view.
+test("a longer terminal's copy of an accumulated item is weighed against the stream", async () => {
+  const streamed =
+    event({ type: "response.created", response: { id: "resp_l", output: [] } }) +
+    event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "a", type: "message", role: "assistant", content: [] },
+    }) +
+    event({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: "kept text",
+    });
+  const item = (id, text) => ({
+    id,
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text, annotations: [] }],
+  });
+  const terminal = (text) => ({
+    id: "resp_l",
+    status: "completed",
+    output: [item("a", text), item("b", "new item")],
+  });
+  // Two terminal items where the stream carried one, and the copy of the one
+  // it carried is truncated: the terminal is longer, but it is not a whole
+  // view of the item the stream delivered. The policy is the conservative one —
+  // an item the terminal re-emits in a shorter form than the stream held makes
+  // the whole terminal a partial view, and none of it is trusted, including the
+  // item the stream never carried. It is stated here by id so a change to the
+  // policy has to be made here.
+  const truncated = await json(
+    streamed + event({ type: "response.completed", response: terminal("") }, "response.completed"),
+    "responses",
+  );
+  assert.deepEqual(
+    truncated.output.map((value) => value.id),
+    ["a"],
+    "the terminal's truncated copy replaced the item, and its new item was not taken alone",
+  );
+  assert.equal(truncated.output[0].content[0].text, "kept text");
+  assert.equal(truncated.id, "resp_l", "the terminal's own fields are still the answer");
+  // The same terminal carrying the item whole wins, extra item and all: the
+  // new items are why a longer terminal exists.
+  const whole = await json(
+    streamed +
+      event({ type: "response.completed", response: terminal("kept text") }, "response.completed"),
+    "responses",
+  );
+  assert.deepEqual(whole.output.map((value) => value.id), ["a", "b"]);
+  assert.equal(whole.output[0].content[0].text, "kept text");
+  assert.equal(whole.output[1].content[0].text, "new item");
+});
+
+// A terminal's `output` is a list of items or it is not a view of the items at
+// all. Read as "anything non-null is whole", a scalar or an object replaced
+// the accumulated output and the reply answered 200 with a shape no client
+// reads as a response.
+test("a terminal output that is not a list does not replace the stream's items", async () => {
+  for (const output of ["not a list", { id: "x", type: "message" }, 7, true]) {
+    const body = await json(
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { id: "m", type: "message", role: "assistant", content: [] },
+      }) +
+        event({
+          type: "response.output_text.delta",
+          output_index: 0,
+          content_index: 0,
+          delta: "hello",
+        }) +
+        event(
+          { type: "response.completed", response: { id: "r", status: "completed", output } },
+          "response.completed",
+        ),
+      "responses",
+    );
+    assert.ok(
+      Array.isArray(body.output),
+      `${JSON.stringify(output)} was answered as the reply's list of items`,
+    );
+    assert.equal(body.output[0].content[0].text, "hello", `${JSON.stringify(output)} dropped the text`);
+  }
+});
+
 // `typeof [] === "object"`, so a terminal carrying a list was read as a reply
 // object: the reply was answered with that bare list as its whole body, and
 // every item the stream had accumulated was gone with it. A list is not a
@@ -2991,6 +3083,14 @@ test("success and error JSON remove stale entity headers and preserve retry meta
           "content-length": "999",
           "content-encoding": "gzip",
           "transfer-encoding": "chunked",
+          connection: "keep-alive, x-hop",
+          "x-hop": "1",
+          "keep-alive": "timeout=5",
+          "proxy-connection": "keep-alive",
+          te: "trailers",
+          trailer: "expires",
+          upgrade: "h2c",
+          "content-range": "bytes 0-20/21",
           "content-md5": "md5",
           etag: 'W/"stream"',
           "last-modified": "Wed, 21 Oct 2015 07:28:00 GMT",
@@ -3001,19 +3101,65 @@ test("success and error JSON remove stale entity headers and preserve retry meta
       "chat",
     );
     assert.equal(response.headers.get("content-type"), "application/json");
-    // What described the stream's own bytes cannot describe the JSON body.
+    // What described the stream's own bytes cannot describe the JSON body —
+    // including the hop-by-hop framing and the range a partial response
+    // described, which say nothing true about the bytes written here.
     for (const name of [
       "content-length",
       "content-encoding",
       "transfer-encoding",
+      "connection",
+      "keep-alive",
+      "proxy-connection",
+      "te",
+      "trailer",
+      "upgrade",
+      "content-range",
       "content-md5",
       "etag",
       "last-modified",
+      // Named by the upstream's own `Connection` value rather than by the list:
+      // a field the connection ends at is framing, not reply data, and dropping
+      // the word that named it while forwarding the header is not dropping it.
+      "x-hop",
     ])
       assert.equal(response.headers.get(name), null, name);
     assert.equal(response.headers.get("retry-after"), "12");
     assert.equal(response.headers.get("x-request-id"), "req-1");
   }
+});
+
+// A 206 describes a part of the bytes, and the body a collapse answers with is
+// the whole reply: carrying the upstream's status and range headers onto the
+// complete JSON told the client it held a fragment of a reply that was in fact
+// all of it.
+test("a collapsed partial response is a whole 200, with no range metadata", async () => {
+  const response = await collapseResponse(
+    sse(event({ choices: [{ index: 0, delta: { content: "hi" } }] }) + event("[DONE]"), {
+      status: 206,
+      headers: { "content-range": "bytes 0-20/21", "accept-ranges": "bytes" },
+    }),
+    "chat",
+  );
+  assert.equal(response.status, 200, "a whole collapsed reply is not a partial one");
+  assert.equal(response.headers.get("content-range"), null, "the range described the stream's part");
+  assert.equal(response.headers.get("accept-ranges"), "bytes");
+  assert.equal((await response.json()).choices[0].message.content, "hi");
+});
+
+// 206 is the one `ok` status that describes the bytes rather than the reply, so
+// it is the one a collapse is allowed to rewrite. A 201 that arrived with an
+// event stream is still a 201: rewriting every success to 200 tells a client
+// that has a use for the status something the upstream did not say.
+test("a collapsed reply keeps a success status it did not have to change", async () => {
+  const response = await collapseResponse(
+    sse(event({ choices: [{ index: 0, delta: { content: "hi" } }] }) + event("[DONE]"), {
+      status: 201,
+    }),
+    "chat",
+  );
+  assert.equal(response.status, 201, "the upstream's own success status is the answer");
+  assert.equal((await response.json()).choices[0].message.content, "hi");
 });
 
 // The limit is exact, and it was not pinned: the fixture that stood for
@@ -3167,21 +3313,6 @@ test("a reply larger than the limit is refused, though the stream that produced 
 // bytes and well inside it as characters.
 test("a reply inside the limit as characters but outside it as UTF-8 bytes is refused", { timeout: 60_000 }, async () => {
   const chat = (content) => event({ choices: [{ index: 0, delta: { content } }] }) + event("[DONE]");
-  const raw = async (text) =>
-    (
-      await collapseResponse(
-        new Response(
-          new ReadableStream({
-            pull(controller) {
-              controller.enqueue(encoder.encode(text));
-              controller.close();
-            },
-          }),
-          { headers: { "content-type": "text/event-stream" } },
-        ),
-        "chat",
-      )
-    ).text();
   const emptyStream = chat("");
   const replyOverhead = encoder.encode(await (async () => {
     const response = await collapseResponse(sse(emptyStream), "chat");
@@ -3199,8 +3330,14 @@ test("a reply inside the limit as characters but outside it as UTF-8 bytes is re
   const content = "中".repeat(Math.floor((MAX_BYTES - replyOverhead) / 3) + 1);
   const text = chat(content);
   assert.ok(text.length < MAX_BYTES, `the reply is ${text.length} code units`);
-  assert.ok(encoder.encode(text).byteLength < MAX_BYTES, "the stream itself is over the limit");
-  assert.ok(Buffer.byteLength(text, "utf8") < MAX_BYTES, "the stream's bytes are over the limit");
+  assert.ok(
+    encoder.encode(text).byteLength < MAX_BYTES,
+    "the stream itself is not under the limit",
+  );
+  assert.ok(
+    Buffer.byteLength(text, "utf8") < MAX_BYTES,
+    "the stream's bytes are not under the limit",
+  );
   const response = await collapseResponse(
     new Response(
       new ReadableStream({

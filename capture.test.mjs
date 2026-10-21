@@ -14,6 +14,7 @@ import {
   invokedDirectly,
   neutralise,
   numberFromEnv,
+  readTarget,
   report,
 } from "./capture.mjs";
 
@@ -269,14 +270,16 @@ test("--fingerprint=<path> is read, not silently ignored", () => {
   assert.equal(fingerprintTarget(argv("--fingerprint", "/tmp/space.json", "--fingerprint=/tmp/inline.json"), {}), "/tmp/inline.json");
 });
 
-test("a number from the environment that is not a number is not used", () => {
+test("a number from the environment that this run cannot use is not used", () => {
   // Both knobs are read with `Number()` and were never checked, so a mistyped
   // one decided the run: `CAPTURE_TIMEOUT_MS=abc` is `NaN`, the watchdog fires
   // at once, the child is killed before it has made a request, and the run
   // reports "no request was captured" — the mistyped knob reported as an
   // OpenCode problem. A port outside the range a port can be in fails the same
   // way, inside `Bun.serve`, as an error that says nothing about the variable
-  // that was wrong.
+  // that was wrong. A whole number is the other half: `CAPTURE_PORT=8791.5`
+  // passed the range check and failed inside `Bun.serve` as a socket error, and
+  // a fraction of a millisecond is not a timeout.
   const error = console.error;
   const said = [];
   console.error = (line) => said.push(String(line));
@@ -308,6 +311,21 @@ test("a number from the environment that is not a number is not used", () => {
       "a negative timeout is not a timeout",
     );
     assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "8791.5" }),
+      120_000,
+      "a fractional timeout is not a timeout",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_TIMEOUT_MS", 120_000, { CAPTURE_TIMEOUT_MS: "1e-3" }),
+      120_000,
+      "a scientific value that is a fraction is not a timeout",
+    );
+    assert.equal(
+      numberFromEnv("CAPTURE_PORT", 8791, { CAPTURE_PORT: "8791.5" }, 65535),
+      8791,
+      "a fractional port is not the port",
+    );
+    assert.equal(
       numberFromEnv("CAPTURE_PORT", 8791, { CAPTURE_PORT: "9000" }, 65535),
       9000,
       "a port in the range is used",
@@ -323,13 +341,56 @@ test("a number from the environment that is not a number is not used", () => {
   // Every refused variable is named: a knob that reads as set while it was not
   // is worse than one that is unset, because the run answers for the default
   // and the reader is looking at the wrong number.
-  assert.equal(said.length, 4, `every refused variable is named: ${said.join(" | ")}`);
+  assert.equal(said.length, 7, `every refused variable is named: ${said.join(" | ")}`);
   for (const name of ["CAPTURE_TIMEOUT_MS", "CAPTURE_PORT"])
     assert.equal(
       said.some((line) => line.includes(name)),
       true,
       `the refused variable is named: ${said.join(" | ")}`,
     );
+});
+
+test("a target that cannot be read is one file, not two empty tables", async () => {
+  // `readTarget` hands back the file that will be written and the profiles to
+  // compare against. The success branches alias the two, and the early returns
+  // used to hand back a separately allocated `{ profiles: {} }` for each — a
+  // `profiles` view of a file nobody had written. Nothing writes through
+  // `profiles` today, which is exactly why the aliasing has to be pinned here:
+  // a caller that reads only one of the two would not notice the shape drift,
+  // and the next one would.
+  const root = mkdtempSync(join(tmpdir(), "zen-capture-"));
+  const silent = offline(() => {
+    for (const [what, content] of [
+      ["a file that is not there", undefined],
+      ["a file that is not JSON", "not a capture"],
+      ["a file that is not a table", JSON.stringify([])],
+      ["a file whose profiles are a list", JSON.stringify({ profiles: [] })],
+      ["a file that holds a capture", JSON.stringify({ profiles: {} })],
+    ]) {
+      const path = join(root, "fingerprint.json");
+      if (content === undefined) rmSync(path, { force: true });
+      else writeFileSync(path, content);
+      const target = readTarget(path);
+      // A loose equality answers `undefined === undefined`, so a target whose
+      // views are both missing would pass as aliased: the table is asserted to
+      // be one first, and then the identity is asserted strictly.
+      assert.ok(
+        target.profiles !== null && typeof target.profiles === "object",
+        `${what}: the profiles view is a table`,
+      );
+      assert.deepEqual(target.profiles, {}, `${what}: no profiles were read`);
+      assert.strictEqual(
+        target.profiles,
+        target.file.profiles,
+        `${what}: the two views have to be the same object`,
+      );
+    }
+  });
+  try {
+    await silent.run();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // A port that is already taken is a sentence about the knob, not a stack trace

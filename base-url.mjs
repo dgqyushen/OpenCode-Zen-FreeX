@@ -64,7 +64,14 @@ export function baseFrom(value) {
     url.username ||
     url.password ||
     url.search ||
-    url.hash
+    url.hash ||
+    // An empty query or fragment is not visible in `search`/`hash`: `new URL`
+    // answers "" for both on `https://host?` and `https://host#`, so the guards
+    // above pass and the base joined below is `https://host/?` + `/models` — a
+    // query in the path, which the route cannot answer and reports as a network
+    // failure about a base that was wrong before it was used. The trailing
+    // spelling is what has to be refused, because the parse has already lost it.
+    /[?#]$/.test(trimmed)
   ) {
     throw new Error(
       `ZEN_BASE_URL must be an HTTP(S) URL without credentials, query or fragment: ${JSON.stringify(trimmed)}.`,

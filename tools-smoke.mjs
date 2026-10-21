@@ -280,18 +280,26 @@ export async function check(generation, profile, shape, namesOf) {
   if (response.status === 403)
     return { generation, shape, verdict: "refused", detail: `HTTP 403${says(text)}` };
   // A probe model the route no longer serves is a fact about the PROBE, and
-  // this gate is about the fingerprint. 410 is the route retiring an id and
-  // 404 is the route not knowing it, and both answer a question about the
-  // model this run chose to ask with — a question ZEN_CHECK_MODEL answers.
-  // They are not the fingerprint being stale, and reporting them as "failed"
-  // put them in the same column as an outage, which is where a reader stops
-  // looking.
-  if (response.status === 410 || response.status === 404)
+  // this gate is about the fingerprint. 410 is the route retiring an id, and
+  // it names the one thing that changed: the model. 404 is the route not
+  // knowing the id it was asked for — or not knowing the path, since a
+  // ZEN_BASE_URL that points somewhere the route does not serve answers the
+  // same way — so both variables are named there. They are not the fingerprint
+  // being stale, and reporting them as "failed" put them in the same column as
+  // an outage, which is where a reader stops looking.
+  if (response.status === 410)
     return {
       generation,
       shape,
       verdict: "probe-gone",
-      detail: `HTTP ${response.status}${says(text)} — the probe model is gone; set ZEN_CHECK_MODEL to one the route serves`,
+      detail: `HTTP 410${says(text)} — the probe model is gone; set ZEN_CHECK_MODEL to one the route serves`,
+    };
+  if (response.status === 404)
+    return {
+      generation,
+      shape,
+      verdict: "probe-gone",
+      detail: `HTTP 404${says(text)} — no such probe model or path; set ZEN_CHECK_MODEL to one the route serves and check ZEN_BASE_URL`,
     };
   return { generation, shape, verdict: "failed", detail: `HTTP ${response.status}${says(text)}` };
 }
@@ -446,8 +454,14 @@ export const UNDETERMINED_ENTRY =
 // nothing was asked, so the gate cannot report success. An importer keeps its
 // exports; under a runtime that can answer (Bun, Node ≥ 22.18) this branch is
 // not reached by an import at all, where `import.meta.main` is `false`.
+//
+// The one undeterminable case that is not even an import question is a process
+// that named no script at all — `node -e`, a REPL. Nothing can be run from here
+// then, and the sentence and the exit code would be about a gate the importer
+// never asked for.
 const entry = invokedDirectly();
-if (entry === undefined) {
+const noScriptNamed = process.argv?.[1] === undefined || process.argv?.[1] === "";
+if (entry === undefined && !noScriptNamed) {
   console.error(UNDETERMINED_ENTRY);
   process.exitCode = 1;
 }

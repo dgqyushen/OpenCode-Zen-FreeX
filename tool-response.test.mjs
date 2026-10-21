@@ -455,17 +455,22 @@ function endlessStream(chunk, { cancel = () => {} } = {}) {
 // nothing of one but read/cancel/releaseLock, and a real stream errors itself
 // when its read rejects — where a cancel is a no-op against the error already
 // stored — so this is the only way to see whether that failure cancels what
-// is left of the body or only releases it (#47).
-function failingBody(cause, cancel = () => {}) {
-  const handle = { cancellations: [], released: false };
+// is left of the body or only releases it (#47). The content type says which
+// arm of the guard reads it: a stream is read event by event, a JSON body in
+// one read, and both arms answer the same failure the same way.
+function failingBody(cause, cancel = () => {}, contentType = "text/event-stream") {
+  const handle = { cancellations: [], released: false, reads: 0 };
   handle.response = {
     ok: true,
     status: 200,
     statusText: "OK",
-    headers: new Headers({ "content-type": "text/event-stream" }),
+    headers: new Headers({ "content-type": contentType }),
     body: {
       getReader: () => ({
-        read: () => Promise.reject(cause),
+        read: () => {
+          handle.reads++;
+          return Promise.reject(cause);
+        },
         cancel: (reason) => {
           handle.cancellations.push(reason);
           return cancel(reason);
@@ -1065,6 +1070,25 @@ for (const protocol of protocols) {
     assert.equal(source.body.locked, false);
   });
 
+  // A Node stream raises its cancellation with a code rather than an
+  // `AbortError` name. The streaming arm has to recognise that too, or the
+  // client's own cancellation is answered as an upstream failure — a 502 event
+  // it cannot act on, for a request it stopped itself.
+  test(`${protocol}: a cancellation with Node's code is handed over on the stream`, async () => {
+    const cause = Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" });
+    const source = new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(cause);
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const result = await guardToolResponse(source, protocol, policy);
+    await assert.rejects(result.text(), (error) => error === cause);
+    assert.equal(source.body.locked, false);
+  });
+
   test(`${protocol}: a transport failure cancels the body rather than only releasing it (#47)`, async () => {
     const cause = new TypeError("terminated");
     const body = failingBody(cause);
@@ -1121,6 +1145,70 @@ for (const protocol of protocols) {
     );
     assert.equal(result.status, 502);
     assertError(protocol, await result.json(), false);
+  });
+
+  // The whole-reply arm used to rethrow every failure that was not the guard's
+  // own, while the streaming arm cancelled the body, logged the raw failure and
+  // answered a protocol-shaped 502. One upstream transport failure was then a
+  // 502 to a client that streamed and an unhandled rejection to one that did
+  // not. The body is read once, and then cancelled and let go of.
+  test(`${protocol}: a transport failure in a whole reply is a protocol-shaped 502`, async () => {
+    const cause = new TypeError("terminated");
+    const body = failingBody(cause, () => {}, "application/json");
+    const { logged, value: result } = await withLog(() =>
+      guardToolResponse(body.response, protocol, policy),
+    );
+    assert.equal(result.status, 502);
+    assertError(protocol, await result.json(), false);
+    assert.ok(
+      logged.some((line) => line.includes("terminated")),
+      `the server's log did not keep the raw failure: ${logged.join(" | ")}`,
+    );
+    // The failure cancelled what was left of the body rather than only letting
+    // go of the reader (readBounded cancels without a reason), and the body was
+    // not read again after the read that failed. A cancellation without a
+    // reason is what the read already does, so the reason is what separates
+    // this arm from it.
+    assert.equal(body.cancellations.length, 1, "the failing body was not cancelled");
+    assert.equal(
+      body.cancellations[0],
+      cause,
+      "the failure was not the reason the body was cancelled for",
+    );
+    assert.equal(body.reads, 1, "the guard kept reading a body whose read had failed");
+    assert.equal(body.released, true);
+  });
+
+  // The other kind of failure that is not the guard's own, in the whole-reply
+  // arm: the client asked for the request to stop. It is handed over as it
+  // came, and it is not an upstream failure to log.
+  test(`${protocol}: an abort during a whole reply is handed over as it came`, async () => {
+    const cause = new DOMException("The operation was aborted.", "AbortError");
+    const body = failingBody(cause, () => {}, "application/json");
+    const { logged } = await withLog(async () => {
+      await assert.rejects(
+        guardToolResponse(body.response, protocol, policy),
+        (error) => error === cause,
+      );
+    });
+    assert.deepEqual(logged, [], "the client's own abort was logged as an upstream failure");
+    assert.equal(body.reads, 1);
+    assert.equal(body.released, true);
+  });
+
+  // A Node stream raises its cancellation as an `ABORT_ERR`, not as an
+  // `AbortError`, and recognising only the name answered a client's own
+  // cancellation as a 502 it could not act on.
+  test(`${protocol}: a cancellation with Node's code is the client's own`, async () => {
+    const cause = Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" });
+    const body = failingBody(cause, () => {}, "application/json");
+    const { logged } = await withLog(async () => {
+      await assert.rejects(
+        guardToolResponse(body.response, protocol, policy),
+        (error) => error === cause,
+      );
+    });
+    assert.deepEqual(logged, [], "a cancellation with a code was logged as an upstream failure");
   });
 }
 
@@ -1626,17 +1714,119 @@ test('Responses: two calls with a call_id of "" are two items, not one', async (
   const streamed = await guardToolResponse(sse(text), "responses", policy);
   assert.equal(streamed.status, 200);
   const data = frameData(await streamed.text());
-  const ids = [
-    ...data.filter((value) => value.item).map((value) => value.item.id),
-    ...(data.find((value) => value.type === "response.completed")?.response.output ?? []).map(
-      (item) => item.id,
-    ),
-  ];
-  assert.equal(new Set(ids).size, 2, `two calls shared one item: ${ids.join(", ")}`);
+  // Every call answers one id across the three copies of it: the frame that
+  // opens it, the frame that closes it, and the copy inside the terminal. The
+  // copies arrive in the stream's own order, so the ids are read per group and
+  // each call must own exactly one of each — the first call's closing copy
+  // answering the second call's id (which is what matching the last entry of
+  // the name alone did) leaves the first call unclosed and this fails.
+  const added = data
+    .filter((value) => value.type === "response.output_item.added")
+    .map((value) => value.item.id);
+  const done = data
+    .filter((value) => value.type === "response.output_item.done")
+    .map((value) => value.item.id);
+  const terminal = (
+    data.find((value) => value.type === "response.completed")?.response.output ?? []
+  ).map((item) => item.id);
+  assert.equal(added.length, 2, "the stream opened two calls");
+  assert.equal(new Set(added).size, 2, `two calls shared one item: ${added.join(", ")}`);
+  assert.deepEqual(
+    [...done].sort(),
+    [...added].sort(),
+    `the closing copies answered ids the added frames never opened: ${done.join(", ")}`,
+  );
+  assert.deepEqual(
+    terminal,
+    added,
+    `the terminal's copies answered other ids than the frames: ${terminal.join(", ")}`,
+  );
+  for (const id of added)
+    assert.equal(
+      done.filter((value) => value === id).length,
+      1,
+      `call ${id} was closed ${done.filter((value) => value === id).length} times: ${done.join(", ")}`,
+    );
   assert.deepEqual(
     data.filter((value) => value.type?.startsWith("response.function_call_arguments")).map((v) => v.item_id),
     [],
     "the arguments frames of the calls left out reached the client",
+  );
+});
+
+// A closing copy that arrives twice is one call, not two. The first copy
+// answers the entry and settles it; the second has no unsettled entry of that
+// name left to match, so the name itself is the only thing it can be read by.
+// A rule that preferred unsettled entries and had no settled fallback would
+// fall through to the minting path here and hand the client a second item for
+// one call, while the terminal's copy of it answered the first id. This is the
+// case that keeps that simplification from being made.
+test("Responses: a closing copy that arrives twice answers the call it closes", async () => {
+  const bare = () => ({ type: "function_call", name: "", arguments: "{}" });
+  const text =
+    event({ type: "response.output_item.added", item: bare() }, "response.output_item.added") +
+    event({ type: "response.output_item.done", item: bare() }) +
+    event({ type: "response.output_item.done", item: bare() }) +
+    event(
+      { type: "response.completed", response: { status: "completed", output: [bare()] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const added = data.filter((value) => value.type === "response.output_item.added").map((v) => v.item.id);
+  const done = data.filter((value) => value.type === "response.output_item.done").map((v) => v.item.id);
+  const terminal = (data.find((value) => value.type === "response.completed")?.response.output ?? [])
+    .map((item) => item.id);
+  assert.equal(added.length, 1, "the stream opened one call");
+  assert.equal(done.length, 2, "both closing copies reached the client");
+  assert.deepEqual(
+    [...done, ...terminal],
+    [added[0], added[0], added[0]],
+    `the copies of one call answered more than one id: added ${added.join(", ")}, done ${done.join(", ")}, terminal ${terminal.join(", ")}`,
+  );
+});
+
+// A snapshot's output list is not always the reply's whole output: a
+// `response.created` can carry the one item the stream is working on, at a
+// position that means nothing about the order the stream opened its calls in.
+// The place is read first, but an entry the stream has already answered there
+// is not the call this copy belongs to — the copy that follows the closing
+// frame of the first call is the second one's, and answering by place alone
+// handed the second call the first call's id.
+test("Responses: a partial snapshot's copy answers the call the stream is still inside", async () => {
+  const bare = (name) => ({ type: "function_call", name, arguments: "" });
+  const text =
+    event({ type: "response.output_item.added", item: bare("") }, "response.output_item.added") +
+    event({ type: "response.output_item.done", item: bare("") }) +
+    event({ type: "response.output_item.added", item: bare("") }, "response.output_item.added") +
+    // The snapshot carries the second call only, and puts it first.
+    event(
+      {
+        type: "response.created",
+        response: { id: "r1", status: "in_progress", output: [bare("")] },
+      },
+      "response.created",
+    ) +
+    event(
+      { type: "response.completed", response: { id: "r1", status: "completed", output: [] } },
+      "response.completed",
+    );
+  const streamed = await guardToolResponse(sse(text), "responses", policy);
+  assert.equal(streamed.status, 200);
+  const data = frameData(await streamed.text());
+  const added = data
+    .filter((value) => value.type === "response.output_item.added")
+    .map((value) => value.item.id);
+  const done = data.find((value) => value.type === "response.output_item.done").item.id;
+  const snapshot = data.find((value) => value.type === "response.created").response.output[0].id;
+  assert.equal(added.length, 2, "the stream opened two calls");
+  assert.notEqual(added[0], added[1], "the two calls answered one id");
+  assert.equal(done, added[0], "the closing copy did not answer the call it closes");
+  assert.equal(
+    snapshot,
+    added[1],
+    "the partial snapshot's copy answered the call the stream had already closed",
   );
 });
 

@@ -2105,6 +2105,30 @@ test("what the route taught outranks the table for its axis, and a model nothing
   assert.equal(limitOverrides("never-seen-free", declared, {}, new Map(), new Map(), brackets).context, undefined);
 });
 
+// An axis a record owns as `null` is a value a state file or a caller can write
+// for "not measured". The `!== undefined` guard alone let it through to
+// `.declaredAt`, so a model list threw where it should have answered the axis
+// from the weaker tiers. Both the context entry read before the loop and the
+// per-axis entry inside it need the null guard.
+test("a table entry that owns null for an axis is not a measurement", async () => {
+  const { limitOverrides } = await subject;
+  const declared = { context: 200000, output: 32000, input: 160000 };
+  const table = { "null-entry-free": { context: null, output: null, input: null } };
+  assert.deepEqual(
+    limitOverrides("null-entry-free", declared, table, new Map(), new Map(), new Map()),
+    {},
+    "the null entry is skipped rather than read as a measurement",
+  );
+  // The per-axis guard with no context entry in play: the loop reaches the axes
+  // the table owns as null on its own, and must answer them like a missing entry.
+  const perAxis = { "null-axis-free": { input: null } };
+  assert.deepEqual(
+    limitOverrides("null-axis-free", declared, perAxis, new Map(), new Map(), new Map()),
+    {},
+    "an axis the table owns as null leaves the catalogue's declaration in place",
+  );
+});
+
 test("a bracket survives a restart through one file, and a file that is not one is no state", async () => {
   const { observeRefusedRequest, limitBracket, limitAdaptivity, limitStateJSON, loadLimitState, saveLimitState } =
     await subject;
@@ -2275,6 +2299,20 @@ test("a report of a state file cannot itself become the state, and a state with 
   assert.equal(limitAdaptivity().get("copy-free").floor, 10);
   limitAdaptivity(new Map());
   limitAdaptivity(held);
+});
+
+// An id comes out of a Map, and a caller's model id is not a safe key for a
+// plain object: `models["__proto__"] = row` runs `Object.prototype`'s setter
+// instead of adding a row. The row would be lost from the file — a restart
+// would read no measurement for it — and the object written would carry a
+// row-shaped prototype. A null-prototype map keeps the id as a key, and
+// JSON.stringify writes the same bytes it does for any other map.
+test("an id named __proto__ reaches the state file like any other", async () => {
+  const { limitStateJSON } = await subject;
+  const written = JSON.parse(limitStateJSON(new Map([["__proto__", { floor: 120000, ceiling: 130000 }]])));
+  assert.deepEqual(Object.keys(written.models), ["__proto__"], "the row is an own key of the written map");
+  assert.equal(written.models["__proto__"].ceiling, 130000, "and carries the measurement");
+  assert.equal(Object.getPrototypeOf(written.models), Object.prototype, "and parsing it gives an ordinary object");
 });
 
 // A record measured on another scale is not this record, and the file path has

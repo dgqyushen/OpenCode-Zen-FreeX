@@ -427,11 +427,27 @@ test("every answer the gate reads is let go of, not left dangling", async () => 
   // run it produced said the service should be checked when what needed
   // changing was one line of configuration: `space-bunny-free` was retired on
   // 2026-10-19 and every gate run since then learned nothing.
+  //
+  // A 404 is the route not knowing the id or the path, and a wrong
+  // ZEN_BASE_URL answers it too: the detail names both variables so the reader
+  // is not sent to the model when the base is what changed.
   for (const status of [404, 410]) {
     const gone = box(new Response("Model space-bunny-free has been deprecated.", { status }));
     const result = await ask({ box: gone });
     assert.equal(result.result.verdict, "probe-gone", `HTTP ${status} is about the probe model`);
     assert.match(result.result.detail, /ZEN_CHECK_MODEL/, "and it says what to change");
+    if (status === 404)
+      assert.match(
+        result.result.detail,
+        /ZEN_BASE_URL/,
+        "a 404 can be the base as well as the model, so both are named",
+      );
+    else
+      assert.doesNotMatch(
+        result.result.detail,
+        /ZEN_BASE_URL/,
+        "410 is the route retiring the model, not a wrong base",
+      );
   }
 
   for (const [status, verdict] of [[403, "refused"], [500, "failed"]]) {

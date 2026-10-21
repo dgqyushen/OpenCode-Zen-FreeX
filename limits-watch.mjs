@@ -51,11 +51,19 @@
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { CATALOG } from "./provider.mjs";
-import { baseFrom, offeredIds } from "./limits-audit.mjs";
+import { baseFrom, entryVerdict, namesNoScript, offeredIds } from "./limits-audit.mjs";
 import { learnedAbout, sweepModels as sweepThem } from "./limits-sweep.mjs";
 import { MODELS_DEV_MIN } from "./limits.mjs";
 
-const BASE = baseFrom(process.env.ZEN_BASE_URL);
+// The base is parsed when a run asks for it, not while this module is
+// evaluated. `--check` and `--status` ask nothing, and a malformed
+// `ZEN_BASE_URL` used to throw on the `const BASE = ...` line before the entry
+// point's own try/catch — a snapshot that was perfectly readable could not be
+// checked because a variable the check never uses was wrong.
+function baseURL() {
+  return baseFrom(process.env.ZEN_BASE_URL);
+}
+
 const SNAPSHOT = fileURLToPath(new URL("./limits-observed.json", import.meta.url));
 // The version of the snapshot this file writes, and the only one it reads. A
 // file carrying another one was written by a rule this file does not know, and
@@ -222,8 +230,13 @@ function ageInDays(row, today) {
   if (today === undefined) return undefined;
   const measured = dayNumber(row?.at);
   const tried = dayNumber(row?.tried);
-  const day =
-    measured === undefined ? tried : tried === undefined ? measured : Math.max(measured, tried);
+  // The later of the two days, written as cases: a row can carry either, both
+  // or neither, and a nested ternary here reads as one question when it is
+  // really three. The values are unchanged.
+  let day;
+  if (measured === undefined) day = tried;
+  else if (tried === undefined) day = measured;
+  else day = Math.max(measured, tried);
   if (day === undefined) return undefined;
   return Math.floor((today - day) / DAY);
 }
@@ -311,7 +324,12 @@ export async function watch({
   read = readSnapshot,
   sweepModels = sweepThem,
 } = {}) {
-  const [listing, catalog] = await Promise.all([fetchJSON(`${BASE}/models`), fetchJSON(CATALOG_URL)]);
+  // Parsed once: the base the models are fetched from, the one the log names and
+  // the one the report carries are then one value, and a malformed
+  // `ZEN_BASE_URL` is one failure at the start of the run rather than one per
+  // place it happened to be read.
+  const base = baseURL();
+  const [listing, catalog] = await Promise.all([fetchJSON(`${base}/models`), fetchJSON(CATALOG_URL)]);
   const models = catalog?.opencode?.models ?? {};
   const offered = offeredIds(
     (Array.isArray(listing?.data) ? listing.data : []).map((entry) => entry?.id).filter(Boolean),
@@ -398,7 +416,7 @@ export async function watch({
   // asking for a fresh reading of a model's wall wants, and what nobody wants
   // to pay for on a timer.
   const targets = sweep ? (all ? measurable : [...new Set([...added.filter((id) => measurable.includes(id)), ...suspicion])]) : [];
-  log(`${BASE}`);
+  log(`${base}`);
   log(`${offered.length} free ids offered, ${keptOver.length} measured before, ${added.length} not`);
   if (added.length > 0) log(`  new: ${added.join(", ")}`);
   if (answeredElsewhere.length > 0)
@@ -517,7 +535,7 @@ export async function watch({
   if (dropped.length > 0)
     log(`  dropped from the snapshot, because models.dev answers them: ${dropped.join(", ")}`);
   return {
-    base: BASE, offered, added, gone, suspicion, answeredElsewhere, dropped, unlearned,
+    base, offered, added, gone, suspicion, answeredElsewhere, dropped, unlearned,
     measured: keptOver, results, snapshot: { models: next },
   };
 }
@@ -921,21 +939,40 @@ export async function statusSnapshot(
 // non-flag argument cannot be taken for the file without knowing that: the
 // number after the flag is not a snapshot path. `--stale-after=SECONDS` is read
 // too, and a value that is not a whole number of seconds leaves the default in
-// place rather than turning the status run into an argument error.
+// place rather than turning the status run into an argument error. Such a value
+// is also left in the argument list: it may be the positional snapshot, and
+// consuming it here is the silent other-file report described at the loop.
 function statusArguments(args) {
   let staleAfter = STATUS_STALE_AFTER_SECONDS;
+  // A whole number of seconds or nothing: `parseInt` reads the `2026` out of
+  // `2026-10-21.json`, so a leading number was enough to consume a snapshot path
+  // as the flag's value — the file then never reached the positional list and
+  // the run reported on the default snapshot instead of the one it was handed.
+  const seconds = (text) => {
+    if (!/^\d+$/.test(text)) return undefined;
+    const value = Number.parseInt(text, 10);
+    return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  };
   const positional = [];
   for (let at = 0; at < args.length; at += 1) {
     const arg = args[at];
     if (arg === "--stale-after") {
-      const value = Number.parseInt(args[at + 1] ?? "", 10);
-      if (Number.isSafeInteger(value) && value >= 0) staleAfter = value;
-      at += 1;
+      const value = seconds(args[at + 1] ?? "");
+      // Only a real value is consumed. Stepping over the next token regardless
+      // is what made `--status --stale-after file.json` silently report on the
+      // default snapshot: the path was eaten as the flag's value and never
+      // reached the positional list, so the run looked successful about a file
+      // nobody named. Left in place, the token is read as the positional
+      // snapshot, and if it is not one the run fails and names it.
+      if (value !== undefined) {
+        staleAfter = value;
+        at += 1;
+      }
       continue;
     }
     if (arg.startsWith("--stale-after=")) {
-      const value = Number.parseInt(arg.slice("--stale-after=".length), 10);
-      if (Number.isSafeInteger(value) && value >= 0) staleAfter = value;
+      const value = seconds(arg.slice("--stale-after=".length));
+      if (value !== undefined) staleAfter = value;
       continue;
     }
     if (arg.startsWith("--")) continue;
@@ -972,7 +1009,25 @@ function printStatus(report) {
   for (const issue of report.issues) console.log(`    ${issue.code}: ${issue.message}`);
 }
 
-if (import.meta.main) {
+// Whether this file was run is asked in one place and answered three ways, as
+// in `limits-sweep.mjs`: `import.meta.main` is the direct answer and the one
+// Bun gives, and `entryVerdict` falls back to process.argv[1] for the Node
+// releases before 22.18 that have no such flag. An answer it cannot settle is
+// not a reason to exit 0 — a `--check` that silently did nothing would report
+// success about a snapshot nobody read — so it is said and the run fails. The
+// one exception is a process that named no script at all — `node -e`, a REPL,
+// an import from another program — where nothing can be run from here and the
+// failure would be about an import that never asked to watch anything.
+const main = typeof import.meta.main === "boolean" ? import.meta.main : undefined;
+const entry = entryVerdict({ main, url: import.meta.url, argv: process.argv });
+if (entry === undefined && !namesNoScript(process.argv)) {
+  console.error(
+    "limits watch — could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:watch`.",
+  );
+  process.exitCode = 1;
+}
+
+if (entry === true) {
   const args = process.argv.slice(2);
   // `--check` is a gate on a file that is about to be published, so it asks
   // nothing and writes nothing: it reads a snapshot and says whether it is

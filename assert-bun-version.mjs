@@ -106,7 +106,7 @@ if (actual === "") {
 
 if (actual !== expected) {
   console.error(
-    `package.json declares Bun ${declared} and this workflow pins ${expected}, but the Bun that just ran is ${actual}; bump both together.`,
+    `package.json and this workflow both pin Bun ${expected}, but the Bun on PATH is ${actual}; the file and the pin agree, so install the Bun this project pins (${expected}) or remove the other one from PATH.`,
   );
   process.exit(1);
 }

@@ -115,7 +115,16 @@ jobs:
           # Fail open: an actions API the guard cannot read must not stop the
           # only measurement the project has.
           set +e
-          last="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=walls.yml --status=success --limit 1 --json createdAt --jq '.[0].createdAt' 2>/dev/null)"
+          # `updatedAt`, not `createdAt`: a run that took longer than the
+          # interval was created long before it finished, and the trigger that
+          # queued behind it would read that old start as "the interval has
+          # passed" and measure again. Completion is when the interval the
+          # guard enforces actually restarts. `gh run list` answers runs ordered
+          # by creation, so the newest completion is not `.[0]`: a window of
+          # runs is read and the latest completion among them is what the
+          # interval restarts from. No success yet is no output, which is the
+          # fail-open above.
+          last="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=walls.yml --status=success --limit 30 --json updatedAt --jq '([.[].updatedAt] | sort | last) // empty' 2>/dev/null)"
           code=$?
           set -e
           if [ "$code" -ne 0 ] || [ -z "$last" ]; then
@@ -126,10 +135,10 @@ jobs:
           age=$(( $(date -u +%s) - $(date -u -d "$last" +%s) ))
           if [ "$age" -lt 3300 ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "the last successful walls run was ${age}s ago; this trigger is a duplicate"
+            echo "the last successful walls run finished ${age}s ago; this trigger is a duplicate"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "the last successful walls run was ${age}s ago"
+            echo "the last successful walls run finished ${age}s ago"
           fi
 
   measure:
@@ -160,6 +169,13 @@ jobs:
       # under a workflow that holds a token.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The measurement is the default branch's, whatever ref the dispatch
+          # named: a run from another branch must not publish that branch's
+          # scripts or `limits-observed.json` with this job's write token. The
+          # workflow file itself still comes from the dispatched ref, so
+          # structural changes remain testable; the data and the scripts that
+          # write it come from `main`.
+          ref: ${{ github.event.repository.default_branch }}
           # The token is not needed after the clone, and the step that follows
           # runs a script that asks the network and writes a file. The job's
           # permissions are `contents: write` and `pull-requests: write`, so the
@@ -349,6 +365,11 @@ jobs:
           # by a pull request, so it is not an attacker-controlled path today —
           # but the fix costs one line and the shape is what causes accidents.
           WALLS_AUTOMERGE: ${{ vars.WALLS_AUTOMERGE }}
+          # The base the pull request is opened against, from the same
+          # expression the checkout measures from. A literal `main` here would
+          # diverge from the checkout the day the default branch is renamed, and
+          # the pull request would name a branch that no longer exists.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # The checkout dropped the credential, so the push has to authenticate
@@ -415,7 +436,7 @@ jobs:
           # rebuilt from main may not be a descendant of the old tip.
           git push --force origin "$branch"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "compare=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1" >> "$GITHUB_OUTPUT"
+          echo "compare=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${branch}?expand=1" >> "$GITHUB_OUTPUT"
           {
             echo "A scheduled survey measured the free tier on $(date -u +%Y-%m-%d) and found something"
             echo "that is not what the last run recorded."
@@ -428,13 +449,14 @@ jobs:
             echo "first word, because the samples behind it are there - a measurement here that"
             echo "contradicts one of those entries is the reason to rewrite the entry."
             echo
-            echo '```'
             # The report is a convenience, and its absence must not take the
             # publish step down with it: the branch is already pushed by the
             # time this runs, so a failure here would leave an orphan branch
-            # and no summary saying that the branch exists.
-            cat watch-report.txt 2>/dev/null || echo 'The survey printed no report.'
-            echo '```'
+            # and no summary saying that the branch exists. It is indented
+            # rather than fenced for the reason the run summary is: a line of
+            # route text can close a fence and inject markdown into a
+            # bot-authored pull request.
+            sed 's/^/    /' watch-report.txt 2>/dev/null || echo '    The survey printed no report.'
             echo
             echo "The rules the sweep applies — a failure that is not about a size is not a"
             echo "refusal, a refusal is asked twice before it counts, a wall needs two refused"
@@ -465,17 +487,25 @@ jobs:
             number="$existing"
             echo "::notice title=Reusing the open pull request::Pull request #$number already has $branch as its head; this run updated that pull request."
             opened=true
-          elif creation="$(gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base main --head "$branch" 2>&1)"; then
+          elif creation="$(gh pr create --title "walls: the free tier moved on $(date -u +%Y-%m-%d)" --body-file pr-body.md --base "$DEFAULT_BRANCH" --head "$branch" 2>&1)"; then
             opened=true
-            # `gh pr create` prints the new pull request's URL, and its number is
-            # the URL's last path component. The number is what the merge state
-            # is read by below: a lookup by branch names only an OPEN pull
-            # request, and the one this run merges is closed by the time it is
-            # read.
-            number="${creation##*/}"
-            echo "::notice title=Pull request opened::Pull request #$number carries $branch."
+            # `gh pr create` prints the new pull request's URL on stdout, and
+            # stderr was merged in so a refusal can be reported below: a warning
+            # printed beside the URL must not become part of the number. The
+            # URL line is found by shape instead of by splitting the whole blob.
+            # `grep` answers 1 for "no match", which is a shape this step has to
+            # keep walking through — the warning below is what reports it — and
+            # under `set -e` a failing pipeline would end the step before that.
+            set +e
+            number="$(printf '%s' "$creation" | grep -oE '/pull/[0-9]+$' | tail -n 1 | grep -oE '[0-9]+$')"
+            set -e
+            if [ -n "$number" ]; then
+              echo "::notice title=Pull request opened::Pull request #$number carries $branch."
+            else
+              echo "::warning title=Could not read the new pull request number::gh pr create succeeded but its output did not name a pull request; the branch was pushed and the pull request was left for a person."
+            fi
           else
-            echo "::warning title=Pull request not opened::This repository does not let GitHub Actions open pull requests, so the branch was pushed and no pull request was made. Open it from the link in the run summary, or allow it under Settings > Actions > General > Workflow permissions."
+            echo "::warning title=Pull request not opened::gh pr create failed ($(printf '%s' "$creation" | tail -n 1)), so the branch was pushed and no pull request was made. Open it from the link in the run summary. If the message names Actions permissions, allow them under Settings > Actions > General > Workflow permissions."
           fi
           echo "opened=$opened" >> "$GITHUB_OUTPUT"
           merged=false
@@ -490,7 +520,7 @@ jobs:
             # leave it alone.
             paths=""
             set +e
-            paths="$(gh pr view "$number" --json files --jq '[.files[].path] | join(",")' 2>&1)"
+            paths="$(gh pr view "$number" --json files --jq '[.files[].path] | join(",")' 2>/dev/null)"
             view_code=$?
             set -e
             if [ "$view_code" -ne 0 ]; then
@@ -527,7 +557,7 @@ jobs:
                 # merged is no longer open.
                 merge_state="unreadable"
                 set +e
-                merge_state="$(gh pr view "$number" --json state,mergedAt --jq 'if .state == "MERGED" and .mergedAt != null then "merged" else "not-merged" end' 2>&1)"
+                merge_state="$(gh pr view "$number" --json state,mergedAt --jq 'if .state == "MERGED" and .mergedAt != null then "merged" else "not-merged" end' 2>/dev/null)"
                 state_code=$?
                 set -e
                 if [ "$state_code" -eq 0 ] && [ "$merge_state" = "merged" ]; then

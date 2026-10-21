@@ -410,7 +410,7 @@ test("a row refused for its shape is never also an under-declaration candidate",
 });
 
 test("the run/import question answers true, false, or an honest nothing", async () => {
-  const { entryVerdict } = await subject();
+  const { entryVerdict, namesNoScript } = await subject();
   const here = new URL("./limits-audit.mjs", import.meta.url);
   const path = fileURLToPath(here);
   const other = fileURLToPath(import.meta.url);
@@ -434,6 +434,16 @@ test("the run/import question answers true, false, or an honest nothing", async 
     entryVerdict({ main: undefined, url: here.href, argv: ["node", join(tmpdir(), "limits-audit-not-here.mjs")] }),
     undefined,
   );
+  // The two ways to an `undefined` verdict are told apart before anything is
+  // said or failed: no script named at all is a program that imported this file
+  // (`node -e`, a REPL), while a named script that could not be compared is the
+  // open question. A caller that failed both would fail a host's own process
+  // because it imported a module.
+  assert.equal(namesNoScript(["node"]), true, "no script was named");
+  assert.equal(namesNoScript(["node", ""]), true, "an empty script name names nothing");
+  assert.equal(namesNoScript([]), true, "an argv with no entry at all names nothing");
+  assert.equal(namesNoScript(undefined), true, "no argv names nothing");
+  assert.equal(namesNoScript(["node", path]), false, "a script was named");
 });
 
 // The two cases below are about a file system that makes links, and the third is
@@ -1374,10 +1384,19 @@ test("a base URL with a trailing slash does not become a doubled path", async ()
   // and pasted into the middle of a URL here it fails the same unexplained
   // way. It is refused in a sentence of its own, rather than becoming a URL
   // that cannot be fetched.
+  //
+  // An empty query or fragment needs saying too: `new URL` answers "" for both
+  // `search` and `hash` on `https://host?` and `https://host#`, so the guards
+  // that read those fields pass, and the base joined below became
+  // `https://host/?` + `/models` — a query in the path, which the route cannot
+  // answer. The trailing character is what has to be refused, because the parse
+  // has already lost it.
   for (const value of [
     "https://user:pass@opencode.ai/inference/v1",
     "https://opencode.ai/inference/v1?key=1",
     "https://opencode.ai/inference/v1#section",
+    "https://opencode.ai/inference/v1?",
+    "https://opencode.ai/inference/v1#",
   ])
     assert.throws(
       () => baseFrom(value),

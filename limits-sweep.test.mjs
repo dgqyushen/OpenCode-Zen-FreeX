@@ -10,7 +10,12 @@
 // request, so the rules that spend the budget, confirm a refusal and classify a
 // liveness answer can be run without a route at all.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const subject = import("./limits-sweep.mjs").catch((error) => {
   assert.fail(`limits-sweep.mjs failed to load: ${error?.message ?? error}`);
@@ -150,22 +155,34 @@ test("a bracket is narrowed on its gap, not on how many refusals it collected", 
 });
 
 test("the budget is enough to narrow the widest bracket the ladder produces", async () => {
-  const { BUDGET, NARROW_TO, nextAsk, tally } = await subject;
+  const { BUDGET, LADDER, NARROW_TO, nextAsk, tally } = await subject;
   // The budget and the loop are two halves of one rule: a repaired loop with too
   // small a budget still stops short of the wall, which is exactly what happened
   // when the loop was fixed at BUDGET 6 and the declared floor only reached 279,223
-  // of a 326,702-token wall. What the ladder leaves to narrow is its two lower
-  // rungs, 1,000,000 and 1,600,000, minus the three ladder asks and one refusal
-  // confirmation.
-  const LADDER = [1_000_000, 1_600_000, 2_800_000];
-  const spentOnLadder = LADDER.length + 1;
-  // Bisect the widest bracket the ladder can leave, with the wall just under the
-  // second rung, and count what it takes to satisfy the precision rule.
+  // of a 326,702-token wall.
+  //
+  // The ladder is the file's own. A copy of the old three-rung list lived here
+  // and went on charging three asks after FIRST_SIZE was added below them, so
+  // the budget assertion was made against a first pass the sweep no longer ran.
+  // What a first pass really spends is every rung the climb asked up to the
+  // refusal, the refusal itself, and the second ask that confirms it.
   const wall = 1_522_400;
+  const stop = LADDER.findIndex((chars) => chars > wall);
+  // A ladder that no longer crosses the wall would make `slice(0, -1)` drop a
+  // rung and `LADDER[-1]` undefined, and the failure would arrive later as a
+  // confused bracket rather than as the fixture that stopped matching.
+  assert.notEqual(stop, -1, `no rung of the ladder is above the ${wall}-char wall`);
+  const spentOnLadder = stop + 2;
+  // Bisect the bracket the first pass leaves — the rung below the wall served,
+  // the wall-sized rung refused — and count what it takes to satisfy the
+  // precision rule. The token counts are the served answer's own, at the ratio
+  // this route has been measured at: a served rung reported `tokens: 1` is not
+  // an answer any route gave, and `tally` reads them.
+  const tokensFor = (chars) => Math.round((chars * 215_178) / 1_000_000);
   let asked = [
-    { chars: LADDER[0], kind: "served", tokens: 215178 },
-    { chars: LADDER[1], kind: "refused" },
-    { chars: LADDER[2], kind: "refused" },
+    ...LADDER.slice(0, stop).map((chars) => ({ chars, kind: "served", tokens: tokensFor(chars) })),
+    { chars: LADDER[stop], kind: "refused" },
+    { chars: LADDER[stop], kind: "refused" },
   ];
   let spent = spentOnLadder;
   let bracket = tally(asked);
@@ -175,8 +192,12 @@ test("the budget is enough to narrow the widest bracket the ladder produces", as
     spent += 1;
     asked = [
       ...[...new Set(bracket.refusedSizes)].map((chars) => ({ chars, kind: "refused" })),
-      { chars: bracket.servedChars, kind: "served", tokens: 1 },
-      { chars: next, kind: next <= wall ? "served" : "refused", tokens: next <= wall ? 1 : undefined },
+      { chars: bracket.servedChars, kind: "served", tokens: tokensFor(bracket.servedChars) },
+      {
+        chars: next,
+        kind: next <= wall ? "served" : "refused",
+        tokens: next <= wall ? tokensFor(next) : undefined,
+      },
     ];
     bracket = tally(asked);
   }
@@ -341,6 +362,31 @@ test("a permanent error is asked once, and only a transient one is asked again",
   assert.equal(calls, RETRIES + 1, "a transport failure is asked again");
   assert.equal(recovered.kind, "served");
   assert.equal(recovered.requests, RETRIES + 1, "and the requests it took are reported");
+  // A configuration failure carries no status either, so the rule above read it
+  // as a transport failure: a typo in `ZEN_GENERATION` was asked three times,
+  // spent two ten-second waits, and charged three requests to a budget that had
+  // sent nothing. It is the same answer at every attempt.
+  calls = 0;
+  let waited = 0;
+  const misconfigured = () => {
+    calls += 1;
+    return {
+      chars: 1_000_000,
+      kind: "error",
+      config: true,
+      says: "ZEN_GENERATION is not a generation this build knows",
+    };
+  };
+  const given = await ask("m", 1_000_000, () => {}, {
+    request: misconfigured,
+    wait: async () => {
+      waited += 1;
+    },
+  });
+  assert.equal(calls, 1, "a configuration failure answers the same however often it is asked");
+  assert.equal(waited, 0, "and no wait is spent on a retry that cannot change it");
+  assert.equal(given.requests, 1, "one ask, and nothing charged to the budget for retries");
+  assert.equal(given.config, true, "and the mark the ladder reads is kept");
 });
 
 test("a transient refusal is retried and then reported as an error, never a wall", async () => {
@@ -467,6 +513,29 @@ test("a run of transient failures cannot spend past the budget", async () => {
   assert.equal(result.spent, calls, "and it reports every request it sent");
   assert.ok(calls > LADDER.length, "the retries were charged, not counted as one per question");
   assert.equal(result.wall, "openEnded");
+});
+
+// A failure of the run's own configuration — a `ZEN_GENERATION` this build does
+// not know — is the same answer at every size. Walking the ladder for it reports
+// one typo fourteen times and makes the run look like fourteen route answers, so
+// the first one ends the climb.
+test("a configuration failure ends the ladder instead of being asked at every size", async () => {
+  const { sweep } = await subject;
+  let calls = 0;
+  const request = (model, chars) => {
+    calls += 1;
+    return {
+      chars,
+      kind: "error",
+      config: true,
+      says: "ZEN_GENERATION is not a generation this build knows",
+    };
+  };
+  const result = await sweep("typo-free", () => {}, { request, pause: async () => {} });
+  assert.equal(calls, 1, `the ladder was walked for one configuration error: ${calls} asks`);
+  assert.equal(result.asked.length, 1, "and the report carries the one answer it got");
+  assert.equal(result.asked[0].kind, "error");
+  assert.equal(result.wall, "openEnded", "a configuration failure is not a wall");
 });
 
 // Liveness. The sweep already asks the route, so whether the model still exists
@@ -730,4 +799,65 @@ test("the count is read from the route's own bytes, compact or not", async () =>
   assert.equal(promptTokens('{"usage":{"prompt_tokens": 215178}}'), 215178, "a space after the colon is still the count");
   assert.equal(promptTokens('{"usage":{"prompt_tokens":215178}}'), 215178, "and the compact form is too");
   assert.equal(promptTokens('{"usage":{"completion_tokens":12}}'), undefined, "a body with no count says nothing");
+});
+
+// A malformed base used to throw while this module was evaluated, before any
+// request was built: `limits-watch.mjs` imports the sweep for its rules, so a
+// `--check` on a readable snapshot died with a stack trace about a variable it
+// never used. The base is parsed when a request is built now, so the import has
+// to succeed with the variable wrong — and no request is made to prove it.
+test("a malformed ZEN_BASE_URL is not an import failure", () => {
+  const root = dirname(fileURLToPath(import.meta.url));
+  const script = join(tmpdir(), `zen-sweep-import-${process.pid}-${Date.now()}.mjs`);
+  const subjectUrl = new URL("./limits-sweep.mjs", import.meta.url).href;
+  try {
+    // A real file rather than `-e`, so process.argv[1] names an entry point:
+    // the import question is answered "not this file", as it is for the tests.
+    writeFileSync(script, `await import(${JSON.stringify(subjectUrl)});\nconsole.log("loaded");\n`);
+    const run = spawnSync(process.execPath, [script], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 60000,
+      env: { ...process.env, ZEN_BASE_URL: "ftp://opencode.ai/inference/v1" },
+    });
+    const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    assert.equal(run.status, 0, `a base that cannot be used may not fail the import: ${said}`);
+    assert.ok(said.includes("loaded"), `the module evaluated: ${said}`);
+  } finally {
+    rmSync(script, { force: true });
+  }
+});
+
+// A generation with no profile used to throw while the module was evaluated,
+// before a single answer could be reported. Built inside `once`'s own try, the
+// failure is that ask's error answer and the sweep can say so and go on.
+test("a generation with no profile is an error answer, not an import failure", async () => {
+  const previous = process.env.ZEN_GENERATION;
+  process.env.ZEN_GENERATION = "no-such-generation";
+  try {
+    // A fresh instance, because the generation is read when the file is
+    // evaluated and the suite's import above already read the default.
+    const { ask } = await import("./limits-sweep.mjs?no-such-generation");
+    const result = await ask("unbuildable-free", 1000, () => {}, { wait: async () => {} });
+    assert.equal(result.kind, "error", "the ask answers with the failure rather than throwing out of the run");
+    assert.match(result.says, /no profile for generation/, "and names the generation that is wrong");
+  } finally {
+    if (previous === undefined) delete process.env.ZEN_GENERATION;
+    else process.env.ZEN_GENERATION = previous;
+  }
+});
+
+// The entry point used to be `import.meta.main`, which is Bun's: a Node before
+// 22.18 evaluated nothing and exited 0, so a sweep that measured nothing was
+// indistinguishable from a run that found nothing. The no-argument run is the
+// cheapest way to ask which one happened, and it asks nothing of the route.
+test("a sweep run is visible on whatever runtime ran it", () => {
+  const script = fileURLToPath(new URL("./limits-sweep.mjs", import.meta.url));
+  const run = spawnSync(process.execPath, [script], { encoding: "utf8", timeout: 30000 });
+  const said = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+  assert.notEqual(run.status, 0, `a run that measured nothing may not exit 0 silently: ${said}`);
+  assert.ok(
+    said.includes("usage: bun limits-sweep.mjs") || said.includes("could not tell whether this file was run or imported"),
+    `the run has to say what happened: ${said}`,
+  );
 });

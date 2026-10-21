@@ -7,19 +7,47 @@ export const MAX_BYTES = 32 * 1024 * 1024;
 // The headers that describe the bytes a reply arrived as. A reply whose body
 // is written again — a stream collapsed into one JSON document, or a guarded
 // stream whose frames may be rewritten or added to — no longer describes
-// those bytes: a length, an encoding, hop-by-hop framing, and the validators
-// a cache or a conditional request would compare against all describe the
-// old ones only. What says something about the reply itself (a retry-after,
-// a request id) is left alone. One list, so the two places that write a body
-// again cannot drift apart.
+// those bytes: a length, an encoding, hop-by-hop framing (connection and the
+// headers it names, te, trailer, upgrade), the range a partial response
+// described, and the validators a cache or a conditional request would
+// compare against all describe the old ones only. What says something about
+// the reply itself (a retry-after, a request id) is left alone. One list, so
+// the two places that write a body again cannot drift apart.
 export const STALE_BODY_HEADERS = [
   "content-length",
   "content-encoding",
   "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "upgrade",
+  "content-range",
   "content-md5",
   "etag",
   "last-modified",
 ];
+
+// The headers of a reply whose body is written again, with the hop-by-hop ones
+// the upstream's own `Connection` value names removed as well. `Connection` is a
+// list of field names the connection ends at, so `Connection: x-hop` beside
+// `x-hop: 1` is framing that belongs to the connection and not to the reply:
+// dropping the word that named it and forwarding the header it named leaves
+// exactly what the list exists to take out. Exported with the list so the two
+// places that write a body again cannot drift apart.
+export function dropStaleHeaders(response) {
+  const headers = new Headers(response.headers);
+  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  const named = response.headers.get("connection");
+  if (typeof named === "string") {
+    for (const word of named.split(",")) {
+      const name = word.trim().toLowerCase();
+      if (name) headers.delete(name);
+    }
+  }
+  return headers;
+}
 
 // How much of an upstream error is answered to the caller. The upstream's own
 // error text is relayed as it arrived — the reason a reply failed is the one
@@ -44,8 +72,7 @@ function errorBody(protocol, message) {
 }
 
 function jsonResponse(source, protocol, value, error) {
-  const headers = new Headers(source.headers);
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  const headers = dropStaleHeaders(source);
   headers.set("content-type", "application/json");
   if (error) {
     return new Response(JSON.stringify(errorBody(protocol, error)), { status: 502, headers });
@@ -68,7 +95,16 @@ function jsonResponse(source, protocol, value, error) {
       { status: 502, headers },
     );
   }
-  return new Response(text, { status: source.status, headers });
+  // A collapsed body is the whole reply, whatever the upstream said about the
+  // bytes it was read from. A 206 describes the part of a stream that arrived,
+  // and answering the complete JSON under it — with the partial-range headers
+  // the list above deletes — tells the client it holds a fragment of a reply
+  // that is in fact all of it; a 204 cannot carry the body it now has. Every
+  // other status reached this line because it was `ok` (collapseResponse hands
+  // a failure back untouched), and it is the one the client would have had, so
+  // it is kept rather than rewritten to 200.
+  const status = source.status === 204 || source.status === 206 ? 200 : source.status;
+  return new Response(text, { status, headers });
 }
 
 function errorMessage(value, fallback = "Upstream stream failed") {
@@ -645,9 +681,9 @@ function responsesAccumulator() {
           // reading the Messages accumulator gives a block that is not a block
           // (isSnapshotObject, above), and the one this file gives the items
           // themselves: one that is not an item is skipped, and is not a reason
-          // to fail the stream. An output that is not a list at all is left as
-          // it arrived, which is how `finish` answers one (below): it holds no
-          // entry to read.
+          // to fail the stream. An output that is not a list at all holds no
+          // entry to read and is no view of the reply's items, so `finish`
+          // answers the accumulated ones (below).
           const stated = Array.isArray(data.response.output);
           const items = stated ? data.response.output.filter(isSnapshotObject) : [];
           // The snapshot is spread whole, and its own `usage` comes with it:
@@ -868,24 +904,35 @@ function responsesAccumulator() {
         const id = identity(item.id);
         if (id !== undefined) keptByID.set(id, item);
       }
+      // A terminal whose output is not a list carries no usable output: a
+      // scalar or an object is not a collection of items to answer with, and
+      // taking it as one replaced everything the stream delivered.
       const whole = Array.isArray(final.output)
         ? final.output.length > 0 &&
           final.output.length >= kept.length &&
           names(final.output, kept) &&
           // A terminal that carries MORE items than the stream was seen to
           // accumulate is a superset of the reply, not a shorter view of it:
-          // the missing items are the reason it exists, and it wins. A terminal
-          // of the same length is the shape a re-emitting gateway uses, and each
-          // item is weighed against the one in the same place before it may
-          // replace it. A longer terminal's first items are not weighed because
-          // a partial gateway does not add items, it truncates them.
-          (final.output.length > kept.length ||
-            final.output.every((item, at) => {
-              const id = identity(item.id);
-              const held = id === undefined ? kept[at] : (keptByID.get(id) ?? kept[at]);
-              return held === undefined || carries(item, held, fields);
-            }))
-        : final.output !== null && final.output !== undefined;
+          // the missing items are the reason it exists, and it wins. The items
+          // it names again are still weighed against the stream's copy — a
+          // gateway that adds an item and re-emits an earlier one truncated
+          // would otherwise replace the accumulated item with the shorter
+          // view, and the text the deltas delivered would be gone — while an
+          // item it names for the first time has nothing to be weighed
+          // against. A terminal of the same length is the shape a re-emitting
+          // gateway uses, and each item is weighed against the one in the same
+          // place before it may replace it.
+          (final.output.length > kept.length
+            ? final.output.every((item) => {
+                const held = keptByID.get(identity(item.id));
+                return held === undefined || carries(item, held, fields);
+              })
+            : final.output.every((item, at) => {
+                const id = identity(item.id);
+                const held = id === undefined ? kept[at] : (keptByID.get(id) ?? kept[at]);
+                return held === undefined || carries(item, held, fields);
+              }))
+        : false;
       // The terminal is spread whole onto the answer, so the report it carries
       // is read by shape like every other (keepUsage, above): one that is not a
       // report states none, and the report the stream accumulated stands.
@@ -899,7 +946,12 @@ function responsesAccumulator() {
       // one that omits object, answered without them. The body is the base,
       // the terminal overrides what it carries, and the items it lost come
       // back from the accumulation.
-      if (whole || !kept.length) return { ...body, ...terminal };
+      // A terminal that is not a whole view of the reply contributes only what
+      // it carries beside `output`: the items the stream delivered come back
+      // from the accumulation. A non-list `output` is not a view of the items
+      // at all, so even a reply that accumulated none answers with the empty
+      // list it would have had rather than the scalar.
+      if (whole) return { ...body, ...terminal };
       return { ...body, ...terminal, output: kept };
     },
   };

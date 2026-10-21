@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -613,12 +613,13 @@ function adoptedCeiling(id, seeded, brackets) {
 // usable — a state file somebody edited, a version that wrote another shape —
 // falls back to the seed rather than to a guess.
 function derivedCeiling(record, seeded) {
-  const seed =
-    Number.isSafeInteger(seeded) && seeded > 0
-      ? seeded
-      : Number.isSafeInteger(record?.seededFrom) && record.seededFrom > 0
-        ? record.seededFrom
-        : undefined;
+  // Written as a chain rather than a nested ternary: the seed is either the
+  // caller's declaration or the one this record was born with, and which of the
+  // two answered is worth reading as two cases rather than as one expression
+  // shaped like a question mark. No value changes.
+  let seed;
+  if (Number.isSafeInteger(seeded) && seeded > 0) seed = seeded;
+  else if (Number.isSafeInteger(record?.seededFrom) && record.seededFrom > 0) seed = record.seededFrom;
   const cap = Math.max(seed ?? 0, maxWindow());
   const floor = usable(record?.floor) ? record.floor : 0;
   const step = usable(record?.step) ? record.step : seedStep(seed);
@@ -1103,7 +1104,12 @@ function saveDebounce(env = globalThis.process?.env) {
 // bytes rather than the file, and so a caller that writes its own state has one
 // shape to write.
 export function limitStateJSON(brackets = BRACKETS) {
-  const models = {};
+  // A null-prototype map, for the reason `readLimitState` builds one: an id is
+  // whatever a caller's Map holds, and `models["__proto__"] = row` on a plain
+  // object runs `Object.prototype`'s setter instead of adding a row. The row
+  // would be lost from the file — and the file is what a restart reads back as
+  // a measurement. `JSON.stringify` writes the same bytes for either object.
+  const models = Object.create(null);
   let written = 0;
   for (const [id, record] of brackets) {
     if (!isUsableId(id) || written >= STATE_ENTRIES) continue;
@@ -2408,8 +2414,16 @@ export function limitOverrides(
   // for a model serving 343000 exactly that way.
   const contextEntry = record && Object.hasOwn(record, "context") ? record.context : undefined;
   const contextDeclared = declared && Object.hasOwn(declared, "context") ? declared.context : undefined;
+  // `null` is an own value a row may carry — a state file or a caller can write
+  // it for an axis that was not measured — and `!== undefined` alone let it
+  // through to `.declaredAt` and threw a TypeError out of a model list. It is
+  // not a measurement, so the axis falls back to the weaker tiers like a row
+  // that never named it.
   const contextApplies =
-    contextEntry !== undefined && contextDeclared !== undefined && contextEntry.declaredAt === contextDeclared;
+    contextEntry !== undefined &&
+    contextEntry !== null &&
+    contextDeclared !== undefined &&
+    contextEntry.declaredAt === contextDeclared;
   const settledWindow = settledFor(contextApplies, contextEntry, contextDeclared, measuredWall);
   // A window this process was told about is the strongest thing this axis has, and
   // it is what the input axis follows like any other measured window: a route that
@@ -2466,7 +2480,15 @@ export function limitOverrides(
     // from the settled value below when it is created, so the table still has the
     // first word — it just does not have the last one. A model nothing has been
     // asked of has no record, and its axes are the settled ones and nothing else.
-    const applies = entry !== undefined && declaredValue !== undefined && entry.declaredAt === declaredValue;
+    // `null` is an own value, and an entry that owns `null` is not one that
+    // measured anything: `!== undefined` let it through to `.declaredAt` and
+    // ended the model list with a TypeError. It is treated like a row that
+    // never named the axis, and the settled value below answers instead.
+    const applies =
+      entry !== undefined &&
+      entry !== null &&
+      declaredValue !== undefined &&
+      entry.declaredAt === declaredValue;
     let settled = settledFor(applies, entry, declaredValue, axis === "context" ? measuredWall : undefined);
     // The input axis has no measurement of its own to take: what the route served
     // was a prompt, and the window is how this file states that. So where the

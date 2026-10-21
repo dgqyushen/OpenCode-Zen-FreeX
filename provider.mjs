@@ -30,7 +30,7 @@ import {
   requestSize,
   snapshotState,
 } from "./limits.mjs";
-import { STALE_BODY_HEADERS, collapseResponse } from "./stream.mjs";
+import { collapseResponse, dropStaleHeaders } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
 
 // Zen moved behind opencode.ai/inference; everything under /zen/ answers 403
@@ -154,8 +154,7 @@ export function outboundHeaders({
 // under the upstream's `content-encoding` cannot be read by the caller at all,
 // which for a refusal is the one message a user has to be able to read.
 function rewrittenHeaders(response) {
-  const headers = new Headers(response.headers);
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
+  const headers = dropStaleHeaders(response);
   headers.set("content-type", "application/json");
   return headers;
 }
@@ -167,9 +166,7 @@ function rewrittenHeaders(response) {
 // it: a refusal relayed from a gateway may be HTML, and calling it JSON here
 // would be this package's word rather than the upstream's.
 function relayedHeaders(response) {
-  const headers = new Headers(response.headers);
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
-  return headers;
+  return dropStaleHeaders(response);
 }
 
 // What was read of a refusal is a prefix, not necessarily the refusal. Handing
@@ -319,7 +316,11 @@ async function readRemote(url, json, headers, callerSignal) {
       await response.body?.cancel();
       throw new Error(`Model discovery returned HTTP ${response.status}`);
     }
-    return json ? response.json() : response.text();
+    // Awaited, not merely returned: the `finally` below runs the moment the
+    // promise is handed back, and disposing the combination there would detach
+    // the caller's abort and the read's own timeout from a body that has not
+    // been read yet. The body is part of the read.
+    return await (json ? response.json() : response.text());
   } finally {
     combined?.dispose();
   }
@@ -666,7 +667,10 @@ function conversationSeed(body) {
   // An empty opening is no opening, exactly as an empty name is no name: there
   // is nothing in it to key by, so the caller falls to `previous_response_id`
   // (or to an id of its own) rather than to a key every such body would share.
-  if (first === "" || first === undefined) return undefined;
+  // `null` is the same absence — a host that sends `input: null` is not opening
+  // with the word "null", and every such body shared one session while the
+  // guard read only the empty string and the missing field.
+  if (first === "" || first === undefined || first === null) return undefined;
   return JSON.stringify({ system, first });
 }
 
@@ -1136,7 +1140,15 @@ async function server(_input, options = {}) {
         });
       return fallback;
     }
-    const ids = listing.value.data.map((item) => item.id);
+    // A listing entry that is not a model is the same fact as no listing entry,
+    // not a reason to fail the listing: `item.id` on a `null` entry threw out of
+    // `reading`, and that throw was the whole discovery's — every free model
+    // gone for one dirty row upstream, the failure the catalogue rule below
+    // exists to prevent in its own document. The id is read through the optional
+    // chain and the entry is skipped, in the order the route sent them.
+    const ids = listing.value.data
+      .map((item) => item?.id)
+      .filter((id) => typeof id === "string");
     const discovered = buildModels(ids, metadata, protocols, baseURL);
     if (partial) {
       // Preserve previously verified models only while they remain in the live catalog.

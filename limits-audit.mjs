@@ -454,6 +454,18 @@ export async function ask(id, names) {
 export const UNDETERMINED_ENTRY =
   "Could not tell whether this file was run or imported, so nothing was asked: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:audit`.";
 
+// Whether the process named no script at all — `node -e`, a REPL, an import
+// from another program. `entryVerdict` answers `undefined` for two different
+// situations and a caller has to tell them apart: with no `process.argv[1]`
+// there is no entry point to be, so the module is an import however the file
+// system answered, while a script that was named and could not be compared is
+// the open question that is walked through as a failure. Only the second is
+// worth failing a process over, and this is the test that separates them.
+export function namesNoScript(argv) {
+  const asked = argv?.[1];
+  return asked === undefined || asked === "";
+}
+
 // Whether this module is the file that was run rather than one the tests
 // import. `import.meta.main` is the direct answer and the one Bun gives, but it
 // arrived in Node 22.18 and nothing before that has it — and an audit that cannot
@@ -549,9 +561,13 @@ function invokedDirectly() {
 // importer — a test runner, a loader, anything that asked for these helpers —
 // instead of telling it what happened. Throwing leaves the report and the exit
 // code to the caller, so a run that reaches it still dies non-zero with the
-// sentence above, and an importer can catch it and say so itself.
+// sentence above, and an importer can catch it and say so itself. The one
+// undeterminable case that is not thrown is a process that named no script at
+// all — `node -e`, a REPL: nothing can be run from here, and a module that
+// throws out of its own evaluation takes the importer down with a sentence
+// about an audit it never asked for.
 const entry = invokedDirectly();
-if (entry === undefined) throw new Error(UNDETERMINED_ENTRY);
+if (entry === undefined && !namesNoScript(process.argv)) throw new Error(UNDETERMINED_ENTRY);
 
 if (entry) {
   // A generation nobody captured is a typo or a Zen that has moved on, and is

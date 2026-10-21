@@ -70,7 +70,14 @@ export function fingerprintTarget(argv = process.argv, env = process.env) {
   // rather than as the typo it is. It is also what an empty `--fingerprint=`
   // names. The default is the safe answer either way, since a mistake must not
   // be the thing that decides where a write goes.
-  const value = inline !== undefined ? inline.slice("--fingerprint=".length) : flag === -1 ? undefined : argv[flag + 1];
+  //
+  // The `=` form wins when both are on the command line: it carries its value in
+  // the same argument, so it is the one that cannot be confused with the next
+  // one, and the precedence is stated here rather than read off a nested
+  // conditional.
+  let value;
+  if (inline !== undefined) value = inline.slice("--fingerprint=".length);
+  else if (flag !== -1) value = argv[flag + 1];
   if (value && !value.startsWith("-")) return value;
   // `||` rather than `??` for the environment: an exported-but-empty variable
   // is not a path, and `resolve("")` is the working directory — a write aimed
@@ -87,6 +94,12 @@ export function fingerprintTarget(argv = process.argv, env = process.env) {
 // way, inside `Bun.serve`, as an error that says nothing about the variable
 // that was wrong.
 //
+// A fraction is not one of these numbers either: `CAPTURE_PORT=8791.5` passed the
+// range check and then failed inside `Bun.serve` as a socket error, and a
+// fraction of a millisecond is not a timeout. `Number.isInteger` is the check for
+// that, and it also refuses `NaN` and both infinities, so the finite test is not
+// repeated beside it.
+//
 // So the default stands for a value that is not a number, and the variable that
 // was refused is named: a knob that reads as set while it was not is worse than
 // one that is unset, because the run would answer for the default and the
@@ -99,7 +112,7 @@ export function numberFromEnv(name, fallback, env = process.env, max = Number.PO
   const raw = env[name];
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0 || value > max) {
+  if (!Number.isInteger(value) || value <= 0 || value > max) {
     console.error(`${name} is not a number this run can use (${JSON.stringify(raw)}); using ${fallback}`);
     return fallback;
   }
@@ -606,7 +619,21 @@ export function report({ request, code, fingerprint = FINGERPRINT, dry = process
 // files cannot end up disagreeing about what a table is.
 const isTable = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 
-function readTarget(fingerprint) {
+// The two views a target is returned as describe one file: `report` writes
+// through `file` and compares against `profiles`, so they have to be the same
+// objects. The early returns used to hand back a separately allocated
+// `{ profiles: {} }` for each, which is a `profiles` view of a file nobody wrote.
+// Exported so the shape is pinned by a test rather than trusted, the same reason
+// `numberFromEnv` takes its environment as a parameter.
+//
+// Every return below is built here, so the invariant is stated once: a caller
+// cannot get the two views from different objects, and a new early return cannot
+// reintroduce the pair that is not one target.
+function targetOf(file) {
+  return { file, profiles: file.profiles };
+}
+
+export function readTarget(fingerprint) {
   let text;
   try {
     text = readFileSync(fingerprint, "utf8");
@@ -615,7 +642,7 @@ function readTarget(fingerprint) {
     // or a directory standing where the file belongs, and the write below has
     // its own say about that.
     console.log(`no capture at ${fingerprint} to compare against; one will be written from scratch`);
-    return { file: { profiles: {} }, profiles: {} };
+    return targetOf({ profiles: {} });
   }
   let parsed;
   try {
@@ -624,11 +651,11 @@ function readTarget(fingerprint) {
     console.error(
       `the capture at ${fingerprint} is not JSON (${cause?.message ?? cause}); it will be replaced by this capture`,
     );
-    return { file: { profiles: {} }, profiles: {} };
+    return targetOf({ profiles: {} });
   }
   if (!isTable(parsed)) {
     console.error(`the capture at ${fingerprint} is not a table of profiles; it will be replaced by this capture`);
-    return { file: { profiles: {} }, profiles: {} };
+    return targetOf({ profiles: {} });
   }
   if (!isTable(parsed.profiles)) {
     // The file is kept — the note in it, and whatever else it holds — and only
@@ -641,10 +668,9 @@ function readTarget(fingerprint) {
       `the capture at ${fingerprint} holds no profiles object; its profiles will be written afresh and the rest of the file kept`,
     );
     const file = { ...parsed, profiles: {} };
-    return { file, profiles: file.profiles };
+    return targetOf(file);
   }
-  const file = { ...parsed, profiles: { ...parsed.profiles } };
-  return { file, profiles: file.profiles };
+  return targetOf({ ...parsed, profiles: { ...parsed.profiles } });
 }
 
 // The parts of the --dry sentence, in the order they are said: the change count
@@ -682,15 +708,12 @@ function order(value) {
 // instead of a real `opencode`.
 const entry = invokedDirectly();
 if (entry) {
-  const capturedPath = join(tmpdir(), `zen-capture-${process.pid}.json`);
-  // A run that was killed leaves its file behind and a PID comes round again, so
-  // this one is removed rather than read back as if it were this run's capture.
-  rmSync(capturedPath, { force: true });
   // OpenCode makes more than one request (a short one for the title, then the
   // real one). The one worth reading is the longest, since it is the one that
-  // carries the full toolset. It is kept here rather than written from the handler
-  // as it arrives: two requests in flight at once would both be writing this one
-  // file, and the writes interleave into it.
+  // carries the full toolset. It is kept in memory and handed to `report` as it
+  // is: the request is the only thing this state is for, and the file it used to
+  // be written to and read back from was cleaned up only at the start of the
+  // next run, so every successful run left one behind.
   let longest = { agent: null, body: "" };
   let server;
   try {
@@ -759,8 +782,8 @@ if (entry) {
   );
   // Stopping is awaited, and the snapshot is taken after it: the handler is
   // async, so a body still being read could otherwise replace `longest` after the
-  // capture had already been serialised — which is exactly what the comment above
-  // that state claims cannot happen.
+  // capture had already been read — which is exactly what the comment above that
+  // state claims cannot happen.
   await server.stop(true);
   const captured = { ...longest };
   // Removed before the exit paths below, not after the capture: a run that could
@@ -777,17 +800,15 @@ if (entry) {
   // whatever code came back, and it must not reach the compare and write below:
   // that is how an aborted run used to rewrite fingerprint.json.
   if (!ran) process.exit(1);
-  if (captured.body.length) await Bun.write(capturedPath, JSON.stringify(captured));
-
-  let request;
-  try {
-    request = JSON.parse(readFileSync(capturedPath, "utf8"));
-  } catch {
+  // The empty body is the run that never reached this server, refused here
+  // rather than left to `report`: `report` parses the body, and a failure to
+  // parse would be reported as a bad capture rather than the missing one it is.
+  if (!captured.body.length) {
     console.error("no request was captured; opencode did not reach the local server");
     process.exit(1);
   }
 
-  await report({ request, code });
+  await report({ request: captured, code });
 }
 
 // The User-Agent is stored the way agentFor() reads it back, which is not

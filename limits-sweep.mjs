@@ -77,13 +77,21 @@
 
 import { profileFor } from "./core-tools.mjs";
 import { CATALOG } from "./provider.mjs";
-import { baseFrom } from "./limits-audit.mjs";
+import { baseFrom, entryVerdict, namesNoScript } from "./limits-audit.mjs";
 import { MODELS_DEV_MIN, namedAxes, readBoundedText, refusalAxis } from "./limits.mjs";
 import { chatRequest } from "./tools-smoke.mjs";
 
-const BASE = baseFrom(process.env.ZEN_BASE_URL);
 const GENERATION = process.env.ZEN_GENERATION ?? "1.x";
-const PROFILE = profileFor(GENERATION);
+
+// The base is parsed when a request is built, not while this module is
+// evaluated. `limits-watch.mjs` imports this file, and a malformed
+// `ZEN_BASE_URL` used to throw on the `const BASE = ...` line — so a `--check`
+// or `--status` run that asks nothing died with a stack trace about an import.
+// Asked for here, the same failure lands in `once`'s own try and becomes an
+// error answer for the one ask it belongs to.
+function baseURL() {
+  return baseFrom(process.env.ZEN_BASE_URL);
+}
 
 // The sizes the first pass asks. The second one is where this route's walls have
 // actually been found — deepseek's is about 326,700 tokens, which is around
@@ -261,17 +269,30 @@ export function classifyFailure(chars, status, text, over) {
 // was served, the route's own count when it was, and the words it used when it
 // was not.
 async function once(model, chars) {
-  const { headers, body } = chatRequest({
-    model,
-    generation: GENERATION,
-    profile: PROFILE,
-    names: [...PROFILE.required],
-    maxTokens: ASK_TOKENS,
-    messages: [{ role: "user", content: promptOf(chars) }],
-  });
+  // The profile is asked for here rather than at module scope: a typo in
+  // `ZEN_GENERATION` used to throw during evaluation and take the whole sweep —
+  // and every importer — down before one answer could be reported. It is a
+  // failure of the run's configuration rather than of this size, so it is
+  // answered once and marked: every size of every model would get the same
+  // sentence, and walking the ladder to say it fourteen times spends the run on
+  // a condition no request can change.
+  let profile;
+  try {
+    profile = profileFor(GENERATION);
+  } catch (error) {
+    return { chars, kind: "error", config: true, says: error?.message ?? String(error) };
+  }
   let response;
   try {
-    response = await fetch(`${BASE}/chat/completions`, {
+    const { headers, body } = chatRequest({
+      model,
+      generation: GENERATION,
+      profile,
+      names: [...profile.required],
+      maxTokens: ASK_TOKENS,
+      messages: [{ role: "user", content: promptOf(chars) }],
+    });
+    response = await fetch(`${baseURL()}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -327,6 +348,12 @@ export async function ask(model, chars, log = () => {}, { request = once, wait =
   for (let attempt = 0; attempt < tries; attempt += 1) {
     const result = await request(model, chars);
     const requests = attempt + 1;
+    // A configuration failure is not a transport one. It carries no status, so
+    // the rule below would read it as "the network may come back" and spend the
+    // retries on it — two more attempts and two waits of ten seconds for an
+    // answer no attempt can change, charged to the budget as if the route had
+    // been asked. It is returned as it was asked.
+    if (result.config) return { ...result, requests };
     const transient = result.kind === "error" && result.status === undefined ? true : TRANSIENT.has(result.status);
     if (!transient) return { ...result, requests };
     const why = result.kind === "error" ? result.says : `HTTP ${result.status}`;
@@ -576,15 +603,14 @@ export async function sweep(
     if (result === undefined) return undefined;
     spent += result.requests ?? 1;
     asked.push(result);
-    log(
-      `    ${String(chars).padStart(9)} chars: ${
-        result.kind === "served"
-          ? `served, ${result.tokens ?? "?"} tokens`
-          : result.kind === "refused"
-            ? `refused, HTTP ${result.status}`
-            : `failed, ${result.says}`
-      }`,
-    );
+    // One outcome per answer, written as cases instead of a chain of ternaries:
+    // the three shapes are the vocabulary of every log line below, and reading
+    // them one per branch is what keeps the words and the kinds from drifting.
+    let outcome;
+    if (result.kind === "served") outcome = `served, ${result.tokens ?? "?"} tokens`;
+    else if (result.kind === "refused") outcome = `refused, HTTP ${result.status}`;
+    else outcome = `failed, ${result.says}`;
+    log(`    ${String(chars).padStart(9)} chars: ${outcome}`);
     return result;
   };
 
@@ -629,6 +655,13 @@ export async function sweep(
   // answer the route had already given.
   for (const chars of LADDER) {
     const result = await believe(chars);
+    // A failure of the run's own configuration is the same answer at every
+    // size: the ladder ends here, so the report says it once instead of
+    // fourteen times and the run does not look like fourteen route answers.
+    if (result?.config) {
+      log("    this is a configuration failure, so no other size would answer differently");
+      break;
+    }
     // `believe` asks the identical request again and voids a refusal the route
     // did not reproduce, so a refusal that reaches this line is one the route
     // answered twice.
@@ -755,7 +788,26 @@ export async function sweepModels(models, log = () => {}) {
 
 // `--json` is what the workflow reads: one line, so a log full of pacing lines
 // cannot be mistaken for the result.
-if (import.meta.main) {
+//
+// Whether this file was run is asked in one place and answered three ways.
+// `import.meta.main` is the direct answer and the one Bun gives, but it arrived
+// in Node 22.18 and nothing before that has it, so `entryVerdict` falls back to
+// process.argv[1]. An answer it cannot settle is not a reason to exit 0:
+// nothing was measured, and saying so with a failure is the only answer that
+// cannot be mistaken for a run that asked — unless no script was named at all,
+// which is `node -e` or an import from another program: nothing can be run
+// from here, so the message and the exit code would be about an import that
+// never asked for a sweep and can turn a host's run into a failure.
+const main = typeof import.meta.main === "boolean" ? import.meta.main : undefined;
+const entry = entryVerdict({ main, url: import.meta.url, argv: process.argv });
+if (entry === undefined && !namesNoScript(process.argv)) {
+  console.error(
+    "limits sweep — could not tell whether this file was run or imported, so nothing was measured: neither import.meta.main nor process.argv[1] named an entry point. Run it with `bun run limits:sweep`.",
+  );
+  process.exitCode = 1;
+}
+
+if (entry === true) {
   const args = process.argv.slice(2);
   const json = args.includes("--json");
   const models = args.filter((arg) => !arg.startsWith("--"));

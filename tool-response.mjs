@@ -1,4 +1,4 @@
-import { MAX_BYTES, MAX_STREAM_INDEX, STALE_BODY_HEADERS, mergeFunctionName } from "./stream.mjs";
+import { MAX_BYTES, MAX_STREAM_INDEX, dropStaleHeaders, mergeFunctionName } from "./stream.mjs";
 
 // The limit as a failure's message names it, from the one place it is set:
 // stream.mjs owns the number, and this guard reads the same bytes through it.
@@ -13,9 +13,7 @@ class GuardError extends Error {
 }
 
 function headersFor(response) {
-  const headers = new Headers(response.headers);
-  for (const name of STALE_BODY_HEADERS) headers.delete(name);
-  return headers;
+  return dropStaleHeaders(response);
 }
 
 // failure answers the error a client reads. `code` says what went wrong: only
@@ -36,6 +34,19 @@ function failure(protocol, message, stream = false, code = "upstream_error") {
   return { error: { message, type: "upstream_error", code } };
 }
 
+// The sentence a client is given for an upstream failure, on both arms: a
+// guarded stream and a whole reply are the same failure to the client, and a
+// second copy of the wording is a second thing to keep in step.
+const UPSTREAM_FAILED = "Upstream request failed";
+
+// Whether a failure is the client's own request stopping. An abort reaches an
+// arm as an `AbortError`, or as the code a Node stream raises when the signal
+// behind it fires (`ABORT_ERR`): both are a reason the client already knows,
+// and neither is an upstream failure to log or to answer 502 for.
+function aborted(error) {
+  return error?.name === "AbortError" || error?.code === "ABORT_ERR";
+}
+
 // A failure the client is not told in full: the text of an internal failure —
 // a transport error, a TypeError from the guard's own code — is the server's
 // business, and the server's own log is where it goes. A log line is not
@@ -43,7 +54,7 @@ function failure(protocol, message, stream = false, code = "upstream_error") {
 function logFailure(error) {
   try {
     console.error(
-      `[opencode-zen-freex] upstream stream failed: ${error?.stack ?? error?.message ?? error}`,
+      `[opencode-zen-freex] upstream request failed: ${error?.stack ?? error?.message ?? error}`,
     );
   } catch {
     /* a log line is not worth a failed request */
@@ -1110,7 +1121,10 @@ function snapshotStream(protocol, checkName) {
   // One call is replaced three times — the frame that opens it, the frame that
   // closes it, and that copy — and all three answer the same invented id
   // (inPlaceOf), which is also what its arguments frames are matched by. An
-  // entry is settled once the stream has left the call.
+  // entry is settled once a copy of the call has been answered for it, which
+  // is what tells a second call of the same name from the first: the frame
+  // that opens a call does not settle it, because its closing copy may still
+  // be on its way after another call has been opened.
   const nowhere = []; // { token, name, settled }
   // What each word the reply has used for a call it left out answers: the id
   // the guard invented for that call, under every word the reply names it by.
@@ -1231,14 +1245,22 @@ function snapshotStream(protocol, checkName) {
       // what the rest can be read from, so the entry is matched by the place
       // it holds when the names agree, and by its name when they do not — the
       // same call is copied into several snapshots, and every one of them has
-      // to answer the same id. Two calls of one name cannot be told apart
-      // here, and the last one the stream opened answers for both, and a call
-      // that carries a word of its own is not guessed at from a name.
+      // to answer the same id. An entry the stream has not answered yet is
+      // preferred over one it has, and the place is preferred among entries in
+      // the same state: two calls of one name are told apart by which of them
+      // is still open, and a copy that follows the frame which closed the
+      // first is the second call's. A settled entry is still the answer when
+      // no unsettled one matches — the terminal's copy of a call is that
+      // call's though the frame that closed it came first — and a call that
+      // carries a word of its own is not guessed at from a name.
       const held = left.get(at);
       if (typeof held === "string") return held;
       if (identified(call)) return undefined;
+      const positional = nowhere[at]?.name === call.name ? nowhere[at] : undefined;
       const entry =
-        (nowhere[at]?.name === call.name ? nowhere[at] : undefined) ??
+        (positional && !positional.settled ? positional : undefined) ??
+        nowhere.findLast((value) => value.name === call.name && !value.settled) ??
+        positional ??
         nowhere.findLast((value) => value.name === call.name);
       return entry?.id;
     }
@@ -1261,10 +1283,24 @@ function snapshotStream(protocol, checkName) {
       return mintedFor(call, inside.id);
     }
     // A frame with nothing at all to name it by: the call the stream opened
-    // last of that name, which is the one it is closing — the id it answered
+    // last of that name which it has not answered already — the id it answered
     // is the one the client was handed, and a later copy of the call has to
-    // answer it again rather than mint one of its own.
-    const entry = nowhere.findLast((value) => value.name === call.name) ?? inside;
+    // answer it again rather than mint one of its own. Skipping the entries
+    // that already answered is what tells two placeless calls of one name
+    // apart: matching the last of that name alone answered both closing copies
+    // with the second call's id, and the first call was never closed.
+    //
+    // A settled entry of that name is still the answer when nothing is open: a
+    // closing copy can arrive twice — a re-sent frame, a terminal that repeats
+    // it — and the second copy has no unsettled entry left to match. Minting a
+    // new id for it would hand the client a second item for one call, so the
+    // name alone answers it, as it did before the unsettled rule was added.
+    // `inside` stays ahead of that fallback: the call the stream is inside is
+    // this copy's to answer when it names no one, whatever the name says.
+    const entry =
+      nowhere.findLast((value) => value.name === call.name && !value.settled) ??
+      inside ??
+      nowhere.findLast((value) => value.name === call.name);
     if (entry) {
       entry.settled = true;
       return mintedFor(call, entry.id);
@@ -1304,7 +1340,13 @@ function snapshotStream(protocol, checkName) {
           insideName = undefined;
           insideKept = false;
           insideWords.clear();
-          if (opens && nowhere[open]) nowhere[open].settled = true;
+          // An opening frame ends the window the placeless call had without
+          // settling its entry: its own closing copy may still arrive, and
+          // settling it here made that copy match the newer call, so the older
+          // call was never closed (placeOf). A frame that opens a placeless
+          // call of its own enters it just below, which is where the next
+          // window comes from.
+          if (opens) open = -1;
         }
         // The item this frame carries, when it is a call with no name: the
         // walk below replaces it — opens or closes it, the copy is the same
@@ -1527,13 +1569,15 @@ async function readBounded(response) {
   // loosed. This was the one place in the package that abandoned a body
   // without cancelling it (measured: no cancellation past the limit, and the
   // source still pulled after the 502), which leaves an upstream writing into
-  // a socket nobody reads. A cancel that fails must not stand in for what
-  // ended the read: an oversized body is the 502 this function promises, not
-  // an opaque transport error, so the cancel's failure is kept as that
-  // error's cause — and is thrown itself only when nothing else went wrong.
-  // The lock is released either way.
+  // a socket nobody reads. The reason it was cancelled for is the failure that
+  // ended the read, so a source that watches its own cancellation is told why
+  // — the streaming arm cancels the same way. A cancel that fails must not
+  // stand in for what ended the read: an oversized body is the 502 this
+  // function promises, not an opaque transport error, so the cancel's failure
+  // is kept as that error's cause — and is thrown itself only when nothing
+  // else went wrong. The lock is released either way.
   try {
-    await reader.cancel();
+    await reader.cancel(readFailure);
   } catch (error) {
     if (!readFailure) throw error;
     if (readFailure instanceof Error && !("cause" in readFailure)) readFailure.cause = error;
@@ -2019,7 +2063,7 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             // and the reason it stopped by is a reason it already knows. It is
             // handed over as it came, and it is not the failure the rule below
             // is about.
-            if (error?.name === "AbortError") {
+            if (aborted(error)) {
               controller.error(error);
               closed = true;
               return;
@@ -2034,7 +2078,7 @@ function guardedStream(response, protocol, checkName, endCutShort) {
             controller.enqueue(
               encoder.encode(
                 encodeEvent(
-                  failure(protocol, "Upstream stream failed", true, "upstream_error"),
+                  failure(protocol, UPSTREAM_FAILED, true, "upstream_error"),
                   protocol === "chat" ? "" : "error",
                 ),
               ),
@@ -2099,9 +2143,31 @@ export async function guardToolResponse(response, protocol, policy, options = {}
       answerCalls(checked.calls, protocol, ids);
     }
   } catch (error) {
-    if (!(error instanceof GuardError)) throw error;
-    status = 502;
-    value = failure(protocol, error.message, false, error.code);
+    if (error instanceof GuardError) {
+      status = 502;
+      value = failure(protocol, error.message, false, error.code);
+    } else {
+      // A failure that is not the guard's own is a transport one, and the
+      // whole reply is over either way: readBounded has already read the body,
+      // or cancelled what was left of it, so there is nothing to keep reading.
+      // This arm rethrew the error while the streaming arm answered it, so one
+      // upstream failure was a 502 on one client and an unhandled rejection on
+      // the other. The two arms answer it the same way (guardedStream, above).
+      //
+      // An abort is the client's own: it asked for the request to stop, and
+      // the reason it stopped by is a reason it already knows. It is handed
+      // over as it came, and it is not the failure the rule below is about.
+      if (aborted(error)) throw error;
+      // The client is told in the shape every other failure is told in, and
+      // what it is told says nothing about the failure: the text of an internal
+      // one (a transport error, a TypeError from the guard's own code) is the
+      // server's business, and a client that reads it learns the inside of this
+      // package for nothing. The raw failure goes to the server's own log,
+      // where it belongs.
+      logFailure(error);
+      status = 502;
+      value = failure(protocol, UPSTREAM_FAILED, false, "upstream_error");
+    }
   }
   headers.set("content-type", "application/json");
   return new Response(JSON.stringify(value), { status, headers });
