@@ -416,6 +416,18 @@ models and learned nothing about any of them exits 1, and a run that asked
 nothing at all - every id was answered from models.dev - exits 0, because
 nothing failed and nothing was learned.
 
+**When the timer is not hourly.** GitHub's `schedule` event is best effort: it
+is delayed under load and can be coalesced, and on this repository it has
+arrived every three to five hours rather than hourly. A deployment that needs
+the interval can dispatch `walls.yml` with `automatic=true` from its own timer
+(the oc deployment does this at :17) while the repository keeps the cron as a
+fallback. The `guard` job reads the last successful `walls` run and skips the
+trigger when it is less than 55 minutes old, so a late cron, the external timer
+and both together still cost one measurement; concurrency serialises the two
+runs and the queued one then sees the fresh success. A manual dispatch leaves
+`automatic=false` and bypasses the guard - a person asking is not the timer
+asking.
+
 `limits:watch` tells three answers apart, because the workflow reads the code to
 know what it has: 0 when the route was reached and offered at least one free id,
 1 when the route, the catalogue or the snapshot could not be read or written, and

@@ -57,6 +57,10 @@ on:
         description: Re-measure every id that may be measured, not only the ones with no measurement
         type: boolean
         default: false
+      automatic:
+        description: A scheduler-triggered run; skip if a successful run happened in the last 55 minutes
+        type: boolean
+        default: false
 
 # A scheduled run has no user waiting for it, so it must not be able to cancel
 # the previous one halfway through a measurement, and two of them must not spend
@@ -75,7 +79,62 @@ env:
   BUN_VERSION: 1.4.3
 
 jobs:
+  # GitHub's cron is best effort and has been arriving every three to five hours
+  # on this repository. A deployment that needs the interval can dispatch this
+  # workflow with `automatic=true` from its own timer; the guard below is the
+  # interval itself, so a cron that arrives late, a timer that fires on time,
+  # and both together still cost one measurement, not two. Manual dispatch
+  # leaves `automatic=false` and bypasses the guard, because a person asking is
+  # not the timer asking.
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Is this a run the interval still needs?
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          AUTOMATIC: ${{ inputs.automatic == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$AUTOMATIC" != "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch: the interval guard is bypassed"
+            exit 0
+          fi
+          if [ "$EVENT" != "schedule" ] && [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fail open: an actions API the guard cannot read must not stop the
+          # only measurement the project has.
+          set +e
+          last="$(gh run list --workflow=walls.yml --status=success --limit 1 --json createdAt --jq '.[0].createdAt' 2>/dev/null)"
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ] || [ -z "$last" ]; then
+            echo "::warning title=Interval guard could not read runs::measuring rather than skipping"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          age=$(( $(date -u +%s) - $(date -u -d "$last" +%s) ))
+          if [ "$age" -lt 3300 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "the last successful walls run was ${age}s ago; this trigger is a duplicate"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "the last successful walls run was ${age}s ago"
+          fi
+
   measure:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
     # Job-level rather than step-level, because GitHub scopes permissions to the
     # job and not to a step: every step in here holds these, and the honest fix
