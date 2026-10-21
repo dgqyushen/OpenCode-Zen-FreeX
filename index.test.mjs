@@ -1036,6 +1036,11 @@ test("a cold start reads the discovery cache and answers from it without asking 
     cached,
     "the model the cache remembered is not the one the host was offered",
   );
+  assert.equal(
+    models["muse-spark-1.3-contributor-free"],
+    undefined,
+    "a retired id only the older shipped table knows is not advertised from the cache start",
+  );
   assert.deepEqual(state.calls, [], "a cold start with a fresh cache went to the route");
 });
 

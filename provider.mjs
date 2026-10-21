@@ -815,13 +815,16 @@ async function server(_input, options = {}) {
   // tell a cached answer from a read made a moment ago.
   let knownAt = 0;
   if (cachedDiscovery) {
-    // Per id, the cache wins and the bootstrap table keeps the ids it alone
-    // knows. Both are floors, not rivals: the cache is what the route said the
-    // last time a process asked, the bootstrap table is what this build shipped
-    // with, and a later live discovery overwrites both. No row either source
-    // lacks is invented here.
-    known = { ...known, ...cachedDiscovery.models };
-    protocols = { ...protocols, ...cachedDiscovery.protocols };
+    // The cache is a whole successful listing, so it replaces the bootstrap
+    // table rather than merging with it. The bootstrap table is older than any
+    // cache this process could have written, and an id only the bootstrap knows
+    // is one the last successful listing did not offer — keeping it would
+    // advertise a model Zen has already dropped (Muse Spark 1.3 Contributor
+    // Free was still in the shipped table after the route said 410). The cache
+    // is a floor for a listing failure, not a union with the shipped table; the
+    // live listing still overwrites both.
+    known = { ...cachedDiscovery.models };
+    protocols = { ...cachedDiscovery.protocols };
     knownAt = Date.parse(cachedDiscovery.listedAt) || 0;
   }
   // When the list was last read, or last asked for: the cache's date when one
