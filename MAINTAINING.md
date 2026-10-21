@@ -771,10 +771,11 @@ names another path; an empty value keeps discovery in memory only. The file
 carries `version` (the one schema this build writes and reads), `listedAt` (the
 ISO date and time of the read), the model records and the protocol map as the
 route answered them. It is an input to discovery, not a second source of truth:
-read once at startup and merged per id under the bootstrap table (its `listedAt`
-becomes the last-read time, so a restart does not re-ask inside the re-list
-interval), and it is what the listing-failure fallback carries - a live read
-always wins and overwrites it. Its age travels to the host as
+read once at startup as the starting table (it replaces the older shipped
+bootstrap table, so an id only the bootstrap knows is not advertised after the
+route dropped it; its `listedAt` becomes the last-read time, so a restart does
+not re-ask inside the re-list interval), and it is what the listing-failure
+fallback carries - a live read always wins and overwrites it. Its age travels to the host as
 `Symbol.for("magpie.discoveryAgeMs")`, a non-enumerable symbol beside
 `magpie.fellBack`, so a host can tell a cached answer from a read made a moment
 ago; with no cache and no successful read there is no age to state. The write is
