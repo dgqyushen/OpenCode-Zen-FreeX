@@ -6,6 +6,8 @@
 
 共享凭据 `public` 即用 · 自动发现 · 原生流式协议
 
+**简体中文** · [English](https://github.com/tkhs101/OpenCode-Zen-FreeX/blob/main/README.en.md)
+
 [![CI](https://img.shields.io/github/actions/workflow/status/tkhs101/OpenCode-Zen-FreeX/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/tkhs101/OpenCode-Zen-FreeX/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/opencode-zen-freex?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/opencode-zen-freex) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE) [![Runtime: bun](https://img.shields.io/badge/runtime-bun-f472b6?style=flat-square&logo=bun&logoColor=white)](https://bun.sh)
 
 </div>
