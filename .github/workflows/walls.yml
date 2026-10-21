@@ -115,7 +115,7 @@ jobs:
           # Fail open: an actions API the guard cannot read must not stop the
           # only measurement the project has.
           set +e
-          last="$(gh run list --workflow=walls.yml --status=success --limit 1 --json createdAt --jq '.[0].createdAt' 2>/dev/null)"
+          last="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=walls.yml --status=success --limit 1 --json createdAt --jq '.[0].createdAt' 2>/dev/null)"
           code=$?
           set -e
           if [ "$code" -ne 0 ] || [ -z "$last" ]; then
