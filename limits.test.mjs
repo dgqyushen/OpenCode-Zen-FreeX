@@ -3,7 +3,7 @@ import test from "node:test";
 // The adaptive cases read and write real files: a state file is the one thing
 // this module puts on disk, and a case with a stubbed file system would not be
 // testing the one promise made about it — that a bracket survives a restart.
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,21 @@ const DECLARED = { context: 200000, output: 32000 };
 // of this file, where it is handed a map or a file of its own.
 const SNAPSHOT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT";
 process.env[SNAPSHOT_ENV] = "";
+
+// A case about the installed remote answer is a case about "no local source was
+// named": the suite's module-level pin above is a local source (the empty one).
+// Removing the variable for the length of the case is the documented way to say
+// "nothing pinned here, use the installed answer"; restoring it afterwards keeps
+// the rest of the file isolated from the operator's snapshot.
+function unpinSnapshot() {
+  const previous = process.env[SNAPSHOT_ENV];
+  delete process.env[SNAPSHOT_ENV];
+  return () => {
+    if (previous === undefined) delete process.env[SNAPSHOT_ENV];
+    else process.env[SNAPSHOT_ENV] = previous;
+  };
+}
+
 const SHIPPED_SNAPSHOT = fileURLToPath(new URL("./limits-observed.json", import.meta.url));
 
 // The brackets this suite learns are written by the module's debounced writer,
@@ -3035,4 +3050,470 @@ test("a bracket with evidence of its own still lowers the table", async () => {
     "glm-5.3-flash-free", { context: 200_000, output: 32_000 }, undefined, undefined, undefined, brackets, undefined,
   );
   assert.equal(over.context, 136_973, "the route's own refusal outranks the table");
+});
+
+// ---- the snapshot as a remote input -----------------------------------------
+//
+// The primitives below are the core of reading the same snapshot from the URL
+// the workflow publishes. The provider turns them into a refresh timer; these
+// cases pin the decisions it must not make for itself: which source wins, what a
+// document has to look like to be one, and that a bad fetch never replaces a
+// good answer.
+const LOCAL_SNAPSHOT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT";
+const snapshotDocument = (models, extra = {}) => JSON.stringify({ version: 1, models, ...extra });
+const remoteRow = (over = {}) => ({
+  servedTokens: 375_142,
+  servedChars: 1_750_000,
+  refusedChars: 1_787_500,
+  refusedSizes: [1_787_500],
+  wall: "bracketed",
+  at: "2026-10-20",
+  ...over,
+});
+const remoteWall = (value, over = {}) => ({ value, settles: true, wall: "bracketed", at: "2026-10-20", ...over });
+
+test("the remote snapshot settings are the names the provider imports", async () => {
+  const {
+    LIMITS_SNAPSHOT_URL_ENV,
+    LIMITS_SNAPSHOT_CACHE_ENV,
+    LIMITS_SNAPSHOT_REFRESH_ENV,
+    LIMITS_SNAPSHOT_TIMEOUT_ENV,
+    DEFAULT_LIMITS_SNAPSHOT_URL,
+  } = await subject;
+  assert.equal(LIMITS_SNAPSHOT_URL_ENV, "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL");
+  assert.equal(LIMITS_SNAPSHOT_CACHE_ENV, "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_CACHE");
+  assert.equal(LIMITS_SNAPSHOT_REFRESH_ENV, "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_REFRESH_MS");
+  assert.equal(LIMITS_SNAPSHOT_TIMEOUT_ENV, "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_TIMEOUT_MS");
+  assert.equal(
+    DEFAULT_LIMITS_SNAPSHOT_URL,
+    "https://raw.githubusercontent.com/tkhs101/OpenCode-Zen-FreeX/main/limits-observed.json",
+  );
+});
+
+test("the remote URL is chosen by explicit, then env, then the published default", async () => {
+  const { limitsSnapshotURL, DEFAULT_LIMITS_SNAPSHOT_URL, LIMITS_SNAPSHOT_URL_ENV } = await subject;
+  assert.equal(limitsSnapshotURL(undefined, {}), DEFAULT_LIMITS_SNAPSHOT_URL, "nothing named reads the published file");
+  assert.equal(
+    limitsSnapshotURL("https://explicit.test/s.json", { [LIMITS_SNAPSHOT_URL_ENV]: "https://env.test/s.json" }),
+    "https://explicit.test/s.json",
+    "an explicit URL is the caller's own answer",
+  );
+  assert.equal(limitsSnapshotURL("", {}), undefined, "an explicit empty string disables the remote");
+  assert.equal(
+    limitsSnapshotURL(undefined, { [LIMITS_SNAPSHOT_URL_ENV]: "https://env.test/s.json" }),
+    "https://env.test/s.json",
+    "an environment URL is read next",
+  );
+  assert.equal(limitsSnapshotURL(undefined, { [LIMITS_SNAPSHOT_URL_ENV]: "" }), undefined, "and empty disables it");
+  // A local snapshot path is the operator choosing a source; the remote is off.
+  // `Object.hasOwn` is what makes an empty value a pin too: "no local file" is a
+  // statement about the source, not a request to fetch one.
+  assert.equal(limitsSnapshotURL(undefined, { [LOCAL_SNAPSHOT_ENV]: "/tmp/local.json" }), undefined);
+  assert.equal(limitsSnapshotURL(undefined, { [LOCAL_SNAPSHOT_ENV]: "" }), undefined);
+  // ...and the pin outranks the URL variable too, not only the default. An
+  // operator who named a local source has chosen one; a URL beside it is not a
+  // second source to fetch behind that choice.
+  assert.equal(
+    limitsSnapshotURL(undefined, {
+      [LOCAL_SNAPSHOT_ENV]: "/tmp/local.json",
+      [LIMITS_SNAPSHOT_URL_ENV]: "https://mirror.test/s.json",
+    }),
+    undefined,
+    "a local path plus a URL is still a pinned local source",
+  );
+  assert.equal(
+    limitsSnapshotURL(undefined, {
+      [LOCAL_SNAPSHOT_ENV]: "",
+      [LIMITS_SNAPSHOT_URL_ENV]: "https://mirror.test/s.json",
+    }),
+    undefined,
+    "an empty pin plus a URL is still no snapshot at all",
+  );
+});
+
+test("the remote cache path is explicit, then env, then the platform cache directory", async () => {
+  const { limitsSnapshotCachePath, LIMITS_SNAPSHOT_CACHE_ENV } = await subject;
+  const root = join(tmpdir(), `zen-remote-cache-root-${process.pid}`);
+  assert.equal(
+    limitsSnapshotCachePath(undefined, { XDG_CACHE_HOME: root }),
+    join(root, "opencode-zen-freex", "limits-observed.remote.json"),
+    "nothing named lands in the platform cache directory beside the limits state",
+  );
+  assert.equal(limitsSnapshotCachePath("/custom/remote.json", { [LIMITS_SNAPSHOT_CACHE_ENV]: "/env/x.json" }), "/custom/remote.json");
+  assert.equal(limitsSnapshotCachePath("", {}), undefined, "an explicit empty string disables the cache");
+  assert.equal(limitsSnapshotCachePath(undefined, { [LIMITS_SNAPSHOT_CACHE_ENV]: "/env/x.json" }), "/env/x.json");
+  assert.equal(limitsSnapshotCachePath(undefined, { [LIMITS_SNAPSHOT_CACHE_ENV]: "" }), undefined);
+});
+
+test("the refresh interval is a positive whole number of milliseconds, one hour by default", async () => {
+  const { limitsSnapshotRefreshMs, LIMITS_SNAPSHOT_REFRESH_ENV } = await subject;
+  assert.equal(limitsSnapshotRefreshMs(undefined, {}), 3_600_000);
+  assert.equal(limitsSnapshotRefreshMs(120_000, {}), 120_000, "an explicit interval wins");
+  assert.equal(limitsSnapshotRefreshMs(undefined, { [LIMITS_SNAPSHOT_REFRESH_ENV]: "60000" }), 60_000);
+  for (const bad of [0, -1, 1.5, "nope", "", undefined]) assert.equal(limitsSnapshotRefreshMs(bad, {}), 3_600_000, String(bad));
+  assert.equal(limitsSnapshotRefreshMs(undefined, { [LIMITS_SNAPSHOT_REFRESH_ENV]: "0" }), 3_600_000);
+  assert.equal(limitsSnapshotRefreshMs(undefined, { [LIMITS_SNAPSHOT_REFRESH_ENV]: "1.5" }), 3_600_000);
+});
+
+test("the snapshot timeout is bounded to 100..60000 ms, five seconds by default", async () => {
+  const { limitsSnapshotTimeoutMs, LIMITS_SNAPSHOT_TIMEOUT_ENV } = await subject;
+  assert.equal(limitsSnapshotTimeoutMs(undefined, {}), 5_000);
+  assert.equal(limitsSnapshotTimeoutMs(700, {}), 700);
+  assert.equal(limitsSnapshotTimeoutMs(undefined, { [LIMITS_SNAPSHOT_TIMEOUT_ENV]: "100" }), 100);
+  assert.equal(limitsSnapshotTimeoutMs(undefined, { [LIMITS_SNAPSHOT_TIMEOUT_ENV]: "60000" }), 60_000);
+  for (const bad of [99, 60_001, 0, -1, 1.5, "nope", ""])
+    assert.equal(limitsSnapshotTimeoutMs(bad, {}), 5_000, String(bad));
+  assert.equal(limitsSnapshotTimeoutMs(undefined, { [LIMITS_SNAPSHOT_TIMEOUT_ENV]: "99" }), 5_000);
+  assert.equal(limitsSnapshotTimeoutMs(undefined, { [LIMITS_SNAPSHOT_TIMEOUT_ENV]: "60001" }), 5_000);
+});
+
+test("a snapshot document is parsed into the walls it measures", async () => {
+  const { parseSnapshotDocument } = await subject;
+  const walls = parseSnapshotDocument(
+    snapshotDocument({
+      "bracketed-free": remoteRow(),
+      "open-free": { servedTokens: 599_561, refusedChars: null, refusedSizes: [], wall: "openEnded", at: "2026-10-19" },
+      "named-free": { wall: "named", named: 1_000_000, at: "2026-10-20" },
+      // A prototype name is a key like any other in a Map, and is evidence for
+      // the id that names it and no other model.
+      toString: { servedTokens: 200_000, wall: "bracketed", at: "2026-10-18" },
+    }),
+  );
+  assert.equal(walls.size, 4);
+  assert.deepEqual(walls.get("bracketed-free"), {
+    value: 375_000,
+    settles: true,
+    wall: "bracketed",
+    at: "2026-10-20",
+  });
+  assert.deepEqual(walls.get("open-free"), {
+    value: 599_000,
+    settles: false,
+    wall: "openEnded",
+    at: "2026-10-19",
+  });
+  assert.deepEqual(walls.get("named-free"), {
+    value: 1_000_000,
+    settles: true,
+    wall: "named",
+    at: "2026-10-20",
+  });
+  assert.equal(walls.get("toString").value, 200_000);
+});
+
+test("a snapshot document that is not one is no measurement at all", async () => {
+  const { parseSnapshotDocument } = await subject;
+  assert.equal(parseSnapshotDocument("not json"), undefined);
+  assert.equal(parseSnapshotDocument(JSON.stringify({ version: 2, models: {} })), undefined, "another version is another shape");
+  assert.equal(parseSnapshotDocument(JSON.stringify({ models: { "a-free": remoteRow() } })), undefined, "and no version is not this one");
+  assert.equal(parseSnapshotDocument(JSON.stringify({ version: 1, models: [] })), undefined, "models is a map, not a list");
+  assert.equal(parseSnapshotDocument(JSON.stringify({ version: 1, models: null })), undefined);
+  assert.equal(parseSnapshotDocument("x".repeat(256 * 1024 + 1)), undefined, "a document over the read ceiling is not read");
+  const tooMany = {};
+  for (let at = 0; at <= 1_000; at += 1) tooMany[`row-${at}-free`] = { servedTokens: 1000, wall: "openEnded" };
+  const manyText = snapshotDocument(tooMany);
+  assert.ok(manyText.length < 256 * 1024, "the row-limit case is inside the size ceiling, or it tests the wrong bound");
+  assert.equal(parseSnapshotDocument(manyText), undefined, "more rows than a human-reviewed file may hold");
+  // Zero valid rows is a document this build cannot read, not an empty list of
+  // measurements: installing it would wipe the bundled table.
+  assert.equal(parseSnapshotDocument(snapshotDocument({})), undefined);
+});
+
+test("a row that fails a rule is skipped, and one good row keeps the document", async () => {
+  const { parseSnapshotDocument } = await subject;
+  const walls = parseSnapshotDocument(
+    snapshotDocument({
+      ["__proto__"]: { servedTokens: 100_000, wall: "bracketed" },
+      "": { servedTokens: 100_000, wall: "bracketed" },
+      "text-free": "openEnded",
+      "list-free": [],
+      "wall-free": { servedTokens: 100_000, wall: "bracketedt" },
+      "disagree-free": { servedTokens: 100_000, refusedChars: 1000, refusedSizes: [2000], wall: "bracketed" },
+      "zero-free": { servedTokens: 0, wall: "openEnded" },
+      "float-free": { servedTokens: 1000.5, wall: "openEnded" },
+      "under-a-thousand-free": { servedTokens: 999, wall: "openEnded" },
+      "huge-free": { servedTokens: 4_000_001, wall: "openEnded" },
+      "chars-huge-free": { servedTokens: 100_000, servedChars: 32_000_001, wall: "openEnded" },
+      "tokens-too-dense-free": { servedTokens: 1_000_000, servedChars: 400_000, wall: "openEnded" },
+      "good-free": { servedTokens: 100_000, wall: "openEnded" },
+    }),
+  );
+  assert.deepEqual([...walls.keys()], ["good-free"], "only the row that passes every rule is a measurement");
+  assert.equal(walls.get("good-free").value, 100_000);
+});
+
+test("the remote bounds are inclusive where the sweep's own are", async () => {
+  const { parseSnapshotDocument } = await subject;
+  const walls = parseSnapshotDocument(
+    snapshotDocument({
+      "top-tokens-free": { servedTokens: 4_000_000, servedChars: 32_000_000, wall: "openEnded" },
+      // 497,952 * 2 + 4096 = 1,000,000 exactly: the envelope's slack is inclusive.
+      "at-slack-free": { servedTokens: 1_000_000, servedChars: 497_952, wall: "openEnded" },
+      "over-slack-free": { servedTokens: 1_000_000, servedChars: 497_951, wall: "openEnded" },
+    }),
+  );
+  assert.ok(walls.has("top-tokens-free"));
+  assert.ok(walls.has("at-slack-free"));
+  assert.equal(walls.has("over-slack-free"), false, "one character short of the slack is a row about two different things");
+});
+
+test("a named window is held to the token ceiling too", async () => {
+  const { parseSnapshotDocument } = await subject;
+  const walls = parseSnapshotDocument(
+    snapshotDocument({
+      "named-top-free": { wall: "named", named: 4_000_000 },
+      "named-over-free": { wall: "named", named: 4_000_001 },
+      "named-absurd-free": { wall: "named", named: 9_000_000_000 },
+      "named-good-free": { wall: "named", named: 1_048_576 },
+    }),
+  );
+  assert.deepEqual(
+    [...walls.keys()].sort(),
+    ["named-good-free", "named-top-free"],
+    "named is a token count and obeys the same ceiling as a served one",
+  );
+  assert.equal(walls.get("named-top-free").value, 4_000_000);
+});
+
+test("an installed answer is what measuredWalls(undefined) reads, until it is cleared", async () => {
+  const { installSnapshot, measuredWalls, clearInstalledSnapshot, snapshotState } = await subject;
+  const restorePin = unpinSnapshot();
+  clearInstalledSnapshot();
+  try {
+    assert.equal(snapshotState(), undefined, "nothing is installed at the start");
+    assert.equal(installSnapshot(new Map(), { source: "remote" }), false, "an empty map is no answer");
+    assert.equal(installSnapshot(new Map([["a-free", remoteWall(1000)]]), { source: "remote", fetchedAt: 1234, url: "https://example.test/x" }), true);
+    assert.equal(measuredWalls().get("a-free").value, 1000, "the installed answer answers the no-file question");
+    const state = snapshotState();
+    assert.equal(state.source, "remote");
+    assert.equal(state.fetchedAt, 1234);
+    assert.equal(state.url, "https://example.test/x");
+    assert.ok(Number.isFinite(state.ageMs) && state.ageMs >= 0);
+    // A copy, not the stored object: a caller that mutates what it was handed
+    // is mutating its own view, not the answer a request reads.
+    const again = snapshotState();
+    assert.notEqual(again, state);
+    assert.equal(
+      installSnapshot(new Map([["b-free", remoteWall(2000)]]), { source: "cache" }),
+      true,
+      "a later answer replaces the first",
+    );
+    assert.equal(measuredWalls().has("a-free"), false);
+    assert.equal(measuredWalls().get("b-free").value, 2000);
+    // An empty pin is "no snapshot at all", not "no opinion": it must disable
+    // the installed answer too, or the documented kill switch cannot kill a
+    // cache this process has already installed.
+    process.env[SNAPSHOT_ENV] = "";
+    assert.equal(measuredWalls().size, 0, "an empty pin does not disable the installed answer");
+    delete process.env[SNAPSHOT_ENV];
+    // ...and a file the caller names is always its own answer, installed or not.
+    const file = join(tmpdir(), `zen-remote-explicit-${process.pid}-${Date.now()}.json`);
+    try {
+      writeFileSync(file, snapshotDocument({ "file-free": { servedTokens: 200_000, wall: "openEnded" } }));
+      const explicit = measuredWalls(file);
+      assert.equal(explicit.has("file-free"), true);
+      assert.equal(explicit.has("b-free"), false, "the installed answer does not leak into a named file");
+    } finally {
+      rmSync(file, { force: true });
+    }
+  } finally {
+    clearInstalledSnapshot();
+    restorePin();
+  }
+});
+
+test("an env-named snapshot file outranks an installed answer, and an explicit file outranks both", async () => {
+  const { installSnapshot, measuredWalls, clearInstalledSnapshot } = await subject;
+  const previous = process.env[LOCAL_SNAPSHOT_ENV];
+  const file = join(tmpdir(), `zen-remote-env-${process.pid}-${Date.now()}.json`);
+  clearInstalledSnapshot();
+  try {
+    writeFileSync(file, snapshotDocument({ "local-free": { servedTokens: 100_000, wall: "openEnded" } }));
+    installSnapshot(new Map([["remote-free", remoteWall(1000)]]), { source: "remote" });
+    process.env[LOCAL_SNAPSHOT_ENV] = file;
+    // The process may have cached this path's bundled read already; that is the
+    // file's answer either way, and the point here is only which source wins.
+    assert.equal(measuredWalls().has("local-free"), true, "an operator-pinned path is the source");
+    assert.equal(measuredWalls().has("remote-free"), false, "the installed answer stands aside for it");
+    assert.equal(measuredWalls(file).has("local-free"), true, "and naming it explicitly is the same answer");
+  } finally {
+    clearInstalledSnapshot();
+    if (previous === undefined) delete process.env[LOCAL_SNAPSHOT_ENV];
+    else process.env[LOCAL_SNAPSHOT_ENV] = previous;
+    rmSync(file, { force: true });
+  }
+});
+
+test("a streamed body past the ceiling is cancelled rather than buffered", async () => {
+  const { refreshSnapshot, snapshotState, clearInstalledSnapshot } = await subject;
+  clearInstalledSnapshot();
+  let canceled = false;
+  const body = {
+    getReader() {
+      let sent = 0;
+      return {
+        async read() {
+          sent += 1;
+          if (sent > 3) return { done: true, value: undefined };
+          return { done: false, value: new Uint8Array(100_000).fill(120) };
+        },
+        async cancel() {
+          canceled = true;
+        },
+        releaseLock() {},
+      };
+    },
+  };
+  try {
+    const result = await refreshSnapshot({
+      url: "https://example.test/chunked.json",
+      fetchImpl: async () => ({ ok: true, headers: { get: () => null }, body }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "too-large", "the running byte count is the ceiling, not an after-the-fact string length");
+    assert.equal(canceled, true, "the body was cancelled when the ceiling was crossed");
+    assert.equal(snapshotState(), undefined);
+  } finally {
+    clearInstalledSnapshot();
+  }
+});
+
+test("the remote cache is read only when it holds a whole valid snapshot", async () => {
+  const { readSnapshotCache } = await subject;
+  const dir = mkdtempSync(join(tmpdir(), "zen-remote-cache-"));
+  const file = join(dir, "limits.remote.json");
+  try {
+    writeFileSync(file, "not json");
+    assert.equal(readSnapshotCache(file), undefined, "a cache that is not JSON is no cache");
+    writeFileSync(file, snapshotDocument({}));
+    assert.equal(readSnapshotCache(file), undefined, "and one with no valid row is no answer, not an empty one");
+    const text = snapshotDocument({ "a-free": remoteRow() });
+    writeFileSync(file, text);
+    const cached = readSnapshotCache(file);
+    assert.ok(cached, "a whole document is a cache");
+    assert.equal(cached.walls.get("a-free").value, 375_000);
+    assert.equal(cached.fetchedAt, statSync(file).mtimeMs, "the cache's own write time is its fetchedAt");
+    assert.equal(readSnapshotCache(join(dir, "missing.json")), undefined);
+    // Startup reads the cache synchronously, so its size and kind are checked
+    // before the read: a corrupt large file or a non-file cannot stall a start.
+    writeFileSync(file, "x".repeat(256 * 1024 + 1));
+    assert.equal(readSnapshotCache(file), undefined, "a cache over the read ceiling is not read");
+    assert.equal(readSnapshotCache(dir), undefined, "a directory is not a cache file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a successful refresh installs the answer and caches the validated bytes atomically", async () => {
+  const {
+    refreshSnapshot,
+    measuredWalls,
+    readSnapshotCache,
+    snapshotState,
+    clearInstalledSnapshot,
+  } = await subject;
+  const dir = mkdtempSync(join(tmpdir(), "zen-remote-refresh-"));
+  const cache = join(dir, "nested", "limits.remote.json");
+  const text = snapshotDocument({ "remote-free": remoteRow() });
+  const restorePin = unpinSnapshot();
+  clearInstalledSnapshot();
+  try {
+    const result = await refreshSnapshot({
+      url: "https://example.test/limits-observed.json",
+      cachePath: cache,
+      fetchImpl: async () => new Response(text, { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.reason, undefined);
+    assert.equal(result.walls.get("remote-free").value, 375_000);
+    assert.ok(Number.isFinite(result.fetchedAt));
+    assert.equal(measuredWalls().get("remote-free").value, 375_000, "and it is installed");
+    const state = snapshotState();
+    assert.equal(state.source, "remote");
+    assert.equal(state.url, "https://example.test/limits-observed.json");
+    assert.equal(state.fetchedAt, result.fetchedAt);
+    assert.equal(readFileSync(cache, "utf8"), text, "the raw validated text is what is cached");
+    if (process.platform !== "win32")
+      assert.equal(statSync(cache).mode & 0o777, 0o600, "the cache is private");
+    assert.deepEqual(
+      readdirSync(dirname(cache)).filter((name) => name.endsWith(".tmp")),
+      [],
+      "the temporary it was written through is gone",
+    );
+    const cached = readSnapshotCache(cache);
+    assert.ok(cached);
+    assert.equal(cached.walls.get("remote-free").value, 375_000);
+    // A cache that cannot be written is not a refresh that failed: the answer is
+    // installed, which is the part a request reads.
+    const blocker = join(dir, "not a directory");
+    writeFileSync(blocker, "x");
+    const blocked = await refreshSnapshot({
+      url: "https://example.test/limits-observed.json",
+      cachePath: join(blocker, "cache.json"),
+      fetchImpl: async () => new Response(text, { status: 200 }),
+    });
+    assert.equal(blocked.ok, true, "the cache is an optimisation, not the answer");
+  } finally {
+    clearInstalledSnapshot();
+    restorePin();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed refresh answers why and leaves the installed answer untouched", async () => {
+  const { refreshSnapshot, installSnapshot, measuredWalls, snapshotState, clearInstalledSnapshot } = await subject;
+  const text = snapshotDocument({ "remote-free": remoteRow() });
+  const restorePin = unpinSnapshot();
+  clearInstalledSnapshot();
+  const installed = new Map([["kept-free", remoteWall(1000)]]);
+  installSnapshot(installed, { source: "cache", fetchedAt: 1234, url: "https://old.test/s.json" });
+  const before = snapshotState();
+  try {
+    const cases = [
+      [{ url: "ftp://example.test/x" }, "url"],
+      [{ url: "not a url" }, "url"],
+      [{ url: "https://example.test/x", fetchImpl: async () => { throw new Error("boom"); } }, "fetch"],
+      [{ url: "https://example.test/x", fetchImpl: null }, "fetch"],
+      [
+        { url: "https://example.test/x", fetchImpl: async () => ({ ok: false, status: 500, headers: { get: () => null }, text: async () => "" }) },
+        "http",
+      ],
+      [
+        { url: "https://example.test/x", fetchImpl: async () => { throw new DOMException("timed out", "TimeoutError"); } },
+        "timeout",
+      ],
+      [
+        {
+          url: "https://example.test/x",
+          fetchImpl: async () => ({ ok: true, headers: { get: () => String(300 * 1024) }, text: async () => text }),
+        },
+        "too-large",
+      ],
+      [
+        { url: "https://example.test/x", fetchImpl: async () => ({ ok: true, headers: { get: () => null }, text: async () => "x".repeat(300 * 1024) }) },
+        "too-large",
+      ],
+      [
+        { url: "https://example.test/x", fetchImpl: async () => ({ ok: true, headers: { get: () => null }, text: async () => "not json" }) },
+        "invalid",
+      ],
+      [
+        { url: "https://example.test/x", fetchImpl: async () => ({ ok: true, headers: { get: () => null }, text: async () => snapshotDocument({}) }) },
+        "invalid",
+      ],
+    ];
+    for (const [args, reason] of cases) {
+      const result = await refreshSnapshot(args);
+      assert.equal(result.ok, false, JSON.stringify(args));
+      assert.equal(result.reason, reason, JSON.stringify(args));
+      assert.equal(measuredWalls().get("kept-free").value, 1000, "the installed answer stands");
+      const now = snapshotState();
+      assert.equal(now.source, before.source);
+      assert.equal(now.fetchedAt, before.fetchedAt);
+      assert.equal(now.url, before.url);
+    }
+  } finally {
+    clearInstalledSnapshot();
+    restorePin();
+  }
 });

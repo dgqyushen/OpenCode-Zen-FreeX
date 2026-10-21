@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
 import { readDiscoveryCache, writeDiscoveryCache } from "./models.mjs";
+import { clearInstalledSnapshot, snapshotState } from "./limits.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
 import { requestFor } from "./tools-smoke.mjs";
 
@@ -23,6 +24,10 @@ process.env.OPENCODE_ZEN_FREE_LIMITS_STATE = "";
 // test run may not read what the last run left behind. The cases about the
 // cache name a temporary file of their own below.
 process.env.OPENCODE_ZEN_FREE_DISCOVERY_CACHE = "";
+// The remote limits snapshot is a GitHub URL, and a test run may not depend on
+// it — nor ask for it. The cases about the snapshot pass an explicit local URL
+// or set the local pinned source themselves.
+process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL = "";
 
 // The names the discovery reads are counted by. Zen's own list is also the
 // endpoint the fixture's `models` handler answers, so the three are named here
@@ -337,7 +342,7 @@ function lastCall(state) {
   return state.calls[state.calls.length - 1];
 }
 
-async function fixture(t, input = {}) {
+async function fixture(t, input = {}, serverOptions = {}) {
   // Every case gets the state its own traffic draws and no more. The adaptive
   // limits are module state — a refusal one case provokes would otherwise move
   // the declaration the next case's model list reports, and the suite would
@@ -483,6 +488,10 @@ async function fixture(t, input = {}) {
     // third party in the middle of every assertion. The cases that are ABOUT the
     // second opinion serve it from this same origin.
     modelsDevURL: null,
+    // The remote limits snapshot, for the cases that are about it. Undefined
+    // here leaves the operator's/env defaults, which the suite has already
+    // turned off above.
+    ...serverOptions,
   });
   return { plugin, state, origin };
 }
@@ -1157,6 +1166,310 @@ test("a successful discovery writes the cache for the next process", async (t) =
   assert.equal(cache.protocols["chat-free"], "chat");
   const age = Date.now() - Date.parse(cache.listedAt);
   assert.ok(Number.isFinite(age) && age >= 0 && age < 60_000, `the cache states an old read: ${age}`);
+});
+
+// ---- remote limits snapshot wiring ----------------------------------------
+//
+// limits.mjs owns the fetch, the parser and the installed Map (its own cases
+// pin those). These cases pin the provider's side: the synchronous cache read
+// at start-up, the background refresh with its TTL and its failure memory, and
+// the diagnostics symbol on the answer. A local HTTP server stands in for
+// GitHub in every one of them; the suite guard at the top of this file keeps
+// the other cases from reaching the real URL.
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(predicate, what, timeoutMs = 3000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const value = predicate();
+    if (value) return value;
+    await sleep(5);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+// A document the real sweep could have written: one or more rows in the shape
+// limits-observed.json carries. The parser rounds servedTokens down to 1000, so
+// the windows below are the numbers the route would publish.
+function snapshotDocument(rows) {
+  return `${JSON.stringify({ version: 1, models: rows }, null, 2)}\n`;
+}
+
+const snapshotRow = (tokens) => ({
+  servedTokens: tokens,
+  servedChars: tokens * 4,
+  wall: "bracketed",
+  at: "2026-10-21",
+});
+
+// The remote source, local. Every request is counted so a case can say "one
+// fetch" and mean it. The server is closed with the test, connections included,
+// so a handler that never answers cannot keep the run open.
+async function snapshotOrigin(t, handler) {
+  let fetches = 0;
+  const server = createServer((req, res) => {
+    fetches += 1;
+    handler(req, res);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  return {
+    url: `http://127.0.0.1:${server.address().port}/limits-observed.json`,
+    hits: () => fetches,
+  };
+}
+
+// The local pinned source outranks an installed remote answer in measuredWalls,
+// and an installed answer is process-global. A case about the remote removes the
+// pin for its length — absence is "nothing named here, use the installed
+// answer", while `""` is the operator's "no snapshot at all" and must not let an
+// installed map through — and drops the installed map afterwards whether it
+// passed or not, so no later case inherits either.
+function useInstalledSnapshot(t) {
+  const previous = process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT;
+  delete process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT;
+  t.after(() => {
+    clearInstalledSnapshot();
+    if (previous === undefined) delete process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT;
+    else process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT = previous;
+  });
+}
+
+test("a cold start installs the snapshot cache without fetching until the TTL elapses", async (t) => {
+  useInstalledSnapshot(t);
+  const file = join(discoveryTempDir(t), "remote-limits.json");
+  // A fresh cache: its mtime is the answer's age, and the TTL is an hour, so
+  // neither start-up nor the first model list may spend a request on it.
+  writeFileSync(file, snapshotDocument({ "chat-free": snapshotRow(500_000) }), "utf8");
+  const { url, hits } = await snapshotOrigin(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(snapshotDocument({ "chat-free": snapshotRow(700_000) }));
+  });
+  const { plugin } = await fixture(
+    t,
+    {},
+    {
+      limitsSnapshotURL: url,
+      limitsSnapshotCachePath: file,
+      limitsSnapshotRefreshMs: 3_600_000,
+    },
+  );
+  assert.equal(snapshotState()?.source, "cache", "the cache was not installed at start-up");
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  // The cache was installed before the bootstrap table was built, so the first
+  // list this process answers with already carries the cached window.
+  assert.equal(models["chat-free"].limit.context, 500_000, "the cached wall did not reach the list");
+  const state = models[Symbol.for("magpie.limitsSnapshot")];
+  assert.equal(state.source, "cache");
+  assert.equal(state.url, undefined, "a cache file does not record which URL wrote it, so it must not claim the current one");
+  assert.ok(state.ageMs >= 0, `the state has no age: ${JSON.stringify(state)}`);
+  const descriptor = Object.getOwnPropertyDescriptor(models, Symbol.for("magpie.limitsSnapshot"));
+  assert.equal(descriptor.enumerable, false, "the diagnostics symbol is enumerable");
+  assert.equal(JSON.stringify(models).includes("magpie.limitsSnapshot"), false);
+  await sleep(30);
+  assert.equal(hits(), 0, "a cache inside its TTL was fetched again");
+});
+
+test("a remote snapshot refresh changes a model's context limit on a later models() call", async (t) => {
+  useInstalledSnapshot(t);
+  const file = join(discoveryTempDir(t), "remote-limits.json");
+  writeFileSync(file, snapshotDocument({ "chat-free": snapshotRow(500_000) }), "utf8");
+  // Older than the TTL, so start-up is the moment the process asks again.
+  const old = new Date(Date.now() - 2 * 3_600_000);
+  utimesSync(file, old, old);
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const { url, hits } = await snapshotOrigin(t, async (req, res) => {
+    await gate;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(snapshotDocument({ "chat-free": snapshotRow(700_000) }));
+  });
+  const { plugin } = await fixture(
+    t,
+    {},
+    {
+      limitsSnapshotURL: url,
+      limitsSnapshotCachePath: file,
+      limitsSnapshotRefreshMs: 3_600_000,
+      limitsSnapshotTimeoutMs: 5_000,
+    },
+  );
+  // The stale cache is the first answer: the refresh is in the air and the list
+  // does not wait for it.
+  const before = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(before["chat-free"].limit.context, 500_000, "the first answer was not the cache's");
+  assert.equal(snapshotState()?.source, "cache");
+  release();
+  await waitFor(() => snapshotState()?.source === "remote", "the remote snapshot to install");
+  // A live listing after the install re-reads measuredWalls(), so the model list
+  // that follows carries the remote window.
+  const refreshed = await plugin.refresh();
+  assert.equal(refreshed["chat-free"].limit.context, 700_000);
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(models["chat-free"].limit.context, 700_000, "a later list still had the old window");
+  assert.equal(models[Symbol.for("magpie.limitsSnapshot")].source, "remote");
+  assert.equal(hits(), 1, "the one refresh was fetched more than once");
+});
+
+for (const [label, handler, settle] of [
+  [
+    "404",
+    (req, res) => {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end('{"error":"gone"}');
+    },
+    50,
+  ],
+  [
+    "bad JSON",
+    (req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{ this is not a snapshot");
+    },
+    50,
+  ],
+  [
+    "timeout",
+    () => {
+      /* never answers: the fetch's own deadline ends it */
+    },
+    250,
+  ],
+]) {
+  test(`a failed remote refresh (${label}) keeps the cache and the model list works`, async (t) => {
+    useInstalledSnapshot(t);
+    const file = join(discoveryTempDir(t), "remote-limits.json");
+    writeFileSync(file, snapshotDocument({ "chat-free": snapshotRow(500_000) }), "utf8");
+    const old = new Date(Date.now() - 2 * 3_600_000);
+    utimesSync(file, old, old);
+    const { url, hits } = await snapshotOrigin(t, handler);
+    const { plugin } = await fixture(
+      t,
+      {},
+      {
+        limitsSnapshotURL: url,
+        limitsSnapshotCachePath: file,
+        limitsSnapshotRefreshMs: 3_600_000,
+        limitsSnapshotTimeoutMs: 100,
+      },
+    );
+    await waitFor(() => hits() === 1, `the ${label} refresh to be attempted`);
+    await sleep(settle);
+    // The failure did not replace the cache and did not fall back to the
+    // bundled table: the cache is still the answer, and the last attempt is
+    // remembered so the next model list does not retry it.
+    assert.equal(snapshotState()?.source, "cache", `${label}: the cache was lost`);
+    const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    assert.equal(models["chat-free"].limit.context, 500_000, `${label}: the cached wall was lost`);
+    assert.ok(Object.keys(models).length > 0, `${label}: the model list is empty`);
+    assert.equal(snapshotState()?.source, "cache");
+    await sleep(30);
+    assert.equal(hits(), 1, `${label}: the failure was retried on a model-list call`);
+  });
+}
+
+test("the snapshot TTL allows one fetch across repeated model-list calls", async (t) => {
+  useInstalledSnapshot(t);
+  const { url, hits } = await snapshotOrigin(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(snapshotDocument({ "chat-free": snapshotRow(600_000) }));
+  });
+  const { plugin } = await fixture(
+    t,
+    {},
+    {
+      limitsSnapshotURL: url,
+      // No cache: this case is about the TTL, not the file.
+      limitsSnapshotCachePath: "",
+      limitsSnapshotRefreshMs: 3_600_000,
+      limitsSnapshotTimeoutMs: 5_000,
+    },
+  );
+  await waitFor(() => snapshotState()?.source === "remote", "the first remote snapshot");
+  assert.equal(hits(), 1);
+  for (let call = 0; call < 3; call += 1)
+    await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(hits(), 1, "a fetch inside the TTL was repeated");
+});
+
+test("a null snapshot URL and a local pinned snapshot both leave the remote unread", async (t) => {
+  useInstalledSnapshot(t);
+  const dir = discoveryTempDir(t);
+  const { url, hits } = await snapshotOrigin(t, (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(snapshotDocument({ "chat-free": snapshotRow(900_000) }));
+  });
+  // A cache file that would be read were the URL not disabled. With a null URL
+  // there is no cache read at all, so it must not reach the list either.
+  const cache = join(dir, "unused-cache.json");
+  writeFileSync(cache, snapshotDocument({ "chat-free": snapshotRow(500_000) }), "utf8");
+  const off = await fixture(
+    t,
+    {},
+    {
+      limitsSnapshotURL: null,
+      limitsSnapshotCachePath: cache,
+      limitsSnapshotRefreshMs: 1,
+      limitsSnapshotTimeoutMs: 100,
+    },
+  );
+  assert.equal(snapshotState(), undefined, "a disabled snapshot installed something");
+  const offModels = await off.plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.equal(offModels["chat-free"].limit.context, 200_000, "the cache was read with the remote off");
+  assert.equal(hits(), 0, "a disabled snapshot was fetched");
+
+  // The local pinned source is the other way the remote is off: with a snapshot
+  // path pinned, limitsSnapshotURL answers no URL, so there is no cache read and
+  // no fetch — and measuredWalls() reads the pinned file instead.
+  const local = join(dir, "pinned-limits.json");
+  writeFileSync(local, snapshotDocument({ "chat-free": snapshotRow(400_000) }), "utf8");
+  const previousURL = process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL;
+  const previousPinned = process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT;
+  delete process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL;
+  process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT = local;
+  try {
+    const pinned = await fixture(t);
+    assert.equal(snapshotState(), undefined, "a pinned local source still installed a remote answer");
+    const pinnedModels = await pinned.plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+    assert.equal(pinnedModels["chat-free"].limit.context, 400_000, "the pinned file was not the source");
+  } finally {
+    if (previousURL === undefined) delete process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL;
+    else process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL = previousURL;
+    if (previousPinned === undefined) delete process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT;
+    else process.env.OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT = previousPinned;
+  }
+  assert.equal(hits(), 0, "the pinned local source was fetched");
+});
+
+test("a slow remote snapshot does not delay the model list", async (t) => {
+  useInstalledSnapshot(t);
+  const { url, hits } = await snapshotOrigin(t, () => {
+    /* never answers: the fetch may hang for the length of this case */
+  });
+  const { plugin } = await fixture(
+    t,
+    {},
+    {
+      limitsSnapshotURL: url,
+      limitsSnapshotCachePath: "",
+      limitsSnapshotRefreshMs: 3_600_000,
+      limitsSnapshotTimeoutMs: 5_000,
+    },
+  );
+  const started = Date.now();
+  const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const elapsed = Date.now() - started;
+  assert.ok(Object.keys(models).length > 0, "the model list is empty");
+  assert.ok(elapsed < 1_000, `the model list waited ${elapsed}ms on the snapshot`);
+  assert.equal(hits(), 1, "the startup refresh was not started");
+  assert.equal(snapshotState(), undefined, "a hanging fetch installed something");
 });
 
 test("registers without overwriting user config and enables public access without a secret", async (t) => {

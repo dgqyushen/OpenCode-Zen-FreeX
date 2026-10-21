@@ -14,13 +14,21 @@ import {
 } from "./models.mjs";
 import {
   anyAbortSignals,
+  installSnapshot,
+  limitsSnapshotCachePath,
+  limitsSnapshotRefreshMs,
+  limitsSnapshotTimeoutMs,
+  limitsSnapshotURL,
   loadLimitState,
   modelsDevClaims,
   observeRefusedRequest,
   observeRouteStatement,
   observeServedRequest,
+  readSnapshotCache,
+  refreshSnapshot,
   refusalAxis,
   requestSize,
+  snapshotState,
 } from "./limits.mjs";
 import { STALE_BODY_HEADERS, collapseResponse } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
@@ -41,6 +49,12 @@ const PATHS = { chat: "/chat/completions", responses: "/responses", anthropic: "
 // source of truth about that model — so it is non-enumerable and lives beside
 // `magpie.fellBack` on the map the host is given.
 const DISCOVERY_AGE = Symbol.for("magpie.discoveryAgeMs");
+// Where the remote limits snapshot stands, on the map a host is handed: the
+// source ("cache"/"remote"), when it was fetched and how old it is. A symbol
+// beside the models, not a field on a model, because it describes the table the
+// limits were read from and not any one model; it is non-enumerable, so it is
+// no model id to `Object.keys` and no field to JSON.
+const SNAPSHOT_STATE = Symbol.for("magpie.limitsSnapshot");
 // Which generation to present when the host's tools name neither one: a floor,
 // and not a claim about what opencode-ai publishes as latest. What it publishes
 // as latest is 2.x, and `fingerprint.json` captures it — the profile whose
@@ -772,6 +786,22 @@ function kept(key) {
   return session;
 }
 
+// The model map a host receives, carrying where the limits came from beside it.
+// The getter reads the installed state at the time the host asks, so a map made
+// before the background refresh landed reports the snapshot as it is then; the
+// property is non-enumerable and invisible to `Object.keys`/`JSON.stringify`,
+// which is what lets it sit on a map of model records without being a model.
+function withSnapshotState(models) {
+  if (models && typeof models === "object" && !Object.hasOwn(models, SNAPSHOT_STATE)) {
+    Object.defineProperty(models, SNAPSHOT_STATE, {
+      get: () => snapshotState(),
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return models;
+}
+
 async function server(_input, options = {}) {
   const baseURL = httpURL(options.baseURL ?? DEFAULT_BASE);
   const catalogURL = httpURL(options.catalogURL ?? CATALOG);
@@ -788,6 +818,71 @@ async function server(_input, options = {}) {
       : options.modelsDevURL === undefined
         ? httpURL(MODELS_DEV_URL)
         : httpURL(options.modelsDevURL);
+  // ---- the remote limits snapshot (limits.mjs R7a) -------------------------
+  //
+  // The measured walls this build ships are a snapshot too, just an older one:
+  // the repository's scheduled sweep publishes its result, and a host that can
+  // reach it should read the newer numbers without waiting for a release. This
+  // block owns only the when. limits.mjs owns the URL/cache/TTL settings, the
+  // parser, the installed Map and the fetch itself; nothing here may fail or
+  // wait on a start, because a snapshot is an optimisation over the bundled
+  // table and a network that is slow or absent is that table.
+  const snapshotURL = limitsSnapshotURL(options.limitsSnapshotURL);
+  const snapshotCachePath = limitsSnapshotCachePath(options.limitsSnapshotCachePath);
+  const snapshotRefreshMs = limitsSnapshotRefreshMs(options.limitsSnapshotRefreshMs);
+  const snapshotTimeoutMs = limitsSnapshotTimeoutMs(options.limitsSnapshotTimeoutMs);
+  // When this process last asked for the remote snapshot: the cache's own mtime
+  // when one was installed, and the attempt's start when one is being made. A
+  // failure sets it too, so a host whose model chooser opens every few seconds
+  // does not turn a dead URL into one request per open.
+  let snapshotAttemptAt = 0;
+  let snapshotFlight = null;
+  function refreshSnapshotSoon() {
+    if (snapshotURL === undefined) return false;
+    const now = Date.now();
+    if (now - snapshotAttemptAt < snapshotRefreshMs) return false;
+    if (snapshotFlight !== null) return false;
+    snapshotAttemptAt = now;
+    // Not awaited: the answer improves the limits table, and a host waiting for
+    // its model list must not wait for GitHub. refreshSnapshot installs only a
+    // whole valid document, writes its cache after installing, and answers a
+    // failure instead of throwing; the catch is the last guard for a promise
+    // nothing waits for, and the flight is cleared whichever way it ended.
+    snapshotFlight = refreshSnapshot({
+      url: snapshotURL,
+      cachePath: snapshotCachePath,
+      timeoutMs: snapshotTimeoutMs,
+    })
+      .catch(() => ({ ok: false, reason: "fetch" }))
+      .finally(() => {
+        snapshotFlight = null;
+      });
+    return true;
+  }
+  // The cache is read synchronously, before the first models() answer and before
+  // the bootstrap table is built: limitFor() reads measuredWalls(), and an
+  // installed cache is the newest wall this process has. A URL that is undefined
+  // means no cache is read at all; a missing or corrupt cache is undefined and
+  // the bundled table stands. The age of the installed answer is the cache's,
+  // not this process's, which is why the first model list after a restart with a
+  // fresh cache does not spend a fetch.
+  const cachedSnapshot =
+    snapshotURL === undefined ? undefined : readSnapshotCache(snapshotCachePath);
+  if (cachedSnapshot) {
+    installSnapshot(cachedSnapshot.walls, {
+      source: "cache",
+      fetchedAt: cachedSnapshot.fetchedAt,
+      // The cache file does not carry the URL it was fetched from, so claiming
+      // the currently configured URL would misreport the source after a mirror
+      // change. The source and date are what the file can prove; `url` belongs
+      // to a remote fetch and is left absent here.
+      url: undefined,
+    });
+    snapshotAttemptAt = cachedSnapshot.fetchedAt;
+  }
+  if (snapshotURL !== undefined && Date.now() - snapshotAttemptAt >= snapshotRefreshMs)
+    refreshSnapshotSoon();
+
   // What the last process learned, read once at startup and before the first
   // answer. A restart otherwise begins with the bootstrap table, and the first
   // request after it pays for a listing a previous process already read. The
@@ -1292,13 +1387,18 @@ async function server(_input, options = {}) {
         await loadLimitState();
         if (!auth) return provider.models;
         requirePublic(auth);
+        // The remote snapshot, if one is due. Never awaited: the host asks for a
+        // model list, not for a network read of a table this process already has
+        // a bundled answer for. A failure leaves the cache or the bundled table
+        // installed and is not retried until the TTL says so.
+        refreshSnapshotSoon();
         // Asked without a signal, and deliberately: the hook has none to give,
         // and passing `undefined` on as one would read as a caller that cancels
         // nothing — `leased` takes it as "no way out", which is what this call
         // has. Whether it reads at all is `discover()`'s decision, so a host
         // that opens its model chooser twice in a minute is given the list read
         // the first time instead of a second round of upstream reads.
-        return discover();
+        return withSnapshotState(await discover());
       },
     },
     // Read the list again now, whatever RELIST_AFTER says: the way for a host

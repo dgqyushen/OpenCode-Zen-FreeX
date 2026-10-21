@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1575,6 +1575,13 @@ export function limitsSnapshotPath(explicit, env = globalThis.process?.env) {
 // listing for an answer that cannot have moved.
 const wallReads = new Map();
 
+// The remote snapshot this process has installed, if any. It is kept apart from
+// `wallReads` because it is not a read of a file: it is an answer that arrived
+// over the network or out of the remote cache, and `measuredWalls(undefined)`
+// answers from it before it looks at any path. It has no path to key a read on,
+// which is why the per-file cache cannot hold it.
+let installedSnapshot;
+
 // Whether a row tells one story about its own ceiling. The sweep writes the
 // first refused size twice — as `refusedChars` and as the head of
 // `refusedSizes` — and a row whose two copies disagree was edited by hand into
@@ -1638,6 +1645,22 @@ function rowAgreesWithItself(row) {
 // number still stands for that model, which is the declaration a build makes
 // when nothing here has measured anything.
 export function measuredWalls(file) {
+  // An installed remote answer is the answer for "no file named" — but only
+  // then, and only while no local source is pinned. The precedence the provider
+  // relies on is: explicit file > env path > installed remote > bundled, with the
+  // installed map standing in for the bundled file rather than over a local file
+  // an operator named. An explicit file (including `""`, which says "no source")
+  // asked about that source; an env path is the same choice made once for the
+  // process; only with neither is the remote answer the one to read.
+  //
+  // Presence, not truthiness: `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT=""` is the
+  // operator saying "no snapshot at all", and an installed answer must not
+  // survive that decision. `Object.hasOwn` distinguishes a variable set to empty
+  // from one nobody set.
+  if (file === undefined && installedSnapshot) {
+    const env = globalThis.process?.env;
+    if (!(env && Object.hasOwn(env, LIMITS_SNAPSHOT_ENV))) return installedSnapshot.walls;
+  }
   const path = limitsSnapshotPath(file);
   if (!path) return new Map();
   const held = wallReads.get(path);
@@ -1681,6 +1704,444 @@ export function measuredWalls(file) {
     // No measurement is not a failure: it is a build that declares what it says.
   }
   return walls;
+}
+
+// ---- the snapshot as a remote input -----------------------------------------
+//
+// The snapshot beside this module is the scheduled sweep's own answer, written by
+// a workflow and committed with the table it corrects. It is right for a checkout
+// of this repository and right for the tarball, and it is wrong for the hour
+// after a sweep has published a new measurement and before the next release has
+// been cut: a host runs the number that shipped with it, not the number the route
+// taught since.
+//
+// So the same file is also published where a host can read it, and this section
+// is only the core of that: where the URL is, where the cache is, how often and
+// how long one fetch may take, one parser both sources share, and one installed
+// Map that `measuredWalls()` answers from before it reaches for the bundled file.
+// The provider owns the when (the refresh timer, the fallback order, the
+// diagnostics line); nothing here starts a timer, installs anything by itself or
+// fails a request.
+//
+// Every path into this section is bounded and fallible in the same direction: a
+// URL, a cache file and a response are all inputs this file did not write, so a
+// bad one is no measurement rather than a throw, and a remote answer is installed
+// only after the whole document has been parsed and validated. An installed Map
+// is replaced as a whole or not at all — `installSnapshot` copies before it
+// assigns — so a half-read document can never be the state a request reads.
+export const LIMITS_SNAPSHOT_URL_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL";
+export const LIMITS_SNAPSHOT_CACHE_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_CACHE";
+export const LIMITS_SNAPSHOT_REFRESH_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_REFRESH_MS";
+export const LIMITS_SNAPSHOT_TIMEOUT_ENV = "OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_TIMEOUT_MS";
+export const DEFAULT_LIMITS_SNAPSHOT_URL =
+  "https://raw.githubusercontent.com/tkhs101/OpenCode-Zen-FreeX/main/limits-observed.json";
+
+// The remote document's own bounds. They mirror the sweep's write-side rules and
+// `limits-watch.mjs`'s check: a file a host downloads is even less trusted than
+// one it reads beside itself, because nobody reviewing a diff has seen it. The
+// token/character bounds are deliberately generous — the largest window this
+// route serves is 1,048,576 tokens and the ladder stops around 4.2M characters —
+// and exist to catch a unit error or a runaway probe, not to second-guess a
+// measurement.
+// A 256 KiB document can legally hold more than a thousand rows, but only if
+// each is near the minimum; ten thousand was a bound no real snapshot would
+// reach and, at this document ceiling, one no test could construct either. A
+// thousand is still far above the sweep's current shape (single digits) and
+// leaves the row bound reachable and tested.
+const SNAPSHOT_ROWS_LIMIT = 1_000;
+const SNAPSHOT_TOKENS_LIMIT = 4_000_000;
+const SNAPSHOT_CHARS_LIMIT = 32_000_000;
+const SNAPSHOT_TOKEN_CHAR_SLACK = 4096;
+const SNAPSHOT_REFRESH_DEFAULT = 3_600_000;
+const SNAPSHOT_TIMEOUT_DEFAULT = 5_000;
+const SNAPSHOT_TIMEOUT_MIN = 100;
+const SNAPSHOT_TIMEOUT_MAX = 60_000;
+const SNAPSHOT_WALLS = new Set(["bracketed", "single-refusal", "openEnded", "named"]);
+
+// A whole-number setting with a floor, a ceiling and a default. Only a safe
+// integer in range counts; an explicit value that is not one is not a reason to
+// read the environment after it — the caller said something, and the default is
+// the honest answer to "something this file does not understand".
+function numberSetting(explicit, env, name, { min, max, fallback }) {
+  const usable = (value) => Number.isSafeInteger(value) && value >= min && value <= max;
+  if (explicit !== undefined) {
+    const value = typeof explicit === "string" && explicit !== "" ? Number(explicit) : explicit;
+    return usable(value) ? value : fallback;
+  }
+  const named = env?.[name];
+  if (typeof named === "string" && named !== "") {
+    const value = Number(named);
+    return usable(value) ? value : fallback;
+  }
+  return fallback;
+}
+
+// Where the remote snapshot is read from. An operator who pinned a local snapshot
+// path — `LIMITS_SNAPSHOT_ENV` present at all, including empty — has chosen the
+// source, and the remote is off rather than fighting that choice. An explicit
+// string is the caller's own answer and wins over both; `""` disables the remote
+// the same way in every layer.
+export function limitsSnapshotURL(explicit, env = globalThis.process?.env) {
+  if (explicit !== undefined) {
+    if (typeof explicit !== "string") return undefined;
+    return explicit === "" ? undefined : explicit;
+  }
+  // A pinned local source is a decision about where the snapshot comes from, so
+  // it settles the question before the URL variable is read. This is checked
+  // first for presence, not truthiness: `""` (no snapshot) is still a decision,
+  // and it must disable the remote rather than race it.
+  if (env && Object.hasOwn(env, LIMITS_SNAPSHOT_ENV)) return undefined;
+  // Presence and emptiness are different answers: a URL written is a URL chosen,
+  // and `""` is how the environment says "no" — an absent variable is not a
+  // disable, it is "nothing said here", which falls through to the default.
+  const named = env?.[LIMITS_SNAPSHOT_URL_ENV];
+  if (typeof named === "string") return named === "" ? undefined : named;
+  return DEFAULT_LIMITS_SNAPSHOT_URL;
+}
+
+// Where the remote snapshot is cached between runs. The default is the same
+// platform cache directory the limits state uses, with a file name of its own so
+// a remote answer is never mistaken for the state this process wrote. An empty
+// string disables the cache, which is a supported deployment: the snapshot is an
+// optimisation, not a requirement.
+export function limitsSnapshotCachePath(explicit, env = globalThis.process?.env) {
+  if (explicit !== undefined) {
+    if (typeof explicit !== "string") return undefined;
+    return explicit === "" ? undefined : explicit;
+  }
+  const named = env?.[LIMITS_SNAPSHOT_CACHE_ENV];
+  if (typeof named === "string") return named === "" ? undefined : named;
+  const home = homedir();
+  const base = env?.LOCALAPPDATA || env?.XDG_CACHE_HOME || (home ? join(home, ".cache") : "");
+  return base ? join(base, "opencode-zen-freex", "limits-observed.remote.json") : undefined;
+}
+
+// How long a successful answer is trusted before the provider asks again. An
+// hour: the scheduled sweep is hourly, and a host that restarts more often than
+// that should read its cache rather than spend a request per start.
+export function limitsSnapshotRefreshMs(explicit, env = globalThis.process?.env) {
+  return numberSetting(explicit, env, LIMITS_SNAPSHOT_REFRESH_ENV, {
+    min: 1,
+    max: Number.MAX_SAFE_INTEGER,
+    fallback: SNAPSHOT_REFRESH_DEFAULT,
+  });
+}
+
+// How long one fetch may take. Five seconds by default, bounded to 100ms..60s:
+// shorter is not a network round trip and longer is a request path holding a
+// start-up open for a file that is only an optimisation.
+export function limitsSnapshotTimeoutMs(explicit, env = globalThis.process?.env) {
+  return numberSetting(explicit, env, LIMITS_SNAPSHOT_TIMEOUT_ENV, {
+    min: SNAPSHOT_TIMEOUT_MIN,
+    max: SNAPSHOT_TIMEOUT_MAX,
+    fallback: SNAPSHOT_TIMEOUT_DEFAULT,
+  });
+}
+
+// A remote (or cached) snapshot document, as the walls it measures. The rules are
+// the sweep's own write-side rules, restated here rather than trusted from the
+// document: version shape, a bounded number of rows, ids and rows that are what
+// they claim, a row that does not disagree with itself about its refused size, a
+// wall this file knows, and a window inside the units it says it is in.
+//
+// The whole document is rejected when it names another version, too many rows or
+// no valid row at all. That last one is the important one: an empty or wholly
+// invalid document is not an empty measurement, it is a document this build
+// cannot read, and installing it would wipe the bundled table for every host
+// behind this process. Individual bad rows are skipped — one dirty row upstream
+// is not every model's problem — and the document survives as long as one row
+// does.
+export function parseSnapshotDocument(text) {
+  try {
+    if (typeof text !== "string" || text.length > SNAPSHOT_LIMIT) return undefined;
+    const document = JSON.parse(text);
+    if (document?.version !== SNAPSHOT_VERSION) return undefined;
+    const models = document?.models;
+    if (!models || typeof models !== "object" || Array.isArray(models)) return undefined;
+    const entries = Object.entries(models);
+    if (entries.length > SNAPSHOT_ROWS_LIMIT) return undefined;
+    const walls = new Map();
+    for (const [id, row] of entries) {
+      if (!isUsableId(id) || id === "__proto__") continue;
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      if (!rowAgreesWithItself(row)) continue;
+      const wall = typeof row.wall === "string" ? row.wall : undefined;
+      if (!SNAPSHOT_WALLS.has(wall)) continue;
+      const at = typeof row.at === "string" ? row.at : undefined;
+      // A window the route stated in its own words is the route's number and is
+      // published as it stands, exactly as the bundled reader does — but it is
+      // still a token count, and a count past the same ceiling as a served one
+      // is a unit error, not a window. `named` used to `continue` before every
+      // bound, so a 9,000,000,000-token "named" window was installed as-is.
+      if (usable(row.named)) {
+        if (row.named > SNAPSHOT_TOKENS_LIMIT) continue;
+        walls.set(id, { value: row.named, settles: true, wall: "named", at });
+        continue;
+      }
+      const tokens = row.servedTokens;
+      if (!usable(tokens) || tokens > SNAPSHOT_TOKENS_LIMIT) continue;
+      if (row.servedChars !== undefined && row.servedChars !== null) {
+        // A token is at least one character for every script this route takes;
+        // a token count more than twice its character count is a row about two
+        // different things, which one bad run or one unit error produces.
+        if (!usable(row.servedChars) || row.servedChars > SNAPSHOT_CHARS_LIMIT) continue;
+        if (tokens > row.servedChars * 2 + SNAPSHOT_TOKEN_CHAR_SLACK) continue;
+      }
+      const value = Math.floor(tokens / SNAPSHOT_STEP) * SNAPSHOT_STEP;
+      if (!usable(value)) continue;
+      walls.set(id, { value, settles: wall === "bracketed", wall, at });
+    }
+    return walls.size > 0 ? walls : undefined;
+  } catch {
+    // A document that is not JSON, not text or not shaped like a snapshot is no
+    // measurement. Nothing on a request path may throw because an input was bad.
+    return undefined;
+  }
+}
+
+// The last remote answer written to disk, with the time it was written (the
+// file's mtime). A missing, unreadable, unparsable or empty cache is undefined
+// and never a throw: the caller has a bundled file and a network for exactly this
+// answer.
+export function readSnapshotCache(file) {
+  try {
+    if (typeof file !== "string" || file === "") return undefined;
+    const info = statSync(file);
+    // Startup reads this synchronously. A directory, a FIFO, a device or a file
+    // past the snapshot ceiling is not the cache this process wrote; stat gives
+    // both answers before the read, so a corrupt cache cannot block or exhaust
+    // the start it is only an optimisation for.
+    if (!info.isFile() || info.size > SNAPSHOT_LIMIT) return undefined;
+    const text = readFileSync(file, { encoding: "utf8" });
+    const walls = parseSnapshotDocument(text);
+    if (!walls) return undefined;
+    return { walls, fetchedAt: info.mtimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
+// Install a parsed remote answer as this process's snapshot. The input is a Map
+// of one or more walls; anything else is no answer and leaves the installed state
+// alone. The Map is copied before the assignment, so a caller that keeps building
+// on the one it handed in cannot change what requests read, and a replacement is
+// visible all at once rather than row by row.
+export function installSnapshot(walls, meta = {}) {
+  if (!(walls instanceof Map) || walls.size === 0) return false;
+  const copy = new Map();
+  for (const [id, wall] of walls) {
+    if (!isUsableId(id) || id === "__proto__") continue;
+    if (!wall || typeof wall !== "object" || Array.isArray(wall)) continue;
+    copy.set(id, { ...wall });
+  }
+  if (copy.size === 0) return false;
+  installedSnapshot = {
+    walls: copy,
+    source: typeof meta?.source === "string" ? meta.source : "installed",
+    fetchedAt: Number.isFinite(meta?.fetchedAt) ? meta.fetchedAt : Date.now(),
+    url: typeof meta?.url === "string" ? meta.url : undefined,
+  };
+  return true;
+}
+
+// Drop the installed answer. Only for tests and for a provider that has been told
+// to stop reading remotely: it is the one way back to the bundled file.
+export function clearInstalledSnapshot() {
+  const had = installedSnapshot !== undefined;
+  installedSnapshot = undefined;
+  return had;
+}
+
+// What is installed, as a copy. `ageMs` is the answer's age, not the process's:
+// a cache loaded at start-up is old from the moment it is read, which is exactly
+// what the provider needs to decide whether to ask again.
+export function snapshotState() {
+  if (!installedSnapshot) return undefined;
+  return {
+    source: installedSnapshot.source,
+    fetchedAt: installedSnapshot.fetchedAt,
+    url: installedSnapshot.url,
+    ageMs: Math.max(0, Date.now() - installedSnapshot.fetchedAt),
+  };
+}
+
+// The write counter that keeps two cache writes in one process off one path. The
+// same rule as the state file's: a temporary file is per write, not per process.
+let snapshotWriteSequence = 0;
+
+// One cache write: a temporary file beside the target, 0600, renamed over it.
+// Cache trouble is never the refresh's trouble — a read-only cache directory is
+// a host that asks again next start, not a snapshot that failed to install — so
+// this function answers nothing and a failure inside it is swallowed after its
+// temporary is cleaned up. The temp is best-effort removed, because what is left
+// when the write failed is exactly what the write failed on.
+async function writeSnapshotCache(file, text) {
+  let temporary;
+  try {
+    await mkdir(dirname(file), { recursive: true });
+    temporary = `${file}.${process.pid}.${snapshotWriteSequence++}.tmp`;
+    await writeFile(temporary, text, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, file);
+  } catch {
+    if (temporary !== undefined) {
+      try {
+        await rm(temporary, { force: true });
+      } catch {
+        // Nothing here is worth a second failure.
+      }
+    }
+  }
+}
+
+// Consume a response body without letting it exceed the snapshot ceiling. A
+// content-length header is a promise, not a guarantee: a chunked or HTTP/2
+// mirror can omit it, and `response.text()` would allocate the whole body before
+// the parser ever sees its size. When a stream is available, read it in chunks
+// and cancel the moment the running total passes the bound; only a response with
+// no readable stream falls back to `text()` (fake responses in tests, and a
+// shape some fetch implementations use).
+async function cancelReader(reader) {
+  try {
+    const canceled = reader?.cancel?.();
+    if (canceled && typeof canceled.catch === "function") await canceled.catch(() => {});
+  } catch {
+    // The reader is already being abandoned; a second failure is not worth one.
+  }
+}
+
+async function readSnapshotBody(response) {
+  const body = response?.body;
+  if (body && typeof body.getReader === "function") {
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || typeof value.byteLength !== "number") {
+          await cancelReader(reader);
+          return { reason: "invalid" };
+        }
+        total += value.byteLength;
+        if (total > SNAPSHOT_LIMIT) {
+          // Stop the transfer rather than draining a body this build will never
+          // use; a mirror that ignores cancel is still bounded by the abort
+          // signal on the fetch that owns this stream.
+          await cancelReader(reader);
+          return { reason: "too-large" };
+        }
+        chunks.push(value);
+      }
+    } finally {
+      try {
+        reader.releaseLock?.();
+      } catch {
+        // The reader that failed is not a second failure worth reporting.
+      }
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { text: new TextDecoder().decode(bytes) };
+  }
+  const text = await response.text();
+  if (typeof text !== "string" || text.length > SNAPSHOT_LIMIT) return { reason: "too-large" };
+  return { text };
+}
+
+// Drop a response body this build is not going to read. Called on every early
+// return; a body left undrained holds a connection and, on a streamed response,
+// costs the mirror bytes nobody will use.
+function cancelSnapshotBody(response) {
+  try {
+    const canceled = response?.body?.cancel?.();
+    if (canceled && typeof canceled.catch === "function") canceled.catch(() => {});
+  } catch {
+    // Cancelling is best effort; the answer is already "no".
+  }
+}
+
+// One remote refresh, never throwing. The URL is validated before anything is
+// fetched (an `ftp:` URL is a configuration error, not a network one), the fetch
+// carries its own deadline, and the response is accepted only if it is a 2xx, not
+// larger than the snapshot bound (by header or by streamed body) and a document
+// the parser above accepts whole. Only then is it installed and written to the
+// cache.
+//
+// A failed refresh returns the reason and leaves whatever was installed in place:
+// an installed answer from an hour ago is a better snapshot than a bundled table
+// from a released build, and one bad fetch is not a reason to lose it. The cache
+// write is the last step and its failure does not undo a successful install.
+export async function refreshSnapshot({
+  url,
+  cachePath,
+  timeoutMs = SNAPSHOT_TIMEOUT_DEFAULT,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  let target;
+  try {
+    target = new URL(url);
+  } catch {
+    return { ok: false, reason: "url" };
+  }
+  if (!["http:", "https:"].includes(target.protocol)) return { ok: false, reason: "url" };
+  if (typeof fetchImpl !== "function") return { ok: false, reason: "fetch" };
+  const wait =
+    Number.isSafeInteger(timeoutMs) && timeoutMs >= SNAPSHOT_TIMEOUT_MIN && timeoutMs <= SNAPSHOT_TIMEOUT_MAX
+      ? timeoutMs
+      : SNAPSHOT_TIMEOUT_DEFAULT;
+  const timeoutReason = (error) =>
+    error?.name === "TimeoutError" || error?.name === "AbortError" ? "timeout" : "fetch";
+  let response;
+  try {
+    response = await fetchImpl(target.href, {
+      signal: AbortSignal.timeout(wait),
+      headers: { accept: "application/json" },
+    });
+  } catch (error) {
+    return { ok: false, reason: timeoutReason(error) };
+  }
+  try {
+    if (!response || typeof response !== "object" || response.ok !== true) {
+      cancelSnapshotBody(response);
+      return { ok: false, reason: "http" };
+    }
+    // A header that promises more than the bound is believed before the body is
+    // read: the point of the bound is not to read a large document and then
+    // reject it.
+    const length = response.headers?.get?.("content-length");
+    if (typeof length === "string" && /^\d+$/.test(length) && Number(length) > SNAPSHOT_LIMIT) {
+      cancelSnapshotBody(response);
+      return { ok: false, reason: "too-large" };
+    }
+    let text;
+    try {
+      const read = await readSnapshotBody(response);
+      if (read.reason) return { ok: false, reason: read.reason };
+      text = read.text;
+    } catch (error) {
+      return { ok: false, reason: timeoutReason(error) };
+    }
+    if (typeof text !== "string" || text.length > SNAPSHOT_LIMIT) {
+      cancelSnapshotBody(response);
+      return { ok: false, reason: "too-large" };
+    }
+    const walls = parseSnapshotDocument(text);
+    if (!walls) return { ok: false, reason: "invalid" };
+    const fetchedAt = Date.now();
+    installSnapshot(walls, { source: "remote", fetchedAt, url: target.href });
+    if (typeof cachePath === "string" && cachePath !== "") await writeSnapshotCache(cachePath, text);
+    return { ok: true, fetchedAt, walls };
+  } catch {
+    // A response object that throws, a body that cannot be read, a header getter
+    // that fails: all of it is the fetch failing, and none of it is the caller's.
+    cancelSnapshotBody(response);
+    return { ok: false, reason: "fetch" };
+  }
 }
 
 // ---- models.dev as a second opinion -----------------------------------------
