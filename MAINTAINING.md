@@ -445,6 +445,17 @@ axis only: the output axis is still the table and the catalogue, and `input` is
 still measured by nothing here, though the window that axis follows may be the
 one the sweep settled rather than the table's (above).
 
+A row may also carry `unavailable`, the day the sweep last heard the route call
+the model itself gone. Only an explicit answer counts: a 404 or 410, or wording
+that names the model as not found, unavailable, retired or no longer there, and
+only when every answer of that run was an error. A 429, a 5xx, a timeout, a
+transport failure, an auth rejection or a malformed answer is not a liveness
+verdict - the run could not ask, and the next run may be answered. The field is
+history and not a switch: nothing hides, disables or reroutes a model, a row
+that later serves or refuses the model is rewritten without it, and `--status`
+reports `model_unavailable` only while the day is recent (a week, the same bound
+the suspicion rule uses).
+
 A row that counts characters and no tokens is invisible to the plugin, and that
 is a decision rather than an oversight: the route served the prompt but sent back
 no count of its own, and the only way to turn characters into tokens here is the
@@ -458,13 +469,33 @@ for that model.
 The file says what its numbers are, because the names cannot change: a
 top-level `_units` names the unit of every field - `servedTokens` and `named`
 are tokens, `servedChars`, `refusedChars` and `refusedSizes` are characters,
-`at` is the day it was measured - and a reader who takes one for the other is
+`at` is the day it was measured and `unavailable`, when a row has it, is the day
+the route called the model gone - and a reader who takes one for the other is
 wrong by a factor of four. `bun limits-watch.mjs --check` reads the
 `limits-observed.json` beside `limits-watch.mjs` and says, line by line, what is
 wrong with it; it asks nothing and writes nothing, so it can be a gate on the
 file a run is about to publish. It does not follow
 `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` - the default path is that repository file
 - so name another path on the command line to check one.
+
+`bun limits-watch.mjs --status [--json] [--stale-after N]` asks a different
+question about the same file: whether it is fresh and healthy rather than
+whether it is one the plugin can read. It stats and reads the file, never asks
+the route and never writes. `--json` makes the report one machine-readable line
+(`snapshotPath`, `generatedAt`, `ageSeconds`, `staleAfterSeconds`, `stale`,
+`models`, `rows`, `issues`), where each row carries `id`, `wall`, `at`, `tried`,
+`ageDays`, `stale` and, when the row has one, `unavailableAt`, and each issue is
+a `code` and a `message` (`snapshot_missing`, `snapshot_unreadable`,
+`snapshot_not_json`, `snapshot_invalid`, `snapshot_stale`, `row_stale`,
+`no_measurements`, `model_unavailable`). The staleness bound is two hours
+(`STATUS_STALE_AFTER_SECONDS`), changed with `--stale-after <seconds>`; the file
+follows `--check`'s rule - the first argument that is not a flag - with that
+flag's value skipped. Its exit codes are its own because the question is: 0 when
+the snapshot is readable, valid and fresh; 2 when it was read and is degraded
+(an invalid row or unit, the file or a row past its age bound, no rows at all,
+or a recent `unavailable` row); 1 when it cannot be read at all. `--check`
+remains the publish gate and answers only 0 or 1, because it
+asks nothing and "not reached" is not one of its answers.
 
 Applying one is reported as it happens: `OPENCODE_ZEN_FREE_LIMITS_DEBUG=1` gets a
 `sweep-statement` line naming the model, the axis, the value, the wall behind it
@@ -732,6 +763,25 @@ one — then never sees a model Zen made free since. The marker belongs to the o
 case that describes it: the listing itself could not be read, so what is returned
 really is the last list there was (`yetone/magpie#2385`).
 
+**Keeping the last successful listing.** A discovery round that reached the
+route is remembered in `discovery.json` under the platform cache directory -
+`%LOCALAPPDATA%`, else `$XDG_CACHE_HOME`, else `~/.cache`, then
+`/opencode-zen-freex/discovery.json` - and `OPENCODE_ZEN_FREE_DISCOVERY_CACHE`
+names another path; an empty value keeps discovery in memory only. The file
+carries `version` (the one schema this build writes and reads), `listedAt` (the
+ISO date and time of the read), the model records and the protocol map as the
+route answered them. It is an input to discovery, not a second source of truth:
+read once at startup and merged per id under the bootstrap table (its `listedAt`
+becomes the last-read time, so a restart does not re-ask inside the re-list
+interval), and it is what the listing-failure fallback carries - a live read
+always wins and overwrites it. Its age travels to the host as
+`Symbol.for("magpie.discoveryAgeMs")`, a non-enumerable symbol beside
+`magpie.fellBack`, so a host can tell a cached answer from a read made a moment
+ago; with no cache and no successful read there is no age to state. The write is
+best effort and atomic (a temporary beside the file, then a rename), never
+awaited on the request path, and a cache that cannot be read or written behaves
+exactly as if it were not there.
+
 **Waiting for the catalogue before offering a model Zen already lists.** An id
 ending in `-free` that neither the catalogue nor the docs describe is offered
 anyway, asked through the provider's own protocol (openai-compatible, and so
@@ -750,6 +800,22 @@ measured 2026-10-15, each of the three answers on its own while
 x-opencode-request with x-session-affinity is refused. A header cannot be judged
 by adding it on its own, so add it in `outboundHeaders` and let the pinned test
 and a live `check:gate` say what it did.
+
+**Reading the session name.** The name a conversation is keyed by comes from the
+first signal that has one, in this order: the headers `x-opencode-session`,
+`x-opencode-session-id`, `x-session-affinity`, `x-session-id`, `session_id`,
+`conversation-id`, `conversation_id`; then the body's `conversation_id`,
+`metadata.session_id`, and the Claude Code `metadata.user_id` (its
+`_session_<uuid>` tail, or a JSON object carrying `session_id`). An empty string
+is no name at all - folding those together would give every such host one Zen
+session. When nothing names the conversation, the seed is the system prompt and
+the first user turn together: `system` and `instructions`, then
+`system`/`developer` messages ahead of the first user message; the pair is
+hashed, so a changed system prompt is a different conversation and two agent
+clients that open with the same boilerplate turn do not collide.
+`previous_response_id` is the last explicit signal, read only when there is no
+opening to key by, and a conversation with none of these gets a fresh `ses_` id
+per call. An id already in OpenCode's shape passes through untouched.
 
 **Reading the protocol table by its columns.** The console docs are read as a
 table whose rows name an id and the endpoint that id is asked at, and the
@@ -813,6 +879,29 @@ unavailable". So the gap is real but not reachable today, and the sentence above
 either route puts the rest of it back in scope, and then the item id has to be
 minted across the same copies, the way the dropped ones already are.
 
+**Appending Chat `function.name` fragments.** A name fragment is not always the
+next piece of a name: some vendors re-send the whole name on the frame that
+carries the arguments, and some send a name that has grown. Appended blindly,
+`Read` followed by `Read` became `ReadRead`, which folded onto no declared tool
+and was reported as an unknown tool. `stream.mjs`'s `mergeFunctionName` is the
+one rule both paths read — the same bytes again keep the name, a fragment that
+starts with it replaces it (the name has grown), a shorter prefix re-sent keeps
+the longer name, anything else appends — and `tool-response.mjs`'s guard buffers
+the same fragments through it, so one upstream reply cannot fold two ways.
+`arguments` keep the blind append in both paths: a JSON payload is bytes in
+order, not a name being stated again.
+
+**Treating every 403 as the fingerprint.** Three 403s reach the host and they
+are not the same. The free tier's refusal about the wording carries
+`FreeTierError` and is the one `explain` rewrites into a generation hint. A
+foreign 403 is passed through with its body intact. And the free tier's IP-abuse
+refusal — wording about abusive traffic, or about its free models not being
+available from the current network — is about the egress IP, not about anything
+this package sends: `explain` names that plainly, because no rewrite, retry or
+session change from the same IP can help, and it adds no local cooldown, because
+the block is the upstream's and a process that cooled down would keep refusing a
+network that had already been unblocked.
+
 **Trusting one observation.** The gate is not steady: it moved more than once in
 a day while this was being worked out, and identical requests were answered both
 ways minutes apart. Anything measured once is not a fact. Measure it three times,
@@ -831,7 +920,7 @@ that passes under the stricter of them, since the looser one will not last.
 | `stream.mjs`, `tool-response.mjs` | replies Zen cuts short, and tool calls |
 | `limits-audit.mjs` | asks the route which ids it still offers and which look under-declared (`limits:audit`) |
 | `limits-sweep.mjs` | brackets one id's prompt wall on the live route (`limits:sweep`) |
-| `limits-watch.mjs` | the scheduled diff and sweep: what is offered, what was measured, what to measure (`limits:watch`) |
+| `limits-watch.mjs` | the scheduled diff and sweep: what is offered, what was measured, what to measure, and the snapshot's freshness report (`limits:watch`) |
 | `limits-observed.json` | what the last scheduled run measured: read at run time as the `route-sweep` tier |
 | `capture.mjs` | takes a new capture |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
@@ -907,7 +996,11 @@ defaults are wrong: `ZEN_BASE_URL`, `ZEN_CHECK_MODEL` (gate), `ZEN_CATALOG_URL`,
 `ZEN_GENERATION` (audit) and `CAPTURE_PORT` (capture). `.env.example` lists them
 with their defaults; it is in a repository checkout only, because it is not in
 `package.json`'s `files`. Nothing loads a file by itself, so export them or, in a
-checkout, copy that file to `.env` and export from it.
+checkout, copy that file to `.env` and export from it. Two file knobs belong to
+the runtime rather than to a script: `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` (above)
+and `OPENCODE_ZEN_FREE_DISCOVERY_CACHE`, unset leaving the discovery cache
+beside the limits state under the platform cache directory and an empty value
+keeping discovery in memory only.
 
 ## Publishing
 
