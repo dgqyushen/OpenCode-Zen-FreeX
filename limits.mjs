@@ -41,9 +41,11 @@ import { fileURLToPath } from "node:url";
 // samples and the reasoning are beside its number. The sweep has the last word
 // for the ids and axes it does not: a window nobody measured is a window every
 // host gets wrong, and waiting for somebody to write a table entry by hand is
-// how a new model stays wrong for a week. A sweep says nothing about the output
-// axis — it asks no completion for anything — so that axis is still answered by
-// the table and the catalogue alone.
+// how a new model stays wrong for a week. The output axis is not measured at
+// all: models.dev's largest `limit.output` for the canonical model is the
+// declaration, and the table's output entries are a historical fallback only
+// for an id models.dev does not describe. A sweep asks no completion for
+// anything; it brackets prompts.
 //
 // Being accepted is not evidence. Zen answers 200 to max_tokens 2000000 under a
 // short prompt, so a value that is accepted says something about the request
@@ -2178,8 +2180,17 @@ export const MODELS_DEV_MIN = 1_000_000;
 // the network: a plugin that blocked a model list on a third party would be
 // slower for everybody and wrong for anybody behind a firewall.
 const MODELS_DEV = new Map();
+// The completion ceilings, by the same canonical id and the same maximum rule.
+// The output axis is not measured any more: a sweep brackets the prompt wall
+// because that is what a host plans from and what a refusal can prove, while a
+// completion ceiling is the provider's own figure and the largest entry for the
+// weights is the one that tries to use all of it. This map is therefore the
+// output authority; the table's output entries remain only for an id models.dev
+// does not describe.
+const MODELS_DEV_OUTPUT = new Map();
 // What a canonical id is claimed at, and by whom, for diagnostics.
 const MODELS_DEV_BY = new Map();
+const MODELS_DEV_OUTPUT_BY = new Map();
 // Who claimed each canonical id. The winning claim alone cannot say how many
 // providers described a model: only the largest is kept, so the count was a
 // count of models with a claim at all — every one of them — and the evidence
@@ -2187,15 +2198,22 @@ const MODELS_DEV_BY = new Map();
 // catalogue would not, was thrown away with the claims that lost.
 const MODELS_DEV_PROVIDERS = new Map();
 
-// Reads a models.dev document into the two maps above. Returns how many models
-// it saw two or more claims for, which is the number worth logging: a model one
+// Reads a models.dev document into the maps above. Returns how many models it
+// saw two or more claims for, which is the number worth logging: a model one
 // provider describes says nothing a catalogue would not. A claim is a provider
 // describing a model, so the count is of the models more than one provider
 // described — and the claims that lost are counted too, because the evidence is
 // that a second provider said the same thing, not that it said it louder.
+//
+// Context and output are collected independently: a provider may declare one
+// and not the other, and the output map must not be limited to rows that also
+// declare a context. The two maxima are each over the entries that declare that
+// axis, not over a single winning row.
 export function modelsDevClaims(document) {
   MODELS_DEV.clear();
+  MODELS_DEV_OUTPUT.clear();
   MODELS_DEV_BY.clear();
+  MODELS_DEV_OUTPUT_BY.clear();
   MODELS_DEV_PROVIDERS.clear();
   for (const [provider, entry] of Object.entries(document?.providers ?? document ?? {})) {
     const models = entry?.models;
@@ -2206,28 +2224,36 @@ export function modelsDevClaims(document) {
       // be matched to the catalogue's id for the same weights, so it is not read.
       if (!canonical) continue;
       const context = model?.limit?.context;
-      if (!usable(context)) continue;
+      const output = model?.limit?.output;
+      const hasContext = usable(context);
+      const hasOutput = usable(output);
+      if (!hasContext && !hasOutput) continue;
       // Every provider that describes the model is counted, whoever won: two
       // providers describing the same weights is the cross-provider evidence,
       // and one provider describing the same model twice is still one provider.
       const claimed = MODELS_DEV_PROVIDERS.get(canonical) ?? new Set();
       claimed.add(provider);
       MODELS_DEV_PROVIDERS.set(canonical, claimed);
-      const held = MODELS_DEV.get(canonical);
-      if (held === undefined) {
-        MODELS_DEV.set(canonical, context);
-        MODELS_DEV_BY.set(canonical, `${provider}/${modelId}`);
-        continue;
+      if (hasContext) {
+        const held = MODELS_DEV.get(canonical);
+        if (held === undefined || context > held) {
+          MODELS_DEV.set(canonical, context);
+          MODELS_DEV_BY.set(canonical, `${provider}/${modelId}`);
+        }
       }
-      if (context > held) {
-        MODELS_DEV.set(canonical, context);
-        MODELS_DEV_BY.set(canonical, `${provider}/${modelId}`);
+      if (hasOutput) {
+        const held = MODELS_DEV_OUTPUT.get(canonical);
+        if (held === undefined || output > held) {
+          MODELS_DEV_OUTPUT.set(canonical, output);
+          MODELS_DEV_OUTPUT_BY.set(canonical, `${provider}/${modelId}`);
+        }
       }
     }
   }
   let contested = 0;
   for (const providers of MODELS_DEV_PROVIDERS.values()) if (providers.size > 1) contested += 1;
-  return { models: MODELS_DEV.size, contested };
+  const described = new Set([...MODELS_DEV.keys(), ...MODELS_DEV_OUTPUT.keys()]);
+  return { models: described.size, contested };
 }
 
 export function modelsDevLimit(canonical) {
@@ -2236,6 +2262,14 @@ export function modelsDevLimit(canonical) {
 
 export function modelsDevSource(canonical) {
   return typeof canonical === "string" ? MODELS_DEV_BY.get(canonical) : undefined;
+}
+
+export function modelsDevOutput(canonical) {
+  return typeof canonical === "string" ? MODELS_DEV_OUTPUT.get(canonical) : undefined;
+}
+
+export function modelsDevOutputSource(canonical) {
+  return typeof canonical === "string" ? MODELS_DEV_OUTPUT_BY.get(canonical) : undefined;
 }
 
 // What this plugin declares for a model instead of what the catalogue says, as
@@ -2289,6 +2323,21 @@ export function limitOverrides(
     // catalogue never made, feeding the staleness compare and the raise-only
     // check with a number nobody declared.
     const declaredValue = declared && Object.hasOwn(declared, axis) ? declared[axis] : undefined;
+    // The completion ceiling is not a measured axis any more. models.dev's
+    // largest output for the same weights is the authority for every model it
+    // describes: it is the provider's own figure, not a hand sample, and a
+    // catalogue or table value that disagrees with it is the older opinion.
+    // This is deliberately not raise-only — following the largest entry means
+    // an entry below a stale catalogue figure lowers it too — and it bypasses
+    // the route/table tiers; those remain the fallback only for an id
+    // models.dev does not describe.
+    if (axis === "output") {
+      const claimed = modelsDevOutput(canonical);
+      if (usable(claimed)) {
+        if (claimed !== declaredValue) overrides.output = claimed;
+        continue;
+      }
+    }
     // Own property, the same rule as the two lines around it. Read through the
     // prototype, an axis the record merely inherits — from a table built with
     // `Object.create`, or from a polluted `Object.prototype` — read exactly like

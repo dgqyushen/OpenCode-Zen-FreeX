@@ -2756,6 +2756,70 @@ test("models.dev is read as the largest claim, never as a vote", async () => {
   );
 });
 
+test("models.dev output is the largest completion ceiling for the canonical model", async () => {
+  const { modelsDevClaims, modelsDevOutput, modelsDevOutputSource, limitOverrides } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({
+      providers: {
+        a: { models: { one: { canonical_model_id: "v/m", limit: { context: 200_000, output: 131_072 } } } },
+        // An output-only row still counts: the two maxima are collected apart.
+        b: { models: { two: { canonical_model_id: "v/m", limit: { output: 262_144 } } } },
+        c: { models: { three: { canonical_model_id: "v/m", limit: { output: 100_000 } } } },
+      },
+    });
+    assert.equal(modelsDevOutput("v/m"), 262_144, "the largest output wins, not a vote");
+    assert.equal(modelsDevOutputSource("v/m"), "b/two");
+    const blank = { table: {}, observed: new Map(), observedOutput: new Map(), brackets: new Map(), walls: new Map() };
+    const args = (declared, table = blank.table, observedOutput = blank.observedOutput) => [
+      "id",
+      declared,
+      table,
+      blank.observed,
+      observedOutput,
+      blank.brackets,
+      blank.walls,
+      "v/m",
+    ];
+    // The models.dev maximum is authoritative in both directions.
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 })), { output: 262_144 });
+    assert.deepEqual(
+      limitOverrides(...args({ context: 200_000, output: 500_000 })),
+      { output: 262_144 },
+      "following the largest entry also lowers a stale catalogue ceiling",
+    );
+    // Table and live output are fallback only: neither outranks a claim.
+    const table = { id: { output: { value: 999_999, source: "route", declaredAt: 32_000 } } };
+    const live = new Map([["id", 888_888]]);
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 262_144 }, table, live)), {});
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
+test("without a models.dev output claim, the table and live ceiling remain the fallback", async () => {
+  const { modelsDevClaims, limitOverrides } = await import("./limits.mjs");
+  try {
+    modelsDevClaims({});
+    const blank = { table: {}, observed: new Map(), observedOutput: new Map(), brackets: new Map(), walls: new Map() };
+    const args = (declared, table = blank.table, observedOutput = blank.observedOutput) => [
+      "id",
+      declared,
+      table,
+      blank.observed,
+      observedOutput,
+      blank.brackets,
+      blank.walls,
+      "v/none",
+    ];
+    const table = { id: { output: { value: 64_000, source: "route", declaredAt: 32_000 } } };
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 }, table)), { output: 64_000 });
+    const live = new Map([["id", 96_000]]);
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 }, blank.table, live)), { output: 96_000 });
+  } finally {
+    modelsDevClaims({});
+  }
+});
+
 test("a models.dev row with no canonical id is not matched to anything", async () => {
   const { modelsDevClaims, modelsDevLimit } = await import("./limits.mjs");
   modelsDevClaims({
