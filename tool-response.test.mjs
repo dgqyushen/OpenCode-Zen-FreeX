@@ -2394,6 +2394,115 @@ test("chat: buffers names and arguments by choice/index, including arguments bef
   );
 });
 
+// Upstream zen-free 0.1.12 (#252): some OpenAI-compatible vendors send
+// `"name": null` or `"arguments": null` in a later delta of a call whose
+// fragments are already buffered. A null field carries no new bytes, so it
+// must not reset or fail the fragments already accumulated; the buffered name
+// and arguments are completed by the following string fragments.
+for (const legacy of [false, true]) {
+  const kind = legacy ? "function_call" : "tool_calls";
+  const delta = (fragment) =>
+    legacy
+      ? { function_call: fragment }
+      : { tool_calls: [{ index: 0, id: "call-0", type: "function", function: fragment }] };
+  const functions = (values) =>
+    values.flatMap((value) => value.choices ?? []).flatMap((choice) =>
+      legacy
+        ? (choice.delta?.function_call ? [choice.delta.function_call] : [])
+        : (choice.delta?.tool_calls ?? []).map((value) => value.function),
+    );
+
+  test(`chat: ${kind} ignores null fields while preserving name and argument fragments`, async () => {
+    const fragments = [
+      { name: null, arguments: null },
+      { name: "Re", arguments: null },
+      { name: null, arguments: '{"path":' },
+      { name: "ad", arguments: null },
+      { name: null, arguments: '"example.txt"}' },
+      { name: null, arguments: null },
+    ];
+    const result = await guardToolResponse(
+      sse(
+        fragments.map((fragment) => event(chat(delta(fragment)))).join("") +
+          event(chat({}, kind)) +
+          terminal("chat"),
+        { chunkSize: 1 },
+      ),
+      "chat",
+      policy,
+    );
+    const values = parse(await result.text()).map((frame) => frame.data);
+    assert.ok(!values.some((value) => value.error));
+    assert.deepEqual(functions(values), [{ name: "Read", arguments: '{"path":"example.txt"}' }]);
+  });
+
+  test(`chat: ${kind} still drops a call whose name stays null`, async () => {
+    const result = await guardToolResponse(
+      sse(event(chat(delta({ name: null, arguments: "{}" }))) + terminal("chat")),
+      "chat",
+      policy,
+    );
+    const values = parse(await result.text()).map((frame) => frame.data);
+    assert.ok(!values.some((value) => value.error));
+    assert.deepEqual(functions(values), []);
+    assert.equal(textIn("chat", values), droppedNote(""));
+  });
+}
+
+// Upstream zen-free 0.1.13 (#188, #259): a call's id streamed first and then
+// repeated as null or "" in a later delta must keep the id already buffered.
+// A spread would let the later empty value clobber it, and the host would
+// answer the call with an empty tool_call_id.
+test("chat: later null or empty tool IDs do not replace buffered IDs", async () => {
+  const text = [
+    event(
+      chat({
+        tool_calls: [
+          { index: 0, id: "call_0", type: "function", function: { name: "read", arguments: "{}" } },
+          { index: 1, id: "call_1", type: "function", function: { name: "read", arguments: "{}" } },
+        ],
+      }),
+    ),
+    event(chat({ tool_calls: [{ index: 0, id: null }, { index: 1, id: "" }] })),
+    event(chat({ tool_calls: [{ index: 2, function: { name: "read", arguments: "{}" } }] })),
+    event(chat({ tool_calls: [{ index: 2, id: "call_late" }] })),
+    event(
+      chat(
+        {
+          tool_calls: [
+            {
+              index: 0,
+              id: "choice_1_call",
+              type: "function",
+              function: { name: "read", arguments: "{}" },
+            },
+          ],
+        },
+        null,
+        1,
+      ),
+    ),
+    event(chat({ tool_calls: [{ index: 0, id: null }] }, null, 1)),
+    event(chat({}, "tool_calls", 0)),
+    event(chat({}, "tool_calls", 1)),
+    terminal("chat"),
+  ].join("");
+  const response = await guardToolResponse(sse(text, { chunkSize: 1 }), "chat", policy);
+  const values = parse(await response.text()).map((frame) => frame.data);
+  assert.ok(!values.some((value) => value.error));
+  const choices = values.flatMap((value) => value.choices ?? []);
+  const callsFor = (index) =>
+    choices
+      .filter((choice) => choice.index === index)
+      .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  assert.deepEqual(
+    callsFor(0).map((value) => value.id),
+    ["call_0", "call_1", "call_late"],
+  );
+  assert.deepEqual(callsFor(1).map((value) => value.id), ["choice_1_call"]);
+  assert.deepEqual(callsFor(0).map((value) => value.function.name), ["Read", "Read", "Read"]);
+});
+
 test("chat: legacy fragments flush at DONE, but truncated pending calls never escape", async () => {
   const prefix =
     event(chat({ function_call: { arguments: "{}" } })) +
