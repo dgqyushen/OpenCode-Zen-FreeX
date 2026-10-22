@@ -662,7 +662,12 @@ export const DISCOVERY_CACHE_ENV = "OPENCODE_ZEN_FREE_DISCOVERY_CACHE";
 // `cachedModel` required `capabilities`, and a reader that filters such a row
 // out keeps a listing that silently lost a model — the version check is what
 // turns that into "fetch it again" instead.
-const DISCOVERY_CACHE_VERSION = 2;
+//
+// v2 holds a `limit` computed by an estimator that read a screenshot's base64 as
+// prompt text, so the window in it can be three times the route's; the rows are
+// well formed and the numbers in them are not, which is exactly the change this
+// constant is for.
+const DISCOVERY_CACHE_VERSION = 3;
 // A cache is a listing, not a measurement, so the limit is larger than the
 // state file's: what it bounds is how much a request path can be asked to read
 // from a file it did not write.

@@ -1522,6 +1522,89 @@ test("the tokens a request holds are estimated from its own text", async () => {
   assert.deepEqual(requestSize({ messages: [{ content: "a".repeat(3996) }] }), { tokens: 1000 });
 });
 
+test("an encoded attachment is not prompt text, and does not use up the scan", async () => {
+  const { requestSize, requestText } = await subject;
+  // 140,000 characters is about 100 KB of PNG: small as screenshots go, and
+  // 35,035 "tokens" if the encoding is read as text — 35,000 tokens of a prompt
+  // nobody typed. On the VPS the same arithmetic read a 10 MB screenshot as
+  // 3,498,676 tokens and the floor under it became a model's declared window.
+  const payload = "A".repeat(140_000);
+  const withImage = (text) => ({
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${payload}` } },
+        ],
+      },
+    ],
+  });
+  // The payload adds nothing: the same body with an empty URL reads the same size,
+  // and what the two share is the image part's own labels, not the picture.
+  const shapeOnly = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe the screenshot" },
+          { type: "image_url", image_url: { url: "" } },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(requestSize(withImage("describe the screenshot")), requestSize(shapeOnly));
+  assert.ok(requestSize(shapeOnly).tokens < 20, "the shared part is the prompt's own words and two labels");
+  // The same characters without the data URI are a request body of text, and
+  // nothing in a walk over strings can know better: the rule is the shape.
+  assert.equal(requestSize({ content: payload }).tokens, 35_035);
+  // The anthropic and gemini shapes arrive as a bare base64 field beside what it
+  // holds; a `data` field with nothing saying what it is stays text. What is left
+  // of the first two is the label the part carries, not the picture.
+  assert.equal(
+    requestText({ source: { type: "base64", media_type: "image/png", data: payload } }),
+    "base64image/png",
+  );
+  assert.equal(requestText({ inline_data: { mime_type: "image/jpeg", data: payload } }), "image/jpeg");
+  assert.equal(requestText({ data: payload }), payload);
+  // A data URI too short to be a payload is counted: dropping it would be
+  // skipping text on a guess about its length.
+  assert.equal(requestText({ url: "data:image/gif;base64,R0lGOD" }), "data:image/gif;base64,R0lGOD");
+  // The budget bounds text, and an attachment is not 12 MB of prompt: what comes
+  // after it is still read, which is the half a floor cannot afford to lose.
+  const after = {
+    messages: [
+      {
+        content: [
+          { type: "image_url", image_url: { url: `data:image/png;base64,${"B".repeat(12_000_000)}` } },
+          { type: "text", text: "hello" },
+        ],
+      },
+    ],
+  };
+  assert.equal(requestText(after), "image_urltexthello");
+});
+
+test("a bracket measured before attachments were skipped is dropped", async () => {
+  const { ESTIMATE_SCALE, loadLimitState, limitAdaptivity } = await subject;
+  const at = `${tmpdir()}/zen-attachment-scale-${process.pid}-${Date.now()}.json`;
+  try {
+    // What the VPS wrote on scale 2: a floor that is really a picture's base64.
+    const shot = { floor: 3_491_182, ceiling: 3_491_182, step: 400_000, refusals: 0, seen: 3_491_182, seededFrom: 1_048_576 };
+    writeFileSync(at, JSON.stringify({ version: 1, models: { "shot-free": { ...shot, scale: ESTIMATE_SCALE - 1 } } }));
+    assert.equal(await loadLimitState(at), false, "counted on the scale that read a screenshot as 3.49 million tokens");
+    // The same record on the scale in use is still evidence, so the guard is
+    // about the instrument and not about the picture being unpublishable.
+    const now = `${at}.now`;
+    writeFileSync(now, JSON.stringify({ version: 1, models: { "shot-free": { ...shot, scale: ESTIMATE_SCALE } } }));
+    assert.equal(await loadLimitState(now), true);
+    rmSync(now, { force: true });
+  } finally {
+    limitAdaptivity(new Map());
+    rmSync(at, { force: true });
+  }
+});
+
 test("a body of many strings is read to its end, not to a count of strings", async () => {
   const { requestText, requestSize } = await subject;
   // The budget is characters, and it is the quantity being estimated. It used to
@@ -2825,10 +2908,33 @@ test("models.dev output uses the first-party entry, then the most common claim",
       { output: 262_144 },
       "following models.dev also lowers a stale catalogue ceiling",
     );
-    // Table and live output are fallback only: neither outranks a claim.
+    // The chosen models.dev claim is authoritative in both directions, over the
+    // catalogue: 32000 up to 262144, and 500000 down to it. A route statement is
+    // the one thing it may not cut, because that is evidence about this route
+    // and the claim is evidence about the weights — `big-pickle` had a 131072
+    // ceiling the route named in a refusal and 32000 on screen from its paid
+    // twin's models.dev row.
     const table = { id: { output: { value: 999_999, source: "route", declaredAt: 32_000 } } };
+    assert.deepEqual(
+      limitOverrides(...args({ context: 200_000, output: 32_000 }, table)),
+      { output: 999_999 },
+      "a route statement above the claim is the declaration",
+    );
+    const below = { id: { output: { value: 200_000, source: "route", declaredAt: 32_000 } } };
+    assert.deepEqual(
+      limitOverrides(...args({ context: 200_000, output: 32_000 }, below)),
+      { output: 262_144 },
+      "a claim above the route's statement still wins, which is what the tier is for",
+    );
+    // A refusal this process saw is the same statement and newer than the table.
     const live = new Map([["id", 888_888]]);
-    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 262_144 }, table, live)), {});
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 }, {}, live)), {
+      output: 888_888,
+    });
+    const quiet = new Map([["id", 200_000]]);
+    assert.deepEqual(limitOverrides(...args({ context: 200_000, output: 32_000 }, {}, quiet)), {
+      output: 262_144,
+    });
   } finally {
     modelsDevClaims({});
   }
@@ -2907,18 +3013,22 @@ test("a '-free' route id is looked up as its paid twin in models.dev", async () 
   }
 });
 
-test("a paid twin that models.dev does not list falls back to the canonical claim", async () => {
-  const { modelsDevClaims, modelsDevOutputFor } = await import("./limits.mjs");
+test("with no paid twin, the route's own row and the canonical claim are both read, and the larger wins", async () => {
+  const { modelsDevClaims, modelsDevOutputFor, modelsDevOutputSourceFor } = await import("./limits.mjs");
   try {
     modelsDevClaims({
       providers: {
         opencode: {
           models: {
+            // The route row under-declares what the consensus publishes...
             "mimo-v2.6-flash-free": { canonical_model_id: "xiaomi/mimo", limit: { output: 32_000 } },
+            // ...and here the first-party canonical row is the one below.
+            "vl-free": { canonical_model_id: "v/vl", limit: { output: 131_072 } },
           },
         },
         a: { models: { one: { canonical_model_id: "xiaomi/mimo", limit: { output: 131_072 } } } },
         b: { models: { two: { canonical_model_id: "xiaomi/mimo", limit: { output: 131_072 } } } },
+        v: { models: { vl: { canonical_model_id: "v/vl", limit: { output: 8_192 } } } },
       },
     });
     assert.equal(
@@ -2926,6 +3036,18 @@ test("a paid twin that models.dev does not list falls back to the canonical clai
       131_072,
       "there is no paid twin, so the canonical consensus answers",
     );
+    assert.equal(modelsDevOutputSourceFor("mimo-v2.6-flash-free", "xiaomi/mimo"), "a/one");
+    // The case models.dev's own data has: `opencode/nemotron-3.5-super-vl-free`
+    // declares 131072 while `nvidia/…` declares 8192, the vendor's own service
+    // default. Reading only the canonical row cut that ceiling by sixteen times.
+    assert.equal(
+      modelsDevOutputFor("vl-free", "v/vl"),
+      131_072,
+      "the route row outranks a first-party default below it",
+    );
+    assert.equal(modelsDevOutputSourceFor("vl-free", "v/vl"), "opencode/vl-free");
+    // With no canonical claim there is nothing to compare, and the row answers.
+    assert.equal(modelsDevOutputFor("vl-free", "v/missing"), 131_072);
   } finally {
     modelsDevClaims({});
   }

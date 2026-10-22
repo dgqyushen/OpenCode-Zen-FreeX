@@ -474,24 +474,61 @@ function scriptCount(text) {
 // built on it lands below a size the route has already served. Counting
 // characters makes the cut a bound on the quantity being estimated, which is
 // what `SCAN_LIMIT` already is for the CJK scan below.
+//
+// An encoded attachment is not prompt text either, and counting it was the one
+// way this floor read as a ceiling. A screenshot posted to a chat body arrives
+// as `data:image/png;base64,…` — about 1.37 million characters per megabyte of
+// PNG — which at this file's 3.996 characters per token is 343,000 tokens for a
+// picture the route bills in the low thousands. On the VPS a four-word prompt
+// with a 10 MB screenshot read as 3,498,676 tokens, and that size became a
+// model's floor: the declared window went to 3,491,182 for a route measured at
+// 1,048,092, and a client planning a prompt from it would be refused by the wall
+// the number was supposed to describe. The two shapes read here are the data URI
+// (chat and responses) and a bare base64 field under a `type`, `mime_type` or
+// `media_type` (the anthropic and gemini shapes), and both are skipped whole. A
+// text document pasted as a data URI is skipped with them: that reads the body
+// low, which is the direction a floor is allowed to fail in, and the direction
+// the paragraph above already promises.
+const ATTACHMENT_MIN = 4096;
+
+const isAttachment = (text, key, parent) => {
+  if (text.length >= ATTACHMENT_MIN && text.startsWith("data:") && text.slice(0, 256).includes(","))
+    return true;
+  // The bare-base64 shapes only under a field named `data`, and only when its
+  // parent says what it is: `{type:"base64",data}` and `{mime_type,data}` are
+  // attachments, while a `data` field elsewhere is a name this walk cannot read,
+  // and skipping it would be skipping text nobody proved was not text.
+  return (
+    key === "data" &&
+    parent !== null &&
+    typeof parent === "object" &&
+    (typeof parent.type === "string" ||
+      typeof parent.mime_type === "string" ||
+      typeof parent.media_type === "string")
+  );
+};
+
 export function requestText(body, budget = SCAN_LIMIT) {
   const parts = [];
   let seen = 0;
-  const walk = (value, depth) => {
+  const walk = (value, depth, key, parent) => {
     if (seen >= budget || depth > 12) return;
     if (typeof value === "string") {
+      // Skipped before the budget is charged: the budget bounds the text this
+      // walk is about, and an attachment is not a long prompt that used it up.
+      if (isAttachment(value, key, parent)) return;
       parts.push(value);
       seen += value.length;
       return;
     }
     if (Array.isArray(value)) {
-      for (const item of value) walk(item, depth + 1);
+      for (const item of value) walk(item, depth + 1, key, parent);
       return;
     }
     if (value && typeof value === "object")
-      for (const item of Object.values(value)) walk(item, depth + 1);
+      for (const [name, item] of Object.entries(value)) walk(item, depth + 1, name, value);
   };
-  walk(body, 0);
+  walk(body, 0, undefined, undefined);
   return parts.join("");
 }
 
@@ -512,7 +549,14 @@ export function requestSize(body) {
 // disagrees is dropped rather than repaired: the floor is the largest size the
 // route was seen to serve AS THIS FILE COUNTED IT, and there is nothing to salvage
 // from a count whose unit was wrong.
-export const ESTIMATE_SCALE = 2;
+//
+// It moved to 3 when an attachment stopped being counted as text. A request
+// carrying a 10 MB screenshot read as 3,498,676 tokens on scale 2 and reads as
+// the four words it held on this one, and every floor built out of those
+// pictures — 3,491,182 for one id, 1,233,222 for another — was a window the
+// route had never been asked for. The scale-2 records those numbers live in are
+// dropped by the rule above, which is the repair.
+export const ESTIMATE_SCALE = 3;
 
 // The brackets, by model id, as this process has them. A Map like the two
 // observation maps above, for the same reason: what a route answered about one
@@ -2210,6 +2254,19 @@ const MODELS_DEV_OUTPUT_BY = new Map();
 // declarations are used only through the canonical fallback.
 const MODELS_DEV_PAID_OUTPUT = new Map();
 const MODELS_DEV_PAID_OUTPUT_BY = new Map();
+// The completion ceiling models.dev publishes for a route id under its OWN name
+// in the `opencode` provider, free suffix and all: what that provider says about
+// the tier it is describing, as opposed to what the canonical aggregate says
+// about the weights on whichever host published them. The two disagree in both
+// directions — `opencode/nemotron-3.5-super-vl-free` declares 131072 while
+// `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` declares 8192, NVIDIA's own
+// service default — and there is no ordering that reads both right, so the
+// lookup takes the larger of the two: a route row below the consensus is one
+// distributor's default under a model that answers at the larger size, and a
+// canonical claim below the route row is the weights' ceiling that the row has
+// under-declared.
+const MODELS_DEV_ROUTE_OUTPUT = new Map();
+const MODELS_DEV_ROUTE_OUTPUT_BY = new Map();
 // Who claimed each canonical id. The winning claim alone cannot say how many
 // providers described a model: only the largest is kept, so the count was a
 // count of models with a claim at all — every one of them — and the evidence
@@ -2235,6 +2292,8 @@ export function modelsDevClaims(document) {
   MODELS_DEV_OUTPUT_BY.clear();
   MODELS_DEV_PAID_OUTPUT.clear();
   MODELS_DEV_PAID_OUTPUT_BY.clear();
+  MODELS_DEV_ROUTE_OUTPUT.clear();
+  MODELS_DEV_ROUTE_OUTPUT_BY.clear();
   MODELS_DEV_PROVIDERS.clear();
   // Per canonical id: how often each output value is published, where it was
   // published, and the first-party provider's own value when that provider
@@ -2249,6 +2308,18 @@ export function modelsDevClaims(document) {
     for (const [modelId, model] of Object.entries(models)) {
       const canonical = typeof model?.canonical_model_id === "string" ? model.canonical_model_id : undefined;
       const output = model?.limit?.output;
+      // Every row `opencode` publishes is a statement about this route, and the
+      // one under the route's own name is the only place the free tier's ceiling
+      // is stated by the provider rather than inferred from the weights. Kept
+      // whether or not the row has a canonical id, and before the branches below,
+      // one of which gives up on rows without one.
+      if (provider === "opencode" && usable(output)) {
+        const held = MODELS_DEV_ROUTE_OUTPUT.get(modelId);
+        if (held === undefined || output > held) {
+          MODELS_DEV_ROUTE_OUTPUT.set(modelId, output);
+          MODELS_DEV_ROUTE_OUTPUT_BY.set(modelId, `${provider}/${modelId}`);
+        }
+      }
       // A row with no canonical id cannot join the canonical claims, but its id
       // is still the route's own model name and models.dev's `opencode` provider
       // is where the paid twin lives: `big-pickle` has no canonical at all and
@@ -2362,15 +2433,22 @@ export function modelsDevOutputSource(canonical) {
 // The output a route model id should use. `-free` is stripped first, because
 // models.dev's free entry is the under-reported tier and its paid twin is the
 // same weights' real ceiling; that paid entry is read from the `opencode`
-// provider. With no paid twin, the canonical aggregate above answers. This is
-// the lookup the plugin's own route ids need; `modelsDevOutput(canonical)`
-// remains the canonical-only accessor.
+// provider. With no paid twin, the route's own row in that same provider and the
+// canonical aggregate above are both read, and the larger of the two answers —
+// neither ordering is right: NVIDIA's canonical row says 8192 for weights
+// models.dev's own route row declares 131072 for, and minimax's canonical row
+// says 524288 for a route row that says 512000 and a route that named 524288 in
+// a refusal. This is the lookup the plugin's own route ids need;
+// `modelsDevOutput(canonical)` remains the canonical-only accessor.
 export function modelsDevOutputFor(id, canonical) {
   const stripped =
     typeof id === "string" && id.endsWith("-free") ? id.slice(0, -"-free".length) : id;
   const paid = typeof stripped === "string" ? MODELS_DEV_PAID_OUTPUT.get(stripped) : undefined;
   if (usable(paid)) return paid;
-  return modelsDevOutput(canonical);
+  const route = typeof id === "string" ? MODELS_DEV_ROUTE_OUTPUT.get(id) : undefined;
+  const aggregate = modelsDevOutput(canonical);
+  if (usable(route) && usable(aggregate)) return Math.max(route, aggregate);
+  return usable(route) ? route : aggregate;
 }
 
 export function modelsDevOutputSourceFor(id, canonical) {
@@ -2378,7 +2456,11 @@ export function modelsDevOutputSourceFor(id, canonical) {
     typeof id === "string" && id.endsWith("-free") ? id.slice(0, -"-free".length) : id;
   const paid = typeof stripped === "string" ? MODELS_DEV_PAID_OUTPUT.get(stripped) : undefined;
   if (usable(paid)) return MODELS_DEV_PAID_OUTPUT_BY.get(stripped);
-  return modelsDevOutputSource(canonical);
+  const route = typeof id === "string" ? MODELS_DEV_ROUTE_OUTPUT.get(id) : undefined;
+  const aggregate = modelsDevOutput(canonical);
+  const fromRoute =
+    usable(route) && (!usable(aggregate) || route >= aggregate) ? MODELS_DEV_ROUTE_OUTPUT_BY.get(id) : undefined;
+  return fromRoute ?? modelsDevOutputSource(canonical);
 }
 
 // What this plugin declares for a model instead of what the catalogue says, as
@@ -2443,15 +2525,36 @@ export function limitOverrides(
     // The completion ceiling is not a measured axis any more. models.dev is
     // read with this route id's `-free` suffix removed: its paid twin's output
     // (when the `opencode` provider has one) is the same weights' real ceiling,
-    // and otherwise the canonical aggregate answers. The value is not
-    // raise-only — an entry below a stale catalogue figure lowers it too — and
-    // it bypasses the route/table tiers; those remain the fallback only for an
-    // id models.dev does not describe.
+    // and otherwise the larger of the route's own rows and the canonical
+    // aggregate answers. The value is not raise-only — an entry below a stale
+    // catalogue figure lowers it too — and it bypasses the route/table tiers;
+    // those remain the fallback only for an id models.dev does not describe.
+    //
+    // The one tier it does not bypass is a ceiling the route stated itself. That
+    // is evidence about this route, while a models.dev figure is about the
+    // weights as read on somebody's host, and the two are not rivals: when the
+    // route's number is the larger one, the smaller claim is not a second
+    // opinion, it is the wrong route. `big-pickle` is the case — the route named
+    // 131072 in a refusal, models.dev's paid twin declares 32000, and the
+    // declaration on screen was 32000 for a model that answers. A claim LARGER
+    // than the route's statement still wins, which is the case this tier exists
+    // for: the free tier declares 32000 where the paid twin answers 384000, and
+    // models.dev was read for exactly that correction. A refusal this process
+    // saw is the same statement and newer than the table, so it is read here too.
     if (axis === "output") {
       const claimed = modelsDevOutputFor(id, canonical);
       if (usable(claimed)) {
-        if (claimed !== declaredValue) overrides.output = claimed;
-        continue;
+        const stated = record && Object.hasOwn(record, "output") ? record.output : undefined;
+        const statedValue =
+          stated && typeof stated === "object" && usable(stated.value) ? stated.value : undefined;
+        const routeStated = stated?.source === "route" || stated?.source === "route-twin";
+        const liveOutput = observedOutput?.get?.(id);
+        const routeLarger =
+          (routeStated && statedValue > claimed) || (usable(liveOutput) && liveOutput > claimed);
+        if (!routeLarger) {
+          if (claimed !== declaredValue) overrides.output = claimed;
+          continue;
+        }
       }
     }
     // Own property, the same rule as the two lines around it. Read through the

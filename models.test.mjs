@@ -1658,10 +1658,12 @@ test("a missing, bad-JSON, or foreign-version cache answers no cache", async (t)
   assert.equal(await readDiscoveryCache(join(dir, "missing.json")), undefined);
   await writeFile(file, "{ this is not json", "utf8");
   assert.equal(await readDiscoveryCache(file), undefined);
-  // A v1 cache is the one this build must not read: the record rule got
-  // stricter, and a reader that filtered the rows it cannot serve would answer
-  // a listing that lost a model instead of one that is fetched again.
-  for (const version of [1, 3]) {
+  // A cache from an older build is the one this build must not read: v1 holds
+  // rows written before the record rule got stricter, and v2 holds limits computed
+  // by an estimator that read a screenshot's base64 as prompt text. A reader that
+  // served either would answer a listing with a model missing, or with a window
+  // three times the one the route enforces, instead of fetching it again.
+  for (const version of [1, 2]) {
     await writeFile(
       file,
       JSON.stringify({
@@ -1683,7 +1685,7 @@ test("bad model rows are skipped and protocols are filtered", async (t) => {
   await writeFile(
     file,
     JSON.stringify({
-      version: 2,
+      version: 3,
       models: {
         "chat-free": cachedModel,
         "string-row": "not a model",
@@ -1720,7 +1722,7 @@ test("a cached row without capabilities is skipped, not read as a model", async 
   await writeFile(
     file,
     JSON.stringify({
-      version: 2,
+      version: 3,
       models: {
         "chat-free": cachedModel,
         "missing-capabilities-free": {
@@ -1760,7 +1762,7 @@ test("a cache file over the byte ceiling is not read", async (t) => {
   const dir = await discoveryTempDir(t);
   const file = join(dir, "discovery.json");
   const body = JSON.stringify({
-    version: 2,
+    version: 3,
     models: {},
     protocols: {},
     listedAt: CACHED_AT,
@@ -1832,7 +1834,7 @@ test("listedAt must be an ISO date, and a bad date is not written", async (t) =>
   assert.equal(await readDiscoveryCache(file), undefined);
   await writeFile(
     file,
-    JSON.stringify({ version: 2, models: {}, protocols: {}, listedAt: 123 }),
+    JSON.stringify({ version: 3, models: {}, protocols: {}, listedAt: 123 }),
     "utf8",
   );
   assert.equal(await readDiscoveryCache(file), undefined);
@@ -1898,7 +1900,7 @@ test("the discovery cache writer ignores inputs that are not object maps", async
   assert.equal(await readDiscoveryCache(file), undefined);
   await writeFile(
     file,
-    JSON.stringify({ version: 2, models: {}, protocols: [], listedAt: CACHED_AT }),
+    JSON.stringify({ version: 3, models: {}, protocols: [], listedAt: CACHED_AT }),
     "utf8",
   );
   assert.equal(await readDiscoveryCache(file), undefined);
