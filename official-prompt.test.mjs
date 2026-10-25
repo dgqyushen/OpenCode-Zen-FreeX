@@ -185,7 +185,7 @@ test("a chat system message may be a list of blocks", () => {
   // empty message is not sent as an empty instruction.
   const blank = { model: "m", messages: [{ role: "system", content: "   " }, { role: "user", content: "hi" }] };
   assert.equal(injectOfficialPrompt(blank, "chat", "1.x"), true);
-  assert.ok(blank.messages[0].content.endsWith("</env>"));
+  assert.ok(blank.messages[0].content.endsWith("</system-reminder>"));
 });
 
 test("a chat body that already carries the prompt is not shaped twice", () => {
@@ -230,7 +230,7 @@ test("an anthropic body carries the prompt in its top-level system value", () =>
 
   const empty = { model: "m", system: "   " };
   assert.equal(injectOfficialPrompt(empty, "anthropic", "1.x"), true);
-  assert.ok(empty.system.endsWith("</env>"));
+  assert.ok(empty.system.endsWith("</system-reminder>"));
 
   const block = {
     model: "m",
@@ -263,7 +263,7 @@ test("a responses body carries the prompt in instructions", () => {
 
   const empty = { model: "m", instructions: "" };
   assert.equal(injectOfficialPrompt(empty, "responses", "1.x"), true);
-  assert.ok(empty.instructions.endsWith("</env>"));
+  assert.ok(empty.instructions.endsWith("</system-reminder>"));
 
   const marked = { model: "m", instructions: `${OPENCODE_PROMPT_MARKER} already` };
   assert.equal(injectOfficialPrompt(marked, "responses", "1.x"), false);
@@ -293,4 +293,53 @@ test("an unknown protocol or generation is named rather than guessed", () => {
     () => injectOfficialPrompt({ model: "m", messages: [] }, "chat", "3.x"),
     /no prompt for generation "3\.x"/,
   );
+});
+
+test("the prompt is followed by the truth about which tools this host runs", () => {
+  // The official prompt teaches Code Mode and the official set rides in the
+  // tools array, so a model that believes its prompt calls `execute` first
+  // (measured 2026-10-25 on DeepSeek Harness: execute, then shell, then it
+  // found the clint_ names). The correction travels as a system-reminder, the
+  // prompt's own convention for harness instruction, and it names the wire
+  // names the model must actually call.
+  const body = {
+    model: "chat-free",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [
+      { type: "function", function: { name: "clint_pwsh", description: "run", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "clint_search", description: "find", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "read", description: "official", parameters: { type: "object", properties: {} } } },
+    ],
+  };
+  assert.equal(injectOfficialPrompt(body, "chat", "2.x"), true);
+  const system = body.messages[0].content;
+  const note = system.slice(system.lastIndexOf("<system-reminder>"));
+  assert.ok(note.startsWith("<system-reminder>\nCode Mode is not active"));
+  assert.match(note, /clint_pwsh, clint_search/);
+  assert.doesNotMatch(note, /, read/);
+  assert.ok(system.endsWith("</system-reminder>"));
+  // The note sits between the official prompt and the host's own text, so the
+  // model meets the correction before the host's instructions.
+  const withOwn = {
+    model: "chat-free",
+    messages: [{ role: "system", content: "Host rule." }, { role: "user", content: "hi" }],
+  };
+  assert.equal(injectOfficialPrompt(withOwn, "chat", "2.x"), true);
+  const text = withOwn.messages[0].content;
+  // The prompt's own Harness section names `<system-reminder>` in prose, so
+  // the note is found by its last occurrence, not its first.
+  assert.ok(text.indexOf("the session's working directory.") < text.lastIndexOf("<system-reminder>"));
+  assert.ok(text.lastIndexOf("</system-reminder>") < text.indexOf("Host rule."));
+  // A host that declared nothing is told so, rather than being handed a list
+  // of built-ins it cannot run.
+  const bare = { model: "chat-free", messages: [{ role: "user", content: "hi" }] };
+  injectOfficialPrompt(bare, "chat", "2.x");
+  assert.match(bare.messages[0].content, /This host implements no tools at all/);
+  // A body already carrying the official prompt is left alone, note and all.
+  const marked = {
+    model: "chat-free",
+    messages: [{ role: "system", content: `${OPENCODE_PROMPT_MARKER_V2} v2` }, { role: "user", content: "hi" }],
+  };
+  assert.equal(injectOfficialPrompt(marked, "chat", "2.x"), false);
+  assert.doesNotMatch(marked.messages[0].content, /Code Mode is not active/);
 });

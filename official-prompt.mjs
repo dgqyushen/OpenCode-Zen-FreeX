@@ -12,6 +12,7 @@
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CLIENT_TOOL_PREFIX } from "./official-tools.mjs";
 
 const PROMPT_V1 = new URL("./opencode-prompt-v1.txt", import.meta.url);
 const PROMPT_V2 = new URL("./opencode-prompt-v2.txt", import.meta.url);
@@ -237,14 +238,45 @@ function injectResponsesPrompt(body, prompt) {
   return true;
 }
 
+// The truth about tools this injection adds after the official prompt. The
+// prompt teaches Code Mode — "use `execute` to call the tools below" — and the
+// official set rides in the tools array beside the host's own, so a model that
+// believes its prompt calls `execute` first and is answered `unknown tool`
+// (measured 2026-10-25 on DeepSeek Harness: `execute`, then `shell`, then it
+// found the clint_ names — two failed calls every session). The prompt's own
+// convention is that a `<system-reminder>` is harness instruction, so the
+// correction travels in one: the callable tools are the host's, under their
+// clint_ names, and every unprefixed entry is an OpenCode built-in nothing
+// here implements. The names are read from the body as it stands — the
+// request path renames the host's tools before the prompt goes in, so the
+// clint_ names the note lists are the wire names the model must call.
+function toolAvailabilityNote(body) {
+  const names = [];
+  for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
+    const name = isTable(tool) ? (isTable(tool.function) ? tool.function.name : tool.name) : undefined;
+    if (typeof name === "string" && name.startsWith(CLIENT_TOOL_PREFIX)) names.push(name);
+  }
+  const callable = names.length
+    ? `The tools you can call are the host's own, under their ${CLIENT_TOOL_PREFIX} names: ${names.join(", ")}.`
+    : "This host implements no tools at all; answer without tool calls.";
+  return [
+    "<system-reminder>",
+    "Code Mode is not active in this session: this host is not OpenCode, and the built-in tools described above - `execute` and every entry of the catalog - are not implemented here. A call to one is answered with an unknown-tool error and nothing else.",
+    `${callable} Every other entry in the tools array is an OpenCode built-in nothing here runs: read that array as the host's own list, not as OpenCode's.`,
+    "</system-reminder>",
+  ].join("\n");
+}
+
 // Put the official prompt in front of a shaped body. The protocol decides where
 // its system text lives: Chat folds system and developer messages into one
 // leading system message, Anthropic uses the top-level system value, and
 // Responses uses instructions. A body that already carries the marker is left
-// untouched and answers false.
+// untouched and answers false. The prompt is followed by the tool availability
+// note, so the model meets the correction before it meets the host's own
+// instructions.
 export function injectOfficialPrompt(body, protocol, generation) {
   if (!isTable(body)) return false;
-  const prompt = officialSystemPrompt(generation, body.model);
+  const prompt = `${officialSystemPrompt(generation, body.model)}\n\n${toolAvailabilityNote(body)}`;
   if (protocol === "chat") return injectChatPrompt(body, prompt);
   if (protocol === "anthropic") return injectAnthropicPrompt(body, prompt);
   if (protocol === "responses") return injectResponsesPrompt(body, prompt);

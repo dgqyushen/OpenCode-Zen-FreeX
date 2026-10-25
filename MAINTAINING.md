@@ -1013,6 +1013,23 @@ presents 2.x whatever the host declares (`DEFAULT_GENERATION` in
 still probes 1.x — its `refused` floor is now the retirement showing, not a
 wording gone stale.
 
+**Teaching Code Mode to a host that cannot run it.** The 2.1.4 prompt commands
+the model to "use the `execute` tool to call the tools listed below", and the
+official set — `execute`, `shell` and the rest — rides in the tools array
+beside the host's own, because the gates read it. A model that believes its
+prompt opens with `execute` and is answered `unknown tool`: measured 2026-10-25
+on DeepSeek Harness, `execute` first, then the catalog's `shell`, and only the
+third call found the `clint_` names — two failed calls at the head of every
+session. The correction travels as the prompt's own convention for harness
+instruction, a `<system-reminder>` appended after it (the tier does not check
+the prompt byte for byte: the skills listing was removed in 0.5.5 and the whole
+2.1.4 text was swapped in 0.5.7, both answered): Code Mode is not active here,
+the callable tools are the `clint_` names — enumerated per request, from the
+body as the renaming left it — and a host that declared nothing is told so
+outright. The note is built in `toolAvailabilityNote` and pinned in
+`official-prompt.test.mjs`; it says nothing about generations or gates, only
+what a model in this session needs to choose its first call.
+
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
 whose every call was dropped ended as a plain `stop`. An autonomous host reads

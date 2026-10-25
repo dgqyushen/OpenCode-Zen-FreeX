@@ -1839,7 +1839,15 @@ test("a host's request carries the official prompt in its protocol's field", asy
     // none of OpenCode's built-in skills, and the one 0.5.4 advertised was
     // called by a model that read it (2026-10-25, DeepSeek Harness).
     assert.doesNotMatch(prompt, /<available_skills>/);
-    assert.ok(prompt.endsWith("the session's working directory."));
+    // The availability note follows the official prompt: the truth about which
+    // tools this host runs, before the host's own instructions (0.5.7 taught
+    // Code Mode and the model called execute and shell to two unknown-tool
+    // errors before finding the clint_ names).
+    assert.match(prompt, /Code Mode is not active in this session/);
+    // These bodies declare no tools of their own, so the note says so rather
+    // than naming built-ins nothing here runs.
+    assert.match(prompt, /This host implements no tools at all/);
+    assert.ok(prompt.endsWith("</system-reminder>"));
     assert.equal(
       prompt.split(OPENCODE_PROMPT_MARKER_V2).length - 1,
       1,
