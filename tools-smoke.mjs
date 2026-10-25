@@ -106,6 +106,9 @@ export function baseURL(value = process.env.ZEN_BASE_URL) {
 // equipment like any other and it expires; what changed here is that the
 // failure is now NAMED rather than being one more line of a run that says
 // nothing, so the next expiry is a sentence about the probe and not a silence.
+// It expired again: `minimax-m3.1-flash-free` was deprecated on 2026-10-25
+// (410 `ModelDeprecated`, the answer itself naming `deepseek-v4.1-flash-free`
+// as what to use), so the default is that one now.
 //
 // An empty value names no model either: `ZEN_CHECK_MODEL=` sent `model: ""`,
 // and the route answered that with a 404 the gate reports as `probe-gone` —
@@ -113,7 +116,7 @@ export function baseURL(value = process.env.ZEN_BASE_URL) {
 // was empty. The default is what an unset variable means.
 const MODEL =
   process.env.ZEN_CHECK_MODEL === undefined || process.env.ZEN_CHECK_MODEL.trim() === ""
-    ? "minimax-m3.1-flash-free"
+    ? "deepseek-v4.1-flash-free"
     : process.env.ZEN_CHECK_MODEL.trim();
 
 // A session id of the shape OpenCode makes, since that is part of what is asked.

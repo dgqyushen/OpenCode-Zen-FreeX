@@ -1815,7 +1815,11 @@ test("a host's request carries the official prompt in its protocol's field", asy
     // The environment block names the model this request is actually for, not
     // a package default: the model that answers is the one the body names.
     assert.match(prompt, new RegExp(`model named ${model}\\. The exact model ID is opencode/${model}`));
-    assert.match(prompt, /<available_skills>/);
+    // No skill listing rides with the prompt: a host that is not OpenCode has
+    // none of OpenCode's built-in skills, and the one 0.5.4 advertised was
+    // called by a model that read it (2026-10-25, DeepSeek Harness).
+    assert.doesNotMatch(prompt, /<available_skills>/);
+    assert.ok(prompt.endsWith("</env>"));
     assert.equal(
       prompt.split(OPENCODE_PROMPT_MARKER).length - 1,
       1,

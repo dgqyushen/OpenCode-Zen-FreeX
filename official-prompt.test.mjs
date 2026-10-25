@@ -63,7 +63,7 @@ test("a model id is reduced to the name and id the CLI states", () => {
   assert.match(officialEnvironment("m"), /Is directory a git repo: yes/);
 });
 
-test("the 1.x prompt is the captured CLI text with the environment and skills after it", () => {
+test("the 1.x prompt is the captured CLI text with the environment after it", () => {
   const prompt = officialSystemPrompt("1.x", "opencode/chat-free", {
     cwd: "/workspace",
     platform: "linux",
@@ -75,9 +75,14 @@ test("the 1.x prompt is the captured CLI text with the environment and skills af
   assert.match(prompt, /Working directory: \/workspace/);
   assert.match(prompt, /Platform: linux/);
   assert.match(prompt, /Today's date: Sun Oct 25 2026/);
-  assert.match(prompt, /<available_skills>/);
-  assert.match(prompt, /<name>customize-opencode<\/name>/);
-  assert.ok(prompt.endsWith("</available_skills>"));
+  assert.ok(prompt.endsWith("</env>"));
+  // No skill is advertised: a host that is not OpenCode has none of OpenCode's
+  // built-in skills, and the one 0.5.4 named was called by a model that read
+  // the listing (2026-10-25, DeepSeek Harness: `skill "customize-opencode" is
+  // unknown or no longer available`). The prompt ends where the proven shape
+  // ends — opencode2api's deployed prompts carry no listing either.
+  assert.doesNotMatch(prompt, /<available_skills>/);
+  assert.doesNotMatch(prompt, /customize-opencode/);
   // The four names 1.x spells with capitals are present in the captured text.
   assert.match(prompt, /\bBash\b/);
   assert.match(prompt, /\bWebFetch\b/);
@@ -90,16 +95,15 @@ test("the 2.x prompt is the same text with the 2.x tool names", () => {
   assert.ok(v2.startsWith(OPENCODE_PROMPT_MARKER));
   // The prose is otherwise identical: only the base prompt's tool names
   // differ ("shell" is two characters longer than "Bash" twice, and "subagent"
-  // four longer than "Task"). The environment and skill listing are the same
-  // text in both.
+  // four longer than "Task"). The environment is the same text in both.
   assert.equal(v2.length, v1.length + 6);
   const baseOf = (text) => text.slice(0, text.indexOf("You are powered by the model named"));
-  const skillsOf = (text) => text.slice(text.indexOf("Skills provide specialized instructions"));
+  const envOf = (text) => text.slice(text.indexOf("You are powered by the model named"));
   assert.equal(
     baseOf(v2),
     baseOf(v1).replaceAll("WebFetch", "webfetch").replaceAll("Bash", "shell").replaceAll("Task", "subagent"),
   );
-  assert.equal(skillsOf(v2), skillsOf(v1));
+  assert.equal(envOf(v2), envOf(v1));
   assert.doesNotMatch(v2, /\bWebFetch\b/);
   assert.doesNotMatch(v2, /\bBash\b/);
   assert.doesNotMatch(v2, /\bTask\b/);
@@ -174,7 +178,7 @@ test("a chat system message may be a list of blocks", () => {
   // empty message is not sent as an empty instruction.
   const blank = { model: "m", messages: [{ role: "system", content: "   " }, { role: "user", content: "hi" }] };
   assert.equal(injectOfficialPrompt(blank, "chat", "1.x"), true);
-  assert.ok(blank.messages[0].content.endsWith("</available_skills>"));
+  assert.ok(blank.messages[0].content.endsWith("</env>"));
 });
 
 test("a chat body that already carries the prompt is not shaped twice", () => {
@@ -219,7 +223,7 @@ test("an anthropic body carries the prompt in its top-level system value", () =>
 
   const empty = { model: "m", system: "   " };
   assert.equal(injectOfficialPrompt(empty, "anthropic", "1.x"), true);
-  assert.ok(empty.system.endsWith("</available_skills>"));
+  assert.ok(empty.system.endsWith("</env>"));
 
   const block = {
     model: "m",
@@ -252,7 +256,7 @@ test("a responses body carries the prompt in instructions", () => {
 
   const empty = { model: "m", instructions: "" };
   assert.equal(injectOfficialPrompt(empty, "responses", "1.x"), true);
-  assert.ok(empty.instructions.endsWith("</available_skills>"));
+  assert.ok(empty.instructions.endsWith("</env>"));
 
   const marked = { model: "m", instructions: `${OPENCODE_PROMPT_MARKER} already` };
   assert.equal(injectOfficialPrompt(marked, "responses", "1.x"), false);

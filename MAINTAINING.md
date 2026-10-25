@@ -960,6 +960,19 @@ earlier did — the host's names carrying invented descriptions — and it is a
 guaranteed refusal; the official set is sent whole instead, beside the host's
 own tools.
 
+**Advertising a skill the host does not have.** The prompt 0.5.4 sent ended
+with a listing of OpenCode's built-in skills — `customize-opencode`, "use when
+editing opencode's own configuration … agents, plugins, MCP servers". A model
+asked to register an MCP server on 2026-10-25 read exactly that and called the
+official `skill` tool for the name, twice; the host happened to carry a `skill`
+tool of its own and answered `skill "customize-opencode" is unknown or no
+longer available`, which reads as the tier's error wearing the host's name. The
+listing is not part of the shape Zen is known to read — opencode2api's deployed
+prompts end at `</env>` and name no skills — so it was pure cost: an invitation
+to call a tool nothing stands behind. The prompt ends at the environment block,
+and a skill may be named in it only if something on the host side will answer
+for it.
+
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
 whose every call was dropped ended as a plain `stop`. An autonomous host reads

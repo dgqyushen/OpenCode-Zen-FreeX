@@ -332,9 +332,10 @@ test("the gate asks with the body the plugin sends, not a shape of its own", () 
   );
   assert.equal(body.stream, true, "the gate asks for a stream, as the plugin does");
   // The default is a model the route still serves: `space-bunny-free` was
-  // retired on 2026-10-19, and a gate that probes with a retired model reports
+  // retired on 2026-10-19, `minimax-m3.1-flash-free` deprecated on 2026-10-25, and a
+  // gate that probes with a retired model reports
   // nothing about the fingerprint on every run.
-  assert.equal(body.model, process.env.ZEN_CHECK_MODEL ?? "minimax-m3.1-flash-free");
+  assert.equal(body.model, process.env.ZEN_CHECK_MODEL ?? "deepseek-v4.1-flash-free");
   // And the headers are the plugin's own, which is the other half of the claim.
   assert.equal(headers.get("user-agent"), agentFor("2.x"));
   assert.equal(headers.get("accept"), "*/*");

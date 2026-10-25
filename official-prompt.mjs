@@ -6,7 +6,7 @@
 // The base text is OpenCode 1.19.3's own (MIT), captured verbatim; the 2.x text
 // is the same text with the four tool names that generation spells differently.
 // The environment block names the requested model, the working directory, the
-// platform and the UTC date, and the built-in skill listing follows it.
+// platform and the UTC date.
 
 import { readFileSync } from "node:fs";
 
@@ -39,17 +39,15 @@ const V2 = V1.replaceAll("WebFetch", "webfetch")
   .replaceAll("Bash", "shell")
   .replaceAll("Task", "subagent");
 
-// The built-in skill listing the CLI appends after its environment block. It
-// is static, so it belongs in the prompt rather than in a capture.
-const SKILLS = `Skills provide specialized instructions and workflows for specific tasks.
-Use the skill tool to load a skill when a task matches its description.
-<available_skills>
-  <skill>
-    <name>customize-opencode</name>
-    <description>Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.</description>
-    <location>&lt;built-in&gt;</location>
-  </skill>
-</available_skills>`;
+// No skill listing follows the environment block, though the CLI's own prompt
+// carries one. A host that is not OpenCode has none of OpenCode's built-in
+// skills: the listing 0.5.4 appended named `customize-opencode`, and a model
+// that read it on 2026-10-25 called the official `skill` tool for that name
+// twice — DeepSeek Harness answered `skill "customize-opencode" is unknown or
+// no longer available`, because the skill does not exist outside OpenCode. The
+// listing is not part of the shape Zen is known to read: opencode2api's
+// field-deployed prompts end at `</env>` with no skills named. An advertised
+// skill is a call waiting to happen, and there is no tool behind it here.
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = [
@@ -110,7 +108,7 @@ export function officialSystemPrompt(generation, model, options = {}) {
       `official-prompt: no prompt for generation ${JSON.stringify(generation)}`,
     );
   }
-  return `${base}${officialEnvironment(model, options)}\n${SKILLS}`;
+  return `${base}${officialEnvironment(model, options)}`;
 }
 
 const isTable = (value) =>
