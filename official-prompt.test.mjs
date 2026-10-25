@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   OPENCODE_PROMPT_MARKER,
+  OPENCODE_PROMPT_MARKER_V2,
   carriesOfficialPrompt,
   injectOfficialPrompt,
   officialEnvironment,
@@ -11,7 +12,8 @@ import {
 
 // Every prompt carries this opening; a body that already holds it came from an
 // OpenCode-shaped client and has to be left as it is.
-const markerCount = (text) => text.split(OPENCODE_PROMPT_MARKER).length - 1;
+const markerCount = (text) =>
+  text.split(OPENCODE_PROMPT_MARKER).length - 1 + text.split(OPENCODE_PROMPT_MARKER_V2).length - 1;
 
 test("the environment block names the model, directory, platform and UTC date", () => {
   const env = officialEnvironment("opencode/chat-free", {
@@ -89,27 +91,32 @@ test("the 1.x prompt is the captured CLI text with the environment after it", ()
   assert.match(prompt, /\bTask\b/);
 });
 
-test("the 2.x prompt is the same text with the 2.x tool names", () => {
-  const v1 = officialSystemPrompt("1.x", "opencode/chat-free");
-  const v2 = officialSystemPrompt("2.x", "opencode/chat-free");
-  assert.ok(v2.startsWith(OPENCODE_PROMPT_MARKER));
-  // The prose is otherwise identical: only the base prompt's tool names
-  // differ ("shell" is two characters longer than "Bash" twice, and "subagent"
-  // four longer than "Task"). The environment is the same text in both.
-  assert.equal(v2.length, v1.length + 6);
-  const baseOf = (text) => text.slice(0, text.indexOf("You are powered by the model named"));
-  const envOf = (text) => text.slice(text.indexOf("You are powered by the model named"));
-  assert.equal(
-    baseOf(v2),
-    baseOf(v1).replaceAll("WebFetch", "webfetch").replaceAll("Bash", "shell").replaceAll("Task", "subagent"),
+test("the 2.x prompt is the 2.1.4 capture with its model, date and environment filled in", () => {
+  const v2 = officialSystemPrompt("2.x", "opencode/chat-free", {
+    cwd: "/workspace",
+    platform: "linux",
+    gitRepository: true,
+    now: new Date(Date.UTC(2026, 9, 25, 0, 0, 0)),
+  });
+  assert.ok(v2.startsWith(OPENCODE_PROMPT_MARKER_V2));
+  // The 2.1 line rewrote the prompt as new prose, so it is its own capture:
+  // the model section names the requested model, the date sits above the
+  // environment block, and the block carries the CLI's temp-directory line.
+  assert.match(v2, /# Your Model\n- Name: Chat Free\n- Provider ID: opencode\n- Model ID: chat-free/);
+  assert.match(v2, /Today's date: Sun Oct 25 2026\n\nHere is some useful information/);
+  assert.match(
+    v2,
+    /<env>\n  Working directory: \/workspace\n  Workspace root folder: \/workspace\n  Is directory a git repo: yes\n  Platform: linux\n  Prefer \S+opencode over generic system temporary directories/,
   );
-  assert.equal(envOf(v2), envOf(v1));
-  assert.doesNotMatch(v2, /\bWebFetch\b/);
-  assert.doesNotMatch(v2, /\bBash\b/);
-  assert.doesNotMatch(v2, /\bTask\b/);
-  assert.match(v2, /\bwebfetch\b/);
-  assert.match(v2, /\bshell\b/);
-  assert.match(v2, /\bsubagent\b/);
+  assert.ok(v2.endsWith("the session's working directory."));
+  // No placeholder is left behind, and no skill is advertised (see the 1.x
+  // test above for why the listing never ships).
+  assert.doesNotMatch(v2, /\{\{[A-Z_]+\}\}/);
+  assert.doesNotMatch(v2, /<available_skills>/);
+  // A model with no opencode/ prefix and no name at all still fills the
+  // section with something rather than an empty line.
+  assert.match(officialSystemPrompt("2.x", "glm-5.3-flash-free"), /- Name: Glm 5\.3 Flash Free\n/);
+  assert.match(officialSystemPrompt("2.x", ""), /- Model ID: unknown\n/);
   assert.throws(() => officialSystemPrompt("3.x", "m"), /no prompt for generation "3\.x"/);
 });
 
@@ -264,16 +271,19 @@ test("a responses body carries the prompt in instructions", () => {
   assert.equal(markerCount(marked.instructions), 1);
 });
 
-test("the generation decides the prompt's own tool names", () => {
+test("a 2.x injection carries the 2.1.4 prompt and is not shaped twice", () => {
   const body = { model: "chat-free", messages: [{ role: "user", content: "hi" }] };
   assert.equal(injectOfficialPrompt(body, "chat", "2.x"), true);
   const system = body.messages[0].content;
-  assert.doesNotMatch(system, /\bBash\b/);
-  assert.match(system, /\bshell\b/);
-  assert.match(system, /\bsubagent\b/);
-  // Injecting it again finds the marker and leaves the body alone.
+  // The 2.1 line's prompt is new prose that names no function tool, so the
+  // generation shows in the marker sentence, not in tool spellings.
+  assert.ok(system.startsWith(OPENCODE_PROMPT_MARKER_V2));
+  // Injecting it again finds the marker and leaves the body alone — and a
+  // body carrying the 1.x marker is just as shaped, whatever lane it takes.
   assert.equal(injectOfficialPrompt(body, "chat", "2.x"), false);
   assert.equal(markerCount(body.messages[0].content), 1);
+  const as1x = { model: "chat-free", messages: [{ role: "system", content: `${OPENCODE_PROMPT_MARKER} v1` }, { role: "user", content: "hi" }] };
+  assert.equal(injectOfficialPrompt(as1x, "chat", "2.x"), false);
 });
 
 test("an unknown protocol or generation is named rather than guessed", () => {

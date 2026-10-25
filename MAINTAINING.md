@@ -791,17 +791,21 @@ file replaced without a word is a file nobody knows was there. The Node floor
 `capture` uses `Bun.serve` and `Bun.write`, so it runs under Bun, which is what
 `bun run capture` gives it.
 
-A capture writes `fingerprint.json` only. The prompt and the complete tool set
-are captures of the same releases — `opencode-prompt-v1.txt` is the CLI's system
-prompt from 1.19.3, and `official-tools.json` holds the full tool sets, 1.x from
-1.19.3 and 2.x from 2.1.1 — and no tool rewrites them: a capture rewrites a
-profile entire (`{ agent, required, tools }`), so a table stored inside it would
-be dropped by the next capture. A release that moves to a newer OpenCode takes
-all three from the same one: `capture` for the fingerprint, and the prompt and
-the tool sets by hand from that CLI's own request. The 2.x prompt is not
-captured separately: the only differences between the generations' prompts are
-tool names, so `official-prompt.mjs` derives it from the 1.x text, and the two
-cannot drift apart in prose.
+A capture writes `fingerprint.json` only. The prompts and the complete tool set
+are captures of the same releases — `opencode-prompt-v1.txt` is the 1.x CLI's
+system prompt from 1.19.3, `opencode-prompt-v2.txt` is 2.1.4's (the 2.1 line
+rewrote the prompt as new prose, so it is its own file and carries placeholders
+for the model, the date and the environment block), and `official-tools.json`
+holds the full tool sets, 1.x from 1.19.3 and 2.x from 2.1.4 — and no tool
+rewrites them: a capture rewrites a profile entire (`{ agent, required, tools
+}`), so a table stored inside it would be dropped by the next capture. A
+release that moves to a newer OpenCode takes all of them from the same one:
+`capture` for the fingerprint, and the prompts and the tool sets by hand from
+that CLI's own request. The 2.x prompts and tools on 2026-10-25 came out of the
+2.1.4 desktop CLI through `mini-capture.mjs` (a local server the CLI is pointed
+at, the same trick as `capture.mjs` but driving the desktop binary), and the
+raw request it read is kept beside them as
+`genuine-2.1.4-request.json`.
 
 The `anthropic` provider-utils in `fingerprint.json` is the one entry a capture
 cannot take: no free model speaks that protocol, so the anthropic request shape
@@ -984,6 +988,31 @@ to call a tool nothing stands behind. The prompt ends at the environment block,
 and a skill may be named in it only if something on the host side will answer
 for it.
 
+**Sending the request from a host that is not Bun.** The tier reads the TLS
+handshake before it reads the body, and the official clients handshake as Bun:
+on 2026-10-25, from one live exit with the minute held equal, the genuine
+request replayed byte for byte answered 200 under Bun's BoringSSL ClientHello
+and 429 Free usage limit under Node's OpenSSL one — the same disguised refusal
+an exhausted quota returns. opencode2api built a whole `BunTransport` (uTLS
+replaying Bun 1.4.3's ClientHello) for exactly this; nothing in this package
+can reshape Node's handshake, so the plugin's fetch must simply run inside a
+Bun host. Magpie runs its plugins under the Bun it ships (`magpie-bun.exe`,
+downloaded beside the plugin host), which is why plugin traffic passed while
+every Node-run diagnostic probe beside it was refused. Probing the tier from a
+checkout means `magpie-bun` too — `bun tools-smoke.mjs` already qualifies, a
+`node` one does not.
+
+**Sending a request down a retired lane.** The 1.x lane — 1.19.3's prompt, its
+tool set, its User-Agent — stopped being answered on 2026-10-25: from a live
+exit under Bun, the 1.x shape 429'd where the 2.x shape 200'd, and a DeepSeek
+Harness session died mid-afternoon exactly there, because its tools named
+neither `bash` nor `shell` and the old default sent it as 1.x. No IP, session
+or wording recovers a lane the tier no longer serves, so the request path
+presents 2.x whatever the host declares (`DEFAULT_GENERATION` in
+`provider.mjs`); `generationOf` still exists for diagnostics, and the gate
+still probes 1.x — its `refused` floor is now the retirement showing, not a
+wording gone stale.
+
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
 whose every call was dropped ended as a plain `stop`. An autonomous host reads
@@ -1062,8 +1091,10 @@ that passes under the stricter of them, since the looser one will not last.
 | file | what it is |
 | --- | --- |
 | `fingerprint.json` | the capture: the wording and User-Agent Zen accepts |
-| `opencode-prompt-v1.txt` | the CLI's own system prompt, captured verbatim |
+| `opencode-prompt-v1.txt` | the 1.x CLI's own system prompt, captured verbatim |
+| `opencode-prompt-v2.txt` | the 2.1.4 CLI's own system prompt, placeholders for model, date and env |
 | `official-tools.json` | the CLI's complete tool sets, one per generation |
+| `genuine-2.1.4-request.json` | the raw request the 2026-10-25 2.1.4 assets were read from |
 | `core-tools.mjs` | reads the capture; says which generation a request is |
 | `official-prompt.mjs` | injects the official prompt in front of the host's instructions |
 | `official-tools.mjs` | renames the host's tools `clint_` and appends the official set |
@@ -1076,20 +1107,23 @@ that passes under the stricter of them, since the looser one will not last.
 | `limits-watch.mjs` | the scheduled diff and sweep: what is offered, what was measured, what to measure, and the snapshot's freshness report (`limits:watch`) |
 | `limits-observed.json` | what the last scheduled run measured: read at run time as the `route-sweep` tier |
 | `capture.mjs` | takes a new capture |
+| `mini-capture.mjs` | the same trick driving the desktop CLI binary, for captures of an installed OpenCode |
 | `tools-smoke.mjs` | asks Zen what it accepts (`check:gate`) |
 | `assert-bun-version.mjs` | checks that the Bun on PATH is the one `package.json` declares (CI only) |
 
-`capture.mjs`, `limits-audit.mjs`, `limits-sweep.mjs`, `limits-watch.mjs`,
+`capture.mjs`, `mini-capture.mjs`, `limits-audit.mjs`, `limits-sweep.mjs`,
+`limits-watch.mjs`,
 `tools-smoke.mjs` and `assert-bun-version.mjs` are maintenance tools for this
 repository, not part of what a host loads: they are not in `package.json`'s
 `files`, so a published tarball
 carries the modules a host imports, `fingerprint.json`, `limits-observed.json`
 (which `limits.mjs` does read at run time), the prompt and tool-set captures
-(`opencode-prompt-v1.txt` and `official-tools.json`, which `official-prompt.mjs`
-and `official-tools.mjs` read at run time) and the four documents beside them
+(`opencode-prompt-v1.txt`, `opencode-prompt-v2.txt` and `official-tools.json`,
+which `official-prompt.mjs` and `official-tools.mjs` read at run time) and the
+four documents beside them
 (`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - eighteen named in `files`,
 which with `package.json` and the English `README.en.md` (a README under any
-name is packed whatever `files` says) makes nineteen in the tarball. The same list
+name is packed whatever `files` says) makes twenty in the tarball. The same list
 is why `npm run` has nothing to run in an installed package: `check:gate`,
 `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are entry points for
 a checkout, and the tools they name stay here - each of them now says in one

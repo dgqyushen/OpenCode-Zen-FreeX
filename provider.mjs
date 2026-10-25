@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { agentFor, generationOf, profileFor } from "./core-tools.mjs";
+import { agentFor, profileFor } from "./core-tools.mjs";
 import {
   PROVIDER,
   SDK,
@@ -57,20 +57,19 @@ const DISCOVERY_AGE = Symbol.for("magpie.discoveryAgeMs");
 // limits were read from and not any one model; it is non-enumerable, so it is
 // no model id to `Object.keys` and no field to JSON.
 const SNAPSHOT_STATE = Symbol.for("magpie.limitsSnapshot");
-// Which generation to present when the host's tools name neither one: a floor,
-// and not a claim about what opencode-ai publishes as latest. What it publishes
-// as latest is 2.x, and `fingerprint.json` captures it — the profile whose
-// channel is `latest`, opencode 2.1.1 — so a comment saying this constant is
-// "the latest generation" would be the one thing here that is not true.
-//
-// It stays 1.x because a default is only reached when nothing identified the
-// host, and 1.x is the generation with more to say for it in that case: its
-// `required` set is the wider one, and `bash`/`glob`/`grep`/`read` are the
-// names a host that never sent `shell` still carries. The floor is what a
-// request falls back to, so it is the generation a body is likeliest to already
-// agree with — not the newest one opencode-ai ships, which only a host that
-// says so should be presented as.
-const DEFAULT_GENERATION = "1.x";
+// Every shaped request leaves as the 2.x generation. The tier retired the 1.x
+// lane on 2026-10-25 — measured from a live exit under Bun, exit and minute
+// held equal: the 1.19.3 shape (its prompt, its tools, its User-Agent)
+// answered 429 Free usage limit where the 2.x shape answered 200 — and a
+// retired lane is not something an IP, a session or a wording recovers. This
+// is also why the default is no longer a floor reached through
+// `generationOf`: a host that declares `bash` used to be sent as 1.x, and
+// sending it down a retired lane is a guaranteed refusal. Its `bash` still
+// cannot collide with the official set, because the clint_ renaming moves it
+// out of the way before the 2.x set is appended. `generationOf` remains for
+// what still reads a host's tools diagnostically; the request path does not
+// follow it.
+const DEFAULT_GENERATION = "2.x";
 
 // Zen answers a request only when the whole of it belongs to one generation of
 // OpenCode: its User-Agent, its headers and its tools have to agree. So the
@@ -366,16 +365,15 @@ function normalizeTools(body, protocol) {
     );
   }
   if (legacyChat) delete body.functions;
-  // Zen takes a request for one generation of OpenCode or the other, and the
-  // tools it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far
-  // less often than descriptions do, so this survives a rewording that a pinned
-  // User-Agent would not.
-  //
-  // The generation is read after the legacy declarations are folded in, because
-  // the names a request carries are the names Zen reads and it does not care
-  // which array they arrived in: a host that declares `shell` the old way is the
-  // 2.x host it says it is.
-  const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
+  // Zen answers a request only as the generation of OpenCode it whole-heartedly
+  // resembles, and the 1.x lane is no longer one it answers: retired
+  // 2026-10-25, measured from a live exit under Bun with exit and minute held
+  // equal (the 1.19.3 shape 429 Free usage limit, the 2.x shape 200). So the
+  // generation is not read out of the host's tools anymore — a host declaring
+  // `bash` was sent as 1.x and refused for a lane it never chose — it is the
+  // one lane the tier still serves. The clint_ renaming below already keeps
+  // the host's `bash` from colliding with the official set's `shell`.
+  const generation = DEFAULT_GENERATION;
   // Which official names the host did not declare itself, before the client
   // tools are renamed. Used only to explain a refusal; the full official set is
   // appended either way.

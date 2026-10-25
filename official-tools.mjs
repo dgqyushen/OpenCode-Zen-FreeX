@@ -89,7 +89,10 @@ function platformDescription(generation, name, description) {
     return description.replace("OS: linux, Shell: bash", "OS: windows, Shell: powershell");
   }
   if (generation === "2.x" && name === "shell") {
-    return description.replace("on Linux using bash", "on Windows using powershell");
+    // 2.1.4 on Windows runs bash, not powershell: the desktop client words its
+    // own shell after bash on both platforms, so the rewrite only moves the
+    // platform name. Captured 2026-10-25 from the 2.1.4 desktop CLI.
+    return description.replace("on Linux using bash", "on Windows using bash");
   }
   return description;
 }

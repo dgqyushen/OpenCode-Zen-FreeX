@@ -26,7 +26,7 @@ function capturedDescription(generation, name) {
     return description.replace("OS: linux, Shell: bash", "OS: windows, Shell: powershell");
   }
   if (generation === "2.x" && name === "shell") {
-    return description.replace("on Linux using bash", "on Windows using powershell");
+    return description.replace("on Linux using bash", "on Windows using bash");
   }
   return description;
 }
@@ -54,9 +54,11 @@ test("the capture holds the complete official set for both generations", () => {
     "websearch",
     "write",
   ]);
+  // The 2.x set is 2.1.4's, captured 2026-10-25: `execute` joins the set (Code
+  // Mode's runner), `patch` has left it, and `execute` is ordered last, where
+  // the client sends it.
   assert.deepEqual(officialToolNames("2.x"), [
     "edit",
-    "execute",
     "glob",
     "grep",
     "question",
@@ -67,7 +69,7 @@ test("the capture holds the complete official set for both generations", () => {
     "webfetch",
     "websearch",
     "write",
-    "patch",
+    "execute",
   ]);
   for (const generation of Object.keys(OFFICIAL_SETS)) {
     const set = OFFICIAL_SETS[generation];
@@ -128,13 +130,13 @@ test("the platform's shell is the one the official wording describes", () => {
   if (isWindows) {
     assert.match(bash, /OS: windows, Shell: powershell/);
     assert.doesNotMatch(bash, /OS: linux, Shell: bash/);
-    assert.match(shell, /on Windows using powershell/);
+    assert.match(shell, /on Windows using bash/);
     assert.doesNotMatch(shell, /on Linux using bash/);
   } else {
     assert.match(bash, /OS: linux, Shell: bash/);
     assert.doesNotMatch(bash, /OS: windows, Shell: powershell/);
     assert.match(shell, /on Linux using bash/);
-    assert.doesNotMatch(shell, /on Windows using powershell/);
+    assert.doesNotMatch(shell, /on Windows using bash/);
   }
   // A tool whose description has nothing to do with the shell is left alone.
   assert.equal(

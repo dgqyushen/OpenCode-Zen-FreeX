@@ -8,8 +8,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
-import { OFFICIAL_SETS, officialToolNames } from "./official-tools.mjs";
-import { OPENCODE_PROMPT_MARKER } from "./official-prompt.mjs";
+import {
+  OFFICIAL_SETS,
+  officialTool,
+  officialToolNames,
+} from "./official-tools.mjs";
+import { OPENCODE_PROMPT_MARKER, OPENCODE_PROMPT_MARKER_V2 } from "./official-prompt.mjs";
 import { readDiscoveryCache, writeDiscoveryCache } from "./models.mjs";
 import { clearInstalledSnapshot, snapshotState } from "./limits.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
@@ -544,7 +548,12 @@ for (const { protocol, path, model } of protocols) {
         const renamed = tools.map((tool) => {
           const name = tool.function?.name ?? tool.name;
           if (protocol === "chat") {
-            return { ...tool, function: { ...tool.function, name: `clint_${name}` } };
+            // The 2.x client writes strict:false on every function it sends,
+            // so a host tool that said nothing about strict leaves with one.
+            return {
+              ...tool,
+              function: { strict: false, ...tool.function, name: `clint_${name}` },
+            };
           }
           return { ...tool, name: `clint_${name}` };
         });
@@ -552,12 +561,15 @@ for (const { protocol, path, model } of protocols) {
         for (const raw of outbound.slice(tools.length)) {
           const tool = protocol === "chat" ? raw.function : raw;
           // Zen reads the body as well as the headers: the appended set is
-          // OpenCode's own definitions, not placeholders.
-          const known = OFFICIAL_SETS["1.x"].tools[tool.name];
-          assert.ok(known, `${tool.name} is not one of the tools Zen reads`);
-          assert.ok(
-            tool.description.startsWith(known.description.slice(0, 80)),
-            `${tool.name} does not start as OpenCode describes it`,
+          // OpenCode's own definitions, not placeholders. The set is the 2.1.4
+          // capture, and the shell's wording moves with the platform, so the
+          // expectation is the renderer's own output rather than the stored
+          // text.
+          assert.ok(OFFICIAL_SETS["2.x"].tools[tool.name], `${tool.name} is not one of the tools Zen reads`);
+          assert.equal(
+            tool.description,
+            officialTool("chat", tool.name, "2.x").function.description,
+            `${tool.name} is not described as OpenCode describes it`,
           );
           assert.ok(Object.keys((tool.parameters ?? tool.input_schema).properties).length > 0);
         }
@@ -672,7 +684,7 @@ for (const [input, supplied, expected] of [
     });
     await response.text();
     assert.equal(lastCall(state).headers["x-opencode-project"], expected);
-    assert.equal(lastCall(state).headers["user-agent"], agentOf("1.x"));
+    assert.equal(lastCall(state).headers["user-agent"], agentOf("2.x"));
   });
 }
 
@@ -707,7 +719,7 @@ for (const [path, model, protocol, key] of [
     });
     await response.text();
     const sent = lastCall(state).headers;
-    assert.equal(sent["user-agent"], agentOf("1.x", protocol));
+    assert.equal(sent["user-agent"], agentOf("2.x", protocol));
     assert.equal(sent.accept, "*/*");
     const own = chosenByPlugin(sent, HTTP_STACK);
     assert.deepEqual(
@@ -748,7 +760,15 @@ for (const [generation, profile] of Object.entries(PROFILES)) {
     const gate = requestFor(generation, profile, names).headers;
     const gateNames = [...gate.keys()].filter((name) => !HTTP_STACK.includes(name));
     assert.deepEqual(gateNames.sort(), wire.sort());
-    assert.equal(gate.get("user-agent"), sent["user-agent"]);
+    if (generation === "2.x") {
+      assert.equal(gate.get("user-agent"), sent["user-agent"]);
+    } else {
+      // The 1.x lane is retired (2026-10-25): the gate still asks about it,
+      // but the plugin presents the 2.x agent whatever the tools say, so
+      // parity is the 2.x lane's alone.
+      assert.equal(sent["user-agent"], agentFor("2.x"));
+      assert.notEqual(gate.get("user-agent"), sent["user-agent"]);
+    }
     // Parity is only parity if each side sent something: an empty header set on
     // one side would otherwise compare equal to nothing at all on the other.
     assert.ok(wire.length > 0 && !gate.keys().next().done);
@@ -1776,7 +1796,7 @@ test("forces upstream streaming, preserves existing tools and returns the SSE bo
   assert.equal(sent.body.tools[0].function.description, "real bash");
   assert.deepEqual(sent.body.tools.map((tool) => tool.function.name), [
     "clint_bash",
-    ...officialToolNames("1.x"),
+    ...officialToolNames("2.x"),
   ]);
 });
 
@@ -1811,17 +1831,17 @@ test("a host's request carries the official prompt in its protocol's field", asy
           : sent.instructions;
     if (protocol === "chat") assert.equal(sent.messages[0].role, "system");
     assert.equal(typeof prompt, "string", `${protocol} carries a prompt`);
-    assert.ok(prompt.startsWith(OPENCODE_PROMPT_MARKER), `${protocol} prompt starts as OpenCode's`);
-    // The environment block names the model this request is actually for, not
+    assert.ok(prompt.startsWith(OPENCODE_PROMPT_MARKER_V2), `${protocol} prompt starts as OpenCode's`);
+    // The model section names the model this request is actually for, not
     // a package default: the model that answers is the one the body names.
-    assert.match(prompt, new RegExp(`model named ${model}\\. The exact model ID is opencode/${model}`));
+    assert.match(prompt, new RegExp(`- Name: .+\\n- Provider ID: opencode\\n- Model ID: ${model}`));
     // No skill listing rides with the prompt: a host that is not OpenCode has
     // none of OpenCode's built-in skills, and the one 0.5.4 advertised was
     // called by a model that read it (2026-10-25, DeepSeek Harness).
     assert.doesNotMatch(prompt, /<available_skills>/);
-    assert.ok(prompt.endsWith("</env>"));
+    assert.ok(prompt.endsWith("the session's working directory."));
     assert.equal(
-      prompt.split(OPENCODE_PROMPT_MARKER).length - 1,
+      prompt.split(OPENCODE_PROMPT_MARKER_V2).length - 1,
       1,
       `${protocol} prompt is there once`,
     );
@@ -1853,7 +1873,7 @@ test("the host's own system instructions follow the official prompt", async (t) 
     ["system", "user"],
     "system and developer text fold into the one leading message",
   );
-  assert.ok(messages[0].content.startsWith(OPENCODE_PROMPT_MARKER));
+  assert.ok(messages[0].content.startsWith(OPENCODE_PROMPT_MARKER_V2));
   assert.ok(messages[0].content.endsWith("\n\nHost rule.\nSecond rule."));
   assert.equal(messages[1].content, "hi");
 });
@@ -1931,7 +1951,7 @@ test("sends exactly the headers one generation of OpenCode sends", async (t) => 
   assert.equal(sent["x-opencode-parent-session-id"], undefined);
 });
 
-test("presents the generation the tools say, and a host that names its own", async (t) => {
+test("presents the 2.x generation whatever the tools say, and a host that names its own", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -1946,10 +1966,14 @@ test("presents the generation the tools say, and a host that names its own", asy
     function: { name, description, parameters: { type: "object", properties: { a: { type: "string" } } } },
   });
 
+  // The 1.x lane is retired (2026-10-25), so the generation a request presents
+  // is no longer read out of the tools: every shaped request leaves as 2.x,
+  // including one from a host that declares 1.x's own names or carries none of
+  // them by name.
   await send();
   assert.match(
     lastCall(state).headers["user-agent"],
-    /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\S+ runtime\/bun\//,
+    /^opencode\/[a-z-]+\/[1-9][^/]*\/[^/]+$/,
   );
 
   // A host declaring 2.x tools is answered as 2.x, without a gap being filled.
@@ -1972,7 +1996,7 @@ test("presents the generation the tools say, and a host that names its own", asy
   // A host on a development build is not something Zen accepts, so its word is
   // not taken.
   await send(undefined, { "user-agent": "opencode/dev/0.0.0-dev-1/cli" });
-  assert.match(lastCall(state).headers["user-agent"], /^opencode\/\d+\.\d+\.\d+ ai-sdk\//);
+  assert.match(lastCall(state).headers["user-agent"], /^opencode\/[a-z-]+\/[1-9][^/]*\/[^/]+$/);
 
   // The pass-through above is not a 2.x privilege: a 1.x host says which it is
   // in its own shape, and pinning that one back to the captured version is how
@@ -1981,11 +2005,11 @@ test("presents the generation the tools say, and a host that names its own", asy
   await send(undefined, { "user-agent": oneX });
   assert.equal(lastCall(state).headers["user-agent"], oneX);
   // Whatever a host says about itself, it is not its word that decides which
-  // generation the body belongs to: the tools still do, and a host that is not
-  // OpenCode carries none of them by name, so the 1.x names go out.
+  // generation the body belongs to: no host's does any more, so the 2.x names
+  // go out beside its own.
   assert.deepEqual(
     lastCall(state).body.tools.map((tool) => tool.function.name),
-    officialToolNames("1.x"),
+    officialToolNames("2.x"),
   );
 });
 
@@ -2046,9 +2070,10 @@ test("a tool declared through the legacy functions array is folded in and rename
   const sent = lastCall(state).body;
   const names = sent.tools.map((tool) => tool.function.name);
   // The legacy declaration is one declaration: it goes out under clint_bash
-  // once, and the official bash that follows it is a different tool.
-  assert.deepEqual(names, ["clint_bash", ...officialToolNames("1.x")]);
-  assert.equal(names.filter((name) => name === "bash").length, 1);
+  // once, and the official set that follows it carries no bash at all — its
+  // shell is the 2.x name, a different tool from a different lane.
+  assert.deepEqual(names, ["clint_bash", ...officialToolNames("2.x")]);
+  assert.equal(names.filter((name) => name === "bash").length, 0);
   // The declaration keeps the host's own wording and parameters: it is the tool
   // that will run, and only its wire name moved.
   assert.equal(sent.tools[0].function.description, "the host's own");
@@ -2108,7 +2133,7 @@ test("a tool declared in both arrays goes out once", async (t) => {
   const sent = lastCall(state).body;
   assert.deepEqual(
     sent.tools.map((tool) => tool.function.name),
-    ["clint_bash", ...officialToolNames("1.x")],
+    ["clint_bash", ...officialToolNames("2.x")],
     "the tool is sent once, not once per array it was declared in",
   );
   assert.equal(sent.functions, undefined);
@@ -2142,7 +2167,7 @@ test("renames the host's tools and appends the complete official set", async (t)
   assert.equal((await send()).status, 200);
   assert.deepEqual(
     lastCall(state).body.tools.map((tool) => tool.function.name),
-    officialToolNames("1.x"),
+    officialToolNames("2.x"),
     "a host with no tools gets the official set",
   );
 
@@ -2159,11 +2184,13 @@ test("renames the host's tools and appends the complete official set", async (t)
     assert.deepEqual(tool.function.parameters, own[at].function.parameters, "host parameters are kept");
   }
   const official = sent.slice(own.length);
-  assert.deepEqual(official.map((tool) => tool.function.name), officialToolNames("1.x"));
+  assert.deepEqual(official.map((tool) => tool.function.name), officialToolNames("2.x"));
   for (const tool of official) {
-    const expected = OFFICIAL_SETS["1.x"].tools[tool.function.name].description;
-    assert.ok(
-      tool.function.description.startsWith(expected.slice(0, 80)),
+    // The renderer's own output, not the stored text: the shell's wording
+    // moves with the platform.
+    assert.equal(
+      tool.function.description,
+      officialTool("chat", tool.function.name, "2.x").function.description,
       `${tool.function.name} carries the official definition`,
     );
     assert.ok(tool.function.parameters);
@@ -2194,7 +2221,7 @@ test("renames a tool sent in the other shape where its name sits", async (t) => 
   assert.equal(bash.name, "clint_bash");
   assert.equal(bash.description, "Run a command.");
   assert.deepEqual(bash.parameters.properties, { cmd: { type: "string" } });
-  assert.deepEqual(sent.map((tool) => tool.name ?? tool.function?.name), ["clint_bash", ...officialToolNames("1.x")]);
+  assert.deepEqual(sent.map((tool) => tool.name ?? tool.function?.name), ["clint_bash", ...officialToolNames("2.x")]);
 });
 
 // The appended tools are the official definitions themselves, not placeholders:
@@ -2212,11 +2239,13 @@ test("appends the official definitions without placeholder wording", async (t) =
 
   await send();
   const sent = lastCall(state).body.tools;
-  assert.deepEqual(sent.map((tool) => tool.function.name), officialToolNames("1.x"));
+  assert.deepEqual(sent.map((tool) => tool.function.name), officialToolNames("2.x"));
   for (const tool of sent) {
-    const expected = OFFICIAL_SETS["1.x"].tools[tool.function.name].description;
-    assert.ok(
-      tool.function.description.startsWith(expected.slice(0, 80)),
+    // The renderer's own output, not the stored text: the shell's wording
+    // moves with the platform.
+    assert.equal(
+      tool.function.description,
+      officialTool("chat", tool.function.name, "2.x").function.description,
       `${tool.function.name} carries the official definition`,
     );
     assert.doesNotMatch(tool.function.description, /placeholder|do not call it/i);
@@ -2230,7 +2259,7 @@ test("appends the official definitions without placeholder wording", async (t) =
   const hostRead = tools.find((tool) => tool.function.name === "clint_read");
   const officialRead = tools.find((tool) => tool.function.name === "read");
   assert.equal(hostRead.function.description, "Load a file.");
-  assert.ok(officialRead.function.description.startsWith(OFFICIAL_SETS["1.x"].tools.read.description.slice(0, 80)));
+  assert.ok(officialRead.function.description.startsWith(OFFICIAL_SETS["2.x"].tools.read.description.slice(0, 80)));
 });
 
 // The 2.1 Chat client sends a completion ceiling even when its user did not
@@ -2274,10 +2303,12 @@ test("a 2.x chat request carries the client's completion ceiling unless the call
   assert.equal(sent.max_completion_tokens, 456);
   assert.equal(sent.max_tokens, undefined);
 
-  // The 1.x lane writes neither field on its own.
+  // A host that declares bash used to travel the 1.x lane, which writes
+  // neither field; that lane is retired (2026-10-25), so its ceiling is the
+  // 2.x one like everyone else's.
   await send([tool("bash")]);
   sent = lastCall(state).body;
-  assert.equal(sent.max_completion_tokens, undefined);
+  assert.equal(sent.max_completion_tokens, 32000);
   assert.equal(sent.max_tokens, undefined);
 
   // And the field belongs to Chat: a 2.x Responses request does not grow it.
@@ -2324,11 +2355,9 @@ test("a 2.x chat request marks every tool strict:false, and 1.x marks none", asy
   await send([tool("bash", undefined)]);
   const one = lastCall(state).body.tools;
   for (const entry of one) {
-    assert.equal(
-      Object.hasOwn(entry.function, "strict"),
-      false,
-      `${entry.function.name} does not grow a strict field`,
-    );
+    // The 1.x lane — which wrote no strict — is retired (2026-10-25), so a
+    // bash-declaring host travels the 2.x lane and its strict marking too.
+    assert.equal(entry.function.strict, false, `${entry.function.name} carries strict:false`);
   }
 });
 
@@ -2391,8 +2420,8 @@ test("a refusal names the prompt and tools to update rather than the headers", a
   const { error } = await response.json();
   assert.equal(error.type, "FreeTierError");
   assert.match(error.message, /prompt/i);
-  assert.match(error.message, /bash, edit, glob, grep, read, skill, task, todowrite, webfetch, websearch, write/);
-  assert.match(error.message, new RegExp(PROFILES["1.x"].agent.opencode.replace(/\./g, "\\.")));
+  assert.match(error.message, /edit, glob, grep, question, read, shell, skill, subagent, webfetch, websearch, write, execute/);
+  assert.match(error.message, new RegExp(PROFILES["2.x"].agent.opencode.replace(/\./g, "\\.")));
   // Zen's own wording, which sends people off to change headers, is replaced.
   assert.doesNotMatch(error.message, /can only be used from within OpenCode/);
 });
@@ -2665,7 +2694,9 @@ for (const [path, model, key] of [
     });
     await response.text();
     const sent = lastCall(state);
-    assert.equal(sent.body.tools[0].name, "bash");
+    // No host tool was declared, so the first tool out is the official set's
+    // own first: `edit`, where the retired 1.x lane used to lead with `bash`.
+    assert.equal(sent.body.tools[0].name, "edit");
     assert.equal(sent.body.tools[0][key].type, "object");
     if (path === "messages") {
       assert.equal(sent.headers["x-api-key"], "public");
@@ -2951,7 +2982,7 @@ test("one turn end to end: discover, ask, be refused, be told what to update", a
   const names = sent.body.tools.map((tool) => tool.function.name);
   assert.deepEqual(names, [
     ...declaredTools("chat").map((tool) => `clint_${tool.function.name}`),
-    ...officialToolNames("1.x"),
+    ...officialToolNames("2.x"),
   ]);
   assert.equal(new Set(names).size, names.length, "no name goes out twice");
   assert.equal(sent.body.stream, true, "upstream streaming is forced even for a client that does not stream");

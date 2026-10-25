@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -31,6 +31,7 @@
     "official-tools.json",
     "official-prompt.mjs",
     "opencode-prompt-v1.txt",
+    "opencode-prompt-v2.txt",
     "README.md",
     "MAINTAINING.md",
     "LICENSE",

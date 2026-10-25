@@ -1,43 +1,49 @@
-// The system prompt an OpenCode CLI session sends, and the protocol-aware
-// injection that puts it in front of a host's own instructions.
+// The system prompts OpenCode CLI sessions send, and the protocol-aware
+// injection that puts one in front of a host's own instructions.
 //
 // Zen's free tier accepts only agent-shaped traffic and checks the request
 // against the CLI's prompt, so a request from any other host has to carry it.
-// The base text is OpenCode 1.19.3's own (MIT), captured verbatim; the 2.x text
-// is the same text with the four tool names that generation spells differently.
-// The environment block names the requested model, the working directory, the
+// Each generation's base text is OpenCode's own (MIT), captured verbatim:
+// 1.x is 1.19.3's, 2.x is 2.1.4's — the 2.1 line rewrote the prompt as new
+// prose, so it is its own file and not a derivation from the 1.x text. The
+// environment block names the requested model, the working directory, the
 // platform and the UTC date.
 
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-const PROMPT = new URL("./opencode-prompt-v1.txt", import.meta.url);
+const PROMPT_V1 = new URL("./opencode-prompt-v1.txt", import.meta.url);
+const PROMPT_V2 = new URL("./opencode-prompt-v2.txt", import.meta.url);
 
-// The sentence every copy of the prompt carries. A body that already holds it
-// came from an OpenCode-shaped client and is left alone, so repeated shaping
-// cannot duplicate the prompt.
+// The sentence every copy of a generation's prompt carries. A body that
+// already holds either one came from an OpenCode-shaped client and is left
+// alone, so repeated shaping cannot duplicate the prompt — and either
+// generation's marker counts, because a body already carrying the 1.x prompt
+// is shaped, not half-shaped, whatever lane the request then takes.
 export const OPENCODE_PROMPT_MARKER = "You are opencode, an interactive CLI tool";
+export const OPENCODE_PROMPT_MARKER_V2 = "You are an AI agent running in OpenCode";
 
-function readPrompt() {
+function readPrompt(url, label) {
   try {
-    return readFileSync(PROMPT, "utf8");
+    return readFileSync(url, "utf8");
   } catch (error) {
     const reason =
       error.code === "ENOENT"
         ? "is missing"
         : `could not be read (${error.code ?? error.message})`;
-    throw new Error(`official-prompt: the prompt at ${PROMPT.pathname} ${reason}`, {
+    throw new Error(`official-prompt: the ${label} prompt at ${url.pathname} ${reason}`, {
       cause: error,
     });
   }
 }
 
-const V1 = readPrompt();
-
-// The four differences between the 1.x and 2.x prompt are tool names. Keeping
-// one file and deriving the other cannot let the two drift apart in prose.
-const V2 = V1.replaceAll("WebFetch", "webfetch")
-  .replaceAll("Bash", "shell")
-  .replaceAll("Task", "subagent");
+const V1 = readPrompt(PROMPT_V1, "1.x");
+// The 2.1.4 capture with placeholders for the model it names, the UTC date
+// above the environment block, and the environment block itself. Everything
+// else is byte for byte what the CLI sent, except its skill listing, which is
+// gone for the reason below.
+const V2 = readPrompt(PROMPT_V2, "2.x");
 
 // No skill listing follows the environment block, though the CLI's own prompt
 // carries one. A host that is not OpenCode has none of OpenCode's built-in
@@ -100,15 +106,61 @@ export function officialEnvironment(model, options = {}) {
   ].join("\n");
 }
 
-// The complete prompt for one generation.
+// The name the 2.x prompt's model section carries. The CLI writes the model's
+// display name there ("DeepSeek V4.1 Flash Free"); this package knows the id,
+// so the id is titled — right for deepseek, imperfect for glm, and the tier
+// has not been measured to read this line at all (the whole 1.x-style
+// environment answered on the 2.x lane on 2026-10-25, so the section is
+// fidelity, not a pass requirement).
+function displayName(model) {
+  return model
+    .split("-")
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(" ");
+}
+
+// The <env> block the 2.1 line sends: no date inside (it moved to the line
+// above the block) and a "Prefer" line naming the CLI's own temp directory.
+export function officialEnvironmentV2(model, options = {}) {
+  const raw = options.cwd ?? process.cwd();
+  const directory = typeof raw === "string" && raw && raw !== "." ? raw : "/workspace";
+  const platform = options.platform ?? process.platform;
+  const name = platform === "windows" ? "win32" : platform;
+  const temp = options.tempDir ?? join(tmpdir(), "opencode");
+  return [
+    "<env>",
+    `  Working directory: ${directory}`,
+    `  Workspace root folder: ${directory}`,
+    `  Is directory a git repo: ${options.gitRepository === false ? "no" : "yes"}`,
+    `  Platform: ${name}`,
+    `  Prefer ${temp} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
+    "</env>",
+  ].join("\n");
+}
+
+// The complete prompt for one generation. The 1.x text is followed by its
+// environment block, which carries the model's own two lines; the 2.x text
+// carries its model section, its date and its environment block through the
+// placeholders they were captured with.
 export function officialSystemPrompt(generation, model, options = {}) {
-  const base = generation === "1.x" ? V1 : generation === "2.x" ? V2 : undefined;
-  if (base === undefined) {
-    throw new Error(
-      `official-prompt: no prompt for generation ${JSON.stringify(generation)}`,
-    );
+  if (generation === "1.x") return `${V1}${officialEnvironment(model, options)}`;
+  if (generation === "2.x") {
+    const apiModel =
+      typeof model === "string" && model.startsWith("opencode/")
+        ? model.slice("opencode/".length).trim()
+        : typeof model === "string"
+          ? model.trim()
+          : "";
+    const named = apiModel || "unknown";
+    const now = options.now instanceof Date ? options.now : new Date();
+    return V2.replaceAll("{{MODEL_NAME}}", displayName(named))
+      .replaceAll("{{MODEL_ID}}", named)
+      .replaceAll("{{DATE}}", utcDate(now))
+      .replaceAll("{{ENV}}", officialEnvironmentV2(model, options));
   }
-  return `${base}${officialEnvironment(model, options)}`;
+  throw new Error(
+    `official-prompt: no prompt for generation ${JSON.stringify(generation)}`,
+  );
 }
 
 const isTable = (value) =>
@@ -127,7 +179,10 @@ export function textFragments(value) {
 }
 
 export function carriesOfficialPrompt(value) {
-  return textFragments(value).some((part) => part.includes(OPENCODE_PROMPT_MARKER));
+  return textFragments(value).some(
+    (part) =>
+      part.includes(OPENCODE_PROMPT_MARKER) || part.includes(OPENCODE_PROMPT_MARKER_V2),
+  );
 }
 
 function injectChatPrompt(body, prompt) {

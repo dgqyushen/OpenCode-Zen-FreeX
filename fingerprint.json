@@ -179,7 +179,7 @@
     "2.x": {
       "agent": {
         "channel": "latest",
-        "opencode": "2.1.1",
+        "opencode": "2.1.4",
         "client": "cli"
       },
       "required": [
