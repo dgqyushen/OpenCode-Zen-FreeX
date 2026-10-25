@@ -6,9 +6,13 @@ that goes out of date. This is how to look after it.
 ## What is actually fragile
 
 `fingerprint.json` holds a capture of a real OpenCode: the wording of the tools
-its free tier knows by name, and the User-Agent that identifies it. Zen accepts a
-request only when the whole of it matches one generation of OpenCode, so when
-OpenCode changes any of that, the copy here stops being accepted.
+its free tier knows by name, and the User-Agent that identifies it. Two more
+captures of the same releases sit beside it: `opencode-prompt-v1.txt`, the CLI's
+own system prompt, and `official-tools.json`, the complete tool set a CLI
+session carries. Zen accepts a request only when the whole of it matches one
+generation of OpenCode — it reads the prompt and the tool definitions out of the
+body, not only the headers — so when OpenCode changes any of that, the copies
+here stop being accepted.
 
 Nothing about a stale copy looks different from a working one. The symptom is a
 `403 FreeTierError` on every request, which reads as "you are not OpenCode" and
@@ -787,6 +791,18 @@ file replaced without a word is a file nobody knows was there. The Node floor
 `capture` uses `Bun.serve` and `Bun.write`, so it runs under Bun, which is what
 `bun run capture` gives it.
 
+A capture writes `fingerprint.json` only. The prompt and the complete tool set
+are captures of the same releases — `opencode-prompt-v1.txt` is the CLI's system
+prompt from 1.19.3, and `official-tools.json` holds the full tool sets, 1.x from
+1.19.3 and 2.x from 2.1.1 — and no tool rewrites them: a capture rewrites a
+profile entire (`{ agent, required, tools }`), so a table stored inside it would
+be dropped by the next capture. A release that moves to a newer OpenCode takes
+all three from the same one: `capture` for the fingerprint, and the prompt and
+the tool sets by hand from that CLI's own request. The 2.x prompt is not
+captured separately: the only differences between the generations' prompts are
+tool names, so `official-prompt.mjs` derives it from the 1.x text, and the two
+cannot drift apart in prose.
+
 The `anthropic` provider-utils in `fingerprint.json` is the one entry a capture
 cannot take: no free model speaks that protocol, so the anthropic request shape
 is refused and the value in the file is one a human has to keep. It is
@@ -929,13 +945,20 @@ on the snapshot's own protocol is asked at the wrong one and fails upstream in a
 way a host cannot explain, so `OPENCODE_ZEN_FREE_MODELS_DEBUG=1` says how many
 rows the document had and that none of them names an endpoint.
 
-**Rewriting the tool wording.** The wording sent upstream is OpenCode's, because
-Zen reads it. What replaces it is only the wording: the host's tool and its
-parameters are kept, so the call the model makes still fits the tool that runs
-it. Rewriting the parameters as well looks tidier and breaks the agent.
+**Renaming the host's tools.** The host's tools go out under `clint_` names with
+their own wording and parameters, and the complete official set follows them, so
+the name a host declared never has to impersonate an OpenCode one. What the
+renaming may touch is the name only: the parameters go out as the host declared
+them, so the call the model makes still fits the tool that runs it, every
+reference in the body follows the rename, and the reply's names are restored to
+the ones the host declared — a host that saw a `clint_` name would answer a tool
+it never had. Rewriting the parameters as well looks tidier and breaks the
+agent.
 
-**Replacing the wording with something of your own.** That is what 0.1.5 and
-earlier did, and it is a guaranteed refusal.
+**Sending the host's wording in place of OpenCode's.** That is what 0.1.5 and
+earlier did — the host's names carrying invented descriptions — and it is a
+guaranteed refusal; the official set is sent whole instead, beside the host's
+own tools.
 
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
@@ -1015,7 +1038,11 @@ that passes under the stricter of them, since the looser one will not last.
 | file | what it is |
 | --- | --- |
 | `fingerprint.json` | the capture: the wording and User-Agent Zen accepts |
+| `opencode-prompt-v1.txt` | the CLI's own system prompt, captured verbatim |
+| `official-tools.json` | the CLI's complete tool sets, one per generation |
 | `core-tools.mjs` | reads the capture; says which generation a request is |
+| `official-prompt.mjs` | injects the official prompt in front of the host's instructions |
+| `official-tools.mjs` | renames the host's tools `clint_` and appends the official set |
 | `provider.mjs` | the plugin: discovery, headers, tools, the diagnostic |
 | `models.mjs` | which models are free, and what protocol each speaks |
 | `limits.mjs` | what a model's limits are, where the catalogue under-reports them |
@@ -1033,8 +1060,10 @@ that passes under the stricter of them, since the looser one will not last.
 repository, not part of what a host loads: they are not in `package.json`'s
 `files`, so a published tarball
 carries the modules a host imports, `fingerprint.json`, `limits-observed.json`
-(which `limits.mjs` does read at run time) and the four documents beside them
-(`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - fourteen files in all, the
+(which `limits.mjs` does read at run time), the prompt and tool-set captures
+(`opencode-prompt-v1.txt` and `official-tools.json`, which `official-prompt.mjs`
+and `official-tools.mjs` read at run time) and the four documents beside them
+(`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - eighteen files in all, the
 last being `package.json`, which npm packs whatever `files` says. The same list
 is why `npm run` has nothing to run in an installed package: `check:gate`,
 `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are entry points for

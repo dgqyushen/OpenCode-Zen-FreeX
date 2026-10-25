@@ -1,6 +1,6 @@
 {
   "name": "opencode-zen-freex",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "OpenCode Zen's free models, for hosts that are not OpenCode: the public credential, automatic discovery and native streaming protocols",
   "type": "module",
   "main": "./index.mjs",
@@ -13,6 +13,8 @@
     "./limits.mjs": "./limits.mjs",
     "./stream.mjs": "./stream.mjs",
     "./tool-response.mjs": "./tool-response.mjs",
+    "./official-tools.mjs": "./official-tools.mjs",
+    "./official-prompt.mjs": "./official-prompt.mjs",
     "./package.json": "./package.json"
   },
   "files": [
@@ -25,6 +27,10 @@
     "models.mjs",
     "stream.mjs",
     "tool-response.mjs",
+    "official-tools.mjs",
+    "official-tools.json",
+    "official-prompt.mjs",
+    "opencode-prompt-v1.txt",
     "README.md",
     "MAINTAINING.md",
     "LICENSE",

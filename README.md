@@ -25,7 +25,7 @@
 | 2026-10-14 10:57 | [`a810ee7`](https://github.com/magpie-community/plugins/commit/a810ee7e882012ab106e2deb742176cd43db781a) | 0.1.6 把那段说明**删掉**，改为发 OpenCode 1.19.0 原样的请求头——距加上去 11 小时 |
 | 2026-10-14 17:59 | [`5fc0a75`](https://github.com/magpie-community/plugins/commit/5fc0a75292f0e5c0c10cf65a188bff5545d6b8e9) | 0.1.7：`free models answer again` |
 
-上游的后续更新会按需合并，同时保留自己的取舍（比如工具措辞按代从真实 OpenCode 采集，而不是钉死某一个版本）
+上游的后续更新会按需合并，同时保留自己的取舍（比如系统提示词与完整工具集合按代从真实 OpenCode 采集，而不是钉死某一个版本）
 
 ## 安装与登录
 
@@ -53,7 +53,8 @@ magpie plugin login opencode-zen-free
 
 请求发往 `https://opencode.ai/inference/v1`，按每个模型的原生协议走（Chat Completions / Responses / Anthropic Messages），流式与普通 JSON 都支持。
 
-- **只借 OpenCode 的外壳**：请求头、User-Agent 与工具集合按同一代 OpenCode 配套，宿主缺的 `required` 工具会补发描述（背后没有实现）。请求头是刻意挑出的最小集合——**不要自行添加**，两个各自无害的头组合起来也会被拒。
+- **只借 OpenCode 的外壳**：请求头、User-Agent、系统提示词与完整工具集合按同一代 OpenCode 配套。官方提示词放在宿主自己的系统指令之前；正文里已经带着它就不再动，重复整形不会注入两遍。请求头是刻意挑出的最小集合——**不要自行添加**，两个各自无害的头组合起来也会被拒。
+- **宿主的工具照常运行**：每个工具保留自己的措辞与参数，但以 `clint_` 前缀的名字上路，不会与随后附上的官方工具集合相撞。请求里对它的每一处引用一并改名，回复里的名字再翻译回宿主声明的原名；宿主不会见到自己没声明的名字。OpenCode 自家的工具以采集到的完整形态发送。
 - **工具名对不上就原样交给宿主**：先精确匹配，再忽略大小写，最后忽略 `_`/`-`/`.`/空白，只取唯一结果；对不上或有歧义时不猜、不丢，由宿主回自己的「没有这个工具」，模型据此改名重试。只有没有名字的调用会被略去，并在正文说明。
 - **会话保持稳定**：宿主给了 OpenCode 形状的会话 id 就原样传，否则从宿主的会话标识派生并记住，同一会话各轮共用一个 id。
 - **截断与错误如实报告**：流提前结束时，Chat 流若有内容且无未完成调用，按截断回答收尾并注明；其余情况一律失败。错误正文只读一小段找 Zen 自陈的上限，其余替换为说明。
@@ -69,7 +70,7 @@ magpie plugin login opencode-zen-free
 
 ## 免费层不再应答时
 
-插件给出的 403 会写明措辞采集自哪个 OpenCode 版本，先从它查起。下面三条都**只在仓库副本里**可跑（`check:gate` 与 `capture` 不在发布包里），需要 Bun；`capture` 还需要 PATH 里有 `opencode`：
+插件给出的 403 会写明提示词与工具定义采集自哪个 OpenCode 版本，先从它查起。下面三条都**只在仓库副本里**可跑（`check:gate` 与 `capture` 不在发布包里），需要 Bun；`capture` 还需要 PATH 里有 `opencode`：
 
 ```sh
 bun run check:gate          # 问 Zen 还认哪代指纹；只要有一代 floor 被应答，退出码为 0
@@ -77,13 +78,13 @@ bun run capture -- --dry    # floor 全被拒时：取新采集并报告差异�
 bun run capture             # 确认差异后才写入
 ```
 
-`fingerprint.json` 缺失或损坏时，`capture` 会重写一份而不是拒绝。闸门并不稳定：结论只代表此刻，信之前再跑一遍；同一地址反复被拒后还可能进冷却期。逐代结论与失败判读见 [`MAINTAINING.md` 的 “The loop”](MAINTAINING.md#the-loop) 与 [“Reading a failure”](MAINTAINING.md#reading-a-failure)。
+`fingerprint.json` 缺失或损坏时，`capture` 会重写一份而不是拒绝。它不写提示词与完整工具集合：那两样在 `opencode-prompt-v1.txt` 与 `official-tools.json` 里，发版时随同一代 OpenCode 的采集一起更新（见 [`MAINTAINING.md`](MAINTAINING.md#the-loop)）。闸门并不稳定：结论只代表此刻，信之前再跑一遍；同一地址反复被拒后还可能进冷却期。逐代结论与失败判读见 [`MAINTAINING.md` 的 “The loop”](MAINTAINING.md#the-loop) 与 [“Reading a failure”](MAINTAINING.md#reading-a-failure)。
 
 ## 排查
 
 | 现象 | 处理 |
 | --- | --- |
-| 每个请求都是 `403 FreeTierError`，正文没有 IP 封禁文案 | 指纹措辞过期。在仓库副本里跑 `bun run check:gate`；全被拒时跑 `bun run capture` |
+| 每个请求都是 `403 FreeTierError`，正文没有 IP 封禁文案 | 采集的 OpenCode 形态过期。升级插件；在仓库副本里跑 `bun run check:gate`，全被拒时重新采集指纹，并从同一发行版刷新提示词与工具资产 |
 | `403` 正文是封禁文案（`abuse of traffic`，或 `free models aren't available … from your current network`） | 免费层封的是当前出口 IP。换网络、换 VPN 出口，或等封禁解除；重试与改请求都无用 |
 | `426 Upgrade Required` | 这个包自称的 OpenCode 版本比 Zen 要的旧。升级插件，或在更新的 OpenCode 里运行 |
 | `404 … not available as an OpenCode Zen free model now` | 该模型已不再免费。从报错列出的模型里换一个 |

@@ -188,16 +188,25 @@ function declaredNames(policy) {
 // call). Only a call with no name answers null, and is left out.
 function nameGuard(policy) {
   const declared = declaredNames(policy);
+  // A shaped request renames every client tool under the clint_ prefix. The
+  // reply names the wire spelling, so the restore runs before either match: the
+  // host declared `read`, not `clint_read`, and handing it the latter is a tool
+  // it does not have. A policy without renames (an unshaped path) restores
+  // nothing.
+  const renames = policy?.renames;
+  const restore =
+    typeof renames?.restore === "function" ? (name) => renames.restore(name) : (name) => name;
   const lower = (name) => name.toLowerCase();
   const bare = (name) => name.toLowerCase().replace(separators, "");
   const byCase = foldsTo(declared, lower);
   const byShape = foldsTo(declared, bare);
   return (name) => {
     if (typeof name !== "string" || !name) return null;
-    if (declared.has(name)) return name;
+    const client = restore(name);
+    if (declared.has(client)) return client;
     const match =
-      byCase.get(lower(name)) ?? (byCase.has(lower(name)) ? null : byShape.get(bare(name)));
-    return match || name;
+      byCase.get(lower(client)) ?? (byCase.has(lower(client)) ? null : byShape.get(bare(client)));
+    return match || client;
   };
 }
 

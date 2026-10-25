@@ -18,8 +18,12 @@ const ID_SHAPE = new RegExp(`^[a-z]{${PREFIX.length}}${LAYOUT}`);
 const SHAPE = new RegExp(`^${PREFIX}${LAYOUT}`);
 const FIELD_MASK = 0xffffffffffffn; // the 48 bits that hex field carries
 const COUNTER_MOD = 0x1000n; // its low 12 bits are the counter
-// realSessionID calls a counter below this one of OpenCode's.
-const COUNTER_LIMIT = 16;
+// opencodeID wraps its counter at this one, so every id it mints carries a
+// counter from 1 through 15. realSessionID accepts a wider range — the live
+// endpoint was found to accept 1 through 63 on 2026-10-25 — but the ids this
+// module makes itself stay inside the narrower range.
+const MINT_LIMIT = 16;
+const ACCEPT_LIMIT = 64;
 const WRAP = 2 ** 36; // the 36 bits of Date.now() the field keeps
 
 // Decode an id the way OpenCode's identifier.ts lays it out. One of another
@@ -44,7 +48,7 @@ test("a made-up session id is OpenCode's: descending, the time it was made, a sm
   assert.ok(elapsed <= after - before, `${time} not in ${before}..${after}`);
   // Whatever the counter was, it has to be one realSessionID reads as a
   // counter rather than as part of the time: the id is the shape Zen checks.
-  assert.ok(counter > 0 && counter < COUNTER_LIMIT, `counter ${counter}`);
+  assert.ok(counter > 0 && counter < MINT_LIMIT, `counter ${counter}`);
 });
 
 test("one conversation keeps one session, another gets its own", () => {
@@ -105,20 +109,46 @@ test("a burst that fills the counter field still makes OpenCode's ids", () => {
   const now = 1_790_000_000_001;
   const ids = Array.from({ length: 40 }, () => opencodeID("ses", true, now));
   const counters = ids.map((id) => decode(id, true).counter);
-  // Forty ids is past the sixteen the counter's own range holds, so the burst
+  // Forty ids is past the fifteen the counter's own range holds, so the burst
   // wraps it, and what this holds is that every id of the wrap stays inside that
-  // range. COUNTER_LIMIT is the range: realSessionID reads a counter at or above
-  // it as one OpenCode could not have made, and opencodeID's own wrap keeps the
-  // counter below it. COUNTER_MOD is the width of the whole hex field instead,
+  // range. MINT_LIMIT is the range opencodeID keeps; realSessionID accepts the
+  // wider 1-63 the endpoint was measured to take, and would not catch a wrap
+  // that broke at 16. COUNTER_MOD is the width of the whole hex field instead,
   // and a counter read back below it is true by construction — a burst that
   // broke the wrap would carry into the time the id claims and still pass that
   // boundary, which is why this one is asserted here.
   for (const [at, counter] of counters.entries()) {
-    assert.ok(counter > 0 && counter < COUNTER_LIMIT, `id ${at} has counter ${counter}`);
+    assert.ok(counter > 0 && counter < MINT_LIMIT, `id ${at} has counter ${counter}`);
     assert.ok(realSessionID(ids[at]), `id ${at} is not one OpenCode could have made`);
   }
   // Counting still happens: consecutive ids inside one millisecond differ.
   assert.notEqual(counters[0], counters[1]);
+});
+
+// The live endpoint was measured on 2026-10-25: a correctly-shaped `ses_` id
+// whose counter (the low 12 bits, inverted) is 1 through 63 answers, and one
+// with 0 or 64 is refused with the same 403 FreeTierError as a hash. The gate
+// therefore reads the counter, not only the shape.
+//
+// The time field is deliberately left as zeros here: it is a truncation of
+// Date.now() and every genuine id decodes to 1970 unless the reader
+// reconstructs a cycle, so a plausibility check on it would reject OpenCode's
+// own sessions. What this package mints carries the current time (opencodeID),
+// which is the half that matters on this side.
+test("the session counter is accepted through 63 and rejected at 64", () => {
+  const shaped = (counter) =>
+    `ses_000000000${(0xfff - counter).toString(16).padStart(3, "0")}${"A".repeat(TAIL_CHARS)}`;
+  for (const counter of [1, 15, 16, 63]) {
+    const id = shaped(counter);
+    assert.ok(realSessionID(id), `counter ${counter} is one the endpoint accepts: ${id}`);
+  }
+  for (const counter of [0, 64, 65, 0xfff]) {
+    const id = shaped(counter);
+    assert.equal(realSessionID(id), false, `counter ${counter} is not: ${id}`);
+  }
+  assert.equal(realSessionID(shaped(1).replace("ses_", "msg_")), false, "the prefix still has to be ses_");
+  assert.equal(realSessionID(shaped(1).slice(0, -1)), false, "the tail still has to be fourteen characters");
+  assert.ok(realSessionID(shaped(1)), "the acceptance check is not rejecting the shape itself");
 });
 
 // A signal the host sends outranks an empty opening. `""` is falsy, so a

@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { PROFILES, agentFor, generationOf } from "./core-tools.mjs";
+import { OFFICIAL_SETS, officialToolNames } from "./official-tools.mjs";
+import { OPENCODE_PROMPT_MARKER } from "./official-prompt.mjs";
 import { readDiscoveryCache, writeDiscoveryCache } from "./models.mjs";
 import { clearInstalledSnapshot, snapshotState } from "./limits.mjs";
 import { protocols, declaredTools, toolReply } from "./tool-fixtures.mjs";
@@ -297,8 +299,17 @@ test("a round of discovery is counted only where every URL of it was read", () =
 // apart from each other. `host` is only excluded where the request is held
 // against the gate's own copy of the headers, which does not carry one; the test
 // that pins the set by name sends the same list and includes `host` deliberately.
-const HTTP_STACK = ["host", "connection", "content-length", "accept-encoding"];
-const HTTP_STACK_WITHOUT_HOST = ["connection", "content-length", "accept-encoding"];
+const HTTP_STACK = [
+  "host",
+  "connection",
+  "content-length",
+  "accept-encoding",
+  // Node's fetch adds these two where Bun's does not. They are the transport's
+  // choice either way, so ignoring them here keeps the two runtimes comparable.
+  "accept-language",
+  "sec-fetch-mode",
+];
+const HTTP_STACK_WITHOUT_HOST = ["connection", "content-length", "accept-encoding", "accept-language", "sec-fetch-mode"];
 const chosenByPlugin = (sent, transport) =>
   Object.keys(sent).filter((name) => !transport.includes(name));
 
@@ -390,7 +401,7 @@ async function fixture(t, input = {}, serverOptions = {}) {
   const server = createServer(async (req, res) => {
     let text = "";
     for await (const chunk of req) text += chunk;
-    state.calls.push({ url: req.url, headers: req.headers, body: parseBody(text) });
+    state.calls.push({ url: req.url, headers: req.headers, body: parseBody(text), raw: text });
     state.requests += 1;
     if (state.discoveryHang) {
       // Counted before the wait, so a test can tell that a read has arrived
@@ -516,6 +527,11 @@ for (const { protocol, path, model } of protocols) {
           ["bash", "Bash"],
           ["read", "Read"],
           ["Bash", "Bash"],
+          // The request now names its client tools clint_<name> on the wire,
+          // so a reply naming the wire spelling is the likeliest one. It has
+          // to reach the host as the name the host declared.
+          ["clint_Bash", "Bash"],
+          ["clint_read", "Read"],
         ]) {
           state.reply = toolReply(protocol, upstream, upstreamSSE);
           const response = await send();
@@ -525,16 +541,22 @@ for (const { protocol, path, model } of protocols) {
           assert.doesNotMatch(text, /"name"\s*:\s*"(?:bash|read)"/);
         }
         const outbound = lastCall(state).body.tools;
-        assert.deepEqual(outbound.slice(0, tools.length), tools);
+        const renamed = tools.map((tool) => {
+          const name = tool.function?.name ?? tool.name;
+          if (protocol === "chat") {
+            return { ...tool, function: { ...tool.function, name: `clint_${name}` } };
+          }
+          return { ...tool, name: `clint_${name}` };
+        });
+        assert.deepEqual(outbound.slice(0, tools.length), renamed);
         for (const raw of outbound.slice(tools.length)) {
           const tool = protocol === "chat" ? raw.function : raw;
-          // Zen reads the body as well as the headers: a tool it knows the
-          // name of has to carry OpenCode's own description, so the gap is
-          // filled with that rather than with a refusal (#130).
-          const known = PROFILES["1.x"].tools[tool.name];
+          // Zen reads the body as well as the headers: the appended set is
+          // OpenCode's own definitions, not placeholders.
+          const known = OFFICIAL_SETS["1.x"].tools[tool.name];
           assert.ok(known, `${tool.name} is not one of the tools Zen reads`);
           assert.ok(
-            known.description.startsWith(tool.description.slice(0, 200)),
+            tool.description.startsWith(known.description.slice(0, 80)),
             `${tool.name} does not start as OpenCode describes it`,
           );
           assert.ok(Object.keys((tool.parameters ?? tool.input_schema).properties).length > 0);
@@ -724,7 +746,8 @@ for (const [generation, profile] of Object.entries(PROFILES)) {
     const sent = lastCall(state).headers;
     const wire = chosenByPlugin(sent, HTTP_STACK);
     const gate = requestFor(generation, profile, names).headers;
-    assert.deepEqual([...gate.keys()].sort(), wire.sort());
+    const gateNames = [...gate.keys()].filter((name) => !HTTP_STACK.includes(name));
+    assert.deepEqual(gateNames.sort(), wire.sort());
     assert.equal(gate.get("user-agent"), sent["user-agent"]);
     // Parity is only parity if each side sent something: an empty header set on
     // one side would otherwise compare equal to nothing at all on the other.
@@ -1747,12 +1770,110 @@ test("forces upstream streaming, preserves existing tools and returns the SSE bo
   assert.equal(sent.body.stream, true);
   assert.equal(sent.body.stream_options.include_usage, true);
   assert.deepEqual(sent.body.tools[0].function.parameters, bash.function.parameters);
-  // The wording sent is OpenCode's, whatever the host called its own bash.
-  assert.equal(sent.body.tools[0].function.description, PROFILES["1.x"].tools.bash.description);
+  // The host's tool keeps its own wording and parameters; only its name moves
+  // under the clint_ prefix so it cannot collide with the official set.
+  assert.equal(sent.body.tools[0].function.name, "clint_bash");
+  assert.equal(sent.body.tools[0].function.description, "real bash");
+  assert.deepEqual(sent.body.tools.map((tool) => tool.function.name), [
+    "clint_bash",
+    ...officialToolNames("1.x"),
+  ]);
+});
+
+// Zen's free tier reads the system prompt in the body as well as the headers
+// and tools. A host that is not OpenCode has no reason to carry OpenCode's
+// prompt, so the request path puts it in front of whatever the host wrote.
+// Each protocol keeps its system text in a different field, and the test reads
+// the one the protocol actually sends.
+test("a host's request carries the official prompt in its protocol's field", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  for (const { protocol, path, model } of protocols) {
+    const body = { model, stream: false };
+    if (protocol === "chat") body.messages = [{ role: "user", content: "hi" }];
+    if (protocol === "anthropic") {
+      body.messages = [{ role: "user", content: "hi" }];
+      body.max_tokens = 16;
+    }
+    if (protocol === "responses") body.input = "hi";
+    const response = await loader.fetch(`${origin}/v1/${path}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    await response.text();
+    const sent = lastCall(state).body;
+    const prompt =
+      protocol === "chat"
+        ? sent.messages[0].content
+        : protocol === "anthropic"
+          ? sent.system
+          : sent.instructions;
+    if (protocol === "chat") assert.equal(sent.messages[0].role, "system");
+    assert.equal(typeof prompt, "string", `${protocol} carries a prompt`);
+    assert.ok(prompt.startsWith(OPENCODE_PROMPT_MARKER), `${protocol} prompt starts as OpenCode's`);
+    // The environment block names the model this request is actually for, not
+    // a package default: the model that answers is the one the body names.
+    assert.match(prompt, new RegExp(`model named ${model}\\. The exact model ID is opencode/${model}`));
+    assert.match(prompt, /<available_skills>/);
+    assert.equal(
+      prompt.split(OPENCODE_PROMPT_MARKER).length - 1,
+      1,
+      `${protocol} prompt is there once`,
+    );
+    // The rest of the request is still the request that was made.
+    assert.equal(sent.model, model);
+    assert.equal(sent.stream, true);
+  }
+});
+
+test("the host's own system instructions follow the official prompt", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      messages: [
+        { role: "system", content: "Host rule." },
+        { role: "user", content: "hi" },
+        { role: "developer", content: "Second rule." },
+      ],
+    }),
+  });
+  await response.text();
+  const messages = lastCall(state).body.messages;
   assert.deepEqual(
-    sent.body.tools.map((tool) => tool.function.name),
-    ["bash", "glob", "grep", "read"],
+    messages.map((message) => message.role),
+    ["system", "user"],
+    "system and developer text fold into the one leading message",
   );
+  assert.ok(messages[0].content.startsWith(OPENCODE_PROMPT_MARKER));
+  assert.ok(messages[0].content.endsWith("\n\nHost rule.\nSecond rule."));
+  assert.equal(messages[1].content, "hi");
+});
+
+test("a body that already carries the official prompt is not shaped twice", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const own = `${OPENCODE_PROMPT_MARKER} and a host's own continuation`;
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "chat-free",
+      messages: [
+        { role: "system", content: own },
+        { role: "user", content: "hi" },
+      ],
+    }),
+  });
+  await response.text();
+  const messages = lastCall(state).body.messages;
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].content, own, "the host's prompt is left as it was sent");
+  assert.equal(messages[0].content.split(OPENCODE_PROMPT_MARKER).length - 1, 1);
 });
 
 test("collapses SSE for a non-streaming client and preserves upstream HTTP errors", async (t) => {
@@ -1836,7 +1957,7 @@ test("presents the generation the tools say, and a host that names its own", asy
   assert.equal(two.headers["user-agent"], agentOf("2.x"));
   assert.deepEqual(
     two.body.tools.map((t) => t.function.name),
-    ["shell", "read"],
+    ["clint_shell", "clint_read", ...officialToolNames("2.x")],
   );
 
   // A host that is OpenCode itself already says which it is; that is above
@@ -1860,7 +1981,7 @@ test("presents the generation the tools say, and a host that names its own", asy
   // OpenCode carries none of them by name, so the 1.x names go out.
   assert.deepEqual(
     lastCall(state).body.tools.map((tool) => tool.function.name),
-    ["bash", "glob", "grep", "read"],
+    officialToolNames("1.x"),
   );
 });
 
@@ -1885,11 +2006,15 @@ test("reads a tool's name out of either shape, so nothing is filled twice", asyn
     }),
   });
   const tools = lastCall(state).body.tools;
-  assert.equal(tools.length, 2, "the host's tools go out once each, not once each and again filled");
-  assert.deepEqual(
-    tools.map((tool) => tool.function.name),
-    ["shell", "read"],
+  const names = tools.map((tool) => tool.function?.name ?? tool.name);
+  // The two declarations supplied in the other shape are still declarations:
+  // they are renamed under clint_, not sent a second time by their client name.
+  assert.equal(
+    tools.length,
+    2 + officialToolNames("2.x").length,
+    "the host's tools go out once each, followed by the official set",
   );
+  assert.deepEqual(names, ["clint_shell", "clint_read", ...officialToolNames("2.x")]);
 });
 
 // A chat host may still declare its tools the legacy way, in the top-level
@@ -1902,7 +2027,7 @@ test("reads a tool's name out of either shape, so nothing is filled twice", asyn
 // only ever pushed into `tools`. And the legacy array is dropped, because a
 // declaration left in it is a tool sent twice — once with OpenCode's wording
 // and once with the host's.
-test("a tool declared through the legacy functions array is not filled in again", async (t) => {
+test("a tool declared through the legacy functions array is folded in and renamed once", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -1916,26 +2041,16 @@ test("a tool declared through the legacy functions array is not filled in again"
   });
   const sent = lastCall(state).body;
   const names = sent.tools.map((tool) => tool.function.name);
-  assert.deepEqual(
-    names.filter((name) => name === "bash"),
-    ["bash"],
-    "the legacy declaration is a declaration: it is not stood in for a second time",
-  );
-  // The names the host did not declare are still filled, as they are for any
-  // host that is not OpenCode — and the declaration the host did make comes
-  // first, in the place it was made.
-  assert.deepEqual(names, ["bash", "glob", "grep", "read"]);
-  // And the wording is Zen's wherever the tool was declared: the declaration
-  // went out in `tools`, wearing OpenCode's wording and keeping the host's own
-  // parameters, so the call the model makes still fits the tool that runs it.
-  assert.equal(
-    sent.tools[0].function.description,
-    PROFILES["1.x"].tools.bash.description,
-    "the legacy entry is reworded too",
-  );
+  // The legacy declaration is one declaration: it goes out under clint_bash
+  // once, and the official bash that follows it is a different tool.
+  assert.deepEqual(names, ["clint_bash", ...officialToolNames("1.x")]);
+  assert.equal(names.filter((name) => name === "bash").length, 1);
+  // The declaration keeps the host's own wording and parameters: it is the tool
+  // that will run, and only its wire name moved.
+  assert.equal(sent.tools[0].function.description, "the host's own");
   assert.deepEqual(sent.tools[0].function.parameters, { type: "object", properties: {} });
-  // The legacy array is gone: a declaration left in it is one Zen may not read,
-  // and one left in both arrays is a tool sent twice.
+  // The legacy array is gone: left in place it would be a second declaration
+  // Zen may not read.
   assert.equal(sent.functions, undefined, "the legacy array does not go out beside `tools`");
 });
 
@@ -1960,7 +2075,7 @@ test("a legacy declaration counts towards the generation the request is sent as"
   assert.equal(sent.headers["user-agent"], agentOf("2.x"), "the tools say 2.x, so the request is 2.x");
   assert.deepEqual(
     sent.body.tools.map((tool) => tool.function.name),
-    ["shell", "read"],
+    ["clint_shell", ...officialToolNames("2.x")],
     "the 1.x stand-in names are not added to a 2.x request",
   );
 });
@@ -1989,16 +2104,17 @@ test("a tool declared in both arrays goes out once", async (t) => {
   const sent = lastCall(state).body;
   assert.deepEqual(
     sent.tools.map((tool) => tool.function.name),
-    ["bash", "glob", "grep", "read"],
+    ["clint_bash", ...officialToolNames("1.x")],
     "the tool is sent once, not once per array it was declared in",
   );
   assert.equal(sent.functions, undefined);
-  assert.equal(sent.tools[0].function.description, PROFILES["1.x"].tools.bash.description);
+  assert.equal(sent.tools[0].function.description, "the host's own");
 });
-// A host that is not OpenCode describes its tools in its own words, and Zen
-// reads the wording of the tools it knows by name. The tool itself is the
-// host's, so that it still runs; the wording sent is OpenCode's.
-test("keeps the host's tools and sends OpenCode's wording for the names Zen reads", async (t) => {
+// A host that is not OpenCode describes its tools in its own names and words.
+// Those tools still run, so their parameters and wording are left alone; they
+// go out under clint_ names, and the complete official set is appended after
+// them so the request reads as an OpenCode session.
+test("renames the host's tools and appends the complete official set", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -2022,39 +2138,38 @@ test("keeps the host's tools and sends OpenCode's wording for the names Zen read
   assert.equal((await send()).status, 200);
   assert.deepEqual(
     lastCall(state).body.tools.map((tool) => tool.function.name),
-    ["bash", "glob", "grep", "read"],
+    officialToolNames("1.x"),
+    "a host with no tools gets the official set",
   );
 
   assert.equal((await send(own)).status, 200);
   const sent = lastCall(state).body.tools;
+  const renamed = sent.slice(0, own.length);
   assert.deepEqual(
-    sent.map((tool) => tool.function.name),
-    ["bash", "read", "glob", "grep", "write"],
-    "nothing is filled in, and nothing is sent twice",
+    renamed.map((tool) => tool.function.name),
+    own.map((tool) => `clint_${tool.function.name}`),
+    "the host's tools go out once each, under the client prefix",
   );
-  const spoken = PROFILES["1.x"].tools;
-  for (const tool of sent) {
-    const name = tool.function.name;
-    assert.equal(tool.function.description, spoken[name].description, `${name} wording`);
+  for (const [at, tool] of renamed.entries()) {
+    assert.equal(tool.function.description, own[at].function.description, "host wording is kept");
+    assert.deepEqual(tool.function.parameters, own[at].function.parameters, "host parameters are kept");
   }
-  // The tool that will run the call is still the host's, so its parameters are
-  // what the model has to fit.
-  assert.deepEqual(sent[0].function.parameters.properties, { cmd: { type: "string" } });
-  assert.deepEqual(sent[0].function.parameters.required, ["cmd"]);
-  // Nothing this package uses to decide what to send is ever sent: `required`
-  // marks which names Zen insists on and is not part of a tool.
-  for (const tool of sent) assert.equal(tool.function.required, undefined);
-  const added = (await (async () => {
-    await send();
-    return lastCall(state).body.tools;
-  })()).filter((tool) => !own.some((declared) => declared.function.name === tool.function.name));
-  for (const tool of added) assert.equal(tool.function.required, undefined);
+  const official = sent.slice(own.length);
+  assert.deepEqual(official.map((tool) => tool.function.name), officialToolNames("1.x"));
+  for (const tool of official) {
+    const expected = OFFICIAL_SETS["1.x"].tools[tool.function.name].description;
+    assert.ok(
+      tool.function.description.startsWith(expected.slice(0, 80)),
+      `${tool.function.name} carries the official definition`,
+    );
+    assert.ok(tool.function.parameters);
+  }
 });
 
 // A host may put a tool in the other protocol's shape. The name is read from
-// either, and so is the wording to replace; a tool whose wording went out
-// unchanged would be one Zen refuses.
-test("replaces the wording of a tool sent in the other shape", async (t) => {
+// either, so the declaration is renamed rather than left to collide with the
+// official name of the same tool.
+test("renames a tool sent in the other shape where its name sits", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -2067,17 +2182,21 @@ test("replaces the wording of a tool sent in the other shape", async (t) => {
       tools: [{ type: "function", name: "bash", description: "Run a command.", parameters: { type: "object", properties: { cmd: { type: "string" } } } }],
     }),
   });
-  const bash = lastCall(state).body.tools[0];
-  // Left in the shape it arrived in, with the wording replaced where the
-  // description sits in that shape.
+  const sent = lastCall(state).body.tools;
+  const bash = sent[0];
+  // Left in the shape it arrived in, with the name moved where that shape
+  // carries it so it cannot be read as the official bash.
   assert.equal(bash.function, undefined);
-  assert.equal(bash.description, PROFILES["1.x"].tools.bash.description);
+  assert.equal(bash.name, "clint_bash");
+  assert.equal(bash.description, "Run a command.");
   assert.deepEqual(bash.parameters.properties, { cmd: { type: "string" } });
+  assert.deepEqual(sent.map((tool) => tool.name ?? tool.function?.name), ["clint_bash", ...officialToolNames("1.x")]);
 });
 
-// A tool this plugin added has nothing behind it, so it is said to be one — but
-// only that tool, and only after the opening Zen reads.
-test("marks an added tool as a placeholder without touching the host's own", async (t) => {
+// The appended tools are the official definitions themselves, not placeholders:
+// the free tier reads their wording, and a note telling the model not to call
+// them was measured to stop it using its own tools too.
+test("appends the official definitions without placeholder wording", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -2088,25 +2207,170 @@ test("marks an added tool as a placeholder without touching the host's own", asy
     });
 
   await send();
-  for (const tool of lastCall(state).body.tools) {
-    const spoken = PROFILES["1.x"].tools[tool.function.name];
+  const sent = lastCall(state).body.tools;
+  assert.deepEqual(sent.map((tool) => tool.function.name), officialToolNames("1.x"));
+  for (const tool of sent) {
+    const expected = OFFICIAL_SETS["1.x"].tools[tool.function.name].description;
     assert.ok(
-      tool.function.description.startsWith(spoken.description),
-      `${tool.function.name} still opens as OpenCode words it`,
+      tool.function.description.startsWith(expected.slice(0, 80)),
+      `${tool.function.name} carries the official definition`,
     );
-    assert.match(tool.function.description, /placeholder/i);
-    assert.match(tool.function.description, /do not call it/i);
+    assert.doesNotMatch(tool.function.description, /placeholder|do not call it/i);
   }
 
-  // The host's own tool gets OpenCode's wording and nothing else: it is the one
-  // that runs, so nothing may tell the model to leave it.
+  // The host's own tool keeps its own wording; the official read beside it is
+  // the one that carries OpenCode's.
   const own = { type: "function", function: { name: "read", description: "Load a file.", parameters: { type: "object", properties: { path: { type: "string" } } } } };
   await send([own]);
-  const read = lastCall(state).body.tools.find((tool) => tool.function.name === "read");
-  assert.equal(read.function.description, PROFILES["1.x"].tools.read.description);
+  const tools = lastCall(state).body.tools;
+  const hostRead = tools.find((tool) => tool.function.name === "clint_read");
+  const officialRead = tools.find((tool) => tool.function.name === "read");
+  assert.equal(hostRead.function.description, "Load a file.");
+  assert.ok(officialRead.function.description.startsWith(OFFICIAL_SETS["1.x"].tools.read.description.slice(0, 80)));
 });
 
-test("a refusal names the wording to update rather than the headers", async (t) => {
+// The 2.1 Chat client sends a completion ceiling even when its user did not
+// ask for one. The value is the client's default, so an explicit limit in
+// either spelling still wins, and no other lane grows the field.
+test("a 2.x chat request carries the client's completion ceiling unless the caller set one", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const tool = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: `The host's ${name}.`,
+      parameters: { type: "object", properties: { command: { type: "string" } } },
+    },
+  });
+  const send = (tools, extra = {}) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "chat-free",
+        messages: [{ role: "user", content: "hi" }],
+        tools,
+        ...extra,
+      }),
+    });
+
+  await send([tool("shell")]);
+  let sent = lastCall(state).body;
+  assert.equal(sent.max_completion_tokens, 32000, "an omitted ceiling is filled");
+  assert.equal(sent.max_tokens, undefined, "the filled field is the one 2.x writes");
+
+  await send([tool("shell")], { max_tokens: 123 });
+  sent = lastCall(state).body;
+  assert.equal(sent.max_tokens, 123);
+  assert.equal(sent.max_completion_tokens, undefined, "an explicit max_tokens is not overridden");
+
+  await send([tool("shell")], { max_completion_tokens: 456 });
+  sent = lastCall(state).body;
+  assert.equal(sent.max_completion_tokens, 456);
+  assert.equal(sent.max_tokens, undefined);
+
+  // The 1.x lane writes neither field on its own.
+  await send([tool("bash")]);
+  sent = lastCall(state).body;
+  assert.equal(sent.max_completion_tokens, undefined);
+  assert.equal(sent.max_tokens, undefined);
+
+  // And the field belongs to Chat: a 2.x Responses request does not grow it.
+  await loader.fetch(`${origin}/v1/responses`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "responses-free",
+      input: "hi",
+      tools: [{ type: "function", name: "shell", description: "Run a command.", parameters: { type: "object" } }],
+    }),
+  });
+  assert.equal(lastCall(state).body.max_completion_tokens, undefined);
+});
+
+test("a 2.x chat request marks every tool strict:false, and 1.x marks none", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const tool = (name, strict) => {
+    const fn = {
+      name,
+      description: `The host's ${name}.`,
+      parameters: { type: "object", properties: {} },
+    };
+    if (strict !== undefined) fn.strict = strict;
+    return { type: "function", function: fn };
+  };
+  const send = (tools) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }], tools }),
+    });
+
+  await send([tool("shell", undefined), tool("read", true)]);
+  const two = lastCall(state).body.tools;
+  assert.equal(two[0].function.name, "clint_shell");
+  assert.equal(two[0].function.strict, false, "an omitted strict is filled");
+  assert.equal(two[1].function.name, "clint_read");
+  assert.equal(two[1].function.strict, true, "a stated strict is kept");
+  for (const entry of two.slice(2)) {
+    assert.equal(entry.function.strict, false, `${entry.function.name} carries strict:false`);
+  }
+
+  await send([tool("bash", undefined)]);
+  const one = lastCall(state).body.tools;
+  for (const entry of one) {
+    assert.equal(
+      Object.hasOwn(entry.function, "strict"),
+      false,
+      `${entry.function.name} does not grow a strict field`,
+    );
+  }
+});
+
+test("a 2.x chat body writes the client's key order", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  // The host's own order is deliberately unlike the client's: the shaping
+  // reorders the body it sends, not the body it received.
+  const body = JSON.stringify({
+    user: "conversation-a",
+    temperature: 0.2,
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "shell",
+          description: "Run a command.",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ],
+    stream: false,
+    messages: [{ role: "user", content: "hi" }],
+    model: "chat-free",
+  });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body,
+  });
+  await response.text();
+  const sent = lastCall(state);
+  assert.deepEqual(Object.keys(JSON.parse(sent.raw)), [
+    "model",
+    "messages",
+    "tools",
+    "stream",
+    "stream_options",
+    "max_completion_tokens",
+    "temperature",
+    "user",
+  ]);
+  assert.deepEqual(JSON.parse(sent.raw), sent.body);
+});
+
+test("a refusal names the prompt and tools to update rather than the headers", async (t) => {
   const { plugin, state, origin } = await fixture(t);
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
@@ -2122,8 +2386,8 @@ test("a refusal names the wording to update rather than the headers", async (t) 
   assert.equal(response.status, 403);
   const { error } = await response.json();
   assert.equal(error.type, "FreeTierError");
-  assert.match(error.message, /wording/i);
-  assert.match(error.message, /bash, glob, grep, read/);
+  assert.match(error.message, /prompt/i);
+  assert.match(error.message, /bash, edit, glob, grep, read, skill, task, todowrite, webfetch, websearch, write/);
   assert.match(error.message, new RegExp(PROFILES["1.x"].agent.opencode.replace(/\./g, "\\.")));
   // Zen's own wording, which sends people off to change headers, is replaced.
   assert.doesNotMatch(error.message, /can only be used from within OpenCode/);
@@ -2179,7 +2443,7 @@ test("a rewritten refusal carries headers for the body it actually returns", asy
   // And the body is the diagnostic, readable as JSON by a caller that trusted
   // the headers it was given.
   const { error } = await response.json();
-  assert.match(error.message, /wording/i);
+  assert.match(error.message, /prompt/i);
 });
 
 // A refusal whose body was not read to its end is not a refusal this package
@@ -2671,17 +2935,20 @@ test("one turn end to end: discover, ask, be refused, be told what to update", a
     assert.equal(response.headers.get(name), null, `${name} describes bytes that were replaced`);
   const { error } = await response.json();
   assert.equal(error.type, "FreeTierError");
-  assert.match(error.message, /wording/i);
+  assert.match(error.message, /prompt/i);
   assert.match(error.message, /this package's, for OpenCode \d/);
 
   // The request that was refused is still the request the plugin makes: the
-  // tools it sent are OpenCode's own wording for the names Zen reads, with the
-  // host's declarations kept alongside.
+  // host's tools go out under the client prefix, and the complete official set
+  // follows them.
   const sent = lastCall(state);
   assert.ok(sent.headers["user-agent"].startsWith("opencode/"), sent.headers["user-agent"]);
   assert.equal(sent.headers["x-opencode-session"], sent.headers["x-opencode-session-id"]);
   const names = sent.body.tools.map((tool) => tool.function.name);
-  assert.deepEqual(names, [...declaredTools("chat").map((tool) => tool.function.name), "bash", "glob", "grep", "read"]);
+  assert.deepEqual(names, [
+    ...declaredTools("chat").map((tool) => `clint_${tool.function.name}`),
+    ...officialToolNames("1.x"),
+  ]);
   assert.equal(new Set(names).size, names.length, "no name goes out twice");
   assert.equal(sent.body.stream, true, "upstream streaming is forced even for a client that does not stream");
 });
@@ -2695,14 +2962,16 @@ test("one turn end to end: discover, ask, be refused, be told what to update", a
 
 test("a served request and a refusal move what the model list declares", async (t) => {
   const { plugin, state, origin } = await fixture(t);
-  // A window small enough to fill with a test payload: 5000 tokens is about
-  // 23000 characters at the ratio the estimator uses.
+  // A window large enough for the official prompt and tool set plus a test
+  // payload: 40000 tokens is about 186000 characters at the ratio the
+  // estimator uses, and the shaped request carries roughly 10000 tokens of
+  // prompt and definitions before the first user word.
   state.ids = ["small-free"];
   state.catalogRows = {
-    "small-free": { name: "Small Free", cost: { input: 0, output: 0 }, limit: { context: 5000, output: 1024 } },
+    "small-free": { name: "Small Free", cost: { input: 0, output: 0 }, limit: { context: 40000, output: 1024 } },
   };
   const models = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
-  assert.equal(models["small-free"].limit.context, 5000, "the catalogue's own window, to begin with");
+  assert.equal(models["small-free"].limit.context, 40000, "the catalogue's own window, to begin with");
   const loader = await plugin.auth.loader(publicAuth);
   const send = (text) =>
     loader.fetch(`${origin}/v1/chat/completions`, {
@@ -2717,7 +2986,7 @@ test("a served request and a refusal move what the model list declares", async (
   // is the list the host was already given, and what this case is about is what
   // a rebuilt list says.
   const afterServe = await plugin.refresh();
-  assert.equal(afterServe["small-free"].limit.context, 5000, "a floor is not a reason to move a window");
+  assert.equal(afterServe["small-free"].limit.context, 40000, "a floor is not a reason to move a window");
   // ...and then the route refuses one that is over the wall. What the list
   // declares afterwards is the largest size the route is known to have served,
   // which is the only number a refusal leaves standing.
@@ -2730,7 +2999,7 @@ test("a served request and a refusal move what the model list declares", async (
       code: "context_length_exceeded",
     },
   });
-  const refused = await send("a".repeat(23250)); // about 4989 tokens of text, plus the tools
+  const refused = await send("a".repeat(200000)); // about 42918 tokens of text, plus the shaped body
   assert.equal(refused.status, 400, "the refusal is the route's, and it is handed on");
   await refused.text();
   const afterRefusal = await plugin.refresh();
@@ -2744,7 +3013,7 @@ test("a served request and a refusal move what the model list declares", async (
   const { limitBracket } = await import("./limits.mjs");
   const bracket = limitBracket("small-free");
   assert.ok(bracket.floor > 0, "the served request proved a floor");
-  assert.ok(bracket.floor < 5000, "and it is under the window the catalogue declared");
+  assert.ok(bracket.floor < 40000, "and it is under the window the catalogue declared");
   assert.equal(
     afterRefusal["small-free"].limit.context,
     bracket.floor,
@@ -2763,7 +3032,7 @@ test("a refusal that is not about the window leaves the window where it was", as
     "faulted-free": {
       name: "Faulted Free",
       cost: { input: 0, output: 0 },
-      limit: { context: 5000, output: 1024 },
+      limit: { context: 40000, output: 1024 },
     },
   };
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
@@ -2799,7 +3068,7 @@ test("a refusal that is not about the window leaves the window where it was", as
   for (const [status, body] of faults) {
     state.status = status;
     state.body = body;
-    const refused = await send("a".repeat(23250)); // about 4989 tokens of text, plus the tools
+    const refused = await send("a".repeat(200000)); // about 42918 tokens of text, plus the shaped body
     assert.equal(refused.status, status, "the answer is the route's, and it is handed on");
     await refused.text();
   }
@@ -2807,7 +3076,7 @@ test("a refusal that is not about the window leaves the window where it was", as
   assert.equal(bracket.refusals, 0, "none of the three was a refusal about the window");
   assert.equal(bracket.ceil, undefined, "so none of them put a bound under the declaration");
   const after = await plugin.refresh();
-  assert.equal(after["faulted-free"].limit.context, 5000, "and the window is the one it began with");
+  assert.equal(after["faulted-free"].limit.context, 40000, "and the window is the one it began with");
   // The completion ceiling the third answer named is still read, on its own axis.
   // It is a refusal and it is worth knowing; it is just not about the window, and
   // a declaration pulled down by it would be a window narrowed over a number that

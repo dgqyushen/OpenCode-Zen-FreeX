@@ -32,6 +32,8 @@ import {
 } from "./limits.mjs";
 import { collapseResponse, dropStaleHeaders } from "./stream.mjs";
 import { guardToolResponse } from "./tool-response.mjs";
+import { injectOfficialPrompt } from "./official-prompt.mjs";
+import { officialToolNames, renameAndCompleteTools } from "./official-tools.mjs";
 
 // Zen moved behind opencode.ai/inference; everything under /zen/ answers 403
 // FreeTierError now, however the request is made.
@@ -58,23 +60,17 @@ const SNAPSHOT_STATE = Symbol.for("magpie.limitsSnapshot");
 // Which generation to present when the host's tools name neither one: a floor,
 // and not a claim about what opencode-ai publishes as latest. What it publishes
 // as latest is 2.x, and `fingerprint.json` captures it — the profile whose
-// channel is `latest`, opencode 2.0.29 — so a comment saying this constant is
+// channel is `latest`, opencode 2.1.1 — so a comment saying this constant is
 // "the latest generation" would be the one thing here that is not true.
 //
 // It stays 1.x because a default is only reached when nothing identified the
 // host, and 1.x is the generation with more to say for it in that case: its
-// `required` set is the wider one, `normalizeTools` can stand in for every name
-// in it, and `bash`/`glob`/`grep`/`read` are the names a host that never sent
-// `shell` still carries. The floor is what a request falls back to, so it is
-// the generation a body is likeliest to already agree with — not the newest one
-// opencode-ai ships, which only a host that says so should be presented as.
+// `required` set is the wider one, and `bash`/`glob`/`grep`/`read` are the
+// names a host that never sent `shell` still carries. The floor is what a
+// request falls back to, so it is the generation a body is likeliest to already
+// agree with — not the newest one opencode-ai ships, which only a host that
+// says so should be presented as.
 const DEFAULT_GENERATION = "1.x";
-// Said only of a tool this plugin added, which the agent has no such tool for.
-// It has to be phrased as being about that one tool: a blanket "these tools are
-// not available" was measured to stop the model using the host's own tools too.
-const PLACEHOLDER =
-  "This one is a placeholder that satisfies OpenCode Zen's request and is not " +
-  "connected to anything: do not call it, and use the other tools you have.";
 
 // Zen answers a request only when the whole of it belongs to one generation of
 // OpenCode: its User-Agent, its headers and its tools have to agree. So the
@@ -370,69 +366,30 @@ function normalizeTools(body, protocol) {
     );
   }
   if (legacyChat) delete body.functions;
-  // Zen takes a request for one generation of OpenCode or the other, and the tools
-  // it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far less
-  // often than descriptions do, so this survives a rewording that a pinned
+  // Zen takes a request for one generation of OpenCode or the other, and the
+  // tools it carries say which: `shell` is 2.x, `bash` is 1.x. Names move far
+  // less often than descriptions do, so this survives a rewording that a pinned
   // User-Agent would not.
-  //
-  // Neither name being there is not the same as 1.x being there: the fallback
-  // is the floor described on DEFAULT_GENERATION, and it decides the names this
-  // loop then fills in as well as the User-Agent `agentForRequest` composes.
   //
   // The generation is read after the legacy declarations are folded in, because
   // the names a request carries are the names Zen reads and it does not care
-  // which array they arrived in: a host that declares `shell` the old way is
-  // the 2.x host it says it is, and reading the generation from `tools` alone
-  // answered the floor and the 1.x stand-in names for a 2.x request.
+  // which array they arrived in: a host that declares `shell` the old way is the
+  // 2.x host it says it is.
   const generation = generationOf(body.tools) ?? DEFAULT_GENERATION;
-  // Through `profileFor`, not `PROFILES[generation]`: a capture that holds one
-  // generation leaves the other key absent, and the direct read fails below on
-  // `profile.tools` with a TypeError that names nothing — the capture is what
-  // has to change, and it is the one thing that error does not say.
-  const profile = profileFor(generation);
-  const filled = [];
-  for (const [name, spoken] of Object.entries(profile.tools)) {
-    const index = at.get(name);
-    if (index !== undefined) {
-      // The host's own tool, kept whole so that it still runs and the reply's
-      // call still finds it. Only the wording is replaced: Zen reads the
-      // wording of a tool it knows by name, and a host that is not OpenCode
-      // describes its tools in its own words. The host's parameters are left
-      // as they are, since Zen does not read those and the call the model
-      // makes has to fit the tool that will run it.
-      setDescription(body.tools[index], spoken.description);
-      continue;
-    }
-    // The names in `required` are stood in for: a host that is not OpenCode has
-    // no tool by these names, and Zen reads a request as belonging to a
-    // generation partly by the tools it carries. `required` is deliberately
-    // wider than what Zen was measured to insist on — `read` alone was answered,
-    // and everything but `read` was refused, on 2026-10-15 — because a wider
-    // set is served, so the extra names cost a host that lacks them only the
-    // tokens of a tool it will not call, and they are the first thing a
-    // tightened check would otherwise find missing.
-    if (!profile.required.includes(name)) continue;
-    filled.push(name);
-    // A tool added here has nothing behind it: the agent has no such tool, so a
-    // call to it goes to the agent as called and comes back as the agent's own
-    // unknown-tool error, which the model corrects. Describing it as OpenCode
-    // describes it is what Zen asks for, and that description also makes the
-    // model want to call it, so the note goes after the opening Zen reads and
-    // before the closing it does not.
-    body.tools.push(shapeOf({ ...spoken, description: `${spoken.description}\n\n${PLACEHOLDER}` }, protocol));
-  }
-  return { declared, filled, generation };
+  // Which official names the host did not declare itself, before the client
+  // tools are renamed. Used only to explain a refusal; the full official set is
+  // appended either way.
+  const added = officialToolNames(generation).filter((name) => !declared.has(name));
+  // The host's tools keep their parameters and their meaning, but go out under
+  // clint_ names, and the complete official set follows them. Zen reads the
+  // request as an OpenCode session; the response path restores the names the
+  // host declared, so nothing downstream sees the wire names.
+  const renames = renameAndCompleteTools(body, protocol, generation);
+  return { declared, added, generation, renames };
 }
 
-// The description sits inside `function` on the chat shape and beside the name
-// on the other two, and which one a host used is its own business: it is
-// matched by where the name was found, so a tool sent in the other shape still
-// has its wording read and replaced.
-function setDescription(tool, description) {
-  if (tool?.function) tool.function.description = description;
-  else if (tool) tool.description = description;
-}
-
+// The description sits beside the name on each protocol's tool shape; only the
+// legacy `functions` conversion needs to write one into `tools`.
 function shapeOf(definition, protocol) {
   if (protocol === "chat") return { type: "function", function: definition };
   if (protocol === "anthropic") {
@@ -445,11 +402,78 @@ function shapeOf(definition, protocol) {
   return { type: "function", ...definition };
 }
 
+// A 2.x Chat body carries the client's own completion ceiling when the caller
+// did not ask for one. An explicit max_tokens or max_completion_tokens still
+// wins: the ceiling is the client's default, not this package's opinion.
+const V2_COMPLETION_LIMIT = 32000;
+
+function ensureCompletionLimit(body, protocol, generation) {
+  if (protocol !== "chat" || generation !== "2.x") return false;
+  if (Object.hasOwn(body, "max_completion_tokens")) return false;
+  if (Object.hasOwn(body, "max_tokens")) return false;
+  body.max_completion_tokens = V2_COMPLETION_LIMIT;
+  return true;
+}
+
+// The key order a 2.1 Chat client writes: model first, the completion ceiling
+// after the stream options, and any other field after that. JSON parsing does
+// not care, but the gate fingerprints the body as well as the headers, and Go's
+// encoder (unlike JSON.stringify) cannot keep insertion order for us.
+const V2_CHAT_ORDER = [
+  "model",
+  "messages",
+  "tools",
+  "stream",
+  "stream_options",
+  "max_completion_tokens",
+];
+
+function orderedChatBody(body) {
+  const ordered = {};
+  for (const key of V2_CHAT_ORDER) {
+    if (Object.hasOwn(body, key)) ordered[key] = body[key];
+  }
+  for (const key of Object.keys(body).sort()) {
+    if (!Object.hasOwn(ordered, key)) ordered[key] = body[key];
+  }
+  return ordered;
+}
+
+// The bytes that leave for one shaped request. Only the v2 Chat lane reorders
+// keys; every other lane keeps the body as JSON.stringify writes it, which is
+// already the client's own layout for object keys the host supplied.
+export function encodeBody(body, protocol, generation) {
+  if (protocol === "chat" && generation === "2.x") {
+    return JSON.stringify(orderedChatBody(body));
+  }
+  return JSON.stringify(body);
+}
+
+// The 2.1 client groups /inference routes by provider family: chat and
+// Responses go to /inference/openai/v1/..., Messages to
+// /inference/anthropic/v1/... A 2.0 client posted the flat path and that route
+// still answers, so this is fidelity rather than a fix. A custom base URL and
+// every other origin keep the flat route, because the grouping belongs to the
+// /inference gateway alone. The Messages route also carries the beta query the
+// 2.x client appends.
+export function upstreamEndpoint(baseURL, protocol) {
+  const path = PATHS[protocol];
+  if (!path) throw new Error(`Unknown protocol ${JSON.stringify(protocol)}`);
+  const url = new URL(baseURL);
+  const base = url.pathname.replace(/\/+$/, "");
+  if (!base.endsWith("/inference/v1")) return `${baseURL}${path}`;
+  const root = base.slice(0, -"/v1".length);
+  const family = protocol === "anthropic" ? "anthropic" : "openai";
+  const target = `${url.origin}${root}/${family}/v1${path}`;
+  return protocol === "anthropic" ? `${target}?beta=true` : target;
+}
+
 // Zen's own wording for a refusal says only that the request did not look like
 // OpenCode's, which sends people off to change headers. Everything the plugin
-// sends apart from the tool wording is what Zen expects — the endpoint, the
-// shape of the User-Agent, both session headers — so a refusal this far in is
-// about the wording, and this says so, and says which wording went out.
+// sends apart from the prompt and the tool definitions is what Zen expects —
+// the endpoint, the shape of the User-Agent, both session headers — so a
+// refusal this far in is about the body, and this says so, and says what went
+// out.
 //
 // The free tier's wording for a network it has blocked. This is a fact about
 // the egress IP, not about the request: the wording names traffic it considers
@@ -523,8 +547,9 @@ function explain(observed, source, toolPolicy) {
   // this message explains is about the generation that request was sent as, and
   // a capture that lost that profile has to say so rather than fail on `.tools`.
   const profile = profileFor(toolPolicy.generation);
-  const names = Object.keys(profile.tools).join(", ");
-  const { filled } = toolPolicy;
+  const names = officialToolNames(toolPolicy.generation).join(", ");
+  const renamed = toolPolicy.renames?.size ?? 0;
+  const added = toolPolicy.added ?? [];
   // 426 is not a refusal of the wording: it is this plugin presenting itself as
   // an OpenCode older than Zen accepts, which only a newer copy of it answers.
   const message =
@@ -532,11 +557,9 @@ function explain(observed, source, toolPolicy) {
       ? `OpenCode Zen answered 426 Upgrade Required: this plugin presents itself as OpenCode ${profile.agent.opencode} and Zen now wants a newer one. Update the plugin, or run inside a newer OpenCode.`
       : [
           "OpenCode Zen's free tier refused this request as not coming from OpenCode.",
-          `Zen reads the wording of ${names} from the request body, not only its headers, and wants OpenCode's own. The wording sent was this package's, for OpenCode ${profile.agent.opencode}.`,
-          filled.length
-            ? `The host declares none of ${filled.join(", ")}, so those were added from it.`
-            : `The host declared every one of them; only the wording was replaced, and its own parameters were kept so its tools still run.`,
-          "OpenCode rewords those tools between releases. Run `bun run check:gate` from a clone of this repository to see whether that copy is still current; if it is not, capture the wording again from a current OpenCode and update this package.",
+          `Zen reads the system prompt and the tool definitions from the request body, not only its headers, and wants OpenCode's own. The prompt sent was this package's, for OpenCode ${profile.agent.opencode}.`,
+          `The request carried ${renamed} client tool${renamed === 1 ? "" : "s"} under the clint_ prefix and appended the official set (${names})${added.length ? `, of which the host had not declared ${added.join(", ")}` : ", all of which the host had declared"}.`,
+          "OpenCode rewords its prompt and tools between releases. Run `bun run check:gate` from a clone of this repository to see whether that copy is still current; if it is not, capture them again from a current OpenCode and update this package.",
         ].join(" ");
   return new Response(
     JSON.stringify({
@@ -591,11 +614,27 @@ export function opencodeID(prefix, descending, now = Date.now()) {
   return `${prefix}_${value.toString(16).padStart(12, "0")}${tail}`;
 }
 
-// A session id OpenCode itself could have made: its counter (the low 12
-// bits, inverted) is small. A hash cut to the same shape isn't one.
+// A session id OpenCode itself could have made: its counter (the low 12 bits,
+// inverted) is in the range the free tier accepts. A hash cut to the same shape
+// is not one — its counter lands outside the range.
+//
+// The counter range is 1-63, not the 1-15 this used to read. Probing the live
+// endpoint on 2026-10-25 found counters 1-63 accepted and everything beyond
+// rejected with 403 FreeTierError even when the ses_ shape was right. This
+// package's own ids stay inside 1-15 (see opencodeID), so widening the read
+// only lets a genuine client id through; it does not make a malformed one pass.
+//
+// The 36-bit time field is not checked. It is a truncation of Date.now(), so
+// every genuine id decodes to 1970 unless the reader reconstructs a cycle; a
+// check that did not would reject OpenCode's own sessions. What matters on this
+// side is that an id this package mints carries the current time (opencodeID),
+// which it does — unlike a hash written straight into the field, the failure
+// upstream fixed on 2026-10-25.
 export function realSessionID(value) {
   const match = /^ses_[0-9a-f]{9}([0-9a-f]{3})[0-9A-Za-z]{14}$/.exec(value ?? "");
-  return !!match && 0xfff - Number.parseInt(match[1], 16) < 16;
+  if (!match) return false;
+  const counter = 0xfff - Number.parseInt(match[1], 16);
+  return counter >= 1 && counter <= 63;
 }
 
 // One made-up session per conversation, so its turns keep one session.
@@ -1309,18 +1348,24 @@ async function server(_input, options = {}) {
             const toolPolicy = normalizeTools(body, protocol);
             if (protocol === "chat")
               body.stream_options = { ...body.stream_options, include_usage: true };
-            // What this request is about to cost the window, read from its own
-            // text before it is sent: the only size limits.mjs has for a refusal
-            // that names nothing, and the floor it learns a served prompt from.
-            // Measured here rather than after the call because the body is what
-            // was sent, and a stream that is rewritten on the way back is not.
-            const size = requestSize(body);
             // Adding a header here is the easiest way to break this plugin: Zen
             // takes a request for one generation of OpenCode or the other, and a
             // header belonging to neither is as good as saying so. The names are
             // outboundHeaders', which is also what the gate asks Zen with.
             const given = request.headers;
+            // The session is keyed before the official prompt is injected: the
+            // prompt carries today's date, and a conversation seed that included
+            // it would answer a new Zen session every UTC day for a host that
+            // sends no session id of its own.
             const session = sessionID(given, body);
+            injectOfficialPrompt(body, protocol, toolPolicy.generation);
+            ensureCompletionLimit(body, protocol, toolPolicy.generation);
+            // What this request is about to cost the window, read from its own
+            // text before it is sent: the only size limits.mjs has for a refusal
+            // that names nothing, and the floor it learns a served prompt from.
+            // Measured after shaping, because the official prompt and the
+            // complete tool set are part of what the route receives.
+            const size = requestSize(body);
             const project = _input?.project;
             const headers = outboundHeaders({
               session,
@@ -1334,10 +1379,10 @@ async function server(_input, options = {}) {
                 given.get("x-opencode-project") ||
                 (project?.vcs === "git" && project.id ? project.id : "global"),
             });
-            const response = await fetch(request.url, {
+            const response = await fetch(upstreamEndpoint(baseURL, protocol), {
               method: "POST",
               headers,
-              body: JSON.stringify(body),
+              body: encodeBody(body, protocol, toolPolicy.generation),
               signal: request.signal,
               redirect: "error",
             });
