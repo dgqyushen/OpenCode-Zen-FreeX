@@ -667,13 +667,13 @@ for (const { protocol, path, model } of protocols) {
   }
 }
 
-for (const [input, supplied, expected] of [
-  [{}, undefined, "global"],
-  [{ project: { id: "magpie" } }, undefined, "global"],
-  [{ project: { id: "abc123", vcs: "git" } }, undefined, "abc123"],
-  [{}, "client-project", "client-project"],
+for (const [input, supplied, expected, label] of [
+  [{}, undefined, /^[0-9a-f]{40}$/, "its own fresh hash"],
+  [{ project: { id: "magpie" } }, undefined, /^[0-9a-f]{40}$/, "its own fresh hash"],
+  [{ project: { id: "abc123", vcs: "git" } }, undefined, "abc123", "abc123"],
+  [{}, "client-project", "client-project", "client-project"],
 ]) {
-  test(`uses OpenCode project identity ${expected}`, async (t) => {
+  test(`uses OpenCode project identity ${label}`, async (t) => {
     const { plugin, state, origin } = await fixture(t, input);
     await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
     const loader = await plugin.auth.loader(publicAuth);
@@ -683,7 +683,24 @@ for (const [input, supplied, expected] of [
       body: JSON.stringify({ model: "chat-free", stream: true }),
     });
     await response.text();
-    assert.equal(lastCall(state).headers["x-opencode-project"], expected);
+    if (expected instanceof RegExp) {
+      // The tier's quota is ledged per project id and egress together
+      // (measured 2026-10-26), and the old default `global` was shared by
+      // every freeriding plugin user — its buckets on popular exits arrived
+      // pre-burned. A host that names no project gets a git-hash-shaped id of
+      // its own per request, so its ledger is nobody else's.
+      const first = lastCall(state).headers["x-opencode-project"];
+      assert.match(first, expected);
+      const again = await loader.fetch(`${origin}/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: "chat-free", stream: true }),
+      });
+      await again.text();
+      assert.match(lastCall(state).headers["x-opencode-project"], expected);
+      assert.notEqual(lastCall(state).headers["x-opencode-project"], first, "two requests are two project ids");
+    } else {
+      assert.equal(lastCall(state).headers["x-opencode-project"], expected);
+    }
     assert.equal(lastCall(state).headers["user-agent"], agentOf("2.x"));
   });
 }

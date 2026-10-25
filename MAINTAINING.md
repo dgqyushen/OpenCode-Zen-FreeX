@@ -1030,6 +1030,22 @@ outright. The note is built in `toolAvailabilityNote` and pinned in
 `official-prompt.test.mjs`; it says nothing about generations or gates, only
 what a model in this session needs to choose its first call.
 
+**Sharing a project id with the rest of the internet.** The tier ledgers its
+free quota per project id and egress together, not per egress alone: on
+2026-10-26, from an exit that answered 429 to the genuine CLI under one
+project id, the same CLI under a brand-new project id answered 200 — and a
+random 40-hex id in the plugin's own shape answered 200 from a spent exit
+twice. The old default, `global`, is the id every freeriding plugin user's
+traffic carries, so its buckets on popular exits arrive pre-burned: that is
+how a freshly rotated exit answered 429 twenty-one seconds after its first
+use (2026-10-25, Miami). A host that names its project — by header or with a
+git one magpie hands over — keeps its own name; a host that does not gets a
+git-hash-shaped id of its own per request (`randomProjectID` in
+`provider.mjs`), a ledger no other traffic shares wherever the request lands.
+The gate probes the same way (`tools-smoke.mjs`), or it would report a
+wording refusal where the truth is a spent `global` bucket. Nothing is known
+to read the id beyond its shape.
+
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
 whose every call was dropped ended as a plain `stop`. An autonomous host reads

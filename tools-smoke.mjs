@@ -55,7 +55,7 @@ import { fileURLToPath } from "node:url";
 import { baseFrom } from "./base-url.mjs";
 import { PROFILES, agentFor } from "./core-tools.mjs";
 import { readBoundedText } from "./limits.mjs";
-import { opencodeID, outboundHeaders } from "./provider.mjs";
+import { opencodeID, outboundHeaders, randomProjectID } from "./provider.mjs";
 
 // How many characters of an error body are read. A refusal is short, and the
 // one thing this gate quotes is the sentence inside it, so the budget is the
@@ -152,7 +152,12 @@ export function chatRequest({ model, generation, profile, names, maxTokens = 40,
     headers: outboundHeaders({
       session: sessionID(),
       agent: agentFor(generation),
-      project: "global",
+      // A fresh project id per ask: the tier ledgers its free quota per project
+      // id and egress together (measured 2026-10-26), and the shared `global`
+      // bucket is burned by every freeriding plugin user on popular exits —
+      // a gate probing with it reports a wording refusal where the truth is a
+      // spent bucket.
+      project: randomProjectID(),
       protocol: "chat",
     }),
     body: {

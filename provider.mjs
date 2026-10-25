@@ -612,6 +612,17 @@ export function opencodeID(prefix, descending, now = Date.now()) {
   return `${prefix}_${value.toString(16).padStart(12, "0")}${tail}`;
 }
 
+// A project id in the shape the CLI sends — the working directory's git commit
+// hash, 40 hex. The tier's free quota is ledged per project id and egress
+// together (a fresh id on a spent exit answered, and a random id on a spent
+// exit answered, both measured 2026-10-26), and nothing is known to read the
+// id beyond its shape. So a host that does not name its project gets one of
+// its own per request: a ledger no other traffic shares, wherever the request
+// lands.
+export function randomProjectID() {
+  return [...randomBytes(20)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // A session id OpenCode itself could have made: its counter (the low 12 bits,
 // inverted) is in the range the free tier accepts. A hash cut to the same shape
 // is not one — its counter lands outside the range.
@@ -1394,7 +1405,16 @@ async function server(_input, options = {}) {
               given,
               project:
                 given.get("x-opencode-project") ||
-                (project?.vcs === "git" && project.id ? project.id : "global"),
+                // The tier's quota is ledged per project id and egress
+                // together: a fresh id on a spent exit answers, and a spent id
+                // on a fresh exit answers (both measured 2026-10-26). The old
+                // default `global` is shared by every freeriding plugin user
+                // on the planet, so its buckets on popular exits arrive
+                // pre-burned — a rotated-to exit once answered 429 twenty-one
+                // seconds after its first use. A host that names its project
+                // keeps its own name; one that does not gets an id of its
+                // own for the request, in the git-hash shape the CLI sends.
+                (project?.vcs === "git" && project.id ? project.id : randomProjectID()),
             });
             const response = await fetch(upstreamEndpoint(baseURL, protocol), {
               method: "POST",
