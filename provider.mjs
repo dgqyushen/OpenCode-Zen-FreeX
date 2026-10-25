@@ -713,7 +713,26 @@ function conversationSeed(body) {
   return JSON.stringify({ system, first });
 }
 
-export function sessionID(headers, body) {
+// A request leaves as its own session: the id is minted fresh on every call,
+// whatever the host sent to name the conversation. The tier keeps what it
+// thinks of traffic against the session — the burn a conversation leaves is
+// charged where the tier files it, and a session that has been refused once is
+// a session the next request answers for. A fresh id per request borrows
+// OpenCode's shape without the ledger: every request arrives as a session the
+// tier has never seen. The timestamp the id embeds is the current time, which
+// is always inside the window the tier accepts — an id dated far from now is
+// answered with the 429 a genuinely exhausted quota returns (measured by
+// opencode2api on 2026-10-25: hash-derived timestamps landed in 1970 and made
+// healthy egresses look blocked, its 9533101).
+//
+// `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` hands the conversation back to the
+// ladder below: one session per conversation, kept across turns, for a host
+// that wants the affinity a stable session carries. The knob is read per call,
+// so the host honours it from its next request without a reload.
+export function sessionID(headers, body, options = {}) {
+  if (options.rotate ?? process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY !== "1") {
+    return opencodeID("ses", true);
+  }
   let signal;
   for (const name of [
     "x-opencode-session",

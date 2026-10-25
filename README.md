@@ -56,7 +56,7 @@ magpie plugin login opencode-zen-free
 - **只借 OpenCode 的外壳**：请求头、User-Agent、系统提示词与完整工具集合按同一代 OpenCode 配套。官方提示词放在宿主自己的系统指令之前；正文里已经带着它就不再动，重复整形不会注入两遍。提示词到环境块为止，不点名任何内建 skill——宿主没有 OpenCode 的内建 skill 可加载。请求头是刻意挑出的最小集合——**不要自行添加**，两个各自无害的头组合起来也会被拒。
 - **宿主的工具照常运行**：每个工具保留自己的措辞与参数，但以 `clint_` 前缀的名字上路，不会与随后附上的官方工具集合相撞。请求里对它的每一处引用一并改名，回复里的名字再翻译回宿主声明的原名；宿主不会见到自己没声明的名字。OpenCode 自家的工具以采集到的完整形态发送。
 - **工具名对不上就原样交给宿主**：先精确匹配，再忽略大小写，最后忽略 `_`/`-`/`.`/空白，只取唯一结果；对不上或有歧义时不猜、不丢，由宿主回自己的「没有这个工具」，模型据此改名重试。只有没有名字的调用会被略去，并在正文说明。
-- **会话保持稳定**：宿主给了 OpenCode 形状的会话 id 就原样传，否则从宿主的会话标识派生并记住，同一会话各轮共用一个 id。
+- **每个请求自成会话**：每个请求都新铸一枚 OpenCode 形状的会话 id——时间戳取当前时刻，永远落在上游接受的窗口内。Zen 把它对流量的记忆记在会话上，新会话不带旧账。设 `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` 可回到按会话保持（宿主给的 OpenCode 形状 id 原样传，否则从宿主的会话标识派生并记住，同一会话各轮共用一个 id）。
 - **截断与错误如实报告**：流提前结束时，Chat 流若有内容且无未完成调用，按截断回答收尾并注明；其余情况一律失败。错误正文只读一小段找 Zen 自陈的上限，其余替换为说明。
 
 <details>
@@ -64,7 +64,7 @@ magpie plugin login opencode-zen-free
 
 **请求头**只有这些：`content-type`、`accept`、`user-agent`、`x-opencode-project`、`x-opencode-session` 与 `x-opencode-session-id`（同一个值）、`x-opencode-client: cli`、`authorization: Bearer public`；走 Messages 时改用 `x-api-key: public` 加 `anthropic-version`。`anthropic-beta` 插件自己从不设置，宿主发了才原样透传。
 
-**会话 id** 按顺序取：会话头 `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` / `x-session-id` / `session_id` / `conversation-id` / `conversation_id`，body 的 `conversation_id`，`metadata.session_id`，或 Claude Code 的 `metadata.user_id` 里的 `_session_<uuid>`。都没有时用 system/instructions 与首条用户消息做种子（system 变了就是另一个会话）；再没有才看 `previous_response_id`，仍然没有则每次新生成。空字符串一律不算名字。
+**会话 id**：默认每请求新铸一枚，下面这些信号一概不读。设了 `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` 时，按顺序取：会话头 `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` / `x-session-id` / `session_id` / `conversation-id` / `conversation_id`，body 的 `conversation_id`，`metadata.session_id`，或 Claude Code 的 `metadata.user_id` 里的 `_session_<uuid>`。都没有时用 system/instructions 与首条用户消息做种子（system 变了就是另一个会话）；再没有才看 `previous_response_id`，仍然没有则每次新生成。空字符串一律不算名字。
 
 </details>
 
@@ -104,6 +104,7 @@ bun run capture             # 确认差异后才写入
 | 变量 | 作用 |
 | --- | --- |
 | `OPENCODE_ZEN_FREE_DISCOVERY_CACHE` | 模型发现缓存路径；空字符串表示只在内存中 |
+| `OPENCODE_ZEN_FREE_SESSION_AFFINITY` | `1` 恢复按会话保持，不再每请求新铸会话 id |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` | 实测快照路径；空字符串表示不读快照 |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL` | 远程快照地址；空字符串关闭远程 |
 | `OPENCODE_ZEN_FREE_LIMITS_STATE` | 学习到的上限状态路径；空字符串表示只在内存中 |

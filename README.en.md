@@ -57,7 +57,7 @@ Requests go to `https://opencode.ai/inference/v1` in each model's native protoco
 - **Borrow only OpenCode's shell**: headers, User-Agent, the system prompt and the complete tool set are matched to one OpenCode generation. The official prompt goes in front of the host's own system instructions; a body that already carries it is left alone, so repeated shaping cannot duplicate it. The prompt ends at OpenCode's environment block — no built-in skill is advertised, because a host that is not OpenCode has none of them to load. The header set is deliberately minimal — **do not add your own**; two individually harmless headers can be refused together.
 - **The host's tools still run**: each one keeps its own wording and parameters but travels under a `clint_` name, so it cannot collide with the official set that follows it. Every tool reference in the request is renamed with it, and names in the reply are translated back; the host never sees a name it did not declare. OpenCode's own tools are sent in their complete, captured form.
 - **Unknown tool names go to the host as written**: match exactly first, then case-insensitively, then ignoring `_`/`-`/`.`/whitespace, and accept only a unique result; when nothing matches or the match is ambiguous, the call is neither guessed nor dropped — the model's name, id and arguments reach the host as written, which replies with its own "no such tool"; the model then renames the call and retries. Only calls with no name at all are omitted, and the body says so.
-- **Sessions stay stable**: an OpenCode-shaped session id from the host is passed through; otherwise one is derived from the host's session identifiers and remembered, so every turn of the same conversation shares an id.
+- **Every request is its own session**: a fresh OpenCode-shaped session id is minted per request — its timestamp is the current moment, always inside the window the tier accepts. Zen keeps its memory of traffic against the session, and a fresh session carries none of it. Set `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` to go back to one session per conversation (an OpenCode-shaped id from the host passed through; otherwise one derived from the host's session identifiers and remembered, so every turn shares an id).
 - **Truncation and errors are reported honestly**: if a stream ends early, a Chat stream with content and no unfinished tool call is completed as a normal answer marked truncated; anything else fails. The error body is read only far enough to find a limit Zen itself states; the rest is replaced with an explanation.
 
 <details>
@@ -65,7 +65,7 @@ Requests go to `https://opencode.ai/inference/v1` in each model's native protoco
 
 **Headers** are exactly: `content-type`, `accept`, `user-agent`, `x-opencode-project`, `x-opencode-session` and `x-opencode-session-id` (the same value), `x-opencode-client: cli`, `authorization: Bearer public`; Messages uses `x-api-key: public` plus `anthropic-version` instead. The plugin never sets `anthropic-beta` itself — it passes it through only when the host sends it.
 
-**Session id** is taken in order from the session headers `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` / `x-session-id` / `session_id` / `conversation-id` / `conversation_id`, then the body's `conversation_id`, `metadata.session_id`, or the `_session_<uuid>` inside Claude Code's `metadata.user_id`. If none of those exists, the system/instructions and the first user message form the seed (a changed system prompt is a different conversation); only after that is `previous_response_id` consulted, and failing that a new id is generated every time. An empty string is never a name.
+**Session id**: the default mints a fresh one per request and reads none of what follows. With `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1`, the conversation is named in order from the session headers `x-opencode-session` / `x-opencode-session-id` / `x-session-affinity` / `x-session-id` / `session_id` / `conversation-id` / `conversation_id`, then the body's `conversation_id`, `metadata.session_id`, or the `_session_<uuid>` inside Claude Code's `metadata.user_id`. If none of those exists, the system/instructions and the first user message form the seed (a changed system prompt is a different conversation); only after that is `previous_response_id` consulted, and failing that a new id is generated every time. An empty string is never a name.
 
 </details>
 
@@ -105,6 +105,7 @@ Common ones only; the full list and defaults are in [`.env.example`](https://git
 | Variable | Purpose |
 | --- | --- |
 | `OPENCODE_ZEN_FREE_DISCOVERY_CACHE` | Discovery cache path; an empty string keeps discovery in memory only |
+| `OPENCODE_ZEN_FREE_SESSION_AFFINITY` | `1` keeps one session per conversation instead of a fresh session every request |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` | Measured-snapshot path; an empty string disables reading a snapshot |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL` | Remote snapshot URL; an empty string disables the remote |
 | `OPENCODE_ZEN_FREE_LIMITS_STATE` | Path to the learned-limit state; an empty string keeps it in memory only |

@@ -2,6 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { opencodeID, realSessionID, sessionID } from "./provider.mjs";
 
+// This file pins the affinity ladder — how a conversation is named, and how one
+// name keeps one session across its turns. The package engages that ladder only
+// when OPENCODE_ZEN_FREE_SESSION_AFFINITY=1 is set: by default every request
+// leaves as its own fresh session (pinned in the rotation tests at the end of
+// this file). The knob is read per call, so setting it here turns every call
+// below affinity-on without touching them one by one.
+process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY = "1";
+
 // The layout provider.mjs encodes, from OpenCode's identifier.ts: a
 // 3-character prefix and "_", 12 hex of Date.now() * 0x1000 + counter, then
 // 14 random base62 characters. The tail of that layout is written once, in
@@ -608,4 +616,56 @@ test("an empty alias changes nothing about how a request is keyed", () => {
     official,
     "an official id in the body was hashed",
   );
+});
+
+test("the default is a fresh session on every request, whatever names the conversation", () => {
+  const before = Date.now();
+  const headers = new Headers({ "x-session-id": "conversation-one" });
+  const body = { messages: [{ role: "user", content: "hi" }] };
+  const first = sessionID(headers, body, { rotate: true });
+  const second = sessionID(headers, body, { rotate: true });
+  assert.notEqual(first, second, "two requests are two sessions");
+  const after = Date.now();
+  for (const id of [first, second]) {
+    assert.match(id, SHAPE);
+    const { time } = decode(id, true);
+    // The time field wraps every 2^36 ms, so the range check holds the
+    // elapsed offset, exactly as the minted-id test above does.
+    const elapsed = ((time - before) % WRAP + WRAP) % WRAP;
+    assert.ok(elapsed <= after - before, `${id} carries the time it was made`);
+  }
+  // A name the host sends — even an id OpenCode itself minted — does not hold
+  // the request to that session: rotation reads no signal, by design, so a
+  // conversation the tier has already judged cannot be landed back on it.
+  const official = opencodeID("ses", true);
+  assert.notEqual(
+    sessionID(new Headers({ "x-opencode-session": official }), body, { rotate: true }),
+    official,
+    "an official id does not survive rotation",
+  );
+});
+
+test("OPENCODE_ZEN_FREE_SESSION_AFFINITY=1 is what puts the ladder in charge", () => {
+  const saved = process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY;
+  try {
+    delete process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY;
+    const headers = new Headers({ "x-session-id": "conversation-one" });
+    const body = { messages: [{ role: "user", content: "hi" }] };
+    const first = sessionID(headers, body);
+    const second = sessionID(headers, body);
+    assert.notEqual(first, second, "with the knob unset, every request mints its own");
+    process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY = "1";
+    assert.equal(
+      sessionID(headers, body),
+      sessionID(headers, body),
+      "with the knob set, the conversation keeps one session again",
+    );
+    assert.ok(
+      realSessionID(sessionID(headers, body)),
+      "the kept id is still one OpenCode could have minted",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY;
+    else process.env.OPENCODE_ZEN_FREE_SESSION_AFFINITY = saved;
+  }
 });

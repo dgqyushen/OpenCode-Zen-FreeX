@@ -919,7 +919,18 @@ x-opencode-request with x-session-affinity is refused. A header cannot be judged
 by adding it on its own, so add it in `outboundHeaders` and let the pinned test
 and a live `check:gate` say what it did.
 
-**Reading the session name.** The name a conversation is keyed by comes from the
+**Reading the session name.** The default mints a fresh `ses_` id per request
+and reads none of what follows: the tier keeps what it thinks of traffic
+against the session, and a request that arrives as a session the tier has never
+seen carries none of it. The mint is `opencodeID`, whose timestamp is the
+current moment — the one constraint that matters, because the tier decodes the
+timestamp and answers an id dated far from now with the same 429 a genuinely
+exhausted quota returns (measured by opencode2api on 2026-10-25: hash-derived
+timestamps landed in 1970 and made healthy egresses look blocked, its 9533101;
+its own fix anchors to today minus at most 30 days to keep ids deterministic,
+which per-request rotation has no need of). Never write a hash into the time
+field. `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` puts the ladder below back in
+charge, and then the name a conversation is keyed by comes from the
 first signal that has one, in this order: the headers `x-opencode-session`,
 `x-opencode-session-id`, `x-session-affinity`, `x-session-id`, `session_id`,
 `conversation-id`, `conversation_id`; then the body's `conversation_id`,
