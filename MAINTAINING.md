@@ -1063,8 +1063,9 @@ carries the modules a host imports, `fingerprint.json`, `limits-observed.json`
 (which `limits.mjs` does read at run time), the prompt and tool-set captures
 (`opencode-prompt-v1.txt` and `official-tools.json`, which `official-prompt.mjs`
 and `official-tools.mjs` read at run time) and the four documents beside them
-(`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - eighteen files in all, the
-last being `package.json`, which npm packs whatever `files` says. The same list
+(`README.md`, `MAINTAINING.md`, `LICENSE`, `NOTICE`) - eighteen named in `files`,
+which with `package.json` and the English `README.en.md` (a README under any
+name is packed whatever `files` says) makes nineteen in the tarball. The same list
 is why `npm run` has nothing to run in an installed package: `check:gate`,
 `limits:audit`, `capture`, `limits:sweep` and `limits:watch` are entry points for
 a checkout, and the tools they name stay here - each of them now says in one
