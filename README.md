@@ -58,6 +58,7 @@ magpie plugin login opencode-zen-free
 - **工具名对不上就原样交给宿主**：先精确匹配，再忽略大小写，最后忽略 `_`/`-`/`.`/空白，只取唯一结果；对不上或有歧义时不猜、不丢，由宿主回自己的「没有这个工具」，模型据此改名重试。只有没有名字的调用会被略去，并在正文说明。
 - **每个请求自成会话**：每个请求都新铸一枚 OpenCode 形状的会话 id——时间戳取当前时刻，永远落在上游接受的窗口内。Zen 把它对流量的记忆记在会话上，新会话不带旧账。设 `OPENCODE_ZEN_FREE_SESSION_AFFINITY=1` 可回到按会话保持（宿主给的 OpenCode 形状 id 原样传，否则从宿主的会话标识派生并记住，同一会话各轮共用一个 id）。
 - **项目 id 也是自己的**：免费额度按「项目 id × 出口」记账——同一 id 换出口、或同一出口换 id，都是一本新账（2026-10-26 实测）。宿主给了项目 id 就用它的；没给则每请求随机生成一枚 git-hash 形状的专属 id——旧默认 `global` 是全世界蹭免费插件共享的桶，热门出口上早已被烧光。
+- **429 会换一本账再问一次**：既然额度按「项目 id × 出口」记账，被烧穿的桶就不是被烧穿的出口。宿主遇到 429 会结束整轮并报告额度耗尽，所以插件在把它交出去之前，换一枚没花过的项目 id 与会话 id、把同样的字节再发一次。默认重试 2 次，首次等 1.2 秒、逐次翻倍（`OPENCODE_ZEN_FREE_RETRY_429=0` 关闭，`OPENCODE_ZEN_FREE_RETRY_WAIT_MS` 调等待，两者都在下一个请求就生效）。只重试 429：403 是指纹或 IP、426 是版本、5xx 是端点故障，换 id 都救不了；正文点名出口滥用的 429 也不重试，因为没有哪个 id 能救一个被封的 IP。宿主自己命名的项目 id 每次都用它——那是宿主对自己的陈述，不该为了绕开限流而改写。重试用尽后交出去的，仍是 Zen 自己那条 429，原样未改。
 - **截断与错误如实报告**：流提前结束时，Chat 流若有内容且无未完成调用，按截断回答收尾并注明；其余情况一律失败。错误正文只读一小段找 Zen 自陈的上限，其余替换为说明。
 
 <details>
@@ -88,6 +89,7 @@ bun run capture             # 确认差异后才写入
 | 每个请求都是 `403 FreeTierError`，正文没有 IP 封禁文案 | 采集的 OpenCode 形态过期。升级插件；在仓库副本里跑 `bun run check:gate`，全被拒时重新采集指纹，并从同一发行版刷新提示词与工具资产 |
 | `403` 正文是封禁文案（`abuse of traffic`，或 `free models aren't available … from your current network`） | 免费层封的是当前出口 IP。换网络、换 VPN 出口，或等封禁解除；重试与改请求都无用 |
 | `426 Upgrade Required` | 这个包自称的 OpenCode 版本比 Zen 要的旧。升级插件，或在更新的 OpenCode 里运行 |
+| `429`，且宿主因此结束整轮、报「额度已用尽」 | 先确认重试没被关掉（`OPENCODE_ZEN_FREE_RETRY_429` 不能是 `0`）。插件已换新账本重试过仍被拒，说明这个出口上的额度确实用尽：换出口，或稍后再试。若正文是出口封禁文案，见上面 `403` 那行 — 被 IP 封时插件按设计不重试 |
 | `404 … not available as an OpenCode Zen free model now` | 该模型已不再免费。从报错列出的模型里换一个 |
 | `Model is not an available free model for this protocol` | 请求发出时列表变了。让宿主刷新模型列表再试 |
 | `uses the public credential` | 存的密钥不是 `public`。用 `public` 重新登录 |
@@ -106,6 +108,8 @@ bun run capture             # 确认差异后才写入
 | --- | --- |
 | `OPENCODE_ZEN_FREE_DISCOVERY_CACHE` | 模型发现缓存路径；空字符串表示只在内存中 |
 | `OPENCODE_ZEN_FREE_SESSION_AFFINITY` | `1` 恢复按会话保持，不再每请求新铸会话 id |
+| `OPENCODE_ZEN_FREE_RETRY_429` | 429 的重试次数，默认 `2`；`0` 关闭 |
+| `OPENCODE_ZEN_FREE_RETRY_WAIT_MS` | 首次重试前等待的毫秒数，默认 `1200`，逐次翻倍 |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT` | 实测快照路径；空字符串表示不读快照 |
 | `OPENCODE_ZEN_FREE_LIMITS_SNAPSHOT_URL` | 远程快照地址；空字符串关闭远程 |
 | `OPENCODE_ZEN_FREE_LIMITS_STATE` | 学习到的上限状态路径；空字符串表示只在内存中 |

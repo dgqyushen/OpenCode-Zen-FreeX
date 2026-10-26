@@ -368,6 +368,10 @@ async function fixture(t, input = {}, serverOptions = {}) {
   const state = {
     calls: [],
     status: 200,
+    // A queue of answers for inference requests, consumed one per attempt. A
+    // case that wants "429, then 200" writes it here; when the queue is empty
+    // the fixed `status` answers instead.
+    statuses: [],
     modelsStatus: 200,
     docsStatus: 200,
     catalogStatus: 200,
@@ -471,6 +475,25 @@ async function fixture(t, input = {}, serverOptions = {}) {
     } else if (state.hang) {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(": heartbeat\n\n");
+    } else if (state.statuses?.length) {
+      // A queue of answers for inference requests, one per attempt, so a case
+      // can say "429 and then 200" and prove a retry happened rather than
+      // inferring it from a count. An empty queue falls through to `status`,
+      // which is what a case whose first answer is also its last wants.
+      const next = state.statuses.shift();
+      if (next === 200) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          'data: {"id":"chat-1","model":"chat-free","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        );
+      } else {
+        res.writeHead(next, {
+          "content-type": "application/json",
+          "retry-after": "30",
+          ...upstreamHeaders(),
+        });
+        res.end('{"error":{"message":"limited","type":"rate_limit_error"}}');
+      }
     } else if (state.status !== 200) {
       res.writeHead(state.status, {
         "content-type": "application/json",
@@ -1941,6 +1964,106 @@ test("collapses SSE for a non-streaming client and preserves upstream HTTP error
   assert.equal(error.status, 429);
   assert.equal(error.headers.get("retry-after"), "30");
   assert.equal((await error.json()).error.message, "limited");
+});
+
+// The tier ledgers its free quota per project id and egress together, so a spent
+// bucket is not a spent exit: measured 2026-10-26, the same exit answered 429 to
+// one project id and 200 to a fresh random one, twice. A host ends the whole
+// turn on a 429 and calls the quota exhausted, so the plugin asks again with a
+// ledger nothing has spent before it hands that 429 on.
+test("a 429 is retried with a fresh project id, and the retry's answer is the turn", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  // The first answer is the rate limit; the second is the turn.
+  state.statuses = [429, 200];
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(response.status, 200, "the retry's answer is the one the caller gets");
+  assert.equal((await response.json()).choices[0].message.content, "hello");
+  const inference = state.calls.filter((call) => call.url === "/v1/chat/completions");
+  assert.equal(inference.length, 2, "the refused attempt and the retry, and no third");
+  const [first, second] = inference;
+  assert.notEqual(
+    first.headers["x-opencode-project"],
+    second.headers["x-opencode-project"],
+    "the retry asks under a project id the spent bucket does not cover",
+  );
+  assert.match(
+    second.headers["x-opencode-project"],
+    /^[0-9a-f]{40}$/,
+    "and that id is in the git-hash shape the CLI sends",
+  );
+  // The body is the same body: a retry is the same request under a new ledger,
+  // not a re-shaped one.
+  assert.equal(second.raw, first.raw, "the retry sends the bytes the first attempt sent");
+});
+
+// A host that names its own project keeps that name on every attempt. The name
+// is the host's statement about itself, and re-minting it to dodge a limit would
+// be this package answering a question the host was asked.
+test("a retry keeps a project id the host named itself", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.statuses = [429, 200];
+  await (
+    await loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "x-opencode-project": "host-named-project" },
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hello" }] }),
+    })
+  ).text();
+  const inference = state.calls.filter((call) => call.url === "/v1/chat/completions");
+  assert.equal(inference.length, 2);
+  for (const call of inference)
+    assert.equal(call.headers["x-opencode-project"], "host-named-project");
+});
+
+// A 429 whose body names abuse of the egress is a block, and no project id
+// answers a block. Retrying one would spend the caller's patience and the
+// route's budget to arrive at the same refusal.
+test("a 429 that names egress abuse is not retried", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 429;
+  state.body = JSON.stringify({
+    error: { message: "free models aren't available from your current network" },
+  });
+  const refused = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(refused.status, 429);
+  await refused.text();
+  const inference = state.calls.filter((call) => call.url === "/v1/chat/completions");
+  assert.equal(inference.length, 1, "a blocked exit is not asked again");
+});
+
+// The retry is opt-out, and the switch is read per request so an operator
+// reaches for it exactly when a quota problem happens.
+test("the 429 retry can be turned off", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  const held = process.env.OPENCODE_ZEN_FREE_RETRY_429;
+  process.env.OPENCODE_ZEN_FREE_RETRY_429 = "0";
+  t.after(() => {
+    if (held === undefined) delete process.env.OPENCODE_ZEN_FREE_RETRY_429;
+    else process.env.OPENCODE_ZEN_FREE_RETRY_429 = held;
+  });
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.status = 429;
+  const refused = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hello" }] }),
+  });
+  assert.equal(refused.status, 429, "with the retry off the 429 is handed on as before");
+  await refused.text();
+  const inference = state.calls.filter((call) => call.url === "/v1/chat/completions");
+  assert.equal(inference.length, 1);
 });
 
 // Zen accepts a request only when every part of it belongs to one generation of

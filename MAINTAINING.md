@@ -1046,6 +1046,34 @@ The gate probes the same way (`tools-smoke.mjs`), or it would report a
 wording refusal where the truth is a spent `global` bucket. Nothing is known
 to read the id beyond its shape.
 
+**Handing a 429 on when a new ledger would have answered.** The measurement
+above is the whole reason the retry exists: a spent bucket is not a spent exit,
+so the same request under a fresh project id can answer 200 where it just
+answered 429. A host does not recover from a 429 on its own — DeepSeek Harness
+ends the turn and reports the quota as exhausted — so the plugin spends a
+retry before it hands the refusal on. Each attempt mints a project id and a
+session id nothing has spent and sends the same bytes (`attempt` in
+`provider.mjs`); the wait starts at `RETRY_WAIT_DEFAULT_MS` and doubles, and
+the whole thing is off with `OPENCODE_ZEN_FREE_RETRY_429=0`.
+
+What it deliberately does not retry is as important as what it does. A 403 is
+about the fingerprint or the egress, a 426 about the version, and a 5xx is the
+endpoint failing — none of those is answered differently under a new project
+id, so retrying one buys nothing but a slower failure. A 429 whose body names
+abuse of the egress is not retried either: an id is not an IP, and the 403
+branch already documents why no local action helps a block. And the refusal
+that finally leaves is the route's own, untouched — a genuinely exhausted
+account must still read as one, or the retry would be hiding the one fact the
+user has to act on.
+
+Two things a maintainer should keep true if this is ever reworked. The retry
+must not re-shape the body: it is the same request under a new ledger, and
+re-running `normalizeTools` or the prompt injection a second time would send a
+body that differs from the one the first attempt sent. And a host that named
+its own project id keeps it — `x-opencode-project` and magpie's git id are
+statements the host made about itself, so only the id this package minted is
+re-minted (`namedProject`/`hostProject` in the same function).
+
 **Leaving out a call the agent has no tool for.** A call whose name folded onto
 no declared tool was dropped from the reply with a note in its text, and a reply
 whose every call was dropped ended as a plain `stop`. An autonomous host reads

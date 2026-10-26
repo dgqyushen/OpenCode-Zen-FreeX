@@ -492,6 +492,101 @@ function isIPAbuseRefusal(text) {
   );
 }
 
+// Detect whether a 429 is worth retrying. The tier's free quota is ledged per
+// project id and egress together, so a spent bucket is not a spent exit: on
+// 2026-10-26 the same exit answered 429 to one project id and 200 to a fresh
+// random id, twice (see `randomProjectID`). A retry is therefore a new ledger
+// for the same request, not the same request repeated — which is why this is
+// worth doing rather than handing the 429 on.
+//
+// Two things it is not. A 429 whose body names abuse of the egress is a block,
+// and no id fixes an IP; that is the 403 branch's case and it is left to it. And
+// nothing here is a promise: the 429 the caller finally receives is the route's
+// own answer, unchanged, so a genuinely exhausted account still reads as one.
+//
+// The body is not required to say anything. A count-based limit may answer with
+// a minimal body or none at all, and the status is what carries the meaning.
+function looksLikeTransientQuota(status, text) {
+  if (status !== 429) return false;
+  return !isIPAbuseRefusal(typeof text === "string" ? text : "");
+}
+
+// How a 429 is retried, when it is retried at all.
+//
+// The retry exists because of one measured fact: the free tier ledgers its quota
+// per project id and egress together, so a spent bucket is not a spent exit. On
+// 2026-10-26, from an exit that answered 429 to one project id, the same CLI
+// under a fresh id answered 200 — twice, with random ids in the plugin's own
+// shape (see `randomProjectID`). The request path already mints a project id per
+// request; a retry mints another, which is a ledger this exit has never spent.
+//
+// It is opt-out, not opt-in, because the failure it prevents is the one a host
+// cannot recover from on its own: DeepSeek Harness ends the whole turn on a 429
+// and reports the quota as exhausted, so a free tier that would have answered a
+// fresh bucket instead ends the turn. Two retries with a short, growing wait is
+// the smallest thing that turns that into an answer.
+//
+// `OPENCODE_ZEN_FREE_RETRY_429=0` turns it off, and the wait is bounded in both
+// directions so a misconfigured value cannot make a caller wait for minutes.
+const RETRY_429_ENV = "OPENCODE_ZEN_FREE_RETRY_429";
+const RETRY_WAIT_ENV = "OPENCODE_ZEN_FREE_RETRY_WAIT_MS";
+const RETRY_429_DEFAULT = 2;
+const RETRY_WAIT_DEFAULT_MS = 1200;
+const RETRY_WAIT_MIN_MS = 100;
+const RETRY_WAIT_MAX_MS = 5000;
+const RETRY_429_MAX = 5;
+
+// A whole number inside a range, or the fallback. The same rule limits.mjs
+// applies to its own settings, restated here because provider.mjs does not
+// import that module's private helpers and a second reading of "a number" is
+// not worth sharing one function for.
+function retrySetting(raw, { min, max, fallback }) {
+  if (typeof raw !== "string" || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+// How many times a 429 is retried. Read per call so an operator's change takes
+// effect on the next request rather than at the next restart — the host reloads
+// this module once, and a quota problem is exactly when someone reaches for the
+// variable.
+export function retry429Count(raw = globalThis.process?.env?.[RETRY_429_ENV]) {
+  // `0` is the documented off switch and is not a fallback: a value that parsed
+  // to zero means "do not retry", which is a decision, not a typo.
+  if (typeof raw === "string" && raw.trim() === "0") return 0;
+  return retrySetting(raw, { min: 1, max: RETRY_429_MAX, fallback: RETRY_429_DEFAULT });
+}
+
+// How long to wait before the first retry. Later attempts wait longer — one
+// wait, doubled per attempt — so a route that is counting rather than rate
+// limiting is not hammered by the retry that exists to avoid a dead turn.
+export function retryWaitMs(raw = globalThis.process?.env?.[RETRY_WAIT_ENV]) {
+  return retrySetting(raw, {
+    min: RETRY_WAIT_MIN_MS,
+    max: RETRY_WAIT_MAX_MS,
+    fallback: RETRY_WAIT_DEFAULT_MS,
+  });
+}
+
+// Wait, and stop waiting the moment the caller gives up. A retry is a delay the
+// caller never asked for, so it must not outlive the request: a host that
+// aborted gets its abort back rather than a wait it can no longer use. The timer
+// is cleared on both paths so a settled wait leaves nothing behind.
+function pause(ms, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, ms);
+    const stop = () => finish(signal.reason);
+    function finish(reason) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      if (reason === undefined) resolve();
+      else reject(reason);
+    }
+    signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+
 // The body arrives already read: on this path the refusal has to be read for
 // the window it may name before the message that replaces it is built (see
 // limits.mjs), and a response body can only be read once. So what the reader
@@ -1395,49 +1490,106 @@ async function server(_input, options = {}) {
             // complete tool set are part of what the route receives.
             const size = requestSize(body);
             const project = _input?.project;
-            const headers = outboundHeaders({
-              session,
-              // The generation the tools in this request say, which is the one
-              // normalizeTools has already decided: deciding it twice is how a
-              // User-Agent and a body come to describe different generations.
-              agent: agentForRequest(protocol, toolPolicy.generation, given),
-              protocol,
-              given,
-              project:
-                given.get("x-opencode-project") ||
-                // The tier's quota is ledged per project id and egress
-                // together: a fresh id on a spent exit answers, and a spent id
-                // on a fresh exit answers (both measured 2026-10-26). The old
-                // default `global` is shared by every freeriding plugin user
-                // on the planet, so its buckets on popular exits arrive
-                // pre-burned — a rotated-to exit once answered 429 twenty-one
-                // seconds after its first use. A host that names its project
-                // keeps its own name; one that does not gets an id of its
-                // own for the request, in the git-hash shape the CLI sends.
-                (project?.vcs === "git" && project.id ? project.id : randomProjectID()),
-            });
-            const response = await fetch(upstreamEndpoint(baseURL, protocol), {
-              method: "POST",
-              headers,
-              body: encodeBody(body, protocol, toolPolicy.generation),
-              signal: request.signal,
-              redirect: "error",
-            });
-            // A refusal is the one place this route states its own window, and
-            // it has to be read before explain() replaces the body. See
-            // limits.mjs: an under-declared window is never refused, it is just
-            // quietly never used.
+            // The headers of one attempt. A retry is a different attempt and not
+            // the same request repeated: the session and the project id are what
+            // the tier ledgers its quota against, so a retry that reused them
+            // would be asking the same spent bucket again. Both are minted here
+            // rather than above the loop for that reason.
             //
-            // A response body can only be read once, so what the limits reader
-            // took is handed on as the response the rest of the path works with
-            // (see `relayed`): never the upstream's own headers over bytes this
-            // package wrote again, and never a prefix presented as the whole
-            // reply. A response the reader did not consume is used as it arrived.
-            const observed = await observeRouteStatement(body.model, response, undefined, {
-              // The caller's own cancellation reaches this read as well: a host
-              // that has given up is not waiting for a number out of a refusal.
-              signal: request.signal,
-            });
+            // A host that named its own project keeps that name on every
+            // attempt: the name is the host's statement about itself, and
+            // overriding it to dodge a limit would be this package answering a
+            // question the host was asked. Only the id this package minted is
+            // re-minted.
+            const namedProject = given.get("x-opencode-project") || undefined;
+            const hostProject =
+              project?.vcs === "git" && project.id ? project.id : undefined;
+            // The first attempt reuses the session keyed above — under session
+            // affinity that id stands for the conversation and must not move —
+            // and every retry takes a fresh one. Outside affinity (`sessionID`
+            // already minted per request) a fresh id is what `opencodeID` gives,
+            // so the two branches agree and the first attempt is unchanged.
+            let attempts = 0;
+            const attemptHeaders = () =>
+              outboundHeaders({
+                // The tier files what it thinks of this traffic against the
+                // session, and a session that was refused once is a session the
+                // next request answers for. So a retry mints a new one; the
+                // first attempt keeps whatever `sessionID` decided.
+                session: attempts === 0 ? session : opencodeID("ses", true),
+                // The generation the tools in this request say, which is the one
+                // normalizeTools has already decided: deciding it twice is how a
+                // User-Agent and a body come to describe different generations.
+                agent: agentForRequest(protocol, toolPolicy.generation, given),
+                protocol,
+                given,
+                project:
+                  namedProject ||
+                  // The tier's quota is ledged per project id and egress
+                  // together: a fresh id on a spent exit answers, and a spent id
+                  // on a fresh exit answers (both measured 2026-10-26). The old
+                  // default `global` is shared by every freeriding plugin user
+                  // on the planet, so its buckets on popular exits arrive
+                  // pre-burned — a rotated-to exit once answered 429 twenty-one
+                  // seconds after its first use. A host that names its project
+                  // keeps its own name; one that does not gets an id of its
+                  // own for the request, in the git-hash shape the CLI sends.
+                  hostProject ||
+                  randomProjectID(),
+              });
+            // The bytes are the same on every attempt — the body was shaped once
+            // above — so they are encoded once here rather than per attempt.
+            const encoded = encodeBody(body, protocol, toolPolicy.generation);
+            // One attempt's answer, with the refusal body read once for the
+            // window it may name. The read happens here and not after the loop
+            // because a body can only be read once and the retry decision is
+            // made from what it said — the IP-abuse wording is what makes a 429
+            // not worth retrying.
+            const attempt = async () => {
+              attempts += 1;
+              const response = await fetch(upstreamEndpoint(baseURL, protocol), {
+                method: "POST",
+                headers: attemptHeaders(),
+                body: encoded,
+                signal: request.signal,
+                redirect: "error",
+              });
+              // A refusal is the one place this route states its own window, and
+              // it has to be read before explain() replaces the body. See
+              // limits.mjs: an under-declared window is never refused, it is just
+              // quietly never used.
+              //
+              // A response body can only be read once, so what the limits reader
+              // took is handed on as the response the rest of the path works with
+              // (see `relayed`): never the upstream's own headers over bytes this
+              // package wrote again, and never a prefix presented as the whole
+              // reply. A response the reader did not consume is used as it arrived.
+              const observed = await observeRouteStatement(body.model, response, undefined, {
+                // The caller's own cancellation reaches this read as well: a host
+                // that has given up is not waiting for a number out of a refusal.
+                signal: request.signal,
+              });
+              return { response, observed };
+            };
+            // A 429 is worth one more ask with a bucket nothing has spent. How
+            // many, and how long between, is the operator's (see
+            // `retry429Count`); the wait grows so a route that is counting
+            // rather than rate limiting is not hammered.
+            //
+            // Only a 429 is retried. A 403 is about the fingerprint or the IP, a
+            // 426 about the version, and a 5xx is the endpoint failing — none of
+            // those is answered differently by a fresh project id, and retrying
+            // one would only spend the caller's patience and the route's budget.
+            let { response, observed } = await attempt();
+            const retries = retry429Count();
+            let wait = retryWaitMs();
+            for (let tried = 0; tried < retries; tried += 1) {
+              if (!looksLikeTransientQuota(response.status, observed?.text)) break;
+              request.signal.throwIfAborted();
+              await pause(wait, request.signal);
+              wait = Math.min(wait * 2, RETRY_WAIT_MAX_MS);
+              ({ response, observed } = await attempt());
+            }
             // The other half of the same reading: what the route's answer says
             // about this model's wall, learned from a request the host was
             // making anyway. A refusal names a size the window is under; a
