@@ -1,0 +1,22 @@
+# Line endings, stated once.
+#
+# Without this file the working tree and the index disagreed about every text
+# file at once: the 38 tracked files were rewritten LF -> CRLF by an editor or a
+# checkout, `git status` reported all of them as modified, and `git diff` showed
+# 40963 insertions against 40963 deletions that `git diff --ignore-cr-at-eol`
+# reduced to zero lines. None of it was a change; all of it was noise, and it
+# made a real review impossible because a real edit was indistinguishable from
+# the churn around it.
+#
+# `text=auto` lets git decide what is text — it looks at the content, so a file
+# added later that is not text (an image, an archive) is left alone without
+# needing a rule of its own here — and `eol=lf` fixes the working-tree byte for
+# every one of them to LF, which is what the index and every commit already
+# hold. The repository is all text today: 50 tracked files, every one of them
+# UTF-8 or US-ASCII, no binary of any kind.
+#
+# LF and not `native`: this package is published from these exact bytes and its
+# tests compare captured request bodies and SSE frames against literals written
+# here, so a Windows checkout that materialised CRLF would be testing different
+# bytes than the ones that ship. One spelling everywhere is the cheaper promise.
+* text=auto eol=lf
