@@ -511,6 +511,59 @@ function looksLikeTransientQuota(status, text) {
   return !isIPAbuseRefusal(typeof text === "string" ? text : "");
 }
 
+// Whether a request that never got an answer is worth asking again.
+//
+// This is a different failure from the one above and it was missing: a fetch
+// that throws — the egress is being switched, the proxy is momentarily bound to
+// a port nothing listens on, DNS is not up yet — never produces a Response, so
+// the 429 branch never sees it and the exception went straight to the host. A
+// host reports that as a quota failure (measured 2026-10-27: `dial tcp
+// 127.0.0.1:1: connection refused` arrived at dsh as `429 … QUOTA`), and the
+// turn ends for a reason that had nothing to do with the request.
+//
+// A caller's own cancellation is not one of these. `abort` reaches fetch as the
+// request's signal, and retrying an aborted request would ignore the one thing
+// the caller said. So an abort is re-thrown untouched, and only a failure that
+// is about the path to the route is retried.
+//
+// The test is on the error, not on a list of messages: a transport failure is
+// the runtime's own judgement (`TypeError` from fetch, or a `code` it sets), and
+// guessing from prose is how a permanent failure gets retried forever. Anything
+// this cannot confidently call transient is not retried.
+const TRANSPORT_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETDOWN",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "ERR_STREAM_PREMATURE_CLOSE",
+]);
+function looksLikeTransportFailure(error, signal) {
+  // The caller's own cancellation, said by the caller. Never a retry.
+  if (signal?.aborted) return false;
+  if (error?.name === "AbortError") return false;
+  // A `cause` chain is how undici and Node report the socket underneath a
+  // `TypeError: fetch failed`.
+  for (let cursor = error, hops = 0; cursor && hops < 5; hops += 1) {
+    if (typeof cursor.code === "string" && TRANSPORT_CODES.has(cursor.code)) return true;
+    // The wording a proxy failure arrives in when the runtime has no code for
+    // it: measured, the message was "proxyconnect tcp: … connection refused".
+    if (typeof cursor.message === "string" && /^(proxyconnect|connect)\b/i.test(cursor.message))
+      return true;
+    cursor = cursor.cause;
+  }
+  // Only a failed fetch: a bug in this package's own shaping is not a transport
+  // problem, and retrying one would send the same broken request three times.
+  return error instanceof TypeError && /fetch/i.test(String(error.message));
+}
+
 // How a 429 is retried, when it is retried at all.
 //
 // The retry exists because of one measured fact: the free tier ledgers its quota
@@ -1547,13 +1600,23 @@ async function server(_input, options = {}) {
             // not worth retrying.
             const attempt = async () => {
               attempts += 1;
-              const response = await fetch(upstreamEndpoint(baseURL, protocol), {
-                method: "POST",
-                headers: attemptHeaders(),
-                body: encoded,
-                signal: request.signal,
-                redirect: "error",
-              });
+              let response;
+              try {
+                response = await fetch(upstreamEndpoint(baseURL, protocol), {
+                  method: "POST",
+                  headers: attemptHeaders(),
+                  body: encoded,
+                  signal: request.signal,
+                  redirect: "error",
+                });
+              } catch (cause) {
+                // A request that never got an answer has no Response to judge,
+                // so the failure travels to the loop as one instead of ending the
+                // turn here: the egress may be mid-switch, and the retry asks
+                // again once it settles. A caller's own abort is not a failure to
+                // retry, and `looksLikeTransportFailure` says so by refusing it.
+                return { failed: cause };
+              }
               // A refusal is the one place this route states its own window, and
               // it has to be read before explain() replaces the body. See
               // limits.mjs: an under-declared window is never refused, it is just
@@ -1571,25 +1634,43 @@ async function server(_input, options = {}) {
               });
               return { response, observed };
             };
-            // A 429 is worth one more ask with a bucket nothing has spent. How
-            // many, and how long between, is the operator's (see
-            // `retry429Count`); the wait grows so a route that is counting
-            // rather than rate limiting is not hammered.
+            // Two failures are worth asking again about, and they are different
+            // questions. A 429 may be one spent bucket rather than a spent exit,
+            // and a fresh project id is a ledger nothing has drawn on. A request
+            // that never got an answer — the egress mid-switch, the proxy bound
+            // to a port nothing listens on — says nothing about the request at
+            // all, and the same bytes answered once the path settles. Both are
+            // retried here, the first by re-minting the ids and the second by
+            // simply asking again.
             //
-            // Only a 429 is retried. A 403 is about the fingerprint or the IP, a
-            // 426 about the version, and a 5xx is the endpoint failing — none of
-            // those is answered differently by a fresh project id, and retrying
-            // one would only spend the caller's patience and the route's budget.
-            let { response, observed } = await attempt();
+            // Everything else is not retried. A 403 is about the fingerprint or
+            // the IP, a 426 about the version, and a 5xx is the endpoint failing —
+            // none of those is answered differently by a fresh project id, and
+            // retrying one would only spend the caller's patience and the route's
+            // budget.
+            let result = await attempt();
             const retries = retry429Count();
             let wait = retryWaitMs();
             for (let tried = 0; tried < retries; tried += 1) {
-              if (!looksLikeTransientQuota(response.status, observed?.text)) break;
+              const quota =
+                result.response !== undefined &&
+                looksLikeTransientQuota(result.response.status, result.observed?.text);
+              const transport = result.response === undefined;
+              // A failure that is neither of the two above — including a caller's
+              // own abort — ends the loop here rather than waiting out a retry
+              // that cannot help.
+              if (!quota && !(transport && looksLikeTransportFailure(result.failed, request.signal)))
+                break;
               request.signal.throwIfAborted();
               await pause(wait, request.signal);
               wait = Math.min(wait * 2, RETRY_WAIT_MAX_MS);
-              ({ response, observed } = await attempt());
+              result = await attempt();
             }
+            // A connection that never came up is the caller's to see, and it is
+            // thrown as it was caught: there is no Response to explain, and
+            // inventing one would hide the reason the path is down.
+            if (result.response === undefined) throw result.failed;
+            const { response, observed } = result;
             // The other half of the same reading: what the route's answer says
             // about this model's wall, learned from a request the host was
             // making anyway. A refusal names a size the window is under; a

@@ -466,6 +466,11 @@ async function fixture(t, input = {}, serverOptions = {}) {
         ...upstreamHeaders(),
       });
       res.flushHeaders();
+    } else if (state.destroyInference) {
+      // The socket dies before a byte of the answer is written: fetch rejects
+      // with the runtime's own transport error rather than resolving a
+      // Response, which is what an egress that is mid-switch produces.
+      req.socket.destroy();
     } else if (state.body !== undefined) {
       res.writeHead(state.status ?? 403, { "content-type": "application/json", ...upstreamHeaders() });
       res.end(state.body);
@@ -2064,6 +2069,70 @@ test("the 429 retry can be turned off", async (t) => {
   await refused.text();
   const inference = state.calls.filter((call) => call.url === "/v1/chat/completions");
   assert.equal(inference.length, 1);
+});
+
+// A request that never gets an answer is a different failure from a refusal, and
+// it used to end the turn: a fetch that throws produces no Response, so the 429
+// branch never saw it and the exception went straight to the host, which reports
+// it as a quota failure. Measured 2026-10-27, an egress mid-switch answered dsh
+// with `429 … QUOTA` for `dial tcp 127.0.0.1:1: connection refused` — a request
+// that never left the machine, and a turn lost to a path that came back four
+// seconds later. What is pinned here is that the loop spends its retries before
+// handing the failure on: the waits alone are longer than the bound below.
+test("a connection that never came up is retried before the failure is handed on", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  // The socket dies before any header is written, which surfaces as a thrown
+  // `fetch failed` rather than a Response — the shape an egress mid-switch
+  // produces. The fixture's discovery paths still answer, so the model is known
+  // and the request is built and sent.
+  state.destroyInference = true;
+  const started = Date.now();
+  await assert.rejects(
+    async () =>
+      loader.fetch(`${origin}/v1/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({
+          model: "chat-free",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+    /fetch failed|socket|ECONNRESET/i,
+  );
+  const elapsed = Date.now() - started;
+  // Two retries at the defaults are 1200ms and 2400ms of waiting. Anything that
+  // came back faster did not spend them.
+  assert.ok(
+    elapsed >= 3000,
+    `the failure came back in ${elapsed}ms, so the retries were not spent`,
+  );
+});
+
+// A caller's own cancellation is not a failure to retry. It is the one thing the
+// caller said about this request, and a retry that ignored it would keep asking
+// for a turn that was already given up on.
+test("an aborted request is not retried", async (t) => {
+  const { plugin, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const control = new AbortController();
+  const started = Date.now();
+  const call = loader
+    .fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", messages: [{ role: "user", content: "hi" }] }),
+      signal: control.signal,
+    })
+    .catch(() => {});
+  control.abort(new Error("cancelled by the caller"));
+  await call;
+  // The first wait is 1200ms by default. An abort that exited the loop shows up
+  // as a call that came back well inside one wait.
+  assert.ok(
+    Date.now() - started < 900,
+    "the aborted request waited out a retry pause instead of ending",
+  );
 });
 
 // Zen accepts a request only when every part of it belongs to one generation of
